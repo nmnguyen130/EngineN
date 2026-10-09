@@ -50,6 +50,18 @@ void Gamepad::Close() {
     }
 }
 
+void Gamepad::HandleDeviceEvent(const SDL_Event& event) {
+    if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
+        if (!IsConnected()) {
+            Open(event.gdevice.which);
+        }
+    } else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        if (IsConnected() && m_instanceId == event.gdevice.which) {
+            Close();
+        }
+    }
+}
+
 const char* Gamepad::GetName() const {
     if (!m_gamepad) return "Disconnected";
     const char* name = SDL_GetGamepadName(m_gamepad);

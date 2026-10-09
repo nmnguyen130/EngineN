@@ -18,14 +18,20 @@ FetchContent_MakeAvailable(SDL3)
 set(ENGINE_SOURCES
     src/main.cpp
     src/core/Log.cpp
-    src/core/time/HitstopEngine.cpp
-    src/core/time/FramePacer.cpp
     src/core/time/TimeManager.cpp
     src/platform/Platform.cpp
     src/platform/Window.cpp
     src/platform/EventPump.cpp
+    src/platform/input/Keyboard.cpp
+    src/platform/input/Mouse.cpp
     src/platform/input/Gamepad.cpp
+    src/platform/input/ActionMapper.cpp
+    src/platform/input/ActionBuffer.cpp
     src/platform/input/InputSystem.cpp
+    src/renderer/RenderDevice.cpp
+    src/renderer/RenderQueue.cpp
+    src/renderer/PrimitiveBatch.cpp
+    src/renderer/SdlRendererBackend.cpp
 )
 
 add_executable(EngineN ${ENGINE_SOURCES})
@@ -42,8 +48,6 @@ add_custom_command(TARGET EngineN POST_BUILD
 # Automated Verification Test Suites
 set(TEST_TIMELOOP_SOURCES
     tests/test_timeloop.cpp
-    src/core/time/HitstopEngine.cpp
-    src/core/time/FramePacer.cpp
     src/core/time/TimeManager.cpp
 )
 add_executable(TestTimeLoop ${TEST_TIMELOOP_SOURCES})
@@ -64,9 +68,26 @@ set(TEST_PLATFORM_SOURCES
     src/platform/Platform.cpp
     src/platform/Window.cpp
     src/platform/EventPump.cpp
+    src/platform/input/Keyboard.cpp
+    src/platform/input/Mouse.cpp
     src/platform/input/Gamepad.cpp
+    src/platform/input/ActionMapper.cpp
+    src/platform/input/ActionBuffer.cpp
     src/platform/input/InputSystem.cpp
 )
 add_executable(TestPlatform ${TEST_PLATFORM_SOURCES})
 target_include_directories(TestPlatform PRIVATE src)
 target_link_libraries(TestPlatform PRIVATE SDL3::SDL3)
+
+set(TEST_RENDERER_SOURCES
+    tests/test_renderer.cpp
+    src/core/Log.cpp
+    src/renderer/RenderDevice.cpp
+    src/renderer/RenderQueue.cpp
+    src/renderer/PrimitiveBatch.cpp
+    src/renderer/SdlRendererBackend.cpp
+)
+add_executable(TestRenderer ${TEST_RENDERER_SOURCES})
+target_include_directories(TestRenderer PRIVATE src)
+target_link_libraries(TestRenderer PRIVATE SDL3::SDL3)
+

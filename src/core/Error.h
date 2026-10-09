@@ -7,9 +7,9 @@
 namespace EngineN {
 
 struct EngineError {
-    std::string_view     message = "";
-    i32                  code = 0;
-    std::source_location location = std::source_location::current();
+    std::string_view     message{};
+    i32                  code{0};
+    std::source_location location{std::source_location::current()};
 
     constexpr EngineError() = default;
 

@@ -1,8 +1,10 @@
 #include "core/Log.h"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
-#include <string>
 
 namespace EngineN {
 
@@ -12,40 +14,41 @@ std::atomic<LogLevel> s_minLevel{LogLevel::Trace};
 std::FILE* s_fileHandle = nullptr;
 std::mutex s_logMutex;
 
-const char* LevelToString(LogLevel level) noexcept {
-    switch (level) {
-        case LogLevel::Trace: return "TRACE";
-        case LogLevel::Debug: return "DEBUG";
-        case LogLevel::Info:  return "INFO";
-        case LogLevel::Warn:  return "WARN";
-        case LogLevel::Error: return "ERROR";
-        case LogLevel::Fatal: return "FATAL";
-    }
-    return "UNKNOWN";
+constexpr usize kHistoryCapacity = 16;
+LogRecord s_logHistory[kHistoryCapacity];
+usize s_historyHead = 0;
+usize s_historyCount = 0;
+
+constexpr std::string_view kLevelNames[] = {
+    "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
+};
+
+constexpr std::string_view kCategoryNames[] = {
+    "Core", "Platform", "Physics", "Render", "Audio", "Gameplay"
+};
+
+constexpr std::string_view kLevelColors[] = {
+    "\033[90m", // TRACE (gray)
+    "\033[36m", // DEBUG (cyan)
+    "\033[32m", // INFO  (green)
+    "\033[33m", // WARN  (yellow)
+    "\033[31m", // ERROR (red)
+    "\033[35m"  // FATAL (magenta)
+};
+
+inline std::string_view LevelToString(LogLevel level) noexcept {
+    const auto idx = static_cast<size_t>(level);
+    return (idx < std::size(kLevelNames)) ? kLevelNames[idx] : "UNKNOWN";
 }
 
-const char* CategoryToString(LogCategory category) noexcept {
-    switch (category) {
-        case LogCategory::Core:     return "Core";
-        case LogCategory::Platform: return "Platform";
-        case LogCategory::Physics:  return "Physics";
-        case LogCategory::Render:   return "Render";
-        case LogCategory::Audio:    return "Audio";
-        case LogCategory::Gameplay: return "Gameplay";
-    }
-    return "Unknown";
+inline std::string_view CategoryToString(LogCategory category) noexcept {
+    const auto idx = static_cast<size_t>(category);
+    return (idx < std::size(kCategoryNames)) ? kCategoryNames[idx] : "Unknown";
 }
 
-const char* LevelColorAnsi(LogLevel level) noexcept {
-    switch (level) {
-        case LogLevel::Trace: return "\033[90m"; // Gray
-        case LogLevel::Debug: return "\033[36m"; // Cyan
-        case LogLevel::Info:  return "\033[32m"; // Green
-        case LogLevel::Warn:  return "\033[33m"; // Yellow
-        case LogLevel::Error: return "\033[31m"; // Red
-        case LogLevel::Fatal: return "\033[35m"; // Magenta
-    }
-    return "\033[0m";
+inline std::string_view LevelColorAnsi(LogLevel level) noexcept {
+    const auto idx = static_cast<size_t>(level);
+    return (idx < std::size(kLevelColors)) ? kLevelColors[idx] : "\033[0m";
 }
 
 } // namespace
@@ -53,8 +56,11 @@ const char* LevelColorAnsi(LogLevel level) noexcept {
 void Logger::Init(std::string_view logFilePath) {
     std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_fileHandle && !logFilePath.empty()) {
-        std::string path(logFilePath);
-        s_fileHandle = std::fopen(path.c_str(), "w");
+        char pathBuf[512];
+        const size_t len = std::min(logFilePath.size(), sizeof(pathBuf) - 1);
+        std::memcpy(pathBuf, logFilePath.data(), len);
+        pathBuf[len] = '\0';
+        s_fileHandle = std::fopen(pathBuf, "w");
     }
 }
 
@@ -76,29 +82,31 @@ LogLevel Logger::GetLevel() noexcept {
 }
 
 void Logger::LogMessage(LogLevel level,
-                       LogCategory category,
-                       std::string_view formattedMessage,
-                       std::source_location loc) noexcept {
+                        LogCategory category,
+                        std::string_view formattedMessage,
+                        std::source_location loc) noexcept {
     std::lock_guard<std::mutex> lock(s_logMutex);
 
-    const char* lvlStr = LevelToString(level);
-    const char* catStr = CategoryToString(category);
-    const char* colStr = LevelColorAnsi(level);
-    const char* rstStr = "\033[0m";
+    const auto lvlStr = LevelToString(level);
+    const auto catStr = CategoryToString(category);
+    const auto colStr = LevelColorAnsi(level);
+    constexpr const char* rstStr = "\033[0m";
 
-    // Console output (with ANSI color)
+    // Console output
+    std::FILE* console = (level >= LogLevel::Warn) ? stderr : stdout;
     if (level >= LogLevel::Warn) {
-        std::fprintf(stderr,
-                     "%s[%s][%s]%s %.*s \033[90m(%s:%u)%s\n",
-                     colStr, lvlStr, catStr, rstStr,
+        std::fprintf(console,
+                     "%s[%.*s][%.*s]%s %.*s \033[90m(%s:%u)%s\n",
+                     colStr.data(), static_cast<int>(lvlStr.size()), lvlStr.data(),
+                     static_cast<int>(catStr.size()), catStr.data(), rstStr,
                      static_cast<int>(formattedMessage.size()), formattedMessage.data(),
-                     loc.file_name(), loc.line(),
-                     rstStr);
-        std::fflush(stderr);
+                     loc.file_name(), loc.line(), rstStr);
+        std::fflush(console);
     } else {
-        std::fprintf(stdout,
-                     "%s[%s][%s]%s %.*s\n",
-                     colStr, lvlStr, catStr, rstStr,
+        std::fprintf(console,
+                     "%s[%.*s][%.*s]%s %.*s\n",
+                     colStr.data(), static_cast<int>(lvlStr.size()), lvlStr.data(),
+                     static_cast<int>(catStr.size()), catStr.data(), rstStr,
                      static_cast<int>(formattedMessage.size()), formattedMessage.data());
     }
 
@@ -106,18 +114,47 @@ void Logger::LogMessage(LogLevel level,
     if (s_fileHandle) {
         if (level >= LogLevel::Warn) {
             std::fprintf(s_fileHandle,
-                         "[%s][%s] %.*s (%s:%u)\n",
-                         lvlStr, catStr,
+                         "[%.*s][%.*s] %.*s (%s:%u)\n",
+                         static_cast<int>(lvlStr.size()), lvlStr.data(),
+                         static_cast<int>(catStr.size()), catStr.data(),
                          static_cast<int>(formattedMessage.size()), formattedMessage.data(),
                          loc.file_name(), loc.line());
         } else {
             std::fprintf(s_fileHandle,
-                         "[%s][%s] %.*s\n",
-                         lvlStr, catStr,
+                         "[%.*s][%.*s] %.*s\n",
+                         static_cast<int>(lvlStr.size()), lvlStr.data(),
+                         static_cast<int>(catStr.size()), catStr.data(),
                          static_cast<int>(formattedMessage.size()), formattedMessage.data());
         }
         std::fflush(s_fileHandle);
     }
+
+    // Circular history buffer for HUD
+    LogRecord& rec = s_logHistory[s_historyHead];
+    rec.level = level;
+    rec.category = category;
+    const usize copyLen = std::min(formattedMessage.size(), sizeof(rec.message) - 1);
+    std::memcpy(rec.message, formattedMessage.data(), copyLen);
+    rec.message[copyLen] = '\0';
+    rec.timestampNs = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    s_historyHead = (s_historyHead + 1) % kHistoryCapacity;
+    if (s_historyCount < kHistoryCapacity) {
+        s_historyCount++;
+    }
+}
+
+usize Logger::GetRecentLogs(LogRecord* outBuffer, usize maxCount) noexcept {
+    if (!outBuffer || maxCount == 0) return 0;
+    std::lock_guard<std::mutex> lock(s_logMutex);
+
+    const usize count = std::min(maxCount, s_historyCount);
+    for (usize i = 0; i < count; ++i) {
+        // Read oldest to newest
+        const usize idx = (s_historyHead + kHistoryCapacity - count + i) % kHistoryCapacity;
+        outBuffer[i] = s_logHistory[idx];
+    }
+    return count;
 }
 
 } // namespace EngineN

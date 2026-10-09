@@ -26,7 +26,6 @@ constexpr Unexpected<std::decay_t<E>> Err(E&& e) {
 struct SuccessTag {};
 inline constexpr SuccessTag Ok{};
 
-
 // Primary Template: Result<T, E>
 template <typename T, typename E = EngineError>
 class Result {
@@ -89,7 +88,6 @@ public:
 private:
     std::variant<T, E> m_storage;
 };
-
 
 // Specialization: Result<void, E>
 template <typename E>

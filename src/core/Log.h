@@ -25,6 +25,13 @@ enum class LogCategory : u8 {
     Gameplay
 };
 
+struct LogRecord {
+    LogLevel level = LogLevel::Info;
+    LogCategory category = LogCategory::Core;
+    char message[192] = {};
+    u64 timestampNs = 0;
+};
+
 class Logger {
 public:
     static void Init(std::string_view logFilePath = "engine.log");
@@ -37,6 +44,8 @@ public:
                            std::string_view formattedMessage,
                            std::source_location loc) noexcept;
 
+    static usize GetRecentLogs(LogRecord* outBuffer, usize maxCount) noexcept;
+
     template <typename... Args>
     static void Dispatch(LogLevel level,
                          LogCategory category,
@@ -47,7 +56,6 @@ public:
             return;
         }
 
-        // Stack buffer: 1024 bytes avoids heap allocation on 99.9% of engine logs
         char buffer[1024];
         auto res = std::format_to_n(buffer, sizeof(buffer) - 1, fmt, std::forward<Args>(args)...);
         *res.out = '\0';

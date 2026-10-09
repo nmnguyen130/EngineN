@@ -1,11 +1,11 @@
 #pragma once
 
-#include <cstdint>
+#include "core/Types.h"
 
 namespace EngineN {
 
 struct AppConfig {
-    const char* appName = "Metroidvania";
+    const char* appName = "EngineN — Sandbox Runtime";
     int windowWidth = 1280;
     int windowHeight = 720;
     int simulationHz = 120;

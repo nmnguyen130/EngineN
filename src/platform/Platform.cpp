@@ -5,6 +5,51 @@
 
 namespace EngineN {
 
+// ============================================================================
+// ClipboardText RAII Implementation
+// ============================================================================
+
+ClipboardText::~ClipboardText() {
+    Reset();
+}
+
+void ClipboardText::Reset(char* text) noexcept {
+    if (m_text) {
+        SDL_free(m_text);
+    }
+    m_text = text;
+}
+
+// ============================================================================
+// Display Helper Functions
+// ============================================================================
+
+static DisplayInfo ExtractDisplayInfo(SDL_DisplayID id) {
+    DisplayInfo info{};
+    info.id = id;
+
+    const char* name = SDL_GetDisplayName(id);
+    info.name = (name && name[0] != '\0') ? name : "Unknown Display";
+
+    const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(id);
+    if (mode) {
+        info.width = mode->w;
+        info.height = mode->h;
+        info.refreshRate = mode->refresh_rate;
+    }
+
+    float scale = SDL_GetDisplayContentScale(id);
+    info.contentScale = (scale > 0.0f) ? scale : 1.0f;
+    info.hdpi = 96.0f * info.contentScale;
+    info.vdpi = 96.0f * info.contentScale;
+
+    return info;
+}
+
+// ============================================================================
+// Platform Subsystem Implementation
+// ============================================================================
+
 Platform::~Platform() {
     Shutdown();
 }
@@ -56,63 +101,83 @@ i32 Platform::QueryDisplays(std::span<DisplayInfo> outDisplays) const {
 
     int toWrite = std::min(count, static_cast<int>(outDisplays.size()));
     for (int i = 0; i < toWrite; ++i) {
-        SDL_DisplayID id = displays[i];
-        DisplayInfo info{};
-        info.id = id;
-
-        const char* name = SDL_GetDisplayName(id);
-        info.name = name ? name : "Unknown Display";
-
-        const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(id);
-        if (mode) {
-            info.width = mode->w;
-            info.height = mode->h;
-            info.refreshRate = mode->refresh_rate;
-        }
-
-        // DPI queries
-        info.hdpi = 96.0f;
-        info.vdpi = 96.0f;
-
-        outDisplays[i] = info;
+        outDisplays[i] = ExtractDisplayInfo(displays[i]);
     }
 
     SDL_free(displays);
     return toWrite;
 }
 
-DisplayInfo Platform::GetPrimaryDisplayInfo() const {
-    DisplayInfo info{};
-    if (!m_initialized) return info;
+std::vector<DisplayInfo> Platform::GetAllDisplays() const {
+    std::vector<DisplayInfo> result;
+    if (!m_initialized) return result;
 
-    SDL_DisplayID id = SDL_GetPrimaryDisplay();
-    info.id = id;
-
-    const char* name = SDL_GetDisplayName(id);
-    info.name = name ? name : "Primary Display";
-
-    const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(id);
-    if (mode) {
-        info.width = mode->w;
-        info.height = mode->h;
-        info.refreshRate = mode->refresh_rate;
+    int count = 0;
+    SDL_DisplayID* displays = SDL_GetDisplays(&count);
+    if (!displays || count <= 0) {
+        if (displays) SDL_free(displays);
+        return result;
     }
-    info.hdpi = 96.0f;
-    info.vdpi = 96.0f;
 
-    return info;
+    result.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        result.push_back(ExtractDisplayInfo(displays[i]));
+    }
+
+    SDL_free(displays);
+    return result;
+}
+
+DisplayInfo Platform::GetPrimaryDisplayInfo() const {
+    if (!m_initialized) return DisplayInfo{};
+    SDL_DisplayID id = SDL_GetPrimaryDisplay();
+    return ExtractDisplayInfo(id);
+}
+
+DisplayInfo Platform::GetDisplayInfo(u32 displayId) const {
+    if (!m_initialized) return DisplayInfo{};
+    return ExtractDisplayInfo(displayId);
+}
+
+f32 Platform::GetDisplayRefreshRate(u32 displayId) const {
+    if (!m_initialized) return 60.0f;
+    SDL_DisplayID id = (displayId == 0) ? SDL_GetPrimaryDisplay() : displayId;
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(id);
+    if (!mode) {
+        mode = SDL_GetDesktopDisplayMode(id);
+    }
+    return (mode && mode->refresh_rate > 0.0f) ? mode->refresh_rate : 60.0f;
+}
+
+f32 Platform::GetDisplayContentScale(u32 displayId) const {
+    if (!m_initialized) return 1.0f;
+    SDL_DisplayID id = (displayId == 0) ? SDL_GetPrimaryDisplay() : displayId;
+    float scale = SDL_GetDisplayContentScale(id);
+    return (scale > 0.0f) ? scale : 1.0f;
 }
 
 bool Platform::HasClipboardText() const {
     return SDL_HasClipboardText();
 }
 
-const char* Platform::GetClipboardText() const {
-    return SDL_GetClipboardText();
+ClipboardText Platform::GetClipboardText() const {
+    // SDL_GetClipboardText() allocates memory via SDL_malloc that must be freed with SDL_free().
+    // ClipboardText takes ownership and guarantees zero memory leaks via RAII.
+    return ClipboardText(SDL_GetClipboardText());
+}
+
+std::string Platform::GetClipboardString() const {
+    ClipboardText clip = GetClipboardText();
+    return std::string(clip.view());
 }
 
 bool Platform::SetClipboardText(const char* text) {
-    return SDL_SetClipboardText(text);
+    return SDL_SetClipboardText(text ? text : "");
+}
+
+bool Platform::SetClipboardText(std::string_view text) {
+    std::string str(text);
+    return SDL_SetClipboardText(str.c_str());
 }
 
 u64 Platform::GetPerformanceCounter() const noexcept {
@@ -149,6 +214,10 @@ i32 Platform::GetSystemRAM() const noexcept {
 
 i32 Platform::GetCPUCount() const noexcept {
     return SDL_GetNumLogicalCPUCores();
+}
+
+i32 Platform::GetCPUCacheLineSize() const noexcept {
+    return SDL_GetCPUCacheLineSize();
 }
 
 } // namespace EngineN

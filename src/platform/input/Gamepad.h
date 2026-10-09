@@ -1,44 +1,16 @@
 #pragma once
 
 #include "core/Types.h"
-#include <cmath>
-#include <algorithm>
+#include "platform/input/InputTypes.h"
 
 struct SDL_Gamepad;
+union SDL_Event;
 
 namespace EngineN {
 
-struct DeadzoneResult {
-    f32 x = 0.0f;
-    f32 y = 0.0f;
-};
-
-/// Apply radial deadzone to a 2D stick input.
-/// Returns {0,0} inside deadzone; rescales outside to [0,1].
-inline DeadzoneResult ApplyRadialDeadzone(f32 rawX, f32 rawY, f32 deadzone) noexcept {
-    f32 magnitude = std::sqrt(rawX * rawX + rawY * rawY);
-    if (magnitude < deadzone || magnitude <= 1e-6f) {
-        return {0.0f, 0.0f};
-    }
-    f32 scale = (magnitude - deadzone) / (1.0f - deadzone);
-    if (scale > 1.0f) scale = 1.0f;
-    f32 normalizedX = rawX / magnitude;
-    f32 normalizedY = rawY / magnitude;
-    return {normalizedX * scale, normalizedY * scale};
-}
-
-/// Apply axial deadzone to a single axis value.
-inline f32 ApplyAxialDeadzone(f32 rawValue, f32 deadzone) noexcept {
-    if (std::abs(rawValue) < deadzone) {
-        return 0.0f;
-    }
-    f32 sign = (rawValue > 0.0f) ? 1.0f : -1.0f;
-    f32 scale = (std::abs(rawValue) - deadzone) / (1.0f - deadzone);
-    return sign * std::min(scale, 1.0f);
-}
-
-/// RAII wrapper around SDL_Gamepad*.
-/// Handles connection lifecycle, stick normalization, and deadzones.
+/// Low-Level Hardware Abstraction: Physical Gamepad Device.
+/// RAII wrapper around SDL_Gamepad*. Handles connection lifecycle, stick normalization,
+/// radial/axial deadzone filtering, and haptic rumble.
 class Gamepad {
 public:
     Gamepad() = default;
@@ -51,6 +23,7 @@ public:
 
     bool Open(u32 instanceId);
     void Close();
+    void HandleDeviceEvent(const SDL_Event& event);
 
     [[nodiscard]] bool IsConnected() const noexcept { return m_gamepad != nullptr; }
     [[nodiscard]] u32 GetInstanceId() const noexcept { return m_instanceId; }

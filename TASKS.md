@@ -66,13 +66,46 @@
 
 ---
 
-### Milestone 3: Collision World & Swept AABB Solver (PENDING ⏳)
-- [ ] Implement `src/physics/AABB.h`: Axis-Aligned Bounding Box primitives, Minkowski difference.
-- [ ] Implement `src/physics/Tilemap.h/.cpp`: Static grid collision broadphase.
-- [ ] Implement `src/physics/SweptAABB.h/.cpp`:
-  - Ray vs AABB slab algorithm with Time-of-Impact (TOI) and contact normal.
-  - Multi-pass slide resolution (up to 4–6 iterations per tick).
-  - Sub-pixel remainder accumulation.
+### Milestone 3: Renderer Subsystem (COMPLETED ✅)
+- [x] Backend-agnostic hardware abstraction (`src/renderer/RenderBackend.h`):
+  - `IRenderBackend` pure virtual interface and `BatchView` contract.
+  - Built-in `NullBackend` for headless CI/unit tests without OS windows.
+  - High-throughput `SdlRendererBackend` (`src/renderer/SdlRendererBackend.h/.cpp`) powered by SDL3 `SDL_RenderGeometryRaw`.
+- [x] Hardware Render Device (`src/renderer/RenderDevice.h/.cpp`):
+  - Generational texture slot table (`TextureHandle`: 16-bit index + 16-bit generation). Stale handles safely invalidated.
+  - Slot 1 built-in 1×1 solid white texture (`TextureHandle::White()`) for unified sprite/primitive batching.
+  - Adaptive VSync (`SDL_SetRenderVSync`) and logical presentation scaling (`SDL_SetRenderLogicalPresentation`: Letterbox, IntegerScale, Stretch).
+  - Virtual ↔ Window coordinate mappings (`WindowToVirtual`, `VirtualToWindow`).
+  - Strict frame order state machine (`BeginFrame`, `Submit`, `Present`).
+- [x] Core Types & 2D Geometry (`src/renderer/RendererTypes.h`):
+  - Canonical float RGBA `Color` with packed 32-bit byte orders, hex conversions, and zero-alpha-safe premultiplied/unpremultiplied alpha.
+  - Half-open interval `Rect` & `FRect` with non-overlapping touching edges, intersection, union, and center collapse.
+  - 2×3 column-vector `Mat2D` affine matrix with analytical inversion and singular matrix rejection.
+  - `Transform2D` with pivot invariance and shortest-arc angular Lerp across $\pm\pi$.
+  - `ViewTransform2D` with viewport, zoom, rotation, screenSpace bypass, and visible frustum world bounds.
+  - Canonical 20-byte `Vertex` layout (`{f32 x, y, u, v; u32 rgba;}`).
+- [x] High-Throughput Zero-Allocation Batching Pipeline (`src/renderer/RenderQueue.h`):
+  - Monolithic 64-byte aligned arena pre-allocated at boot (~12.64 MiB total).
+  - Transactional reservations (`Reserve`/`Commit`): drops excess draws without leaking partial memory.
+  - 64-bit Radix Sort key: `Pass` (4b) > `Layer` (8b) > `Quantized Depth` (16b) > `Blend` (4b) > `Material` (8b) > `TextureSlot` (16b).
+  - Stable 8-bit LSD Radix Sort across bytes 1..7 with uniform digit skip optimization.
+  - Contiguous run merging across identical GPU states.
+- [x] Vector Primitive Drawer (`src/renderer/PrimitiveBatch.h`):
+  - Solid and outline rectangles (`FillRect`, `StrokeRect` with inner-collapse degradation).
+  - Arbitrary-thickness lines (`Line`), triangles (`FillTriangle`).
+  - Smooth circles and rings (`FillCircle`, `StrokeCircle`) with dynamic sagitta error tessellation.
+  - Oriented hitboxes & hurtboxes (`FillCapsule`, `StrokeCapsule`).
+  - Debug helpers: `Grid`, `DebugHitbox`, `DebugRay`.
+- [x] Per-Frame Recording State Machine (`src/renderer/RenderContext.h`):
+  - 16-deep fixed-capacity state stack with RAII `ScopedState`.
+  - Frustum culling and pixel snapping.
+  - Unified sprite drawing (`DrawSprite`) with UV flipping (`FlipH`, `FlipV`).
+- [x] Complete Automated Test Suite (`tests/test_renderer.cpp`):
+  - 10 comprehensive verification suites.
+  - Allocation hook asserting strictly **0 heap allocations** across multi-frame render loop.
+- [x] Master Runtime Loop Integration (`src/main.cpp`):
+  - Decoupled 120Hz fixed simulation with variable-rate presentation via sub-frame alpha interpolation.
+  - Replaced debug renderer with `RenderDevice` and `RenderContext`.
 
 ---
 

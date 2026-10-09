@@ -1,4 +1,4 @@
-#include "core/time/Time.h"
+#include "core/time/TimeManager.h"
 #include "core/Config.h"
 #include "core/Log.h"
 #include "math/Vec2.h"
@@ -6,6 +6,10 @@
 #include "platform/Window.h"
 #include "platform/EventPump.h"
 #include "platform/input/InputSystem.h"
+#include "renderer/RendererTypes.h"
+#include "renderer/RenderDevice.h"
+#include "renderer/RenderContext.h"
+
 #include <SDL3/SDL.h>
 #include <cstdio>
 #include <cmath>
@@ -29,18 +33,23 @@ struct DemoEntity {
     }
 };
 
-void SetTargetFps(int fps, EngineN::TimeLoop& time, SDL_Renderer* renderer, int& framesThisSec, uint64_t& lastFpsTimeNs) {
+void SetTargetFps(
+    int fps,
+    EngineN::TimeManager& time,
+    EngineN::RenderDevice& device,
+    int& framesThisSec,
+    uint64_t& lastFpsTimeNs)
+{
+    if (time.Pacer().GetTargetFps() == fps) {
+        return; // Already at this target, do not reconfigure VSync or reset timers
+    }
     time.Pacer().SetTargetFps(fps);
     framesThisSec = 0;
     lastFpsTimeNs = SDL_GetTicksNS();
-    if (renderer) {
-        if (fps == 0) {
-            if (!SDL_SetRenderVSync(renderer, -1)) {
-                SDL_SetRenderVSync(renderer, 1);
-            }
-        } else {
-            SDL_SetRenderVSync(renderer, 0);
-        }
+    if (fps == 0) {
+        (void)device.SetVSync(EngineN::VSyncMode::Adaptive);
+    } else {
+        (void)device.SetVSync(EngineN::VSyncMode::Off);
     }
 }
 
@@ -50,7 +59,9 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
-    EngineN::AppConfig config{
+    using namespace EngineN;
+
+    AppConfig config{
         .appName = "EngineN — Sandbox Runtime",
         .windowWidth = 1280,
         .windowHeight = 720,
@@ -83,10 +94,26 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // 3. Create Hardware Accelerated SDL Renderer for debug graphics
-    SDL_Renderer* renderer = SDL_CreateRenderer(window.GetRawHandle(), nullptr);
-    if (!renderer) {
-        ENGINE_LOG(Fatal, Platform, "SDL_CreateRenderer failed: {}", SDL_GetError());
+    // 3. Create Hardware RenderDevice & RenderContext Subsystems (Milestone 03)
+    EngineN::RenderDevice device;
+    EngineN::RenderDeviceConfig renderConfig{
+        .vsync = (config.targetRenderFps == 0) ? EngineN::VSyncMode::Adaptive : EngineN::VSyncMode::Off,
+        .presentation = EngineN::PresentationMode::Letterbox,
+        .virtualWidth = config.windowWidth,
+        .virtualHeight = config.windowHeight,
+        .clearColor = EngineN::Color::FromRGBA8(18, 18, 24, 255),
+        .maxTextures = 1024
+    };
+    auto devRes = device.Create(window, renderConfig);
+    if (!devRes) {
+        ENGINE_LOG(Fatal, Render, "RenderDevice initialization failed: {}", devRes.Error().message);
+        return -1;
+    }
+
+    EngineN::RenderContext ctx;
+    auto ctxRes = ctx.Init(device);
+    if (!ctxRes) {
+        ENGINE_LOG(Fatal, Render, "RenderContext initialization failed: {}", ctxRes.Error().message);
         return -1;
     }
 
@@ -94,8 +121,8 @@ int main(int argc, char* argv[]) {
     EngineN::InputSystem input;
     EngineN::EventPump pump;
 
-    // 5. Unified 120Hz TimeLoop
-    EngineN::TimeLoop time;
+    // 5. Unified 120Hz TimeManager
+    EngineN::TimeManager time;
     time.Init({
         .simulationHz = config.simulationHz,
         .targetRenderFps = config.targetRenderFps,
@@ -111,12 +138,18 @@ int main(int argc, char* argv[]) {
     bool useInterpolation = true;
     bool bulletTime = false;
     bool running = true;
+    float frameTimeHistory[60] = {};
+    int historyIndex = 0;
 
-    SetTargetFps(config.targetRenderFps, time, renderer, framesThisSec, lastFpsTimeNs);
+    SetTargetFps(config.targetRenderFps, time, device, framesThisSec, lastFpsTimeNs);
 
     while (running) {
         // [TIME] Begin frame measurement
         time.BeginFrame();
+
+        float currentFrameMs = static_cast<float>(time.GetLastRawDeltaMs());
+        frameTimeHistory[historyIndex] = currentFrameMs;
+        historyIndex = (historyIndex + 1) % 60;
 
         // [EVENT PUMP & INPUT] Drain SDL events once per frame
         pump.BeginFrame();
@@ -125,11 +158,6 @@ int main(int argc, char* argv[]) {
 
         if (pump.WasQuitRequested() || input.IsActionJustPressed(EngineN::PlayerAction::MenuPause)) {
             running = false;
-        }
-
-        // Handle window refocus clock stabilization
-        if (window.HasFocus() == false) {
-            // Can pause or throttle if needed
         }
 
         // [DIAGNOSTICS] FPS calculation
@@ -143,61 +171,45 @@ int main(int argc, char* argv[]) {
         }
 
         // Toggle Fullscreen (F11)
-        if (input.IsKeyDown(SDL_SCANCODE_F11)) {
-            static bool s_f11Down = false;
-            if (!s_f11Down) {
-                s_f11Down = true;
-                auto newMode = (window.GetMode() == EngineN::WindowMode::Windowed)
-                    ? EngineN::WindowMode::BorderlessFullscreen
-                    : EngineN::WindowMode::Windowed;
-                auto res = window.SetMode(newMode);
-                (void)res;
-            }
-        } else {
-            static bool s_f11Down = false;
-            s_f11Down = false;
+        if (input.IsKeyJustPressed(SDL_SCANCODE_F11)) {
+            auto newMode = (window.GetMode() == EngineN::WindowMode::Windowed)
+                ? EngineN::WindowMode::BorderlessFullscreen
+                : EngineN::WindowMode::Windowed;
+            auto res = window.SetMode(newMode);
+            (void)res;
         }
 
         // Interactive Hotkeys
-        if (input.IsKeyDown(SDL_SCANCODE_I)) {
-            static bool s_iDown = false;
-            if (!s_iDown) {
-                s_iDown = true;
-                useInterpolation = !useInterpolation;
-            }
-        } else {
-            static bool s_iDown = false;
-            s_iDown = false;
+        if (input.IsKeyJustPressed(SDL_SCANCODE_I)) {
+            useInterpolation = !useInterpolation;
         }
 
-        if (input.IsKeyDown(SDL_SCANCODE_H)) {
-            static bool s_hDown = false;
-            if (!s_hDown) {
-                s_hDown = true;
-                time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .freezeDurationSec = 0.100});
-            }
-        } else {
-            static bool s_hDown = false;
-            s_hDown = false;
+        if (input.IsKeyJustPressed(SDL_SCANCODE_H)) {
+            time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .freezeDurationSec = 0.100});
         }
 
-        if (input.IsKeyDown(SDL_SCANCODE_B)) {
-            static bool s_bDown = false;
-            if (!s_bDown) {
-                s_bDown = true;
-                bulletTime = !bulletTime;
-                time.PlayerTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
-                time.WorldTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
-            }
-        } else {
-            static bool s_bDown = false;
-            s_bDown = false;
+        if (input.IsKeyJustPressed(SDL_SCANCODE_B)) {
+            bulletTime = !bulletTime;
+            time.PlayerTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
+            time.WorldTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
         }
 
-        if (input.IsKeyDown(SDL_SCANCODE_1)) SetTargetFps(60, time, renderer, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyDown(SDL_SCANCODE_2)) SetTargetFps(120, time, renderer, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyDown(SDL_SCANCODE_3)) SetTargetFps(144, time, renderer, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyDown(SDL_SCANCODE_0)) SetTargetFps(0, time, renderer, framesThisSec, lastFpsTimeNs);
+        if (input.IsKeyJustPressed(SDL_SCANCODE_1)) SetTargetFps(60, time, device, framesThisSec, lastFpsTimeNs);
+        if (input.IsKeyJustPressed(SDL_SCANCODE_2)) SetTargetFps(120, time, device, framesThisSec, lastFpsTimeNs);
+        if (input.IsKeyJustPressed(SDL_SCANCODE_3)) SetTargetFps(144, time, device, framesThisSec, lastFpsTimeNs);
+        if (input.IsKeyJustPressed(SDL_SCANCODE_0)) SetTargetFps(0, time, device, framesThisSec, lastFpsTimeNs);
+
+        // Diagnostic hotkeys (F-keys to avoid conflicting with gameplay: WASD, J, K, L)
+        if (input.IsKeyJustPressed(SDL_SCANCODE_F1)) {
+            static int s_logCounter = 1;
+            if (s_logCounter % 3 == 1) {
+                LOG_INFO("Live log test #{}: Player active at ({:.0f}, {:.0f})", s_logCounter++, player.position.x, player.position.y);
+            } else if (s_logCounter % 3 == 2) {
+                LOG_WARN("Live log test #{}: Resource usage threshold alert", s_logCounter++);
+            } else {
+                LOG_ERROR("Live log test #{}: Synthetic anomaly test", s_logCounter++);
+            }
+        }
 
         // Input Actions triggering combat feedback
         if (input.IsActionJustPressed(EngineN::PlayerAction::Attack)) {
@@ -226,17 +238,22 @@ int main(int argc, char* argv[]) {
                     currentSpeed *= 2.2f;
                 }
 
-                // If input active, move player; else bounce gently
-                if (std::abs(moveX) > 0.01f || std::abs(moveY) > 0.01f) {
-                    player.velocity = EngineN::Vec2{moveX, moveY} * currentSpeed;
+                EngineN::Vec2 moveDir{moveX, moveY};
+                float lenSq = moveDir.x * moveDir.x + moveDir.y * moveDir.y;
+                if (lenSq > 1.0f) {
+                    float invLen = 1.0f / std::sqrt(lenSq);
+                    moveDir.x *= invLen;
+                    moveDir.y *= invLen;
+                }
+
+                if (lenSq > 0.0001f) {
+                    player.velocity = moveDir * currentSpeed;
                 } else if (!player.isDashing) {
-                    // Friction damping towards zero
                     player.velocity *= std::max(0.0f, 1.0f - 10.0f * dtFloat);
                 }
 
                 player.position += player.velocity * dtFloat;
 
-                // Action timer decrement
                 if (player.actionTimer > 0.0) {
                     player.actionTimer -= dt;
                     if (player.actionTimer <= 0.0) {
@@ -245,13 +262,11 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // Bounds clamp within window
-                float arenaW = static_cast<float>(window.GetWidth());
-                float arenaH = static_cast<float>(window.GetHeight());
+                // Bounds clamp within virtual arena (1280x720)
                 float minX = 40.0f;
-                float maxX = arenaW - 40.0f - player.size.x;
+                float maxX = static_cast<float>(config.windowWidth) - 40.0f - player.size.x;
                 float minY = 40.0f;
-                float maxY = arenaH - 40.0f - player.size.y;
+                float maxY = static_cast<float>(config.windowHeight) - 40.0f - player.size.y;
 
                 if (player.position.x < minX) player.position.x = minX;
                 if (player.position.x > maxX) player.position.x = maxX;
@@ -265,93 +280,173 @@ int main(int argc, char* argv[]) {
         time.EndFrame();
         double alpha = time.GetAlpha();
 
-        SDL_SetRenderDrawColor(renderer, 18, 18, 24, 255);
-        SDL_RenderClear(renderer);
+        (void)device.BeginFrame();
+        ctx.BeginFrame();
 
-        // Arena border
-        SDL_FRect arenaRect{
+        // --------------------------------------------------------------------
+        // Pass 1: World Entities & Arena Geometry (World Space)
+        // --------------------------------------------------------------------
+        ctx.SetPass(EngineN::RenderPass::World);
+        ctx.SetLayer(0);
+
+        // Arena background border
+        const EngineN::FRect arenaRect{
             40.0f, 40.0f,
-            static_cast<float>(window.GetWidth()) - 80.0f,
-            static_cast<float>(window.GetHeight()) - 80.0f
+            static_cast<float>(config.windowWidth) - 80.0f,
+            static_cast<float>(config.windowHeight) - 80.0f
         };
-        SDL_SetRenderDrawColor(renderer, 35, 38, 52, 255);
-        SDL_RenderFillRect(renderer, &arenaRect);
-        SDL_SetRenderDrawColor(renderer, 65, 72, 104, 255);
-        SDL_RenderRect(renderer, &arenaRect);
+        ctx.Primitives().FillRect(arenaRect, EngineN::Color::FromRGBA8(35, 38, 52, 255));
+        ctx.Primitives().StrokeRect(arenaRect, 2.0f, EngineN::Color::FromRGBA8(65, 72, 104, 255));
 
-        // Visual position via alpha interpolation
+        // Arena grid lines
+        ctx.Primitives().Grid(arenaRect, 80.0f, 1.0f, EngineN::Color{0.18f, 0.20f, 0.28f, 0.4f});
+
+        // Visual position via sub-frame alpha interpolation
         EngineN::Vec2 visualPos = useInterpolation
             ? EngineN::Lerp(player.prevPosition, player.position, static_cast<float>(alpha))
             : player.position;
 
-        SDL_FRect boxRect{visualPos.x, visualPos.y, player.size.x, player.size.y};
+        EngineN::Color playerColor = EngineN::Color::FromRGBA8(92, 224, 153, 255); // Green: Normal
         if (time.Hitstop().IsFrozen(EngineN::HitstopChannel::Player)) {
-            SDL_SetRenderDrawColor(renderer, 255, 90, 95, 255); // Red: Hitstop Freeze
+            playerColor = EngineN::Color::FromRGBA8(255, 90, 95, 255); // Red: Hitstop Freeze
         } else if (player.isAttacking) {
-            SDL_SetRenderDrawColor(renderer, 255, 215, 0, 255); // Gold: Attack
+            playerColor = EngineN::Color::FromRGBA8(255, 215, 0, 255); // Gold: Attack
         } else if (player.isDashing) {
-            SDL_SetRenderDrawColor(renderer, 180, 100, 255, 255); // Purple: Dash
+            playerColor = EngineN::Color::FromRGBA8(180, 100, 255, 255); // Purple: Dash
         } else if (bulletTime) {
-            SDL_SetRenderDrawColor(renderer, 100, 220, 255, 255); // Cyan: Bullet-time
-        } else {
-            SDL_SetRenderDrawColor(renderer, 92, 224, 153, 255); // Green: Normal
-        }
-        SDL_RenderFillRect(renderer, &boxRect);
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 200);
-        SDL_RenderRect(renderer, &boxRect);
-
-        // HUD overlay
-        char fpsTargetBuf[32];
-        if (time.Pacer().GetTargetFps() == 0) {
-            snprintf(fpsTargetBuf, sizeof(fpsTargetBuf), "VSync (Auto)");
-        } else {
-            snprintf(fpsTargetBuf, sizeof(fpsTargetBuf), "%d FPS", time.Pacer().GetTargetFps());
+            playerColor = EngineN::Color::FromRGBA8(100, 220, 255, 255); // Cyan: Bullet-time
         }
 
-        const char* padStatus = input.HasGamepad() ? input.GetGamepad().GetName() : "None";
+        // Combat VFX: Dash ghost trail capsule
+        if (player.isDashing) {
+            EngineN::Vec2 trailStart = visualPos - (player.velocity * 0.04f);
+            ctx.Primitives().FillCapsule(trailStart, visualPos, 20.0f, EngineN::Color{0.7f, 0.4f, 1.0f, 0.35f});
+            ctx.Primitives().StrokeCapsule(trailStart, visualPos, 20.0f, 1.5f, EngineN::Color{0.8f, 0.5f, 1.0f, 0.7f});
+        }
 
-        char hudBuffer[1024];
-        snprintf(hudBuffer, sizeof(hudBuffer),
-            "%s - 120Hz Sim & Platform Subsystem\n"
-            "Window: %dx%d (Pixel: %dx%d, DPI: %.1fx) | Mode: %s [F11: Toggle Fullscreen]\n"
-            "FPS: %.1f | Raw Delta: %.2f ms | Ticks This Frame: %d | Total Ticks: %llu\n"
-            "Gamepad: %s | Mouse: (%d, %d)\n"
-            "Actions: Jump=%s Attack=%s Dash=%s Parry=%s [Ts Actions Queued: %u]\n"
-            "Interpolation: %s [Press I to toggle]\n"
-            "Hitstop: %s [Press H or Attack]\n"
-            "Bullet-Time: %s [Press B to toggle]\n"
-            "Target FPS: %s [Press 1=60, 2=120, 3=144, 0=VSync]\n"
-            "Controls: WASD / Stick / Arrows to Move | Space/A: Jump | J/LeftClick/X: Attack | Shift/RB: Dash",
-            config.appName,
-            window.GetWidth(), window.GetHeight(), window.GetPixelWidth(), window.GetPixelHeight(),
-            window.GetDPIScale(),
-            window.GetMode() == EngineN::WindowMode::Windowed ? "Windowed" : "Borderless",
-            fpsCounter,
-            time.GetLastRawDeltaMs(),
-            time.GetTicksThisFrame(),
-            static_cast<unsigned long long>(time.GetSimTickCount()),
-            padStatus, input.GetMouseX(), input.GetMouseY(),
-            input.IsActionHeld(EngineN::PlayerAction::Jump) ? "HELD" : "IDLE",
-            input.IsActionHeld(EngineN::PlayerAction::Attack) ? "HELD" : "IDLE",
-            input.IsActionHeld(EngineN::PlayerAction::Dash) ? "HELD" : "IDLE",
-            input.IsActionHeld(EngineN::PlayerAction::Parry) ? "HELD" : "IDLE",
-            input.GetTimestampedActionCount(),
-            useInterpolation ? "ON (Lerp)" : "OFF (Snap)",
-            time.Hitstop().IsFrozen(EngineN::HitstopChannel::Player) ? "FROZEN" : "ACTIVE",
-            bulletTime ? "ON (0.25x)" : "OFF (1.0x)",
-            fpsTargetBuf
-        );
+        // Player Box & Outline
+        const EngineN::FRect boxRect{visualPos.x, visualPos.y, player.size.x, player.size.y};
+        ctx.Primitives().FillRect(boxRect, playerColor);
+        ctx.Primitives().StrokeRect(boxRect, 2.0f, EngineN::Color{1.0f, 1.0f, 1.0f, 0.8f});
 
-        SDL_SetRenderDrawColor(renderer, 240, 240, 245, 255);
-        SDL_RenderDebugText(renderer, 50.0f, 50.0f, hudBuffer);
+        // Combat VFX: Attack slash circle
+        if (player.isAttacking) {
+            EngineN::Vec2 attackCenter{visualPos.x + player.size.x * 0.5f + 30.0f, visualPos.y + player.size.y * 0.5f};
+            ctx.Primitives().FillCircle(attackCenter, 32.0f, EngineN::Color{1.0f, 0.85f, 0.1f, 0.45f});
+            ctx.Primitives().StrokeCircle(attackCenter, 32.0f, 3.0f, EngineN::Color{1.0f, 0.95f, 0.4f, 0.9f});
+        }
 
-        SDL_RenderPresent(renderer);
+        // --------------------------------------------------------------------
+        // Pass 2: Screen-Space HUD (Virtual UI Canvas)
+        // --------------------------------------------------------------------
+        ctx.SetScreenSpace();
+        ctx.SetPass(EngineN::RenderPass::Ui);
+        ctx.SetLayer(10);
+
+        // 1. Top-Left Controls & Shortcuts Panel
+        const EngineN::FRect controlsPanel{40.0f, 40.0f, 540.0f, 130.0f};
+        ctx.Primitives().FillRect(controlsPanel, EngineN::Color{0.06f, 0.07f, 0.10f, 0.85f});
+        ctx.Primitives().StrokeRect(controlsPanel, 1.5f, EngineN::Color{0.25f, 0.30f, 0.45f, 0.8f});
+
+        ctx.Primitives().Text(Vec2{55.0f, 52.0f}, "--- ENGINEN METROIDVANIA RUNTIME ---", Color{0.4f, 0.8f, 1.0f, 1.0f});
+        ctx.Primitives().Text(Vec2{55.0f, 70.0f}, "WASD / Stick: Move  |  J / Space: Attack  |  K / Shift: Dash  |  L: Parry", Colors::White);
+        ctx.Primitives().Text(Vec2{55.0f, 88.0f}, "1/2/3/0: 60/120/144/Uncapped  |  H: Hitstop  |  B: Bullet-Time", Color{0.8f, 0.8f, 0.8f, 1.0f});
+        ctx.Primitives().Text(Vec2{55.0f, 106.0f}, "I: Interpolation  |  F1: Test Log  |  F11: Fullscreen  |  Esc: Quit", Color{0.9f, 0.75f, 0.3f, 1.0f});
+
+        // 2. Top-Right CPU Performance & Frame Spike Monitor
+        const FRect perfPanel{960.0f, 40.0f, 280.0f, 160.0f};
+        ctx.Primitives().FillRect(perfPanel, Color{0.06f, 0.07f, 0.10f, 0.88f});
+        ctx.Primitives().StrokeRect(perfPanel, 1.5f, Color{0.20f, 0.50f, 0.35f, 0.8f});
+
+        ctx.Primitives().Text(Vec2{975.0f, 50.0f}, "CPU & FRAME SPIKE MONITOR", Color{0.3f, 1.0f, 0.5f, 1.0f});
+
+        int targetFps = time.Pacer().GetTargetFps();
+        float targetBudgetMs = (targetFps > 0) ? (1000.0f / static_cast<float>(targetFps)) : 8.333f;
+        float maxGraphScaleMs = std::max(33.333f, targetBudgetMs * 2.2f);
+
+        char fpsText[64];
+        std::snprintf(fpsText, sizeof(fpsText), "FPS: %.1f (Target: %d)", fpsCounter, targetFps);
+        ctx.Primitives().Text(Vec2{975.0f, 68.0f}, fpsText, Colors::White);
+
+        char frameText[64];
+        std::snprintf(frameText, sizeof(frameText), "Frame: %.2f ms (Sim: %d ticks)", currentFrameMs, time.GetTicksThisFrame());
+        const Color frameCol = (currentFrameMs > targetBudgetMs * 1.40f) ? Colors::Red
+                             : (currentFrameMs > targetBudgetMs * 1.15f) ? Colors::Yellow
+                                                                         : Color{0.3f, 1.0f, 0.5f, 1.0f};
+        ctx.Primitives().Text(Vec2{975.0f, 86.0f}, frameText, frameCol);
+
+        const auto& stats = ctx.Queue().GetStats();
+        char statsText[64];
+        std::snprintf(statsText, sizeof(statsText), "Batches: %u runs | %u verts", stats.runCount, stats.vertexCount);
+        ctx.Primitives().Text(Vec2{975.0f, 104.0f}, statsText, Color{0.75f, 0.75f, 0.85f, 1.0f});
+
+        // Real-time Sparkline Graph (60-frame history, dynamic budget line)
+        const FRect graphArea{975.0f, 124.0f, 250.0f, 65.0f};
+        ctx.Primitives().FillRect(graphArea, Color{0.02f, 0.02f, 0.04f, 0.95f});
+        ctx.Primitives().StrokeRect(graphArea, 1.0f, Color{0.25f, 0.25f, 0.30f, 0.8f});
+
+        // Target budget reference line (e.g. 16.6ms for 60fps, 8.33ms for 120fps)
+        const f32 budgetY = 124.0f + 65.0f - std::clamp((targetBudgetMs / maxGraphScaleMs) * 65.0f, 4.0f, 62.0f);
+        ctx.Primitives().Line(Vec2{975.0f, budgetY}, Vec2{1225.0f, budgetY}, 1.0f, Color{0.2f, 0.8f, 0.3f, 0.5f});
+
+        // Draw 60 history bars
+        for (int i = 0; i < 60; ++i) {
+            int histIdx = (historyIndex + i) % 60;
+            f32 ms = frameTimeHistory[histIdx];
+            if (ms <= 0.01f) continue;
+
+            f32 barHeight = std::clamp((ms / maxGraphScaleMs) * 65.0f, 2.0f, 63.0f);
+            f32 barX = 976.0f + static_cast<f32>(i) * 4.12f;
+            f32 barY = 124.0f + 65.0f - barHeight;
+
+            Color barColor = (ms > targetBudgetMs * 1.40f) ? Color{1.0f, 0.2f, 0.2f, 1.0f} // Red: True Spike (>40% over target)
+                           : (ms > targetBudgetMs * 1.15f) ? Color{1.0f, 0.85f, 0.2f, 1.0f} // Yellow: Slight Jitter (>15% over target)
+                                                           : Color{0.2f, 0.9f, 0.4f, 0.9f}; // Green: Healthy
+
+            ctx.Primitives().FillRect(FRect{barX, barY, 3.0f, barHeight}, barColor);
+        }
+
+        // 3. Bottom-Left Live Engine Log Feed Panel
+        const FRect logPanel{40.0f, 525.0f, 620.0f, 155.0f};
+        ctx.Primitives().FillRect(logPanel, Color{0.05f, 0.06f, 0.09f, 0.92f});
+        ctx.Primitives().StrokeRect(logPanel, 1.5f, Color{0.30f, 0.35f, 0.50f, 0.8f});
+
+        ctx.Primitives().Text(Vec2{55.0f, 537.0f}, "--- LIVE LOG FEED (Press 'F1' for test log) ---", Color{0.6f, 0.75f, 0.95f, 1.0f});
+
+        LogRecord recentLogs[5];
+        usize logCount = Logger::GetRecentLogs(recentLogs, 5);
+
+        for (usize i = 0; i < logCount; ++i) {
+            const auto& rec = recentLogs[i];
+            Color lvlCol = Color{0.3f, 0.9f, 0.4f, 1.0f}; // Info: Green
+            const char* lvlTag = "[INFO]";
+            if (rec.level == LogLevel::Warn) {
+                lvlCol = Color{1.0f, 0.85f, 0.2f, 1.0f}; // Warn: Yellow
+                lvlTag = "[WARN]";
+            } else if (rec.level >= LogLevel::Error) {
+                lvlCol = Color{1.0f, 0.3f, 0.3f, 1.0f}; // Error/Fatal: Red
+                lvlTag = "[FAIL]";
+            } else if (rec.level == LogLevel::Debug) {
+                lvlCol = Color{0.3f, 0.8f, 1.0f, 1.0f}; // Debug: Cyan
+                lvlTag = "[DBUG]";
+            }
+
+            char logLine[256];
+            std::snprintf(logLine, sizeof(logLine), "%s %.66s", lvlTag, rec.message);
+            ctx.Primitives().Text(Vec2{55.0f, 558.0f + static_cast<f32>(i) * 20.0f}, logLine, lvlCol);
+        }
+
+        // Finalize batch and submit to RenderDevice
+        (void)ctx.EndFrame();
+
+        // Hardware swapchain present
+        (void)device.Present();
 
         // [TIME] Frame Pacing delay
         time.Pacer().WaitForTarget();
     }
 
-    SDL_DestroyRenderer(renderer);
+    device.Destroy();
     window.Destroy();
     platform.Shutdown();
 
