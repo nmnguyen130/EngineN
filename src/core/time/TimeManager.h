@@ -5,89 +5,108 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace EngineN {
 
 // Timestep constants & helpers
-inline constexpr uint64_t kDefaultSimHz = 120ULL;
-inline constexpr uint64_t kNsPerSec = 1'000'000'000ULL;
-inline constexpr uint64_t kDefaultFixedDtNs = kNsPerSec / kDefaultSimHz;
+inline constexpr std::uint64_t kDefaultSimHz = 120ULL;
+inline constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
+inline constexpr std::uint64_t kDefaultFixedDtNs = kNsPerSec / kDefaultSimHz;
 inline constexpr double kDefaultFixedDtSec = 1.0 / static_cast<double>(kDefaultSimHz);
 
-static_assert(kDefaultSimHz % 60ULL == 0, "Simulation Hz must be an integer multiple of 60Hz");
+static_assert(kDefaultSimHz % 60ULL == 0, "Simulation Hz must be an exact integer multiple of 60Hz");
 
-// Converts 60Hz authoring frames to 120Hz ticks (e.g. 6_f60 == 12 ticks)
-constexpr uint64_t operator""_f60(unsigned long long frames) noexcept {
+// Converts 60Hz authoring frames to simulation ticks at compile-time (e.g. 6_f60 == 12 ticks)
+constexpr std::uint64_t operator""_f60(unsigned long long frames) noexcept {
     return frames * (kDefaultSimHz / 60ULL);
 }
 
-// Monotonic hardware clock (nanoseconds)
-struct HighResolutionClock {
-    uint64_t previousTicks = 0;
+// Q16.16 fixed-point math helpers for domain dilation
+inline constexpr std::uint32_t kQ16One = 1u << 16;
+constexpr std::uint32_t ToQ16(float scale) noexcept {
+    return static_cast<std::uint32_t>(scale * static_cast<float>(kQ16One) + 0.5f);
+}
+constexpr float FromQ16(std::uint32_t q) noexcept {
+    return static_cast<float>(q) / static_cast<float>(kQ16One);
+}
 
-    void Init() noexcept {
-        previousTicks = SDL_GetTicksNS();
-    }
+/**
+ * HighResolutionClock: Monotonic hardware nanosecond clock.
+ * Queries SDL_GetTicksNS() and filters out backwards jumps or large resume spikes.
+ */
+class HighResolutionClock {
+public:
+    void Init() noexcept { Reset(); }
+    void Reset() noexcept;
 
-    // Samples elapsed nanoseconds since last sample; rejects negative clock jumps
-    uint64_t Sample() noexcept {
-        const uint64_t now = SDL_GetTicksNS();
-        const uint64_t deltaNs = (now >= previousTicks) ? (now - previousTicks) : 0ULL;
-        previousTicks = now;
-        return deltaNs;
-    }
+    // Samples elapsed nanoseconds since previous sample, rejecting negative clock jumps
+    [[nodiscard]] std::uint64_t Sample() noexcept;
 
-    // Reset previous ticks after pause or window defocus to prevent delta spikes
-    void ResetDelta() noexcept {
-        previousTicks = SDL_GetTicksNS();
-    }
+    [[nodiscard]] std::uint64_t GetPreviousTicksNs() const noexcept { return m_prevTicksNs; }
+    void SetPreviousTicksNs(std::uint64_t ns) noexcept { m_prevTicksNs = ns; }
+
+private:
+    std::uint64_t m_prevTicksNs = 0;
+    bool m_initialized = false;
 };
 
-// Discrete simulation channel
-struct TimeChannel {
-    double timeScale = 1.0;
-    double scaledDt = 0.0;
-    double totalTime = 0.0;
-    uint64_t simTicks = 0;
-
-    void SetModifier(double rawFixedDtSec, double hitstopModifier) noexcept {
-        const double effectiveScale = timeScale * hitstopModifier;
-        scaledDt = rawFixedDtSec * effectiveScale;
-    }
-
-    void CommitTick() noexcept {
-        totalTime += scaledDt;
-        simTicks++;
-    }
-
-    void Advance(double rawDtSec, double hitstopModifier) noexcept {
-        SetModifier(rawDtSec, hitstopModifier);
-        totalTime += scaledDt;
-        simTicks++;
-    }
-
-    void SetTimeScale(double scale) noexcept {
-        if (!std::isfinite(scale) || scale < 0.0) {
-            return;
-        }
-        timeScale = std::clamp(scale, 0.0, 8.0);
-    }
+enum class ChannelId : std::uint8_t {
+    Real = 0,
+    World,
+    Player,
+    Enemy,
+    Count
 };
 
-// Combat hitstop manager (non-stacking merge-by-max)
-enum class HitstopChannel : uint8_t {
+enum class HitstopChannel : std::uint8_t {
     World = 0,
-    Player = 1,
-    Enemy = 2,
-    Count = 3
+    Player,
+    Enemy,
+    Count
 };
 
 struct HitstopRequest {
     HitstopChannel channel = HitstopChannel::World;
-    double freezeDurationSec = 0.0;
+    double durationSec = 0.0;
 };
 
+/**
+ * TimeChannel: Discrete simulation channel for isolated time scaling and hitstop.
+ * Provides scaled dt for physics integration, total accumulated sim time, and tick gating.
+ */
+class TimeChannel {
+public:
+    void SetTimeScale(double scale) noexcept;
+
+    [[nodiscard]] double GetTimeScale() const noexcept { return m_timeScale; }
+    [[nodiscard]] std::uint32_t GetScaleQ16() const noexcept { return m_scaleQ16; }
+    [[nodiscard]] double GetScaledDt() const noexcept { return m_scaledDt; }
+    [[nodiscard]] double GetTotalTime() const noexcept { return m_totalTime; }
+    [[nodiscard]] std::uint64_t GetSimTicks() const noexcept { return m_simTicks; }
+
+private:
+    friend class TimeManager;
+
+    void SetRealDelta(double dtSec) noexcept;
+    void PrepareTick(double fixedDtSec, double hitstopModifier) noexcept;
+    void CommitTick() noexcept;
+
+    double m_timeScale = 1.0;
+    std::uint32_t m_scaleQ16 = kQ16One;
+    double m_scaledDt = 0.0;
+    double m_totalTime = 0.0;
+    std::uint64_t m_simTicks = 0;
+
+    std::uint32_t m_accQ16 = 0;            // Q16 progress toward next domain tick
+    std::uint32_t m_effScaleQ16 = kQ16One; // Effective scale accounting for hitstop
+};
+
+/**
+ * HitstopEngine: Manages impact freeze durations per channel.
+ * Implements non-stacking merge-by-max to prevent runaway freezes during combos.
+ */
 class HitstopEngine {
 public:
     void Request(const HitstopRequest& req) noexcept;
@@ -96,93 +115,105 @@ public:
 
     [[nodiscard]] double GetModifier(HitstopChannel ch) const noexcept;
     [[nodiscard]] bool IsFrozen(HitstopChannel ch) const noexcept;
+    [[nodiscard]] double GetRemainingSec(HitstopChannel ch) const noexcept;
 
 private:
-    std::array<double, static_cast<size_t>(HitstopChannel::Count)> m_remainingFreezeSec{};
+    std::array<double, static_cast<std::size_t>(HitstopChannel::Count)> m_remainingSec{};
 };
 
-// Absolute-deadline frame rate limiter
+/**
+ * FramePacer: Absolute-deadline frame rate limiter.
+ * Prevents cumulative sleep drift by incrementing an absolute target deadline.
+ */
 class FramePacer {
 public:
     void SetTargetFps(int fps) noexcept;
     [[nodiscard]] int GetTargetFps() const noexcept { return m_targetFps; }
-    [[nodiscard]] uint64_t GetTargetFrameNs() const noexcept { return m_targetFrameNs; }
-    [[nodiscard]] uint64_t GetTargetDeadlineNs() const noexcept { return m_targetDeadlineNs; }
+    [[nodiscard]] std::uint64_t GetTargetFrameNs() const noexcept { return m_targetFrameNs; }
+    [[nodiscard]] std::uint64_t GetTargetDeadlineNs() const noexcept { return m_targetDeadlineNs; }
 
     void WaitForTarget() noexcept;
     void Reset() noexcept;
 
 private:
-    int m_targetFps = 0; // 0 = uncapped / vsync-driven
-    uint64_t m_targetFrameNs = 0;
-    uint64_t m_targetDeadlineNs = 0;
+    int m_targetFps = 0; // 0 = uncapped or VSync-driven presentation
+    std::uint64_t m_targetFrameNs = 0;
+    std::uint64_t m_targetDeadlineNs = 0;
 };
 
-// Central timeloop manager
 struct TimeConfig {
     int simulationHz = static_cast<int>(kDefaultSimHz);
-    int targetRenderFps = 0; // 0 = uncapped / vsync
+    int targetRenderFps = 0;                   // 0 = uncapped / vsync
     int maxCatchupTicks = 8;
+    std::uint64_t maxFrameNs = 250'000'000ULL; // 250ms spiral-of-death safety clamp
 };
 
-enum class ChannelId : uint8_t {
-    Real = 0,
-    World = 1,
-    Player = 2,
-    Enemy = 3,
-    Count = 4
-};
-
+/**
+ * TimeManager: Central timeloop coordinator for deterministic 120Hz fixed-timestep.
+ * Accumulator is tracked in integer ns x Hz to ensure bitwise zero-drift over long runs.
+ */
 class TimeManager {
 public:
     void Init(const TimeConfig& config = {}) noexcept;
 
     void BeginFrame() noexcept;
-    void BeginFrameManual(uint64_t rawDeltaNs) noexcept;
+    void BeginFrameManual(std::uint64_t rawDeltaNs) noexcept;
     [[nodiscard]] bool ConsumeTick() noexcept;
     void EndTick() noexcept;
     void EndFrame() noexcept;
 
     void SetPaused(bool paused) noexcept;
     [[nodiscard]] bool IsPaused() const noexcept { return m_paused; }
-
     void ResetClocksOnRefocus() noexcept;
 
-    // Presentation and telemetry metrics
+    // Sub-frame presentation interpolation alpha [0.0, 1.0)
     [[nodiscard]] double GetAlpha() const noexcept { return m_alpha; }
-    [[nodiscard]] uint64_t GetAccumulatorNs() const noexcept { return m_accumulatorNs; }
-    [[nodiscard]] uint64_t GetFixedDtNs() const noexcept { return m_fixedDtNs; }
+    [[nodiscard]] double GetDomainAlpha(ChannelId ch) const noexcept;
+
+    // Exact accumulator metrics
+    [[nodiscard]] std::uint64_t GetAccumulatorNsHz() const noexcept { return m_accNsHz; }
+    [[nodiscard]] std::uint64_t GetAccumulatorNs() const noexcept {
+        return (m_simHz > 0) ? (m_accNsHz / m_simHz) : 0ULL;
+    }
+
+    [[nodiscard]] std::uint64_t GetFixedDtNs() const noexcept { return m_fixedDtNs; }
     [[nodiscard]] double GetFixedDtSec() const noexcept { return m_fixedDtSec; }
-    [[nodiscard]] uint64_t GetSimTickCount() const noexcept { return m_simTickCount; }
+    [[nodiscard]] std::uint64_t GetSimTickCount() const noexcept { return m_simTickCount; }
     [[nodiscard]] int GetTicksThisFrame() const noexcept { return m_ticksThisFrame; }
     [[nodiscard]] double GetLastRawDeltaMs() const noexcept { return m_lastRawDeltaMs; }
+    [[nodiscard]] bool WasTimeDropped() const noexcept { return m_droppedTime; }
 
-    // Channel accessors
-    TimeChannel& RealTime() noexcept { return m_channels[static_cast<size_t>(ChannelId::Real)]; }
-    TimeChannel& WorldTime() noexcept { return m_channels[static_cast<size_t>(ChannelId::World)]; }
-    TimeChannel& PlayerTime() noexcept { return m_channels[static_cast<size_t>(ChannelId::Player)]; }
-    TimeChannel& EnemyTime() noexcept { return m_channels[static_cast<size_t>(ChannelId::Enemy)]; }
+    // Channel accessors: RealTime is const to ensure gameplay never scales wall clock
+    [[nodiscard]] const TimeChannel& RealTime() const noexcept;
+    [[nodiscard]] TimeChannel& WorldTime() noexcept;
+    [[nodiscard]] TimeChannel& PlayerTime() noexcept;
+    [[nodiscard]] TimeChannel& EnemyTime() noexcept;
 
     // Subsystem accessors
-    HitstopEngine& Hitstop() noexcept { return m_hitstop; }
-    FramePacer& Pacer() noexcept { return m_pacer; }
-    HighResolutionClock& Clock() noexcept { return m_clock; }
+    [[nodiscard]] HitstopEngine& Hitstop() noexcept { return m_hitstop; }
+    [[nodiscard]] FramePacer& Pacer() noexcept { return m_pacer; }
+    [[nodiscard]] HighResolutionClock& Clock() noexcept { return m_clock; }
 
 private:
+    void UpdateDomainDeltas() noexcept;
+
     TimeConfig m_config{};
-    uint64_t m_fixedDtNs = kDefaultFixedDtNs;
+    std::uint64_t m_simHz = kDefaultSimHz;
+    std::uint64_t m_fixedDtNs = kDefaultFixedDtNs;
     double m_fixedDtSec = kDefaultFixedDtSec;
-    uint64_t m_maxFrameTimeNs = kDefaultFixedDtNs * 8ULL;
+    std::uint64_t m_maxFrameNs = 250'000'000ULL;
 
     HighResolutionClock m_clock{};
-    uint64_t m_accumulatorNs = 0;
+    std::uint64_t m_accNsHz = 0; // Integer ns x Hz accumulator: exactly 10^9 per tick (Zero Drift)
     double m_alpha = 0.0;
-    uint64_t m_simTickCount = 0;
+    std::uint64_t m_simTickCount = 0;
     int m_ticksThisFrame = 0;
     double m_lastRawDeltaMs = 0.0;
     bool m_paused = false;
+    bool m_droppedTime = false;
+    bool m_tickOpen = false; // Guard enforcing balanced ConsumeTick/EndTick lifecycles
 
-    std::array<TimeChannel, static_cast<size_t>(ChannelId::Count)> m_channels{};
+    std::array<TimeChannel, static_cast<std::size_t>(ChannelId::Count)> m_channels{};
     HitstopEngine m_hitstop{};
     FramePacer m_pacer{};
 };

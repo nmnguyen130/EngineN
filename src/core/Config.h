@@ -5,7 +5,7 @@
 namespace EngineN {
 
 struct AppConfig {
-    const char* appName = "EngineN — Sandbox Runtime";
+    const char* appName = "EngineN - Sandbox Runtime";
     int windowWidth = 1280;
     int windowHeight = 720;
     int simulationHz = 120;

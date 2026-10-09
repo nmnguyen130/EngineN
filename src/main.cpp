@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (input.IsKeyJustPressed(SDL_SCANCODE_H)) {
-            time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .freezeDurationSec = 0.100});
+            time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.100});
         }
 
         if (input.IsKeyJustPressed(SDL_SCANCODE_B)) {
@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
         if (input.IsActionJustPressed(EngineN::PlayerAction::Attack)) {
             player.isAttacking = true;
             player.actionTimer = 0.15;
-            time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .freezeDurationSec = 0.050});
+            time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.050});
         }
         if (input.IsActionJustPressed(EngineN::PlayerAction::Dash)) {
             player.isDashing = true;
@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
 
         // [SIMULATION] Deterministic Fixed Timestep 120Hz Loop
         while (time.ConsumeTick()) {
-            double dt = time.PlayerTime().scaledDt;
+            double dt = time.PlayerTime().GetScaledDt();
             if (dt > 0.0) {
                 float dtFloat = static_cast<float>(dt);
                 player.prevPosition = player.position;
