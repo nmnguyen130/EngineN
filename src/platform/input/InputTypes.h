@@ -6,8 +6,8 @@
 
 namespace EngineN {
 
-// Virtual game actions decoupled from physical hardware
-enum class PlayerAction : u8 {
+/// Logical gameplay and interface actions decoupled from physical hardware.
+enum class InputAction : u8 {
     Jump = 0,
     Attack,
     Dash,
@@ -19,15 +19,15 @@ enum class PlayerAction : u8 {
     Count
 };
 
-// Edge and contextual state for virtual actions
-enum class ActionState : u8 {
-    Idle = 0,
-    JustPressed,
-    Held,
-    JustReleased
+/// High-level input contexts isolating gameplay from menus and debugging.
+enum class InputContext : u8 {
+    Gameplay = 0,
+    UI,
+    Debug,
+    Count
 };
 
-// Virtual 2D gameplay axes
+/// Virtual 2D directional axes.
 enum class AxisId : u8 {
     MoveX = 0,
     MoveY,
@@ -36,86 +36,87 @@ enum class AxisId : u8 {
     Count
 };
 
-// Fixed array capacities to ensure zero dynamic heap allocations in hot paths
-inline constexpr usize kActionCount           = static_cast<usize>(PlayerAction::Count);
-inline constexpr usize kAxisCount             = static_cast<usize>(AxisId::Count);
-inline constexpr usize kMaxKeyboardKeys       = 512;
-inline constexpr usize kMaxMouseButtons       = 8;
-inline constexpr usize kMaxTimestampedActions = 64;
-inline constexpr usize kMaxBufferedActions    = 64;
-inline constexpr usize kMaxKeyBindings        = 32;
-inline constexpr usize kMaxMouseBindings      = 8;
-inline constexpr usize kMaxGamepadBindings    = 16;
+inline constexpr usize kActionCount = static_cast<usize>(InputAction::Count);
+inline constexpr usize kContextCount = static_cast<usize>(InputContext::Count);
+inline constexpr usize kAxisCount = static_cast<usize>(AxisId::Count);
 
-// Standard Metroidvania Input Buffering Windows (in nanoseconds)
-// Derived from 120Hz fixed-timestep requirements (architecture.md):
-// 100 ms = ~12 simulation ticks; 67 ms = ~8 simulation ticks; 40 ms = ~5 simulation ticks.
-inline constexpr u64 kDefaultBufferWindowNs   = 100'000'000ULL; // 100 ms
-inline constexpr u64 kJumpBufferWindowNs      = 100'000'000ULL; // 100 ms
-inline constexpr u64 kAttackBufferWindowNs    = 100'000'000ULL; // 100 ms
-inline constexpr u64 kDashBufferWindowNs      =  67'000'000ULL; //  67 ms
-inline constexpr u64 kWallJumpBufferWindowNs  =  67'000'000ULL; //  67 ms
-inline constexpr u64 kParryBufferWindowNs     =  40'000'000ULL; //  40 ms
+inline constexpr usize kMaxKeyboardKeys = 512;
+inline constexpr usize kMaxMouseButtons = 8;
 
-[[nodiscard]] constexpr u64 MsToNs(u64 ms) noexcept {
-    return ms * 1'000'000ULL;
-}
+inline constexpr usize kMaxKeyBindings = 32;
+inline constexpr usize kMaxMouseBindings = 16;
+inline constexpr usize kMaxAxisBindings = 12;
+inline constexpr usize kMaxFrameLogActions = 32;
 
-[[nodiscard]] constexpr f64 NsToMs(u64 ns) noexcept {
-    return static_cast<f64>(ns) / 1'000'000.0;
-}
+// Standard action intent buffering window (100ms = ~12 ticks at 120Hz)
+inline constexpr u64 kDefaultBufferWindowNs = 100'000'000ULL;
 
-// Low-level deadzone calculation output
+/**
+ * ActionFrameState: Tri-state model separating continuous hold from discrete edges.
+ * Allows both a press and release occurring within the same frame/tick to be captured.
+ */
+struct ActionFrameState {
+    bool down = false;
+    bool pressed = false;
+    bool released = false;
+};
+
+struct TimestampedAction {
+    InputAction action = InputAction::Jump;
+    u64 timestampNs = 0;
+    bool pressed = false;
+};
+
 struct DeadzoneResult {
     f32 x = 0.0f;
     f32 y = 0.0f;
 };
 
-/// Apply radial deadzone to a 2D analog stick input.
-/// Returns {0,0} inside deadzone; rescales smoothly to [0,1] outside.
+/// Apply radial deadzone to 2D analog input with finite validation and smooth rescale.
 [[nodiscard]] inline DeadzoneResult ApplyRadialDeadzone(f32 rawX, f32 rawY, f32 deadzone) noexcept {
-    f32 magnitude = std::sqrt(rawX * rawX + rawY * rawY);
-    if (magnitude < deadzone || magnitude <= 1e-6f) {
+    if (!std::isfinite(rawX) || !std::isfinite(rawY) || !std::isfinite(deadzone)) {
         return {0.0f, 0.0f};
     }
-    f32 scale = (magnitude - deadzone) / (1.0f - deadzone);
-    if (scale > 1.0f) scale = 1.0f;
-    f32 normalizedX = rawX / magnitude;
-    f32 normalizedY = rawY / magnitude;
-    return {normalizedX * scale, normalizedY * scale};
+    f32 clampedDeadzone = std::clamp(deadzone, 0.0f, 0.999f);
+    f32 magnitude = std::sqrt(rawX * rawX + rawY * rawY);
+    if (magnitude <= clampedDeadzone || magnitude <= 1e-6f) {
+        return {0.0f, 0.0f};
+    }
+    f32 scale = std::min((magnitude - clampedDeadzone) / (1.0f - clampedDeadzone), 1.0f);
+    return {(rawX / magnitude) * scale, (rawY / magnitude) * scale};
 }
 
-/// Apply axial deadzone to a single axis value.
+/// Apply axial deadzone to a 1D axis with finite validation and smooth rescale.
 [[nodiscard]] inline f32 ApplyAxialDeadzone(f32 rawValue, f32 deadzone) noexcept {
-    if (std::abs(rawValue) < deadzone) {
+    if (!std::isfinite(rawValue) || !std::isfinite(deadzone)) {
+        return 0.0f;
+    }
+    f32 clampedDeadzone = std::clamp(deadzone, 0.0f, 0.999f);
+    if (std::abs(rawValue) <= clampedDeadzone) {
         return 0.0f;
     }
     f32 sign = (rawValue > 0.0f) ? 1.0f : -1.0f;
-    f32 scale = (std::abs(rawValue) - deadzone) / (1.0f - deadzone);
-    return sign * std::min(scale, 1.0f);
+    f32 scale = std::min((std::abs(rawValue) - clampedDeadzone) / (1.0f - clampedDeadzone), 1.0f);
+    return sign * scale;
 }
 
-// Sub-frame timestamped action event recorded within a single frame
-struct TimestampedAction {
-    PlayerAction action = PlayerAction::Jump;
-    u64 timestamp = 0;   // Hardware timestamp in nanoseconds
-    bool pressed = true;
-};
-
-// Binding descriptors mapping physical hardware codes to virtual actions
 struct KeyBinding {
     u32 scancode = 0;
-    PlayerAction action = PlayerAction::Jump;
+    InputAction action = InputAction::Jump;
+    InputContext context = InputContext::Gameplay;
 };
 
 struct MouseButtonBinding {
     u8 button = 0;
-    PlayerAction action = PlayerAction::Attack;
+    InputAction action = InputAction::Attack;
+    InputContext context = InputContext::Gameplay;
 };
 
-struct GamepadButtonBinding {
-    u8 button = 0;
-    PlayerAction action = PlayerAction::Jump;
+struct AxisKeyBinding {
+    AxisId axis = AxisId::MoveX;
+    u32 negativeScancode = 0;
+    u32 positiveScancode = 0;
+    InputContext context = InputContext::Gameplay;
 };
 
 } // namespace EngineN

@@ -156,7 +156,7 @@ int main(int argc, char* argv[]) {
         input.BeginFrame();
         pump.PollAll(window, input);
 
-        if (pump.WasQuitRequested() || input.IsActionJustPressed(EngineN::PlayerAction::MenuPause)) {
+        if (pump.WasQuitRequested() || input.WasActionPressedThisFrame(EngineN::InputAction::MenuPause)) {
             running = false;
         }
 
@@ -212,12 +212,12 @@ int main(int argc, char* argv[]) {
         }
 
         // Input Actions triggering combat feedback
-        if (input.IsActionJustPressed(EngineN::PlayerAction::Attack)) {
+        if (input.WasActionPressedThisFrame(EngineN::InputAction::Attack)) {
             player.isAttacking = true;
             player.actionTimer = 0.15;
             time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.050});
         }
-        if (input.IsActionJustPressed(EngineN::PlayerAction::Dash)) {
+        if (input.WasActionPressedThisFrame(EngineN::InputAction::Dash)) {
             player.isDashing = true;
             player.actionTimer = 0.20;
         }

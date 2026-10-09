@@ -22,11 +22,8 @@ set(ENGINE_SOURCES
     src/platform/Platform.cpp
     src/platform/Window.cpp
     src/platform/EventPump.cpp
-    src/platform/input/Keyboard.cpp
-    src/platform/input/Mouse.cpp
-    src/platform/input/Gamepad.cpp
-    src/platform/input/ActionMapper.cpp
     src/platform/input/ActionBuffer.cpp
+    src/platform/input/InputBindings.cpp
     src/platform/input/InputSystem.cpp
     src/renderer/RenderDevice.cpp
     src/renderer/RenderQueue.cpp
@@ -68,11 +65,8 @@ set(TEST_PLATFORM_SOURCES
     src/platform/Platform.cpp
     src/platform/Window.cpp
     src/platform/EventPump.cpp
-    src/platform/input/Keyboard.cpp
-    src/platform/input/Mouse.cpp
-    src/platform/input/Gamepad.cpp
-    src/platform/input/ActionMapper.cpp
     src/platform/input/ActionBuffer.cpp
+    src/platform/input/InputBindings.cpp
     src/platform/input/InputSystem.cpp
 )
 add_executable(TestPlatform ${TEST_PLATFORM_SOURCES})
@@ -90,4 +84,15 @@ set(TEST_RENDERER_SOURCES
 add_executable(TestRenderer ${TEST_RENDERER_SOURCES})
 target_include_directories(TestRenderer PRIVATE src)
 target_link_libraries(TestRenderer PRIVATE SDL3::SDL3)
+
+set(TEST_INPUT_SOURCES
+    tests/test_input.cpp
+    src/core/Log.cpp
+    src/platform/input/ActionBuffer.cpp
+    src/platform/input/InputBindings.cpp
+    src/platform/input/InputSystem.cpp
+)
+add_executable(TestInput ${TEST_INPUT_SOURCES})
+target_include_directories(TestInput PRIVATE src)
+target_link_libraries(TestInput PRIVATE SDL3::SDL3)
 
