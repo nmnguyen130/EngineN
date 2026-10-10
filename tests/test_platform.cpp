@@ -1,336 +1,253 @@
 #include "platform/Platform.h"
 #include "platform/Window.h"
-#include "platform/EventPump.h"
+#include "platform/EventRouting.h"
 #include "platform/input/InputSystem.h"
 #include "core/Log.h"
 
 #include <SDL3/SDL.h>
 #include <cassert>
 #include <iostream>
-#include <vector>
-#include <string_view>
 
 using namespace EngineN;
 
-void TestPlatformAndWindow() {
-    std::cout << "  -> Testing Platform and Window Subsystem..." << std::endl;
+void TestPlatformLifecycleAndTopology() {
+    std::cout << "  [1/5] Testing Platform Lifecycle & Display Topology..." << std::endl;
 
     Platform platform;
     auto initRes = platform.Init();
     assert(initRes);
     assert(platform.IsInitialized());
 
-    // Query displays
-    i32 displayCount = platform.GetDisplayCount();
-    assert(displayCount >= 1);
+    const auto& topology = platform.Displays();
+    assert(!topology.Displays().empty());
 
-    DisplayInfo primary = platform.GetPrimaryDisplayInfo();
-    assert(primary.width > 0);
-    assert(primary.height > 0);
-    assert(primary.refreshRate > 0.0f);
-    assert(!primary.name.empty());
-
-    // Create window
-    Window window;
-    WindowConfig config{
-        .title = "Test Window",
-        .width = 800,
-        .height = 600,
-        .mode = WindowMode::Windowed,
-        .highDPI = true,
-        .resizable = true
-    };
-
-    auto winRes = window.Create(config);
-    assert(winRes);
-    assert(window.IsValid());
-    assert(window.GetWidth() == 800);
-    assert(window.GetHeight() == 600);
-    assert(window.GetPixelWidth() >= 800);
-    assert(window.GetPixelHeight() >= 600);
-    assert(window.GetDPIScale() >= 1.0f);
-    assert(window.GetMode() == WindowMode::Windowed);
-
-    // Toggle mode
-    auto modeRes = window.SetMode(WindowMode::BorderlessFullscreen);
-    assert(modeRes);
-    assert(window.GetMode() == WindowMode::BorderlessFullscreen);
-
-    modeRes = window.SetMode(WindowMode::Windowed);
-    assert(modeRes);
-    assert(window.GetMode() == WindowMode::Windowed);
-
-    // Event pump quit test
-    EventPump pump;
-    InputSystem input;
-    pump.BeginFrame();
-
-    // Synthesize quit event
-    SDL_Event quitEvent{};
-    quitEvent.type = SDL_EVENT_QUIT;
-    SDL_PushEvent(&quitEvent);
-
-    bool quitResult = pump.PollAll(window, input);
-    assert(quitResult == true);
-    assert(pump.WasQuitRequested() == true);
-
-    window.Destroy();
-    assert(!window.IsValid());
+    const DisplayInfo* primary = topology.Primary();
+    assert(primary != nullptr);
+    assert(primary->bounds.w > 0);
+    assert(primary->bounds.h > 0);
+    assert(primary->contentScale >= 1.0f);
+    assert(!primary->name.Empty());
 
     platform.Shutdown();
     assert(!platform.IsInitialized());
-
-    std::cout << "     [PASS] Platform and Window Subsystem" << std::endl;
+    std::cout << "        -> PASS" << std::endl;
 }
 
-void TestClipboardRAII() {
-    std::cout << "  -> Testing Clipboard RAII & Zero-Leak Safety..." << std::endl;
+void TestWindowLifecycleAndModes() {
+    std::cout << "  [2/5] Testing Window Creation, Modes & Dirty Tracking..." << std::endl;
 
     Platform platform;
     auto initRes = platform.Init();
     assert(initRes);
 
-    const char* testStr = "EngineN_Zero_Leak_RAII_Test_2026";
-    bool setOk = platform.SetClipboardText(testStr);
-    assert(setOk);
-    assert(platform.HasClipboardText());
-
-    // RAII query
-    {
-        ClipboardText clip = platform.GetClipboardText();
-        assert(!clip.empty());
-        assert(clip.view() == testStr);
-        assert(clip.length() == std::string_view(testStr).length());
-        assert(clip == testStr);
-        assert(clip == std::string_view(testStr));
-        assert(std::string_view(clip) == testStr);
-
-        // Move construction
-        ClipboardText moved(std::move(clip));
-        assert(clip.empty());
-        assert(clip.c_str()[0] == '\0');
-        assert(moved.view() == testStr);
-
-        // Move assignment
-        ClipboardText moved2;
-        moved2 = std::move(moved);
-        assert(moved.empty());
-        assert(moved2.view() == testStr);
-
-        // Explicit reset
-        moved2.Reset();
-        assert(moved2.empty());
-    } // clip, moved, moved2 go out of scope, guaranteeing 0 leaks
-
-    // std::string convenience query
-    std::string clipStr = platform.GetClipboardString();
-    assert(clipStr == testStr);
-
-    platform.Shutdown();
-    std::cout << "     [PASS] Clipboard RAII & Zero-Leak Safety" << std::endl;
-}
-
-void TestDisplayQueriesAndDiagnostics() {
-    std::cout << "  -> Testing Display Queries & Native Content Scaling..." << std::endl;
-
-    Platform platform;
-    auto initRes = platform.Init();
-    assert(initRes);
-
-    i32 count = platform.GetDisplayCount();
-    assert(count >= 1);
-
-    DisplayInfo primary = platform.GetPrimaryDisplayInfo();
-    assert(primary.id != 0);
-    assert(primary.width > 0);
-    assert(primary.height > 0);
-    assert(primary.refreshRate > 0.0f);
-    assert(primary.contentScale >= 1.0f);
-    assert(primary.hdpi >= 96.0f);
-    assert(primary.vdpi >= 96.0f);
-    // Verify memory safety: owned std::string name outlives any scope
-    assert(!primary.name.empty());
-
-    std::vector<DisplayInfo> allDisplays = platform.GetAllDisplays();
-    assert(!allDisplays.empty());
-    assert(allDisplays.size() == static_cast<size_t>(count));
-
-    assert(platform.GetDisplayRefreshRate() > 0.0f);
-    assert(platform.GetDisplayContentScale() >= 1.0f);
-
-    // Diagnostics
-    assert(platform.GetCPUCount() > 0);
-    assert(platform.GetSystemRAM() > 0);
-    assert(platform.GetCPUCacheLineSize() > 0);
-    PowerInfo power = platform.GetPowerInfo();
-    (void)power;
-    assert(platform.GetPerformanceCounter() > 0);
-    assert(platform.GetPerformanceFrequency() > 0);
-
-    platform.Shutdown();
-    std::cout << "     [PASS] Display Queries & Native Content Scaling" << std::endl;
-}
-
-void TestWindowModeTogglesAndScaling() {
-    std::cout << "  -> Testing Window Mode Toggles & Display Synchronization..." << std::endl;
-
-    Platform platform;
-    auto initRes = platform.Init();
-    assert(initRes);
-
-    Window window;
     WindowConfig config{
-        .title = "Mode Toggle Window",
-        .width = 640,
-        .height = 480,
-        .mode = WindowMode::Windowed,
-        .highDPI = true,
-        .resizable = true
+        .title = "EngineN Production Test Window",
+        .size = {1280, 720},
+        .mode = WindowMode::Windowed
     };
-    auto winRes = window.Create(config);
+
+    auto winRes = Window::Create(config, platform.Displays());
     assert(winRes);
+
+    Window window = std::move(*winRes);
     assert(window.IsValid());
-    assert(window.GetMode() == WindowMode::Windowed);
-    assert(!window.IsFullscreen());
-    assert(window.GetFullscreenMode() == nullptr);
-    assert(window.GetDisplayScale() >= 1.0f);
-    assert(window.GetDPIScale() >= 1.0f);
-    assert(window.GetPixelDensity() >= 1.0f);
-    assert(window.GetRefreshRate() > 0.0f);
-    assert(window.GetDisplayID() != 0);
+    assert(window.Native() != nullptr);
+    assert(window.State().metrics.logicalSize.w == 1280);
+    assert(window.State().metrics.logicalSize.h == 720);
+    assert(window.State().mode == WindowMode::Windowed);
+
+    // Initial dirty changes drained
+    auto initChanges = window.TakeChanges();
+    assert(initChanges != WindowChange::None);
 
     // Toggle BorderlessFullscreen
-    auto borderlessRes = window.SetMode(WindowMode::BorderlessFullscreen);
-    assert(borderlessRes);
-    assert(window.GetMode() == WindowMode::BorderlessFullscreen);
-    assert(window.IsFullscreen());
-    // In SDL3, borderless fullscreen desktop uses mode == nullptr
-    assert(window.GetFullscreenMode() == nullptr);
+    auto modeRes = window.SetMode(WindowMode::BorderlessFullscreen);
+    assert(modeRes);
+    assert(window.State().mode == WindowMode::BorderlessFullscreen);
 
-    // Toggle ExclusiveFullscreen
-    auto exclusiveRes = window.SetMode(WindowMode::ExclusiveFullscreen);
-    assert(exclusiveRes);
-    assert(window.GetMode() == WindowMode::ExclusiveFullscreen);
-    assert(window.IsFullscreen());
+    auto modeChanges = window.TakeChanges();
+    assert(HasAny(modeChanges, WindowChange::Mode));
 
     // Toggle back to Windowed
-    auto windowedRes = window.SetMode(WindowMode::Windowed);
-    assert(windowedRes);
-    assert(window.GetMode() == WindowMode::Windowed);
-    assert(!window.IsFullscreen());
+    modeRes = window.SetMode(WindowMode::Windowed);
+    assert(modeRes);
+    assert(window.State().mode == WindowMode::Windowed);
 
     window.Destroy();
     assert(!window.IsValid());
 
     platform.Shutdown();
-    std::cout << "     [PASS] Window Mode Toggles & Display Synchronization" << std::endl;
+    std::cout << "        -> PASS" << std::endl;
 }
 
-void TestDecoupledEventPumpAndRouting() {
-    std::cout << "  -> Testing Decoupled Event Routing & Modular Filtering..." << std::endl;
+void TestSingleSourcePlatformPump() {
+    std::cout << "  [3/5] Testing Single-Source Event Drainage & Dispatch..." << std::endl;
 
     Platform platform;
     auto initRes = platform.Init();
     assert(initRes);
 
-    struct MockAudioListener : public IEventListener {
-        u32 audioEventCount = 0;
-        void ProcessEvent(const SDL_Event& e) override {
-            if (e.type == SDL_EVENT_AUDIO_DEVICE_ADDED) {
-                audioEventCount++;
-            }
-        }
+    WindowConfig config{
+        .title = "Pump Test Window",
+        .size = {640, 480}
     };
+    Window window;
+    auto winRes = window.Create(config);
+    assert(winRes);
 
-    struct MockInputListener : public IEventListener {
-        u32 inputEventCount = 0;
-        void ProcessEvent(const SDL_Event& e) override {
-            if (e.type == SDL_EVENT_KEY_DOWN) {
-                inputEventCount++;
-            }
-        }
-    };
+    InputSystem input;
 
-    EventPump pump;
-    MockAudioListener audioListener;
-    MockInputListener inputListener;
-
-    // Register with category masks
-    pump.AddListener(&audioListener, EventCategory::Audio);
-    pump.AddListener(&inputListener, EventCategory::Keyboard);
-
-    assert(pump.HasListener(&audioListener));
-    assert(pump.HasListener(&inputListener));
-
-    // Register a lambda callback for system events
-    bool quitCallbackInvoked = false;
-    u32 cbId = pump.AddCallback([&](const SDL_Event& e) {
-        if (e.type == SDL_EVENT_QUIT) {
-            quitCallbackInvoked = true;
-        }
-    }, EventCategory::System);
-    assert(cbId > 0);
-
-    // 1. Synthesize and push an audio event
-    pump.BeginFrame();
-    SDL_Event audioEv{};
-    audioEv.type = SDL_EVENT_AUDIO_DEVICE_ADDED;
-    SDL_PushEvent(&audioEv);
-
-    // 2. Synthesize and push a keyboard event
-    SDL_Event keyEv{};
-    keyEv.type = SDL_EVENT_KEY_DOWN;
-    keyEv.key.scancode = SDL_SCANCODE_SPACE;
-    SDL_PushEvent(&keyEv);
-
-    // 3. Synthesize and push a quit event
+    // Synthesize SDL_EVENT_QUIT
     SDL_Event quitEv{};
     quitEv.type = SDL_EVENT_QUIT;
-    SDL_PushEvent(&quitEv);
+    quitEv.quit.timestamp = SDL_GetTicksNS();
+    (void)SDL_PushEvent(&quitEv);
 
-    // Drain all events via decoupled Poll()
-    bool quitRequested = pump.Poll();
-    assert(quitRequested == true);
-    assert(pump.WasQuitRequested() == true);
+    // Unified single-source pump
+    const auto& events = platform.Pump(window, input);
+    assert(platform.WasQuitRequested());
+    assert(!events.Empty());
+    assert(events[0].type == PlatformEventType::QuitRequested);
 
-    // Verify targeted routing according to category mask:
-    assert(audioListener.audioEventCount == 1);
-    assert(inputListener.inputEventCount == 1);
-    assert(quitCallbackInvoked == true);
+    window.Destroy();
+    platform.Shutdown();
+    std::cout << "        -> PASS" << std::endl;
+}
 
-    // 4. Test category filtering isolation:
-    // Reset listener counts
-    audioListener.audioEventCount = 0;
-    inputListener.inputEventCount = 0;
+void TestPrioritizedEventRoutingAndSuppression() {
+    std::cout << "  [4/5] Testing 4-Stage Routing & Anti-Sticking Suppression..." << std::endl;
 
-    // Push ONLY a keyboard event
-    SDL_PushEvent(&keyEv);
-    pump.Poll();
+    Platform platform;
+    auto initRes = platform.Init();
+    assert(initRes);
 
-    // Audio listener must NOT have received keyboard event!
-    assert(audioListener.audioEventCount == 0);
-    assert(inputListener.inputEventCount == 1);
+    // Mock DevTools overlay backend capturing keyboard at Stage 0
+    struct MockDevToolsBackend {
+        DevToolsCapture capture{};
+        u32 processedEvents{0};
 
-    // 5. Test unregistering listener and callback
-    pump.RemoveListener(&audioListener);
-    assert(!pump.HasListener(&audioListener));
+        void ProcessEvent(const SDL_Event&) noexcept {
+            processedEvents++;
+        }
+        [[nodiscard]] DevToolsCapture Capture() const noexcept {
+            return capture;
+        }
+    } devToolsBackend;
 
-    bool removeCbOk = pump.RemoveCallback(cbId);
-    assert(removeCbOk == true);
+    DevToolsSink<MockDevToolsBackend> devToolsSink(devToolsBackend);
+    assert(devToolsSink.Attach(platform.Router()));
+
+    // Mock App Sink registered at Stage 3
+    struct MockAppSink {
+        u32 keyDownCount{0};
+        u32 keyUpCount{0};
+
+        SinkVerdict OnEvent(const SDL_Event& e) noexcept {
+            if (e.type == SDL_EVENT_KEY_DOWN) keyDownCount++;
+            if (e.type == SDL_EVENT_KEY_UP) keyUpCount++;
+            return SinkVerdict::Continue;
+        }
+    } appSink;
+
+    assert(platform.Router().Add(
+        SinkStage::App,
+        EventSinkRef::Bind<&MockAppSink::OnEvent>(appSink)));
+
+    // Case 1: Uncaptured -> Key Down & Up both pass to App
+    devToolsBackend.capture.wantsKeyboard = false;
+
+    SDL_Event keyDown{};
+    keyDown.type = SDL_EVENT_KEY_DOWN;
+    keyDown.key.scancode = SDL_SCANCODE_SPACE;
+    (void)SDL_PushEvent(&keyDown);
+
+    SDL_Event keyUp{};
+    keyUp.type = SDL_EVENT_KEY_UP;
+    keyUp.key.scancode = SDL_SCANCODE_SPACE;
+    (void)SDL_PushEvent(&keyUp);
+
+    (void)platform.Pump();
+    assert(appSink.keyDownCount == 1);
+    assert(appSink.keyUpCount == 1);
+
+    // Case 2: Captured -> Key Down is SUPPRESSED, Key Up ALWAYS passes through
+    devToolsBackend.capture.wantsKeyboard = true;
+    appSink.keyDownCount = 0;
+    appSink.keyUpCount = 0;
+
+    (void)SDL_PushEvent(&keyDown);
+    (void)SDL_PushEvent(&keyUp);
+
+    (void)platform.Pump();
+    assert(appSink.keyDownCount == 0); // Suppressed by DevTools Stage 0
+    assert(appSink.keyUpCount == 1);   // Anti-sticking rule: release passes
 
     platform.Shutdown();
-    std::cout << "     [PASS] Decoupled Event Routing & Modular Filtering" << std::endl;
+    std::cout << "        -> PASS" << std::endl;
+}
+
+void TestEnvironmentServicesAndSandboxing() {
+    std::cout << "  [5/5] Testing Services (Clipboard RAII & Path Sandbox)..." << std::endl;
+
+    Platform platform;
+    auto initRes = platform.Init();
+    assert(initRes);
+
+    // Clipboard RAII zero-leak
+    const char* sampleText = "EngineN_Platform_Zero_Leak_2026";
+    auto clipSetRes = platform.ClipboardService().SetText(sampleText);
+    assert(clipSetRes);
+    assert(platform.ClipboardService().HasText());
+
+    {
+        ClipboardText text = platform.ClipboardService().GetText();
+        assert(!text.Empty());
+        assert(text.View() == sampleText);
+
+        ClipboardText moved(std::move(text));
+        assert(text.Empty());
+        assert(moved.View() == sampleText);
+    }
+
+    // Path sandbox
+    auto validUser = platform.Paths().ResolveUser("saves/slot1.sav");
+    assert(validUser);
+    assert(validUser->View().find("saves/slot1.sav") != std::string_view::npos);
+
+    auto validAsset = platform.Paths().ResolveAsset("textures/player.png");
+    assert(validAsset);
+    assert(validAsset->View().find("textures/player.png") != std::string_view::npos);
+
+    // Security constraints: reject ".." traversal and absolute paths
+    auto traversal = platform.Paths().ResolveUser("../../../secret.dat");
+    assert(!traversal);
+    assert(traversal.Error().code == static_cast<i32>(PlatformErrc::PathRejected));
+
+    auto driveLetter = platform.Paths().ResolveUser("C:/Windows/cmd.exe");
+    assert(!driveLetter);
+    assert(driveLetter.Error().code == static_cast<i32>(PlatformErrc::PathRejected));
+
+    // Diagnostics queries
+    assert(platform.Specs().logicalCores > 0);
+    assert(platform.Specs().ramMiB > 0);
+
+    platform.Shutdown();
+    std::cout << "        -> PASS" << std::endl;
 }
 
 int main() {
-    std::cout << "[TestPlatform] Running platform subsystem tests..." << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << " EngineN — Platform Subsystem Test Suite " << std::endl;
+    std::cout << "========================================" << std::endl;
 
-    TestPlatformAndWindow();
-    TestClipboardRAII();
-    TestDisplayQueriesAndDiagnostics();
-    TestWindowModeTogglesAndScaling();
-    TestDecoupledEventPumpAndRouting();
+    TestPlatformLifecycleAndTopology();
+    TestWindowLifecycleAndModes();
+    TestSingleSourcePlatformPump();
+    TestPrioritizedEventRoutingAndSuppression();
+    TestEnvironmentServicesAndSandboxing();
 
-    std::cout << "[TestPlatform] All tests passed." << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << " [ALL TESTS PASSED] Platform is 100% OK " << std::endl;
+    std::cout << "========================================" << std::endl;
     return 0;
 }

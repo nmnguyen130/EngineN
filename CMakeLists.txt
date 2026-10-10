@@ -19,9 +19,12 @@ set(ENGINE_SOURCES
     src/main.cpp
     src/core/Log.cpp
     src/core/time/TimeManager.cpp
-    src/platform/Platform.cpp
+    src/platform/PlatformTypes.cpp
+    src/platform/Display.cpp
     src/platform/Window.cpp
-    src/platform/EventPump.cpp
+    src/platform/Devices.cpp
+    src/platform/Services.cpp
+    src/platform/Platform.cpp
     src/platform/input/ActionBuffer.cpp
     src/platform/input/InputBindings.cpp
     src/platform/input/InputSystem.cpp
@@ -62,9 +65,12 @@ target_link_libraries(TestCoreFoundation PRIVATE SDL3::SDL3)
 set(TEST_PLATFORM_SOURCES
     tests/test_platform.cpp
     src/core/Log.cpp
-    src/platform/Platform.cpp
+    src/platform/PlatformTypes.cpp
+    src/platform/Display.cpp
     src/platform/Window.cpp
-    src/platform/EventPump.cpp
+    src/platform/Devices.cpp
+    src/platform/Services.cpp
+    src/platform/Platform.cpp
     src/platform/input/ActionBuffer.cpp
     src/platform/input/InputBindings.cpp
     src/platform/input/InputSystem.cpp

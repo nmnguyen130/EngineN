@@ -1,365 +1,398 @@
-#include "platform/input/InputTypes.h"
+#include "core/Log.h"
+#include "platform/input/ActionBuffer.h"
+#include "platform/input/InputBindings.h"
 #include "platform/input/InputSystem.h"
-
+#include "platform/input/InputTypes.h"
 #include <SDL3/SDL.h>
 #include <cassert>
 #include <iostream>
-#include <cmath>
-#include <limits>
 
 using namespace EngineN;
 
-void TestDeadzoneMath() {
-    std::cout << "  -> Testing Deadzone Math & Validation..." << std::endl;
+namespace {
 
-    const f32 deadzone = 0.22f;
+enum class GameAction : ActionId {
+    Jump = 0,
+    Attack = 1,
+    Dash = 2,
+    Cast = 3
+};
 
-    // Inside radial deadzone must map strictly to zero vector
-    DeadzoneResult inside = ApplyRadialDeadzone(0.1f, 0.1f, deadzone);
-    assert(inside.x == 0.0f && inside.y == 0.0f);
+enum class GameContext : ContextId {
+    Gameplay = 0,
+    Menu = 1
+};
 
-    DeadzoneResult zero = ApplyRadialDeadzone(0.0f, 0.0f, deadzone);
-    assert(zero.x == 0.0f && zero.y == 0.0f);
-
-    // Full deflection at boundary
-    DeadzoneResult edge = ApplyRadialDeadzone(1.0f, 0.0f, deadzone);
-    assert(std::abs(edge.x - 1.0f) < 1e-5f);
-    assert(std::abs(edge.y - 0.0f) < 1e-5f);
-
-    // Intermediate value smoothly re-scaled between deadzone and 1.0
-    DeadzoneResult intermediate = ApplyRadialDeadzone(0.5f, 0.0f, deadzone);
-    f32 expectedScale = (0.5f - deadzone) / (1.0f - deadzone);
-    assert(std::abs(intermediate.x - expectedScale) < 1e-5f);
-    assert(intermediate.y == 0.0f);
-
-    // Defensive check: NaN or invalid deadzone must safely evaluate to zero
-    DeadzoneResult nanResult = ApplyRadialDeadzone(0.5f, 0.5f, std::numeric_limits<f32>::quiet_NaN());
-    assert(nanResult.x == 0.0f && nanResult.y == 0.0f);
-
-    // 1D Axial deadzone
-    assert(ApplyAxialDeadzone(0.1f, deadzone) == 0.0f);
-    assert(ApplyAxialDeadzone(-0.1f, deadzone) == 0.0f);
-    assert(std::abs(ApplyAxialDeadzone(1.0f, deadzone) - 1.0f) < 1e-5f);
-    assert(std::abs(ApplyAxialDeadzone(-1.0f, deadzone) - (-1.0f)) < 1e-5f);
-
-    std::cout << "     [PASS] Deadzone Math & Validation" << std::endl;
-}
-
-void TestSameFrameEdgeDetection() {
-    std::cout << "  -> Testing Same-Frame Press and Release Detection..." << std::endl;
-
-    InputSystem input;
-    input.BeginFrame();
-
-    // Synthesize rapid press and release within the same render frame
-    SDL_Event e1{};
-    e1.type = SDL_EVENT_KEY_DOWN;
-    e1.key.scancode = SDL_SCANCODE_SPACE;
-    e1.key.timestamp = 1000ULL;
-    input.ProcessEvent(e1);
-
-    SDL_Event e2{};
-    e2.type = SDL_EVENT_KEY_UP;
-    e2.key.scancode = SDL_SCANCODE_SPACE;
-    e2.key.timestamp = 2000ULL;
-    input.ProcessEvent(e2);
-
-    // Both transitions must be latched for this frame, while down state returns false
-    assert(input.WasActionPressedThisFrame(InputAction::Jump));
-    assert(input.WasActionReleasedThisFrame(InputAction::Jump));
-    assert(!input.IsActionDown(InputAction::Jump));
-
-    // Next frame clears transient edges
-    input.BeginFrame();
-    assert(!input.WasActionPressedThisFrame(InputAction::Jump));
-    assert(!input.WasActionReleasedThisFrame(InputAction::Jump));
-    assert(!input.IsActionDown(InputAction::Jump));
-
-    std::cout << "     [PASS] Same-Frame Press and Release Detection" << std::endl;
-}
-
-void TestFixedTickEdgeLatching() {
-    std::cout << "  -> Testing 120Hz Fixed-Tick Edge Latching..." << std::endl;
-
-    InputSystem input;
-
-    // Frame 1: Player presses Jump during render frame
-    input.BeginFrame();
+SDL_Event CreateKeyEvent(Uint32 type, SDL_Scancode scancode, u64 timestampNs, bool repeat = false) {
     SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_SPACE;
-    e.key.timestamp = 5000ULL;
-    input.ProcessEvent(e);
-
-    // First physics tick consumes the edge trigger
-    input.BeginFixedTick();
-    assert(input.WasActionPressedThisTick(InputAction::Jump));
-    assert(input.IsActionDown(InputAction::Jump));
-
-    // Catch-up tick in the same frame must NOT re-trigger the edge
-    input.BeginFixedTick();
-    assert(!input.WasActionPressedThisTick(InputAction::Jump));
-    assert(input.IsActionDown(InputAction::Jump));
-
-    // Frame 2: Player releases Jump
-    input.BeginFrame();
-    e.type = SDL_EVENT_KEY_UP;
-    e.key.timestamp = 10000ULL;
-    input.ProcessEvent(e);
-
-    // Tick 3 observes release edge
-    input.BeginFixedTick();
-    assert(input.WasActionReleasedThisTick(InputAction::Jump));
-    assert(!input.IsActionDown(InputAction::Jump));
-
-    // Tick 4: Edge cleared
-    input.BeginFixedTick();
-    assert(!input.WasActionReleasedThisTick(InputAction::Jump));
-
-    std::cout << "     [PASS] 120Hz Fixed-Tick Edge Latching" << std::endl;
+    e.type = type;
+    e.key.scancode = scancode;
+    e.key.down = (type == SDL_EVENT_KEY_DOWN);
+    e.key.repeat = repeat;
+    e.key.timestamp = timestampNs;
+    return e;
 }
 
-void TestMetroidvaniaIntentBuffering() {
-    std::cout << "  -> Testing Metroidvania Intent Buffering & Anti-Ghosting..." << std::endl;
+void TestOOBAndSourceValidation() {
+    std::cout << "  -> Test 1: OOB & Source Validation..." << std::endl;
+
+    InputBindings bindings;
+
+    // Test rejecting invalid scancodes and mouse buttons
+    auto res1 = bindings.BindAxis(0, Source{Device::Keyboard, 9999}, Source{Device::Keyboard, 3}, 0);
+    assert(!res1.HasValue());
+    assert(res1.Error() == InputError::InvalidSource);
+
+    auto res2 = bindings.BindAction(0, Source{Device::Keyboard, 0}, GameAction::Jump);
+    assert(!res2.HasValue());
+    assert(res2.Error() == InputError::InvalidSource);
+
+    auto res3 = bindings.BindAction(0, Source{Device::Mouse, 0}, GameAction::Jump);
+    assert(!res3.HasValue());
+    assert(res3.Error() == InputError::InvalidSource);
+
+    auto res4 = bindings.BindAxis(0, Source{Device::Keyboard, SDL_SCANCODE_A}, Source{Device::Keyboard, SDL_SCANCODE_A}, 0);
+    assert(!res4.HasValue());
+    assert(res4.Error() == InputError::InvalidSource);
+
+    // Ingest invalid scancodes into InputSystem without crash
+    InputSystem input;
+    SDL_Event badEvent = CreateKeyEvent(SDL_EVENT_KEY_DOWN, static_cast<SDL_Scancode>(9999), 1000);
+    input.Ingest(badEvent);
+
+    badEvent = CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_UNKNOWN, 2000);
+    input.Ingest(badEvent);
+}
+
+void TestSyntheticPressPreventionAndReleaseOnLoss() {
+    std::cout << "  -> Test 2: Synthetic Press Prevention & Release on Loss..." << std::endl;
 
     InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
 
-    // 1. Jump Buffering across frames before landing
-    input.BeginFrame();
-    SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_SPACE;
-    e.key.timestamp = 10'000'000ULL; // t = 10ms
-    input.ProcessEvent(e);
+    // Press Space at 1ms
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 1'000'000));
+    TickInput tick0 = input.CutTick(0, 8'333'333);
+    assert(tick0.Pressed(GameAction::Jump));
+    assert(tick0.Held(GameAction::Jump));
 
-    assert(input.WasActionPressedThisFrame(InputAction::Jump));
-    assert(input.HasBufferedAction(InputAction::Jump, 10'000'000ULL, kDefaultBufferWindowNs));
+    // While Space is still held down, unbind Jump
+    (void)input.GetBindings().UnbindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+    input.ResyncActionStates(10'000'000);
 
-    // Frame 2 at t = 20ms: Intent remains active even after edge expires
-    input.BeginFrame();
-    assert(!input.WasActionPressedThisFrame(InputAction::Jump));
-    assert(input.HasBufferedAction(InputAction::Jump, 20'000'000ULL, kDefaultBufferWindowNs));
+    // Next tick must observe a synthetic release
+    TickInput tick1 = input.CutTick(1, 16'666'666);
+    assert(tick1.Released(GameAction::Jump));
+    assert(!tick1.Held(GameAction::Jump));
 
-    // Landing at t = 60ms (50ms elapsed, within 100ms buffer window)
-    u64 landTimeNs = 60'000'000ULL;
-    assert(input.ConsumeAction(InputAction::Jump, landTimeNs, kDefaultBufferWindowNs));
+    // Rebind Jump while Space is still physically held
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+    input.ResyncActionStates(20'000'000);
 
-    // Anti-ghosting: Intent cannot be consumed twice
-    assert(!input.ConsumeAction(InputAction::Jump, landTimeNs, kDefaultBufferWindowNs));
+    // Must be latched: no synthetic press!
+    TickInput tick2 = input.CutTick(2, 25'000'000);
+    assert(!tick2.Pressed(GameAction::Jump));
+    assert(!tick2.Held(GameAction::Jump));
 
-    // 2. Buffer Window Expiration (Out of Window query)
-    input.BeginFrame();
-    e.key.scancode = SDL_SCANCODE_J; // Attack
-    e.key.timestamp = 100'000'000ULL; // t = 100ms
-    input.ProcessEvent(e);
+    // Release Space
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, 30'000'000));
+    (void)input.CutTick(3, 33'333'333);
 
-    // Query 150ms later exceeds 100ms window
-    u64 lateQueryNs = 250'000'000ULL;
-    assert(!input.HasBufferedAction(InputAction::Attack, lateQueryNs, kDefaultBufferWindowNs));
-    assert(!input.ConsumeAction(InputAction::Attack, lateQueryNs, kDefaultBufferWindowNs));
+    // Press Space again: clean press must fire
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 35'000'000));
+    TickInput tick4 = input.CutTick(4, 41'666'666);
+    assert(tick4.Pressed(GameAction::Jump));
+    assert(tick4.Held(GameAction::Jump));
+}
 
-    // 3. Hitstun / Hazard cancellation
-    input.BeginFrame();
-    e.key.scancode = SDL_SCANCODE_LSHIFT; // Dash
-    e.key.timestamp = 300'000'000ULL;
-    input.ProcessEvent(e);
+void TestSubTickTapEdgePreservation() {
+    std::cout << "  -> Test 3: Sub-Tick Tap Edge Preservation..." << std::endl;
 
-    assert(input.HasBufferedAction(InputAction::Dash, 310'000'000ULL, kDefaultBufferWindowNs));
-    input.ClearActionBuffer();
-    assert(!input.HasBufferedAction(InputAction::Dash, 310'000'000ULL, kDefaultBufferWindowNs));
-    assert(!input.ConsumeAction(InputAction::Dash, 310'000'000ULL, kDefaultBufferWindowNs));
+    InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
 
-    // 4. Standalone ActionBuffer newest intent retention
-    ActionBuffer buffer;
-    for (u64 i = 0; i < 70; ++i) {
-        buffer.RecordAction(InputAction::Attack, i * 1'000'000ULL);
+    // Tap Space between 2ms and 5ms (both within tick 0: [0, 8.33ms))
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 2'000'000));
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, 5'000'000));
+
+    // Tick 0 consumes press
+    TickInput tick0 = input.CutTick(0, 8'333'333);
+    assert(tick0.Pressed(GameAction::Jump));
+    assert(tick0.Held(GameAction::Jump));
+    assert(!tick0.Released(GameAction::Jump));
+
+    // Tick 1 consumes release
+    TickInput tick1 = input.CutTick(1, 16'666'666);
+    assert(!tick1.Pressed(GameAction::Jump));
+    assert(!tick1.Held(GameAction::Jump));
+    assert(tick1.Released(GameAction::Jump));
+}
+
+void Test50msHitchReplay() {
+    std::cout << "  -> Test 4: 50ms Hitch Replay (Section 4.2)..." << std::endl;
+
+    InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+
+    // Jump pressed at 3ms, released at 40ms during a 50ms frame hitch
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 3'000'000));
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, 40'000'000));
+
+    // Tick 0 (boundary 8.33ms)
+    TickInput t0 = input.CutTick(0, 8'333'333);
+    assert(t0.Pressed(GameAction::Jump));
+    assert(t0.Held(GameAction::Jump));
+    assert(t0.heldTicks[static_cast<u8>(GameAction::Jump)] == 1);
+
+    // Tick 1 (boundary 16.67ms)
+    TickInput t1 = input.CutTick(1, 16'666'666);
+    assert(!t1.Pressed(GameAction::Jump));
+    assert(t1.Held(GameAction::Jump));
+    assert(t1.heldTicks[static_cast<u8>(GameAction::Jump)] == 2);
+
+    // Tick 2 (boundary 25.00ms)
+    TickInput t2 = input.CutTick(2, 25'000'000);
+    assert(t2.Held(GameAction::Jump));
+    assert(t2.heldTicks[static_cast<u8>(GameAction::Jump)] == 3);
+
+    // Tick 3 (boundary 33.33ms)
+    TickInput t3 = input.CutTick(3, 33'333'333);
+    assert(t3.Held(GameAction::Jump));
+    assert(t3.heldTicks[static_cast<u8>(GameAction::Jump)] == 4);
+
+    // Tick 4 (boundary 41.67ms) -> release at 40ms lands here
+    TickInput t4 = input.CutTick(4, 41'666'666);
+    assert(!t4.Held(GameAction::Jump));
+    assert(t4.Released(GameAction::Jump));
+    assert(t4.heldTicks[static_cast<u8>(GameAction::Jump)] == 0);
+
+    // Tick 5 (boundary 50.00ms) -> idle
+    TickInput t5 = input.CutTick(5, 50'000'000);
+    assert(!t5.Held(GameAction::Jump));
+    assert(!t5.Released(GameAction::Jump));
+}
+
+void TestZeroTickFrames() {
+    std::cout << "  -> Test 5: 0-Tick Frames (240Hz Render vs 120Hz Sim)..." << std::endl;
+
+    InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+
+    // Frame 0 arrives with input, but no sim tick is due yet
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 2'000'000));
+    const FrameInput& f0 = input.PublishFrameInput();
+    assert(f0.Pressed(GameAction::Jump));
+    assert(f0.Held(GameAction::Jump));
+
+    // Next frame (sim tick now runs at boundary 8.33ms)
+    TickInput t0 = input.CutTick(0, 8'333'333);
+    assert(t0.Pressed(GameAction::Jump));
+    assert(t0.Held(GameAction::Jump));
+}
+
+void TestTakeNewerAxisResolution() {
+    std::cout << "  -> Test 6: TakeNewer Digital Axis Resolution..." << std::endl;
+
+    InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAxis(0, Source{Device::Keyboard, SDL_SCANCODE_A}, Source{Device::Keyboard, SDL_SCANCODE_D}, 0);
+
+    // Press A at 1ms -> Axis = -1.0
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_A, 1'000'000));
+    TickInput t0 = input.CutTick(0, 8'333'333);
+    assert(t0.Axis(0) < -0.99f);
+
+    // Press D at 10ms while A is still held -> TakeNewer: Axis = +1.0
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_D, 10'000'000));
+    TickInput t1 = input.CutTick(1, 16'666'666);
+    assert(t1.Axis(0) > 0.99f);
+
+    // Release D at 20ms while A is still held -> reverts to -1.0
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_D, 20'000'000));
+    TickInput t2 = input.CutTick(2, 25'000'000);
+    assert(t2.Axis(0) < -0.99f);
+
+    // Release A at 30ms -> Axis = 0.0
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_A, 30'000'000));
+    TickInput t3 = input.CutTick(3, 33'333'333);
+    assert(std::abs(t3.Axis(0)) < 0.001f);
+}
+
+void TestContextStackAndLatching() {
+    std::cout << "  -> Test 7: Context Stack & Latching..." << std::endl;
+
+    InputSystem input;
+    input.GetBindings().Clear();
+    // Gameplay (ctx 0): Space = Jump
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+    // Menu (ctx 1): Space = Attack (Confirm)
+    (void)input.GetBindings().BindAction(1, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Attack);
+
+    // Hold Space in Gameplay
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 1'000'000));
+    TickInput t0 = input.CutTick(0, 8'333'333);
+    assert(t0.Pressed(GameAction::Jump));
+
+    // Push Menu context (consumes = true) while Space is held
+    auto pushRes = input.PushContext(GameContext::Menu, true);
+    assert(pushRes.HasValue());
+
+    // Gameplay Jump must receive synthetic release
+    TickInput t1 = input.CutTick(1, 16'666'666);
+    assert(t1.Released(GameAction::Jump));
+    // Menu Attack must NOT receive a phantom press (it is latched)
+    assert(!t1.Pressed(GameAction::Attack));
+
+    // Release Space in Menu
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, 20'000'000));
+    (void)input.CutTick(2, 25'000'000);
+
+    // Re-press Space in Menu -> Menu action Attack fires cleanly
+    input.Ingest(CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 28'000'000));
+    TickInput t3 = input.CutTick(3, 33'333'333);
+    assert(t3.Pressed(GameAction::Attack));
+
+    // Pop Menu context
+    auto popRes = input.PopContext();
+    assert(popRes.HasValue());
+}
+
+void TestQueueOverflow() {
+    std::cout << "  -> Test 8: Queue Overflow Protection..." << std::endl;
+
+    InputSystem input;
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+
+    // Inject 12 rapid transitions in a single tick
+    for (u64 i = 0; i < 12; ++i) {
+        const Uint32 type = (i % 2 == 0) ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+        input.Ingest(CreateKeyEvent(type, SDL_SCANCODE_SPACE, 1'000'000 + i * 100'000));
     }
-    // Newest press is at 69ms; consume at 70ms with 100ms window succeeds
-    assert(buffer.ConsumeAction(InputAction::Attack, 70'000'000ULL, kDefaultBufferWindowNs));
-    assert(!buffer.ConsumeAction(InputAction::Attack, 70'000'000ULL, kDefaultBufferWindowNs));
 
-    std::cout << "     [PASS] Metroidvania Intent Buffering & Anti-Ghosting" << std::endl;
+    assert(input.GetDroppedTransitionsCount() > 0);
 }
 
-void TestMultiSourceKeyRedundancy() {
-    std::cout << "  -> Testing Multi-Source Physical State Tracking..." << std::endl;
+void TestDeterminism() {
+    std::cout << "  -> Test 9: Determinism Verification..." << std::endl;
+
+    InputSystem inputA;
+    InputSystem inputB;
+    ActionBuffer bufferA;
+    ActionBuffer bufferB;
+
+    inputA.GetBindings().Clear();
+    inputB.GetBindings().Clear();
+    (void)inputA.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+    (void)inputB.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
+
+    u64 simTimeNs = 0;
+    for (u64 tick = 0; tick < 1000; ++tick) {
+        simTimeNs += 8'333'333;
+
+        // Deterministic synthetic inputs every few ticks
+        if (tick % 7 == 0) {
+            auto e = CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, simTimeNs - 4'000'000);
+            inputA.Ingest(e);
+            inputB.Ingest(e);
+        } else if (tick % 7 == 3) {
+            auto e = CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, simTimeNs - 2'000'000);
+            inputA.Ingest(e);
+            inputB.Ingest(e);
+        }
+
+        TickInput inA = inputA.CutTick(tick, simTimeNs);
+        TickInput inB = inputB.CutTick(tick, simTimeNs);
+
+        assert(inA.held == inB.held);
+        assert(inA.pressed == inB.pressed);
+        assert(inA.released == inB.released);
+
+        bufferA.Feed(inA);
+        bufferB.Feed(inB);
+
+        assert(bufferA.Peek(GameAction::Jump, 5) == bufferB.Peek(GameAction::Jump, 5));
+    }
+}
+
+void TestImGuiGate() {
+    std::cout << "  -> Test 10: ImGui DevTools Press-Gating..." << std::endl;
 
     InputSystem input;
-    input.BindKey(SDL_SCANCODE_UP, InputAction::Jump);
+    input.GetBindings().Clear();
+    (void)input.GetBindings().BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, GameAction::Jump);
 
-    // Frame 1: Press Space
-    input.BeginFrame();
-    SDL_Event e1{};
-    e1.type = SDL_EVENT_KEY_DOWN;
-    e1.key.scancode = SDL_SCANCODE_SPACE;
-    e1.key.timestamp = 100ULL;
-    input.ProcessEvent(e1);
-    assert(input.WasActionPressedThisFrame(InputAction::Jump));
+    // Simulate ImGui capturing keyboard: suppress DOWN, pass UP
+    bool imguiWantsKeyboard = true;
+    SDL_Event downEv = CreateKeyEvent(SDL_EVENT_KEY_DOWN, SDL_SCANCODE_SPACE, 1'000'000);
+    if (!imguiWantsKeyboard) {
+        input.Ingest(downEv);
+    }
 
-    // Frame 2: While holding Space, press Up
-    input.BeginFrame();
-    SDL_Event e2{};
-    e2.type = SDL_EVENT_KEY_DOWN;
-    e2.key.scancode = SDL_SCANCODE_UP;
-    e2.key.timestamp = 200ULL;
-    input.ProcessEvent(e2);
-    assert(input.IsActionDown(InputAction::Jump));
-    assert(!input.WasActionPressedThisFrame(InputAction::Jump));
+    // Release ALWAYS passes through
+    SDL_Event upEv = CreateKeyEvent(SDL_EVENT_KEY_UP, SDL_SCANCODE_SPACE, 5'000'000);
+    input.Ingest(upEv);
 
-    // Frame 3: Release Space (Up remains held)
-    input.BeginFrame();
-    e1.type = SDL_EVENT_KEY_UP;
-    e1.key.timestamp = 300ULL;
-    input.ProcessEvent(e1);
-    assert(input.IsActionDown(InputAction::Jump));
-    assert(!input.WasActionReleasedThisFrame(InputAction::Jump));
-
-    // Frame 4: Release Up (All physical sources released)
-    input.BeginFrame();
-    e2.type = SDL_EVENT_KEY_UP;
-    e2.key.timestamp = 400ULL;
-    input.ProcessEvent(e2);
-    assert(!input.IsActionDown(InputAction::Jump));
-    assert(input.WasActionReleasedThisFrame(InputAction::Jump));
-
-    std::cout << "     [PASS] Multi-Source Physical State Tracking" << std::endl;
+    TickInput t0 = input.CutTick(0, 8'333'333);
+    assert(!t0.Held(GameAction::Jump));
+    assert(!t0.Pressed(GameAction::Jump));
 }
 
-void TestCompositeVirtualAxes() {
-    std::cout << "  -> Testing Composite Virtual Axis Evaluation..." << std::endl;
+void TestIntentBufferForgiveness() {
+    std::cout << "  -> Test 11: IntentBuffer Forgiveness & Hitstop Freeze..." << std::endl;
 
-    InputSystem input;
-    input.BeginFrame();
+    ActionBuffer buf;
+    TickInput in{};
+    in.pressed = (1u << static_cast<u8>(GameAction::Jump));
+    in.held = in.pressed;
 
-    // Press D -> MoveX = +1.0
-    SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_D;
-    input.ProcessEvent(e);
-    assert(std::abs(input.GetAxis(AxisId::MoveX) - 1.0f) < 1e-5f);
+    // Feed press
+    buf.Feed(in);
+    assert(buf.Peek(GameAction::Jump, 3));
 
-    // Press A while holding D -> Neutralized to 0.0
-    e.key.scancode = SDL_SCANCODE_A;
-    input.ProcessEvent(e);
-    assert(std::abs(input.GetAxis(AxisId::MoveX)) < 1e-5f);
+    // Age 2 ticks without press
+    TickInput emptyIn{};
+    buf.Feed(emptyIn);
+    buf.Feed(emptyIn);
+    assert(buf.Peek(GameAction::Jump, 3));
 
-    // Release A while D remains held -> Returns to +1.0
-    e.type = SDL_EVENT_KEY_UP;
-    input.ProcessEvent(e);
-    assert(std::abs(input.GetAxis(AxisId::MoveX) - 1.0f) < 1e-5f);
+    // Hitstop freeze for 5 ticks: age must NOT increment!
+    for (int i = 0; i < 5; ++i) {
+        buf.Feed(emptyIn, /*frozen=*/true);
+    }
+    assert(buf.Peek(GameAction::Jump, 3));
 
-    std::cout << "     [PASS] Composite Virtual Axis Evaluation" << std::endl;
+    // Consume action
+    assert(buf.Consume(GameAction::Jump, 3));
+    assert(!buf.Peek(GameAction::Jump, 3)); // Consumed once, cannot be re-consumed
 }
 
-void TestContextIsolationAndPurge() {
-    std::cout << "  -> Testing InputContext Isolation & State Purge..." << std::endl;
+} // namespace
 
-    InputSystem input;
-    assert(input.GetActiveContext() == InputContext::Gameplay);
+int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
 
-    // In Gameplay context, Escape maps to MenuPause
-    input.BeginFrame();
-    SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_ESCAPE;
-    e.key.timestamp = 100ULL;
-    input.ProcessEvent(e);
-    assert(input.IsActionDown(InputAction::MenuPause));
+    std::cout << "========================================\n";
+    std::cout << "Running EngineN Input Subsystem Test Suite\n";
+    std::cout << "========================================\n";
 
-    // Switching to UI context purges active Gameplay actions
-    input.SetActiveContext(InputContext::UI);
-    assert(input.GetActiveContext() == InputContext::UI);
-    assert(!input.IsActionDown(InputAction::MenuPause));
+    TestOOBAndSourceValidation();
+    TestSyntheticPressPreventionAndReleaseOnLoss();
+    TestSubTickTapEdgePreservation();
+    Test50msHitchReplay();
+    TestZeroTickFrames();
+    TestTakeNewerAxisResolution();
+    TestContextStackAndLatching();
+    TestQueueOverflow();
+    TestDeterminism();
+    TestImGuiGate();
+    TestIntentBufferForgiveness();
 
-    // In UI Context, Space maps to MenuConfirm (not Jump)
-    input.BeginFrame();
-    e.key.scancode = SDL_SCANCODE_SPACE;
-    e.key.timestamp = 200ULL;
-    input.ProcessEvent(e);
-    assert(input.IsActionDown(InputAction::MenuConfirm));
-    assert(!input.IsActionDown(InputAction::Jump));
-
-    std::cout << "     [PASS] InputContext Isolation & State Purge" << std::endl;
-}
-
-void TestSubFrameTimestampLogging() {
-    std::cout << "  -> Testing Sub-Frame Timestamp Logging..." << std::endl;
-
-    InputSystem input;
-    input.BeginFrame();
-
-    SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_SPACE;
-    e.key.timestamp = 12345ULL;
-    input.ProcessEvent(e);
-
-    e.key.scancode = SDL_SCANCODE_J; // Attack
-    e.key.timestamp = 23456ULL;
-    input.ProcessEvent(e);
-
-    assert(input.GetTimestampedActionCount() == 2);
-    assert(input.GetTimestampedAction(0).action == InputAction::Jump);
-    assert(input.GetTimestampedAction(0).timestampNs == 12345ULL);
-    assert(input.GetTimestampedAction(0).pressed);
-
-    assert(input.GetTimestampedAction(1).action == InputAction::Attack);
-    assert(input.GetTimestampedAction(1).timestampNs == 23456ULL);
-    assert(input.GetTimestampedAction(1).pressed);
-
-    // Frame boundary clears event log
-    input.BeginFrame();
-    assert(input.GetTimestampedActionCount() == 0);
-
-    std::cout << "     [PASS] Sub-Frame Timestamp Logging" << std::endl;
-}
-
-void TestFocusLossSafety() {
-    std::cout << "  -> Testing Window Focus Loss Release..." << std::endl;
-
-    InputSystem input;
-    input.BeginFrame();
-
-    // Holding keys before focus lost
-    SDL_Event e{};
-    e.type = SDL_EVENT_KEY_DOWN;
-    e.key.scancode = SDL_SCANCODE_D;
-    e.key.timestamp = 100ULL;
-    input.ProcessEvent(e);
-
-    e.key.scancode = SDL_SCANCODE_SPACE;
-    e.key.timestamp = 200ULL;
-    input.ProcessEvent(e);
-
-    assert(input.IsKeyDown(SDL_SCANCODE_D));
-    assert(input.IsActionDown(InputAction::Jump));
-
-    // Focus lost event (e.g. Alt-Tab)
-    SDL_Event focusLost{};
-    focusLost.type = SDL_EVENT_WINDOW_FOCUS_LOST;
-    focusLost.window.timestamp = 300ULL;
-    input.ProcessEvent(focusLost);
-
-    assert(!input.IsKeyDown(SDL_SCANCODE_D));
-    assert(!input.IsActionDown(InputAction::Jump));
-    assert(input.WasActionReleasedThisFrame(InputAction::Jump));
-
-    std::cout << "     [PASS] Window Focus Loss Release" << std::endl;
-}
-
-int main() {
-    std::cout << "EngineN Input Subsystem Test Suite" << std::endl;
-
-    TestDeadzoneMath();
-    TestSameFrameEdgeDetection();
-    TestFixedTickEdgeLatching();
-    TestMetroidvaniaIntentBuffering();
-    TestMultiSourceKeyRedundancy();
-    TestCompositeVirtualAxes();
-    TestContextIsolationAndPurge();
-    TestSubFrameTimestampLogging();
-    TestFocusLossSafety();
-
-    std::cout << "All input subsystem tests passed successfully." << std::endl;
+    std::cout << "All Input Subsystem Tests Passed Successfully!\n";
     return 0;
 }

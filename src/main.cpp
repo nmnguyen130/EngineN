@@ -4,7 +4,7 @@
 #include "math/Vec2.h"
 #include "platform/Platform.h"
 #include "platform/Window.h"
-#include "platform/EventPump.h"
+#include "platform/EventRouting.h"
 #include "platform/input/InputSystem.h"
 #include "renderer/RendererTypes.h"
 #include "renderer/RenderDevice.h"
@@ -53,6 +53,15 @@ void SetTargetFps(
     }
 }
 
+enum class GameAction : EngineN::ActionId {
+    Jump = 0,
+    Attack = 1,
+    Dash = 2,
+    Sprint = 3,
+    MenuPause = 4,
+    Confirm = 5
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -79,20 +88,19 @@ int main(int argc, char* argv[]) {
     }
 
     // 2. Create Engine Window
-    EngineN::Window window;
     EngineN::WindowConfig winConfig{
         .title = config.appName,
-        .width = config.windowWidth,
-        .height = config.windowHeight,
+        .size = {config.windowWidth, config.windowHeight},
         .mode = EngineN::WindowMode::Windowed,
         .highDPI = true,
         .resizable = true
     };
-    auto winRes = window.Create(winConfig);
+    auto winRes = EngineN::Window::Create(winConfig, platform.Displays());
     if (!winRes) {
         ENGINE_LOG(Fatal, Platform, "Window creation failed: {}", winRes.Error().message);
         return -1;
     }
+    EngineN::Window window = std::move(*winRes);
 
     // 3. Create Hardware RenderDevice & RenderContext Subsystems (Milestone 03)
     EngineN::RenderDevice device;
@@ -117,9 +125,23 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // 4. Input & Event Pump Subsystems
+    // 4. Input Subsystem & Key Event Watcher
     EngineN::InputSystem input;
-    EngineN::EventPump pump;
+    std::array<bool, 512> keysJustPressed{};
+
+    struct KeyWatcher {
+        std::array<bool, 512>* keys{nullptr};
+        SinkVerdict OnEvent(const SDL_Event& e) noexcept {
+            if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode < 512) {
+                (*keys)[e.key.scancode] = true;
+            }
+            return SinkVerdict::Continue;
+        }
+    } keyWatcher{&keysJustPressed};
+
+    (void)platform.Router().Add(
+        SinkStage::App,
+        EventSinkRef::Bind<&KeyWatcher::OnEvent>(keyWatcher));
 
     // 5. Unified 120Hz TimeManager
     EngineN::TimeManager time;
@@ -151,12 +173,12 @@ int main(int argc, char* argv[]) {
         frameTimeHistory[historyIndex] = currentFrameMs;
         historyIndex = (historyIndex + 1) % 60;
 
-        // [EVENT PUMP & INPUT] Drain SDL events once per frame
-        pump.BeginFrame();
-        input.BeginFrame();
-        pump.PollAll(window, input);
+        // [PLATFORM & INPUT] Drain SDL events once per frame via single-source coordinator
+        keysJustPressed.fill(false);
+        (void)platform.Pump(window, input);
+        const auto& frameInput = input.PublishFrameInput();
 
-        if (pump.WasQuitRequested() || input.WasActionPressedThisFrame(EngineN::InputAction::MenuPause)) {
+        if (platform.WasQuitRequested() || frameInput.Pressed(GameAction::MenuPause)) {
             running = false;
         }
 
@@ -171,7 +193,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Toggle Fullscreen (F11)
-        if (input.IsKeyJustPressed(SDL_SCANCODE_F11)) {
+        if (keysJustPressed[SDL_SCANCODE_F11]) {
             auto newMode = (window.GetMode() == EngineN::WindowMode::Windowed)
                 ? EngineN::WindowMode::BorderlessFullscreen
                 : EngineN::WindowMode::Windowed;
@@ -180,27 +202,27 @@ int main(int argc, char* argv[]) {
         }
 
         // Interactive Hotkeys
-        if (input.IsKeyJustPressed(SDL_SCANCODE_I)) {
+        if (keysJustPressed[SDL_SCANCODE_I]) {
             useInterpolation = !useInterpolation;
         }
 
-        if (input.IsKeyJustPressed(SDL_SCANCODE_H)) {
+        if (keysJustPressed[SDL_SCANCODE_H]) {
             time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.100});
         }
 
-        if (input.IsKeyJustPressed(SDL_SCANCODE_B)) {
+        if (keysJustPressed[SDL_SCANCODE_B]) {
             bulletTime = !bulletTime;
             time.PlayerTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
             time.WorldTime().SetTimeScale(bulletTime ? 0.25 : 1.0);
         }
 
-        if (input.IsKeyJustPressed(SDL_SCANCODE_1)) SetTargetFps(60, time, device, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyJustPressed(SDL_SCANCODE_2)) SetTargetFps(120, time, device, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyJustPressed(SDL_SCANCODE_3)) SetTargetFps(144, time, device, framesThisSec, lastFpsTimeNs);
-        if (input.IsKeyJustPressed(SDL_SCANCODE_0)) SetTargetFps(0, time, device, framesThisSec, lastFpsTimeNs);
+        if (keysJustPressed[SDL_SCANCODE_1]) SetTargetFps(60, time, device, framesThisSec, lastFpsTimeNs);
+        if (keysJustPressed[SDL_SCANCODE_2]) SetTargetFps(120, time, device, framesThisSec, lastFpsTimeNs);
+        if (keysJustPressed[SDL_SCANCODE_3]) SetTargetFps(144, time, device, framesThisSec, lastFpsTimeNs);
+        if (keysJustPressed[SDL_SCANCODE_0]) SetTargetFps(0, time, device, framesThisSec, lastFpsTimeNs);
 
         // Diagnostic hotkeys (F-keys to avoid conflicting with gameplay: WASD, J, K, L)
-        if (input.IsKeyJustPressed(SDL_SCANCODE_F1)) {
+        if (keysJustPressed[SDL_SCANCODE_F1]) {
             static int s_logCounter = 1;
             if (s_logCounter % 3 == 1) {
                 LOG_INFO("Live log test #{}: Player active at ({:.0f}, {:.0f})", s_logCounter++, player.position.x, player.position.y);
@@ -212,26 +234,27 @@ int main(int argc, char* argv[]) {
         }
 
         // Input Actions triggering combat feedback
-        if (input.WasActionPressedThisFrame(EngineN::InputAction::Attack)) {
+        if (frameInput.Pressed(GameAction::Attack)) {
             player.isAttacking = true;
             player.actionTimer = 0.15;
             time.Hitstop().Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.050});
         }
-        if (input.WasActionPressedThisFrame(EngineN::InputAction::Dash)) {
+        if (frameInput.Pressed(GameAction::Dash) || frameInput.Pressed(GameAction::Sprint)) {
             player.isDashing = true;
             player.actionTimer = 0.20;
         }
 
         // [SIMULATION] Deterministic Fixed Timestep 120Hz Loop
         while (time.ConsumeTick()) {
+            TickInput tickInput = input.CutTick();
             double dt = time.PlayerTime().GetScaledDt();
             if (dt > 0.0) {
                 float dtFloat = static_cast<float>(dt);
                 player.prevPosition = player.position;
 
-                // Query Virtual Axes (Gamepad Stick or WASD/Arrows)
-                float moveX = input.GetAxis(EngineN::AxisId::MoveX);
-                float moveY = input.GetAxis(EngineN::AxisId::MoveY);
+                // Query Virtual Axes (0 = MoveX, 1 = MoveY)
+                float moveX = tickInput.Axis(0);
+                float moveY = tickInput.Axis(1);
 
                 float currentSpeed = player.speed;
                 if (player.isDashing) {

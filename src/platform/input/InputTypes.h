@@ -1,122 +1,207 @@
 #pragma once
 
 #include "core/Types.h"
-#include <cmath>
+#include "math/Vec2.h"
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <span>
+#include <type_traits>
 
 namespace EngineN {
 
-/// Logical gameplay and interface actions decoupled from physical hardware.
-enum class InputAction : u8 {
-    Jump = 0,
-    Attack,
-    Dash,
-    Parry,
-    Interact,
-    MenuConfirm,
-    MenuCancel,
-    MenuPause,
-    Count
+using ActionId = u8;
+using AxisId = u8;
+using ContextId = u8;
+
+constexpr usize kMaxActions = 16;
+constexpr usize kMaxAxes = 4;
+constexpr usize kMaxContexts = 4;
+constexpr u16 kMaxKeyboardKeys = 512;
+constexpr u16 kMaxMouseButtons = 8;
+constexpr u16 kMaxGamepadButtons = 32;
+constexpr u32 kMaxFrameLogEvents = 64;
+constexpr u64 kDefaultTickDurationNs = 8'333'333ULL;
+
+enum class Device : u8 {
+    None = 0,
+    Keyboard,
+    Mouse,
+    Gamepad
 };
 
-/// High-level input contexts isolating gameplay from menus and debugging.
-enum class InputContext : u8 {
-    Gameplay = 0,
-    UI,
-    Debug,
-    Count
+enum class Edge : u8 {
+    Press = 0,
+    Release
 };
 
-/// Virtual 2D directional axes.
-enum class AxisId : u8 {
-    MoveX = 0,
-    MoveY,
-    AimX,
-    AimY,
-    Count
+enum class InputError : u8 {
+    InvalidSource = 0,
+    TableFull,
+    Duplicate,
+    ContextStackFull,
+    ContextStackEmpty,
+    NotFound
 };
-
-inline constexpr usize kActionCount = static_cast<usize>(InputAction::Count);
-inline constexpr usize kContextCount = static_cast<usize>(InputContext::Count);
-inline constexpr usize kAxisCount = static_cast<usize>(AxisId::Count);
-
-inline constexpr usize kMaxKeyboardKeys = 512;
-inline constexpr usize kMaxMouseButtons = 8;
-
-inline constexpr usize kMaxKeyBindings = 32;
-inline constexpr usize kMaxMouseBindings = 16;
-inline constexpr usize kMaxAxisBindings = 12;
-inline constexpr usize kMaxFrameLogActions = 32;
-
-// Standard action intent buffering window (100ms = ~12 ticks at 120Hz)
-inline constexpr u64 kDefaultBufferWindowNs = 100'000'000ULL;
 
 /**
- * ActionFrameState: Tri-state model separating continuous hold from discrete edges.
- * Allows both a press and release occurring within the same frame/tick to be captured.
+ * Validated physical input source across all device types.
+ * Strictly range-checked to prevent out-of-bounds reads on state arrays.
  */
-struct ActionFrameState {
-    bool down = false;
-    bool pressed = false;
-    bool released = false;
+struct Source {
+    Device device = Device::None;
+    u16 code = 0;
+
+    [[nodiscard]] constexpr bool IsValid() const noexcept {
+        switch (device) {
+            case Device::Keyboard:
+                return code > 0 && code < kMaxKeyboardKeys;
+            case Device::Mouse:
+                return code >= 1 && code < kMaxMouseButtons;
+            case Device::Gamepad:
+                return code < kMaxGamepadButtons;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] constexpr bool operator==(const Source& other) const noexcept = default;
 };
 
-struct TimestampedAction {
-    InputAction action = InputAction::Jump;
+inline constexpr f32 ApplyAxialDeadzone(f32 value, f32 deadzone) noexcept {
+    const f32 absVal = std::abs(value);
+    if (absVal <= deadzone) {
+        return 0.0f;
+    }
+    const f32 sign = (value > 0.0f) ? 1.0f : -1.0f;
+    return sign * (absVal - deadzone) / (1.0f - deadzone);
+}
+
+inline Vec2 ApplyRadialDeadzone(Vec2 input, f32 deadzone) noexcept {
+    const f32 mag = input.Length();
+    if (mag <= deadzone) {
+        return Vec2{0.0f, 0.0f};
+    }
+    const f32 normMag = std::min(1.0f, (mag - deadzone) / (1.0f - deadzone));
+    return (input / mag) * normMag;
+}
+
+/**
+ * Immutable per-tick input state consumed by 120Hz simulation.
+ * Trivially copyable POD guaranteed to fit in a single 64-byte L1 cache line.
+ */
+struct TickInput {
+    u64 tick = 0;
+    u32 held = 0;
+    u32 pressed = 0;
+    u32 released = 0;
+    i16 axis[kMaxAxes]{};
+    u16 heldTicks[kMaxActions]{};
+
+    [[nodiscard]] constexpr bool Held(ActionId a) const noexcept {
+        return a < kMaxActions && ((held & (1u << a)) != 0);
+    }
+    [[nodiscard]] constexpr bool Pressed(ActionId a) const noexcept {
+        return a < kMaxActions && ((pressed & (1u << a)) != 0);
+    }
+    [[nodiscard]] constexpr bool Released(ActionId a) const noexcept {
+        return a < kMaxActions && ((released & (1u << a)) != 0);
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Held(E a) const noexcept {
+        return Held(static_cast<ActionId>(a));
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Pressed(E a) const noexcept {
+        return Pressed(static_cast<ActionId>(a));
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Released(E a) const noexcept {
+        return Released(static_cast<ActionId>(a));
+    }
+
+    [[nodiscard]] constexpr f32 Axis(AxisId a) const noexcept {
+        return (a < kMaxAxes) ? (static_cast<f32>(axis[a]) / 32767.0f) : 0.0f;
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr f32 Axis(E a) const noexcept {
+        return Axis(static_cast<AxisId>(a));
+    }
+
+    [[nodiscard]] Vec2 Stick(AxisId axisX, AxisId axisY) const noexcept {
+        return Vec2{Axis(axisX), Axis(axisY)};
+    }
+};
+
+static_assert(std::is_trivially_copyable_v<TickInput>);
+static_assert(sizeof(TickInput) <= 64, "TickInput must fit in a 64-byte cache line");
+
+/**
+ * Diagnostic or UI action transition record within a single render frame.
+ */
+struct ActionEvent {
     u64 timestampNs = 0;
-    bool pressed = false;
+    ActionId action = 0;
+    Edge edge = Edge::Press;
+    bool synthetic = false;
 };
 
-struct DeadzoneResult {
-    f32 x = 0.0f;
-    f32 y = 0.0f;
-};
+/**
+ * Immutable per-frame input snapshot consumed by UI, cursor, and dev tools.
+ * Populated at the end of Platform::Pump without interfering with simulation queues.
+ */
+struct FrameInput {
+    u64 frameIndex = 0;
+    u64 timestampNs = 0;
+    u32 held = 0;
+    u32 pressed = 0;
+    u32 released = 0;
+    Vec2 mousePosition{0.0f, 0.0f};
+    Vec2 mouseDelta{0.0f, 0.0f};
+    Vec2 mouseWheel{0.0f, 0.0f};
+    std::array<ActionEvent, kMaxFrameLogEvents> events{};
+    u32 eventCount = 0;
+    u32 droppedEvents = 0;
 
-/// Apply radial deadzone to 2D analog input with finite validation and smooth rescale.
-[[nodiscard]] inline DeadzoneResult ApplyRadialDeadzone(f32 rawX, f32 rawY, f32 deadzone) noexcept {
-    if (!std::isfinite(rawX) || !std::isfinite(rawY) || !std::isfinite(deadzone)) {
-        return {0.0f, 0.0f};
+    [[nodiscard]] std::span<const ActionEvent> Events() const noexcept {
+        return std::span<const ActionEvent>(events.data(), eventCount);
     }
-    f32 clampedDeadzone = std::clamp(deadzone, 0.0f, 0.999f);
-    f32 magnitude = std::sqrt(rawX * rawX + rawY * rawY);
-    if (magnitude <= clampedDeadzone || magnitude <= 1e-6f) {
-        return {0.0f, 0.0f};
+
+    [[nodiscard]] constexpr bool Held(ActionId a) const noexcept {
+        return a < kMaxActions && ((held & (1u << a)) != 0);
     }
-    f32 scale = std::min((magnitude - clampedDeadzone) / (1.0f - clampedDeadzone), 1.0f);
-    return {(rawX / magnitude) * scale, (rawY / magnitude) * scale};
-}
-
-/// Apply axial deadzone to a 1D axis with finite validation and smooth rescale.
-[[nodiscard]] inline f32 ApplyAxialDeadzone(f32 rawValue, f32 deadzone) noexcept {
-    if (!std::isfinite(rawValue) || !std::isfinite(deadzone)) {
-        return 0.0f;
+    [[nodiscard]] constexpr bool Pressed(ActionId a) const noexcept {
+        return a < kMaxActions && ((pressed & (1u << a)) != 0);
     }
-    f32 clampedDeadzone = std::clamp(deadzone, 0.0f, 0.999f);
-    if (std::abs(rawValue) <= clampedDeadzone) {
-        return 0.0f;
+    [[nodiscard]] constexpr bool Released(ActionId a) const noexcept {
+        return a < kMaxActions && ((released & (1u << a)) != 0);
     }
-    f32 sign = (rawValue > 0.0f) ? 1.0f : -1.0f;
-    f32 scale = std::min((std::abs(rawValue) - clampedDeadzone) / (1.0f - clampedDeadzone), 1.0f);
-    return sign * scale;
-}
 
-struct KeyBinding {
-    u32 scancode = 0;
-    InputAction action = InputAction::Jump;
-    InputContext context = InputContext::Gameplay;
-};
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Held(E a) const noexcept {
+        return Held(static_cast<ActionId>(a));
+    }
 
-struct MouseButtonBinding {
-    u8 button = 0;
-    InputAction action = InputAction::Attack;
-    InputContext context = InputContext::Gameplay;
-};
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Pressed(E a) const noexcept {
+        return Pressed(static_cast<ActionId>(a));
+    }
 
-struct AxisKeyBinding {
-    AxisId axis = AxisId::MoveX;
-    u32 negativeScancode = 0;
-    u32 positiveScancode = 0;
-    InputContext context = InputContext::Gameplay;
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] constexpr bool Released(E a) const noexcept {
+        return Released(static_cast<ActionId>(a));
+    }
 };
 
 } // namespace EngineN

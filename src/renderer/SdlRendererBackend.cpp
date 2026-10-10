@@ -51,7 +51,7 @@ Result<void> SdlRendererBackend::Init(Window* window, const RenderDeviceConfig& 
             "Cannot create SdlRendererBackend without a valid Window"));
     }
 
-    m_renderer = SDL_CreateRenderer(window->GetRawHandle(), nullptr);
+    m_renderer = SDL_CreateRenderer(window->Native(), nullptr);
     if (!m_renderer) {
         ENGINE_LOG(Error, Render, "SDL_CreateRenderer failed: {}", SDL_GetError());
         return Unexpected(MakeRenderError(

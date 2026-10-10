@@ -1,142 +1,175 @@
 #pragma once
 
+#include "core/Result.h"
 #include "core/Types.h"
-#include <string>
-#include <string_view>
 
-union SDL_Event;
+#include <array>
+#include <cstddef>
+#include <span>
+#include <string_view>
+#include <type_traits>
 
 namespace EngineN {
 
-// ============================================================================
-// Clipboard RAII Safe Wrapper
-// ============================================================================
+enum class PlatformErrc : u16 {
+    SdlInitFailed,
+    WindowCreateFailed,
+    DisplayQueryFailed,
+    FullscreenFailed,
+    PathUnavailable,
+    PathRejected,
+    ClipboardFailed,
+    DeviceOpenFailed,
+    CapacityExceeded,
+    InvalidState,
+};
 
-/// RAII wrapper for SDL-allocated clipboard text ensuring zero memory leaks.
-/// SDL_GetClipboardText() allocates memory with SDL_malloc, which MUST be freed with SDL_free().
-/// This wrapper guarantees RAII cleanup upon destruction or reassignment.
-class ClipboardText {
+[[nodiscard]] EngineError MakePlatformError(PlatformErrc code, std::string_view detail = {}) noexcept;
+
+template <typename Tag>
+struct StrongId {
+    u32 value{0};
+
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return value != 0; }
+    friend constexpr bool operator==(StrongId, StrongId) noexcept = default;
+};
+
+using DisplayId     = StrongId<struct DisplayIdTag>;
+using WindowId      = StrongId<struct WindowIdTag>;
+using GamepadId     = StrongId<struct GamepadIdTag>;
+using AudioDeviceId = StrongId<struct AudioDeviceIdTag>;
+
+struct IPoint {
+    i32 x{0};
+    i32 y{0};
+    friend constexpr bool operator==(const IPoint&, const IPoint&) noexcept = default;
+};
+
+struct Extent2i {
+    i32 w{0};
+    i32 h{0};
+    friend constexpr bool operator==(const Extent2i&, const Extent2i&) noexcept = default;
+};
+
+struct IRect {
+    i32 x{0};
+    i32 y{0};
+    i32 w{0};
+    i32 h{0};
+    friend constexpr bool operator==(const IRect&, const IRect&) noexcept = default;
+};
+
+
+/**
+ * FixedString: inline NUL-terminated static string buffer.
+ * Non-allocating and safe for fixed stack and struct layout.
+ */
+template <usize N>
+class FixedString {
+    static_assert(N >= 2, "FixedString capacity must be at least 2 bytes");
+
 public:
-    ClipboardText() noexcept = default;
-    explicit ClipboardText(char* text) noexcept : m_text(text) {}
-    ~ClipboardText();
+    constexpr FixedString() noexcept = default;
 
-    ClipboardText(const ClipboardText&) = delete;
-    ClipboardText& operator=(const ClipboardText&) = delete;
-
-    ClipboardText(ClipboardText&& other) noexcept : m_text(other.m_text) {
-        other.m_text = nullptr;
+    constexpr explicit FixedString(std::string_view s) noexcept {
+        (void)Assign(s);
     }
 
-    ClipboardText& operator=(ClipboardText&& other) noexcept {
-        if (this != &other) {
-            Reset(other.m_text);
-            other.m_text = nullptr;
+    constexpr bool Assign(std::string_view s) noexcept {
+        const usize n = s.size() < (N - 1) ? s.size() : (N - 1);
+        for (usize i = 0; i < n; ++i) {
+            m_buf[i] = s[i];
         }
-        return *this;
+        m_buf[n] = '\0';
+        m_len = n;
+        return n == s.size();
     }
 
-    void Reset(char* text = nullptr) noexcept;
-
-    [[nodiscard]] char* Release() noexcept {
-        char* tmp = m_text;
-        m_text = nullptr;
-        return tmp;
+    constexpr void Clear() noexcept {
+        m_buf[0] = '\0';
+        m_len = 0;
     }
 
-    [[nodiscard]] const char* c_str() const noexcept { return m_text ? m_text : ""; }
-    [[nodiscard]] const char* data() const noexcept { return c_str(); }
-    [[nodiscard]] std::string_view view() const noexcept { return std::string_view(c_str()); }
-    [[nodiscard]] usize length() const noexcept { return view().length(); }
-    [[nodiscard]] usize size() const noexcept { return view().size(); }
-    [[nodiscard]] bool empty() const noexcept { return !m_text || m_text[0] == '\0'; }
-    [[nodiscard]] explicit operator bool() const noexcept { return !empty(); }
-    [[nodiscard]] operator std::string_view() const noexcept { return view(); }
+    [[nodiscard]] constexpr std::string_view View() const noexcept { return {m_buf.data(), m_len}; }
+    [[nodiscard]] constexpr const char* CStr() const noexcept { return m_buf.data(); }
+    [[nodiscard]] constexpr usize Size() const noexcept { return m_len; }
+    [[nodiscard]] constexpr bool Empty() const noexcept { return m_len == 0; }
+    static constexpr usize Capacity() noexcept { return N - 1; }
 
-    [[nodiscard]] bool operator==(std::string_view other) const noexcept { return view() == other; }
-    [[nodiscard]] bool operator==(const char* other) const noexcept {
-        return other ? (view() == other) : empty();
-    }
+    constexpr bool operator==(std::string_view other) const noexcept { return View() == other; }
 
 private:
-    char* m_text = nullptr;
+    std::array<char, N> m_buf{};
+    usize m_len{0};
 };
 
-// ============================================================================
-// Event Routing & Listener Abstractions
-// ============================================================================
-
-/// Event routing category bitmask for decoupled event pump filtering.
-enum class EventCategory : u32 {
-    None      = 0,
-    Window    = 1 << 0,
-    Keyboard  = 1 << 1,
-    Mouse     = 1 << 2,
-    Gamepad   = 1 << 3,
-    Input     = (1 << 1) | (1 << 2) | (1 << 3),
-    Audio     = 1 << 4,
-    System    = 1 << 5, // Quit, Terminating, LowMemory
-    All       = 0xFFFFFFFF
-};
-
-constexpr EventCategory operator|(EventCategory a, EventCategory b) noexcept {
-    return static_cast<EventCategory>(static_cast<u32>(a) | static_cast<u32>(b));
-}
-
-constexpr EventCategory operator&(EventCategory a, EventCategory b) noexcept {
-    return static_cast<EventCategory>(static_cast<u32>(a) & static_cast<u32>(b));
-}
-
-constexpr EventCategory operator~(EventCategory a) noexcept {
-    return static_cast<EventCategory>(~static_cast<u32>(a));
-}
-
-/// Modular event listener interface for decoupled platform event routing.
-class IEventListener {
+/**
+ * FixedVector: fixed-capacity non-allocating vector for trivially copyable items.
+ */
+template <typename T, usize N>
+requires std::is_trivially_copyable_v<T>
+class FixedVector {
 public:
-    virtual ~IEventListener() = default;
-    virtual void ProcessEvent(const SDL_Event& event) = 0;
+    [[nodiscard]] constexpr bool TryPush(const T& v) noexcept {
+        if (m_size == N) return false;
+        m_data[m_size++] = v;
+        return true;
+    }
+
+    constexpr void Clear() noexcept {
+        m_size = 0;
+    }
+
+    constexpr bool EraseAt(usize i) noexcept {
+        if (i >= m_size) return false;
+        for (usize j = i + 1; j < m_size; ++j) {
+            m_data[j - 1] = m_data[j];
+        }
+        --m_size;
+        return true;
+    }
+
+    [[nodiscard]] constexpr usize Size() const noexcept { return m_size; }
+    [[nodiscard]] constexpr bool Empty() const noexcept { return m_size == 0; }
+    [[nodiscard]] constexpr bool Full() const noexcept { return m_size == N; }
+    static constexpr usize Capacity() noexcept { return N; }
+
+    [[nodiscard]] constexpr T& operator[](usize i) noexcept { return m_data[i]; }
+    [[nodiscard]] constexpr const T& operator[](usize i) const noexcept { return m_data[i]; }
+    [[nodiscard]] constexpr std::span<T> View() noexcept { return {m_data.data(), m_size}; }
+    [[nodiscard]] constexpr std::span<const T> View() const noexcept { return {m_data.data(), m_size}; }
+
+private:
+    std::array<T, N> m_data{};
+    usize m_size{0};
 };
 
-// ============================================================================
-// Display Information & Window Modes
-// ============================================================================
+inline constexpr usize kMaxPathBytes = 1024;
 
-/// Display monitor metadata with memory-safe owned string and native High-DPI scale.
-struct DisplayInfo {
-    u32 id = 0;              // SDL_DisplayID
-    i32 width = 0;           // Native resolution width
-    i32 height = 0;          // Native resolution height
-    f32 refreshRate = 0.0f;  // Hz (e.g. 60.0, 120.0, 144.0, 240.0)
-    f32 contentScale = 1.0f; // Native SDL3 content scale factor (1.0 = 100%, 2.0 = 200%)
-    f32 hdpi = 96.0f;        // Horizontal DPI (contentScale * 96.0)
-    f32 vdpi = 96.0f;        // Vertical DPI (contentScale * 96.0)
-    std::string name;        // Display name (memory-safe owned string)
+/**
+ * Discrete app-facing platform notifications.
+ */
+enum class PlatformEventType : u8 {
+    QuitRequested,
+    Terminating,
+    DisplayTopologyChanged,
+    GamepadConnected,
+    GamepadDisconnected,
+    AudioDeviceAdded,
+    AudioDeviceRemoved,
+    ClipboardChanged
 };
 
-/// Window display modes compliant with SDL3 display switching architecture.
-enum class WindowMode : u8 {
-    Windowed = 0,
-    BorderlessFullscreen,    // Desktop borderless fullscreen (mode = NULL)
-    ExclusiveFullscreen      // Exclusive fullscreen (display mode switch via SDL_SetWindowFullscreenMode)
+struct PlatformEvent {
+    PlatformEventType type{PlatformEventType::QuitRequested};
+    u8 slot{0};
+    bool recording{false};
+    u32 id{0};
+    u64 timestampNs{0};
 };
+static_assert(std::is_trivially_copyable_v<PlatformEvent>, "PlatformEvent must be trivially copyable");
 
-// ============================================================================
-// Power and Battery States
-// ============================================================================
-
-enum class PowerState : u8 {
-    Unknown = 0,
-    OnBattery,
-    NoBattery,
-    Charging,
-    Charged
-};
-
-struct PowerInfo {
-    PowerState state = PowerState::Unknown;
-    i32 batteryPercent = -1;  // -1 if unknown
-    i32 secondsLeft = -1;     // -1 if unknown
-};
+inline constexpr usize kMaxPlatformEventsPerFrame = 64;
+using PlatformEventQueue = FixedVector<PlatformEvent, kMaxPlatformEventsPerFrame>;
 
 } // namespace EngineN

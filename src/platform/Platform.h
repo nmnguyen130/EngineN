@@ -1,66 +1,79 @@
 #pragma once
 
-#include "core/Result.h"
-#include "core/Types.h"
 #include "platform/PlatformTypes.h"
-#include <span>
-#include <vector>
-#include <string>
-#include <string_view>
+#include "platform/Display.h"
+#include "platform/Window.h"
+#include "platform/Devices.h"
+#include "platform/Services.h"
+#include "platform/EventRouting.h"
 
 namespace EngineN {
 
-/// RAII-based SDL subsystem initialization and platform utility services.
-/// Only ONE Platform instance may exist at any time.
-/// Provides idempotent lifecycle management and non-allocating hardware diagnostics.
+class InputSystem;
+
+/**
+ * Platform: Central platform coordinator.
+ * Owns OS subsystems, coordinates single-source SDL event pumping,
+ * and feeds events through prioritized EventRouter stages.
+ */
 class Platform {
 public:
-    Platform() = default;
+    Platform() noexcept;
     ~Platform();
 
     Platform(const Platform&) = delete;
     Platform& operator=(const Platform&) = delete;
-    Platform(Platform&&) = delete;
-    Platform& operator=(Platform&&) = delete;
 
-    /// Initialize SDL subsystems (VIDEO | GAMEPAD). Idempotent.
-    [[nodiscard]] Result<void> Init();
-
-    /// Shutdown SDL subsystems. Safe to call multiple times (idempotent).
-    void Shutdown();
-
+    [[nodiscard]] Result<void, EngineError> Init() noexcept;
+    void Shutdown() noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept { return m_initialized; }
 
-    // --- Display Queries ---
-    [[nodiscard]] i32 GetDisplayCount() const;
-    [[nodiscard]] i32 QueryDisplays(std::span<DisplayInfo> outDisplays) const;
-    [[nodiscard]] std::vector<DisplayInfo> GetAllDisplays() const;
-    [[nodiscard]] DisplayInfo GetPrimaryDisplayInfo() const;
-    [[nodiscard]] DisplayInfo GetDisplayInfo(u32 displayId) const;
-    [[nodiscard]] f32 GetDisplayRefreshRate(u32 displayId = 0) const;
-    [[nodiscard]] f32 GetDisplayContentScale(u32 displayId = 0) const;
+    // Unified single-source pump driving EventRouter, Window, and InputSystem
+    const PlatformEventQueue& Pump(Window& window, InputSystem& input) noexcept;
+    const PlatformEventQueue& Pump() noexcept;
 
-    // --- Clipboard (RAII Zero-Leak Abstraction) ---
-    [[nodiscard]] bool HasClipboardText() const;
-    [[nodiscard]] ClipboardText GetClipboardText() const;
-    [[nodiscard]] std::string GetClipboardString() const;
-    bool SetClipboardText(const char* text);
-    bool SetClipboardText(std::string_view text);
+    // Subsystem accessors
+    [[nodiscard]] const DisplayTopology& Displays() const noexcept { return m_displays; }
+    [[nodiscard]] DisplayTopology& Displays() noexcept { return m_displays; }
 
-    // --- Performance Counters ---
-    [[nodiscard]] u64 GetPerformanceCounter() const noexcept;
-    [[nodiscard]] u64 GetPerformanceFrequency() const noexcept;
+    [[nodiscard]] const GamepadRegistry& Gamepads() const noexcept { return m_gamepads; }
+    [[nodiscard]] GamepadRegistry& Gamepads() noexcept { return m_gamepads; }
 
-    // --- Power / Battery Diagnostics ---
-    [[nodiscard]] PowerInfo GetPowerInfo() const;
+    [[nodiscard]] const AudioDeviceDirectory& AudioDevices() const noexcept { return m_audioDevices; }
+    [[nodiscard]] AudioDeviceDirectory& AudioDevices() noexcept { return m_audioDevices; }
 
-    // --- System Hardware Diagnostics (Non-allocating) ---
-    [[nodiscard]] i32 GetSystemRAM() const noexcept;
-    [[nodiscard]] i32 GetCPUCount() const noexcept;
-    [[nodiscard]] i32 GetCPUCacheLineSize() const noexcept;
+    [[nodiscard]] const PathService& Paths() const noexcept { return m_paths; }
+    [[nodiscard]] const Clipboard& ClipboardService() const noexcept { return m_clipboard; }
+    [[nodiscard]] Clipboard& ClipboardService() noexcept { return m_clipboard; }
+
+    [[nodiscard]] const SystemSpecs& Specs() const noexcept { return m_specs; }
+
+    [[nodiscard]] EventRouter& Router() noexcept { return m_router; }
+
+    [[nodiscard]] bool WasQuitRequested() const noexcept { return m_quitRequested; }
+    [[nodiscard]] bool IsTerminating() const noexcept { return m_terminating; }
+    void RequestQuit() noexcept { m_quitRequested = true; }
 
 private:
-    bool m_initialized = false;
+    SinkVerdict OnWindowEvent(const SDL_Event& event) noexcept;
+    SinkVerdict OnInputEvent(const SDL_Event& event) noexcept;
+    SinkVerdict OnSystemEvent(const SDL_Event& event) noexcept;
+
+    bool m_initialized{false};
+    bool m_quitRequested{false};
+    bool m_terminating{false};
+
+    DisplayTopology m_displays{};
+    GamepadRegistry m_gamepads{};
+    AudioDeviceDirectory m_audioDevices{};
+    PathService m_paths{};
+    Clipboard m_clipboard{};
+    SystemSpecs m_specs{};
+    EventRouter m_router{};
+    PlatformEventQueue m_events{};
+
+    Window* m_activeWindow{nullptr};
+    InputSystem* m_activeInput{nullptr};
 };
 
 } // namespace EngineN

@@ -1,223 +1,194 @@
 #include "platform/Platform.h"
-#include "core/Log.h"
+#include "platform/input/InputSystem.h"
 #include <SDL3/SDL.h>
-#include <algorithm>
 
 namespace EngineN {
 
-// ============================================================================
-// ClipboardText RAII Implementation
-// ============================================================================
-
-ClipboardText::~ClipboardText() {
-    Reset();
+Platform::Platform() noexcept {
+    (void)m_router.Add(SinkStage::Window, EventSinkRef::Bind<&Platform::OnWindowEvent>(*this));
+    (void)m_router.Add(SinkStage::Input,  EventSinkRef::Bind<&Platform::OnInputEvent>(*this));
+    (void)m_router.Add(SinkStage::App,    EventSinkRef::Bind<&Platform::OnSystemEvent>(*this));
 }
-
-void ClipboardText::Reset(char* text) noexcept {
-    if (m_text) {
-        SDL_free(m_text);
-    }
-    m_text = text;
-}
-
-// ============================================================================
-// Display Helper Functions
-// ============================================================================
-
-static DisplayInfo ExtractDisplayInfo(SDL_DisplayID id) {
-    DisplayInfo info{};
-    info.id = id;
-
-    const char* name = SDL_GetDisplayName(id);
-    info.name = (name && name[0] != '\0') ? name : "Unknown Display";
-
-    const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(id);
-    if (mode) {
-        info.width = mode->w;
-        info.height = mode->h;
-        info.refreshRate = mode->refresh_rate;
-    }
-
-    float scale = SDL_GetDisplayContentScale(id);
-    info.contentScale = (scale > 0.0f) ? scale : 1.0f;
-    info.hdpi = 96.0f * info.contentScale;
-    info.vdpi = 96.0f * info.contentScale;
-
-    return info;
-}
-
-// ============================================================================
-// Platform Subsystem Implementation
-// ============================================================================
 
 Platform::~Platform() {
     Shutdown();
 }
 
-Result<void> Platform::Init() {
-    if (m_initialized) {
-        return Ok;
+Result<void, EngineError> Platform::Init() noexcept {
+    if (m_initialized) return Ok;
+
+    // Initialize ONLY video and gamepad subsystems.
+    // Audio is strictly omitted to prevent failures in headless/CI/virtual environments.
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        return Unexpected(MakePlatformError(PlatformErrc::SdlInitFailed));
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-        ENGINE_LOG(Error, Platform, "SDL_Init failed: {}", SDL_GetError());
-        return Err(EngineError(SDL_GetError()));
+    auto dispRes = m_displays.Refresh();
+    if (!dispRes) {
+        SDL_Quit();
+        return Unexpected(dispRes.Error());
     }
+
+    (void)m_audioDevices.Seed();
+    (void)m_paths.Init("EngineN", "EngineN");
+    m_specs = QuerySystemSpecs();
 
     m_initialized = true;
-    ENGINE_LOG(Info, Platform, "Platform initialized successfully (VIDEO | GAMEPAD)");
+    m_quitRequested = false;
+    m_terminating = false;
     return Ok;
 }
 
-void Platform::Shutdown() {
-    if (!m_initialized) {
-        return;
-    }
+void Platform::Shutdown() noexcept {
+    if (!m_initialized) return;
 
+    m_gamepads.CloseAll();
     SDL_Quit();
     m_initialized = false;
-    ENGINE_LOG(Info, Platform, "Platform shutdown complete");
 }
 
-i32 Platform::GetDisplayCount() const {
-    if (!m_initialized) return 0;
-    int count = 0;
-    SDL_DisplayID* displays = SDL_GetDisplays(&count);
-    if (displays) {
-        SDL_free(displays);
-    }
-    return count;
-}
+const PlatformEventQueue& Platform::Pump(Window& window, InputSystem& input) noexcept {
+    m_activeWindow = &window;
+    m_activeInput = &input;
+    m_events.Clear();
 
-i32 Platform::QueryDisplays(std::span<DisplayInfo> outDisplays) const {
-    if (!m_initialized || outDisplays.empty()) return 0;
-
-    int count = 0;
-    SDL_DisplayID* displays = SDL_GetDisplays(&count);
-    if (!displays || count <= 0) {
-        if (displays) SDL_free(displays);
-        return 0;
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        m_router.Dispatch(event);
     }
 
-    int toWrite = std::min(count, static_cast<int>(outDisplays.size()));
-    for (int i = 0; i < toWrite; ++i) {
-        outDisplays[i] = ExtractDisplayInfo(displays[i]);
+    m_activeWindow = nullptr;
+    m_activeInput = nullptr;
+    return m_events;
+}
+
+const PlatformEventQueue& Platform::Pump() noexcept {
+    m_activeWindow = nullptr;
+    m_activeInput = nullptr;
+    m_events.Clear();
+
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        m_router.Dispatch(event);
     }
 
-    SDL_free(displays);
-    return toWrite;
+    return m_events;
 }
 
-std::vector<DisplayInfo> Platform::GetAllDisplays() const {
-    std::vector<DisplayInfo> result;
-    if (!m_initialized) return result;
+SinkVerdict Platform::OnWindowEvent(const SDL_Event& event) noexcept {
+    if (m_activeWindow) {
+        m_activeWindow->ApplyEvent(event);
+    }
+    return SinkVerdict::Continue;
+}
 
-    int count = 0;
-    SDL_DisplayID* displays = SDL_GetDisplays(&count);
-    if (!displays || count <= 0) {
-        if (displays) SDL_free(displays);
-        return result;
+SinkVerdict Platform::OnInputEvent(const SDL_Event& event) noexcept {
+    if (m_activeInput) {
+        m_activeInput->Ingest(event);
+    }
+    return SinkVerdict::Continue;
+}
+
+SinkVerdict Platform::OnSystemEvent(const SDL_Event& event) noexcept {
+    switch (event.type) {
+        case SDL_EVENT_QUIT: {
+            m_quitRequested = true;
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::QuitRequested,
+                .timestampNs = event.quit.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_TERMINATING: {
+            m_terminating = true;
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::Terminating,
+                .timestampNs = event.common.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_GAMEPAD_ADDED: {
+            auto slotRes = m_gamepads.OnAdded(GamepadId{static_cast<u32>(event.gdevice.which)});
+            const u8 slot = slotRes ? *slotRes : 0;
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::GamepadConnected,
+                .slot = slot,
+                .id = static_cast<u32>(event.gdevice.which),
+                .timestampNs = event.gdevice.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_GAMEPAD_REMOVED: {
+            auto slotOpt = m_gamepads.OnRemoved(GamepadId{static_cast<u32>(event.gdevice.which)});
+            const u8 slot = slotOpt.value_or(0);
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::GamepadDisconnected,
+                .slot = slot,
+                .id = static_cast<u32>(event.gdevice.which),
+                .timestampNs = event.gdevice.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_DISPLAY_ADDED:
+        case SDL_EVENT_DISPLAY_REMOVED:
+        case SDL_EVENT_DISPLAY_MOVED:
+        case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+        case SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED:
+        case SDL_EVENT_DISPLAY_ORIENTATION: {
+            (void)m_displays.Refresh();
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::DisplayTopologyChanged,
+                .id = m_displays.Revision(),
+                .timestampNs = event.display.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_AUDIO_DEVICE_ADDED: {
+            (void)m_audioDevices.OnAdded(AudioDeviceId{static_cast<u32>(event.adevice.which)}, event.adevice.recording != 0);
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::AudioDeviceAdded,
+                .recording = (event.adevice.recording != 0),
+                .id = static_cast<u32>(event.adevice.which),
+                .timestampNs = event.adevice.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_AUDIO_DEVICE_REMOVED: {
+            (void)m_audioDevices.OnRemoved(AudioDeviceId{static_cast<u32>(event.adevice.which)}, event.adevice.recording != 0);
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::AudioDeviceRemoved,
+                .recording = (event.adevice.recording != 0),
+                .id = static_cast<u32>(event.adevice.which),
+                .timestampNs = event.adevice.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_CLIPBOARD_UPDATE: {
+            (void)m_events.TryPush(PlatformEvent{
+                .type = PlatformEventType::ClipboardChanged,
+                .timestampNs = event.clipboard.timestamp
+            });
+            break;
+        }
+
+        case SDL_EVENT_WINDOW_FOCUS_LOST: {
+            m_gamepads.StopAllRumble();
+            break;
+        }
+
+        default:
+            break;
     }
 
-    result.reserve(count);
-    for (int i = 0; i < count; ++i) {
-        result.push_back(ExtractDisplayInfo(displays[i]));
-    }
-
-    SDL_free(displays);
-    return result;
-}
-
-DisplayInfo Platform::GetPrimaryDisplayInfo() const {
-    if (!m_initialized) return DisplayInfo{};
-    SDL_DisplayID id = SDL_GetPrimaryDisplay();
-    return ExtractDisplayInfo(id);
-}
-
-DisplayInfo Platform::GetDisplayInfo(u32 displayId) const {
-    if (!m_initialized) return DisplayInfo{};
-    return ExtractDisplayInfo(displayId);
-}
-
-f32 Platform::GetDisplayRefreshRate(u32 displayId) const {
-    if (!m_initialized) return 60.0f;
-    SDL_DisplayID id = (displayId == 0) ? SDL_GetPrimaryDisplay() : displayId;
-    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(id);
-    if (!mode) {
-        mode = SDL_GetDesktopDisplayMode(id);
-    }
-    return (mode && mode->refresh_rate > 0.0f) ? mode->refresh_rate : 60.0f;
-}
-
-f32 Platform::GetDisplayContentScale(u32 displayId) const {
-    if (!m_initialized) return 1.0f;
-    SDL_DisplayID id = (displayId == 0) ? SDL_GetPrimaryDisplay() : displayId;
-    float scale = SDL_GetDisplayContentScale(id);
-    return (scale > 0.0f) ? scale : 1.0f;
-}
-
-bool Platform::HasClipboardText() const {
-    return SDL_HasClipboardText();
-}
-
-ClipboardText Platform::GetClipboardText() const {
-    // SDL_GetClipboardText() allocates memory via SDL_malloc that must be freed with SDL_free().
-    // ClipboardText takes ownership and guarantees zero memory leaks via RAII.
-    return ClipboardText(SDL_GetClipboardText());
-}
-
-std::string Platform::GetClipboardString() const {
-    ClipboardText clip = GetClipboardText();
-    return std::string(clip.view());
-}
-
-bool Platform::SetClipboardText(const char* text) {
-    return SDL_SetClipboardText(text ? text : "");
-}
-
-bool Platform::SetClipboardText(std::string_view text) {
-    std::string str(text);
-    return SDL_SetClipboardText(str.c_str());
-}
-
-u64 Platform::GetPerformanceCounter() const noexcept {
-    return SDL_GetPerformanceCounter();
-}
-
-u64 Platform::GetPerformanceFrequency() const noexcept {
-    return SDL_GetPerformanceFrequency();
-}
-
-PowerInfo Platform::GetPowerInfo() const {
-    PowerInfo info{};
-    int seconds = -1;
-    int percent = -1;
-    SDL_PowerState state = SDL_GetPowerInfo(&seconds, &percent);
-
-    info.secondsLeft = seconds;
-    info.batteryPercent = percent;
-
-    switch (state) {
-        case SDL_POWERSTATE_ON_BATTERY: info.state = PowerState::OnBattery; break;
-        case SDL_POWERSTATE_NO_BATTERY: info.state = PowerState::NoBattery; break;
-        case SDL_POWERSTATE_CHARGING:   info.state = PowerState::Charging; break;
-        case SDL_POWERSTATE_CHARGED:    info.state = PowerState::Charged; break;
-        default:                        info.state = PowerState::Unknown; break;
-    }
-
-    return info;
-}
-
-i32 Platform::GetSystemRAM() const noexcept {
-    return SDL_GetSystemRAM();
-}
-
-i32 Platform::GetCPUCount() const noexcept {
-    return SDL_GetNumLogicalCPUCores();
-}
-
-i32 Platform::GetCPUCacheLineSize() const noexcept {
-    return SDL_GetCPUCacheLineSize();
+    return SinkVerdict::Continue;
 }
 
 } // namespace EngineN

@@ -1,72 +1,69 @@
 #include "platform/input/ActionBuffer.h"
-#include <SDL3/SDL.h>
 
 namespace EngineN {
 
-void ActionBuffer::RecordAction(InputAction action, u64 timestampNs) noexcept {
-    usize idx = static_cast<usize>(action);
-    if (idx >= kActionCount) return;
+void ActionBuffer::Feed(const TickInput& in, bool frozen) noexcept {
+    for (ActionId a = 0; a < kMaxActions; ++a) {
+        const u32 bit = (1u << a);
 
-    m_entries[idx] = Entry{
-        .timestampNs = timestampNs,
-        .pending = true
-    };
+        // Edge arrived this tick: arm pending and reset age
+        if (in.Pressed(a)) {
+            m_pressPending |= bit;
+            m_pressAge[a] = 0;
+        } else if (!frozen && (m_pressPending & bit) != 0) {
+            // Age existing pending press unless frozen by hitstop
+            if (m_pressAge[a] < 255) {
+                ++m_pressAge[a];
+            }
+        }
+
+        if (in.Released(a)) {
+            m_releasePending |= bit;
+            m_releaseAge[a] = 0;
+        } else if (!frozen && (m_releasePending & bit) != 0) {
+            if (m_releaseAge[a] < 255) {
+                ++m_releaseAge[a];
+            }
+        }
+    }
 }
 
-bool ActionBuffer::ConsumeAction(
-    InputAction action,
-    u64 currentTimestampNs,
-    u64 maxWindowNs) noexcept {
-    usize idx = static_cast<usize>(action);
-    if (idx >= kActionCount) return false;
+bool ActionBuffer::Peek(ActionId a, u8 windowTicks) const noexcept {
+    if (a >= kMaxActions) return false;
+    const u32 bit = (1u << a);
+    return ((m_pressPending & bit) != 0) && (m_pressAge[a] <= windowTicks);
+}
 
-    Entry& entry = m_entries[idx];
-    if (!entry.pending || currentTimestampNs < entry.timestampNs) {
-        return false;
-    }
+bool ActionBuffer::Consume(ActionId a, u8 windowTicks) noexcept {
+    if (!Peek(a, windowTicks)) return false;
+    m_pressPending &= ~(1u << a);
+    return true;
+}
 
-    if (currentTimestampNs - entry.timestampNs <= maxWindowNs) {
-        entry.pending = false;
+bool ActionBuffer::ConsumeRelease(ActionId a, u8 windowTicks) noexcept {
+    if (a >= kMaxActions) return false;
+    const u32 bit = (1u << a);
+    if (((m_releasePending & bit) != 0) && (m_releaseAge[a] <= windowTicks)) {
+        m_releasePending &= ~bit;
         return true;
     }
-
-    // Expired intent is cleared
-    entry.pending = false;
     return false;
 }
 
-bool ActionBuffer::ConsumeAction(InputAction action, u64 maxWindowNs) noexcept {
-    return ConsumeAction(action, SDL_GetTicksNS(), maxWindowNs);
-}
-
-bool ActionBuffer::HasAction(
-    InputAction action,
-    u64 currentTimestampNs,
-    u64 maxWindowNs) const noexcept {
-    usize idx = static_cast<usize>(action);
-    if (idx >= kActionCount) return false;
-
-    const Entry& entry = m_entries[idx];
-    if (!entry.pending || currentTimestampNs < entry.timestampNs) {
-        return false;
-    }
-
-    return (currentTimestampNs - entry.timestampNs <= maxWindowNs);
-}
-
-bool ActionBuffer::HasAction(InputAction action, u64 maxWindowNs) const noexcept {
-    return HasAction(action, SDL_GetTicksNS(), maxWindowNs);
-}
-
 void ActionBuffer::Clear() noexcept {
-    m_entries.fill(Entry{});
+    m_pressPending = 0;
+    m_releasePending = 0;
+    m_pressAge.fill(0);
+    m_releaseAge.fill(0);
 }
 
-void ActionBuffer::ClearAction(InputAction action) noexcept {
-    usize idx = static_cast<usize>(action);
-    if (idx < kActionCount) {
-        m_entries[idx] = Entry{};
-    }
+void ActionBuffer::Clear(ActionId a) noexcept {
+    if (a >= kMaxActions) return;
+    const u32 bit = (1u << a);
+    m_pressPending &= ~bit;
+    m_releasePending &= ~bit;
+    m_pressAge[a] = 0;
+    m_releaseAge[a] = 0;
 }
 
 } // namespace EngineN

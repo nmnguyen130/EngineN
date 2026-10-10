@@ -1,88 +1,81 @@
 #pragma once
 
+#include "core/Result.h"
 #include "core/Types.h"
 #include "platform/input/InputTypes.h"
 #include <array>
+#include <span>
+#include <type_traits>
 
 namespace EngineN {
 
+struct ActionBinding {
+    ContextId context = 0;
+    Source source{};
+    ActionId action = 0;
+};
+
+struct AxisBinding {
+    ContextId context = 0;
+    Source negativeSource{};
+    Source positiveSource{};
+    AxisId axis = 0;
+};
+
 /**
- * InputBindings: Clean registry mapping Keyboard & Mouse inputs to logical actions and axes.
- * Supports context isolation (Gameplay vs UI) and zero heap allocations.
+ * Flat binding tables with validated physical sources and context layer awareness.
+ * Guarantees zero heap allocation and zero out-of-bounds reads.
  */
 class InputBindings {
 public:
-    InputBindings();
+    static constexpr usize kMaxActionBindings = 64;
+    static constexpr usize kMaxAxisBindings = 16;
 
-    void SetDefaultBindings() noexcept;
+    [[nodiscard]] Result<void, InputError> BindAction(ContextId ctx, Source src, ActionId action) noexcept;
+    [[nodiscard]] Result<void, InputError> UnbindAction(ContextId ctx, Source src, ActionId action) noexcept;
+    [[nodiscard]] Result<void, InputError> BindAxis(ContextId ctx, Source neg, Source pos, AxisId axis) noexcept;
+    [[nodiscard]] Result<void, InputError> UnbindAxis(ContextId ctx, AxisId axis) noexcept;
+
     void Clear() noexcept;
+    void SetDefaultBindings() noexcept;
 
-    [[nodiscard]] bool BindKey(
-        u32 scancode,
-        InputAction action,
-        InputContext context = InputContext::Gameplay) noexcept;
-    [[nodiscard]] bool UnbindKey(
-        u32 scancode,
-        InputAction action,
-        InputContext context = InputContext::Gameplay) noexcept;
-
-    [[nodiscard]] bool BindMouseButton(
-        u8 button,
-        InputAction action,
-        InputContext context = InputContext::Gameplay) noexcept;
-    [[nodiscard]] bool UnbindMouseButton(
-        u8 button,
-        InputAction action,
-        InputContext context = InputContext::Gameplay) noexcept;
-
-    [[nodiscard]] bool BindAxisKeys(
-        AxisId axis,
-        u32 negativeScancode,
-        u32 positiveScancode,
-        InputContext context = InputContext::Gameplay) noexcept;
-    [[nodiscard]] bool UnbindAxisKeys(
-        AxisId axis,
-        u32 negativeScancode,
-        u32 positiveScancode,
-        InputContext context = InputContext::Gameplay) noexcept;
-
-    [[nodiscard]] bool IsActionSourceDown(
-        InputAction action,
-        InputContext context,
-        const std::array<bool, kMaxKeyboardKeys>& keysDown,
-        const std::array<bool, kMaxMouseButtons>& mouseButtonsDown) const noexcept;
-
-    [[nodiscard]] f32 EvaluateAxisKeys(
-        AxisId axis,
-        InputContext context,
-        const std::array<bool, kMaxKeyboardKeys>& keysDown) const noexcept;
-
-    template <typename F>
-    void ForEachKeyAction(u32 scancode, InputContext context, F&& func) const noexcept {
-        for (usize i = 0; i < m_keyBindingCount; ++i) {
-            if (m_keyBindings[i].scancode == scancode && m_keyBindings[i].context == context) {
-                func(m_keyBindings[i].action);
-            }
-        }
+    [[nodiscard]] std::span<const ActionBinding> GetActionBindings() const noexcept {
+        return std::span<const ActionBinding>(m_actionBindings.data(), m_actionBindingCount);
     }
 
-    template <typename F>
-    void ForEachMouseButtonAction(u8 button, InputContext context, F&& func) const noexcept {
-        for (usize i = 0; i < m_mouseBindingCount; ++i) {
-            if (m_mouseBindings[i].button == button && m_mouseBindings[i].context == context) {
-                func(m_mouseBindings[i].action);
-            }
-        }
+    [[nodiscard]] std::span<const AxisBinding> GetAxisBindings() const noexcept {
+        return std::span<const AxisBinding>(m_axisBindings.data(), m_axisBindingCount);
+    }
+
+    template <typename EAction>
+    requires std::is_enum_v<EAction>
+    [[nodiscard]] Result<void, InputError> BindAction(ContextId ctx, Source src, EAction action) noexcept {
+        return BindAction(ctx, src, static_cast<ActionId>(action));
+    }
+
+    template <typename EAction>
+    requires std::is_enum_v<EAction>
+    [[nodiscard]] Result<void, InputError> UnbindAction(ContextId ctx, Source src, EAction action) noexcept {
+        return UnbindAction(ctx, src, static_cast<ActionId>(action));
+    }
+
+    template <typename EAxis>
+    requires std::is_enum_v<EAxis>
+    [[nodiscard]] Result<void, InputError> BindAxis(ContextId ctx, Source neg, Source pos, EAxis axis) noexcept {
+        return BindAxis(ctx, neg, pos, static_cast<AxisId>(axis));
+    }
+
+    template <typename EAxis>
+    requires std::is_enum_v<EAxis>
+    [[nodiscard]] Result<void, InputError> UnbindAxis(ContextId ctx, EAxis axis) noexcept {
+        return UnbindAxis(ctx, static_cast<AxisId>(axis));
     }
 
 private:
-    std::array<KeyBinding, kMaxKeyBindings> m_keyBindings{};
-    usize m_keyBindingCount = 0;
+    std::array<ActionBinding, kMaxActionBindings> m_actionBindings{};
+    usize m_actionBindingCount = 0;
 
-    std::array<MouseButtonBinding, kMaxMouseBindings> m_mouseBindings{};
-    usize m_mouseBindingCount = 0;
-
-    std::array<AxisKeyBinding, kMaxAxisBindings> m_axisBindings{};
+    std::array<AxisBinding, kMaxAxisBindings> m_axisBindings{};
     usize m_axisBindingCount = 0;
 };
 

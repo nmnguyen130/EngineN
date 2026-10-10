@@ -1,6 +1,8 @@
 #include "platform/Window.h"
-#include "core/Log.h"
-#include <SDL3/SDL.h>
+#include <SDL3/SDL_video.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_mouse.h>
+#include <utility>
 
 namespace EngineN {
 
@@ -9,37 +11,48 @@ Window::~Window() {
 }
 
 Window::Window(Window&& other) noexcept
-    : m_window(other.m_window),
-      m_mode(other.m_mode),
-      m_logicalWidth(other.m_logicalWidth),
-      m_logicalHeight(other.m_logicalHeight),
-      m_pixelWidth(other.m_pixelWidth),
-      m_pixelHeight(other.m_pixelHeight),
-      m_hasFocus(other.m_hasFocus),
-      m_isMinimized(other.m_isMinimized) {
-    other.m_window = nullptr;
+    : m_handle(std::exchange(other.m_handle, nullptr))
+    , m_id(std::exchange(other.m_id, {}))
+    , m_state(other.m_state)
+    , m_dirty(other.m_dirty)
+{
+    other.m_dirty = WindowChange::None;
 }
 
 Window& Window::operator=(Window&& other) noexcept {
     if (this != &other) {
         Destroy();
-        m_window = other.m_window;
-        m_mode = other.m_mode;
-        m_logicalWidth = other.m_logicalWidth;
-        m_logicalHeight = other.m_logicalHeight;
-        m_pixelWidth = other.m_pixelWidth;
-        m_pixelHeight = other.m_pixelHeight;
-        m_hasFocus = other.m_hasFocus;
-        m_isMinimized = other.m_isMinimized;
-        other.m_window = nullptr;
+        m_handle = std::exchange(other.m_handle, nullptr);
+        m_id = std::exchange(other.m_id, {});
+        m_state = other.m_state;
+        m_dirty = other.m_dirty;
+        other.m_dirty = WindowChange::None;
     }
     return *this;
 }
 
-Result<void> Window::Create(const WindowConfig& config) {
-    if (m_window) {
-        Destroy();
+Result<Window, EngineError> Window::Create(
+    const WindowConfig& config,
+    const DisplayTopology& displays) noexcept
+{
+    Window win;
+    auto res = win.Create(config);
+    if (!res) {
+        return Unexpected(res.Error());
     }
+
+    if (config.mode != WindowMode::Windowed) {
+        (void)win.SetMode(WindowModeRequest{.mode = config.mode}, displays);
+    }
+
+    return win;
+}
+
+Result<void, EngineError> Window::Create(const WindowConfig& config) noexcept {
+    Destroy();
+
+    const i32 width = (config.size.w > 0) ? config.size.w : 1280;
+    const i32 height = (config.size.h > 0) ? config.size.h : 720;
 
     SDL_WindowFlags flags = 0;
     if (config.resizable) {
@@ -48,226 +61,238 @@ Result<void> Window::Create(const WindowConfig& config) {
     if (config.highDPI) {
         flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
     }
-
-    m_window = SDL_CreateWindow(config.title, config.width, config.height, flags);
-    if (!m_window) {
-        ENGINE_LOG(Error, Platform, "SDL_CreateWindow failed: {}", SDL_GetError());
-        return Err(EngineError(SDL_GetError()));
+    if (config.startHidden) {
+        flags |= SDL_WINDOW_HIDDEN;
+    }
+    if (config.startMaximized) {
+        flags |= SDL_WINDOW_MAXIMIZED;
     }
 
-    m_mode = WindowMode::Windowed;
-    RefreshSizes();
-
-    if (config.mode != WindowMode::Windowed) {
-        auto modeRes = SetMode(config.mode);
-        if (!modeRes) {
-            ENGINE_LOG(Warn, Platform, "Failed to set requested window mode, falling back to windowed");
-        }
+    switch (config.graphics) {
+        case WindowGraphicsHint::OpenGL: flags |= SDL_WINDOW_OPENGL; break;
+        case WindowGraphicsHint::Vulkan: flags |= SDL_WINDOW_VULKAN; break;
+        case WindowGraphicsHint::Metal:  flags |= SDL_WINDOW_METAL;  break;
+        case WindowGraphicsHint::None:   break;
     }
 
-    ENGINE_LOG(Info, Platform, "Window created: {} (Logical: {}x{}, Pixel: {}x{}, Scale: {:.2f})",
-               config.title, m_logicalWidth, m_logicalHeight, m_pixelWidth, m_pixelHeight, GetDisplayScale());
+    FixedString<256> titleBuf(config.title);
+    m_handle = SDL_CreateWindow(titleBuf.CStr(), width, height, flags);
+    if (!m_handle) {
+        return Unexpected(MakePlatformError(PlatformErrc::WindowCreateFailed));
+    }
+
+    if (config.minSize.w > 0 && config.minSize.h > 0) {
+        (void)SDL_SetWindowMinimumSize(m_handle, config.minSize.w, config.minSize.h);
+    }
+
+    m_id = WindowId{SDL_GetWindowID(m_handle)};
+    m_state.mode = WindowMode::Windowed;
+    m_dirty = WindowChange::Size | WindowChange::PixelSize | WindowChange::DisplayScale;
+
+    Resync();
     return Ok;
 }
 
-void Window::Destroy() {
-    if (m_window) {
-        SDL_DestroyWindow(m_window);
-        m_window = nullptr;
-        m_logicalWidth = 0;
-        m_logicalHeight = 0;
-        m_pixelWidth = 0;
-        m_pixelHeight = 0;
-        m_mode = WindowMode::Windowed;
+void Window::Destroy() noexcept {
+    if (m_handle) {
+        SDL_DestroyWindow(m_handle);
+        m_handle = nullptr;
+        m_id = {};
+        m_state = {};
+        m_dirty = WindowChange::None;
     }
 }
 
-Result<void> Window::SetMode(WindowMode mode) {
-    if (!m_window) {
-        return Err(EngineError("Window not created"));
+Result<void, EngineError> Window::SetMode(
+    const WindowModeRequest& request,
+    const DisplayTopology& displays) noexcept
+{
+    if (!m_handle) {
+        return Unexpected(MakePlatformError(PlatformErrc::InvalidState, "Window handle is null"));
     }
 
-    bool success = true;
-    switch (mode) {
-        case WindowMode::Windowed: {
-            // Revert fullscreen flag to return to standard windowed mode
-            success = SDL_SetWindowFullscreen(m_window, false);
-            break;
+    if (request.mode == WindowMode::Windowed) {
+        if (!SDL_SetWindowFullscreen(m_handle, false)) {
+            return Unexpected(MakePlatformError(PlatformErrc::FullscreenFailed));
         }
-
-        case WindowMode::BorderlessFullscreen: {
-            // According to SDL3 specifications, mode == nullptr sets borderless desktop fullscreen
-            if (!SDL_SetWindowFullscreenMode(m_window, nullptr)) {
-                ENGINE_LOG(Warn, Platform, "SDL_SetWindowFullscreenMode(null) failed: {}", SDL_GetError());
-            }
-            success = SDL_SetWindowFullscreen(m_window, true);
-            break;
+        m_state.mode = WindowMode::Windowed;
+    } else if (request.mode == WindowMode::BorderlessFullscreen) {
+        (void)SDL_SetWindowFullscreenMode(m_handle, nullptr);
+        if (!SDL_SetWindowFullscreen(m_handle, true)) {
+            return Unexpected(MakePlatformError(PlatformErrc::FullscreenFailed));
         }
-
-        case WindowMode::ExclusiveFullscreen: {
-            // Query the current display that contains this window
-            SDL_DisplayID displayId = SDL_GetDisplayForWindow(m_window);
-            if (displayId == 0) {
-                displayId = SDL_GetPrimaryDisplay();
-            }
-
-            // Find closest matching exclusive display mode
-            SDL_DisplayMode closest{};
-            bool found = SDL_GetClosestFullscreenDisplayMode(
-                displayId,
-                m_logicalWidth,
-                m_logicalHeight,
-                0.0f,
-                true,
-                &closest);
-
-            if (found) {
-                if (!SDL_SetWindowFullscreenMode(m_window, &closest)) {
-                    ENGINE_LOG(Warn, Platform, "Failed to set exclusive mode, falling back to desktop mode");
-                    SDL_SetWindowFullscreenMode(m_window, nullptr);
-                }
-            } else {
-                // Desktop fallback if no exact mode matches
-                ENGINE_LOG(Warn, Platform, "No closest exclusive mode found; using desktop mode fallback");
-                const SDL_DisplayMode* desktopMode = SDL_GetDesktopDisplayMode(displayId);
-                if (!SDL_SetWindowFullscreenMode(m_window, desktopMode)) {
-                    SDL_SetWindowFullscreenMode(m_window, nullptr);
-                }
-            }
-
-            success = SDL_SetWindowFullscreen(m_window, true);
-            if (!success) {
-                // Desktop fallback if hardware mode switch fails (e.g. unsupported resolution or driver rejection)
-                ENGINE_LOG(Warn, Platform, "Exclusive mode switch failed ({}); falling back to borderless fullscreen", SDL_GetError());
-                SDL_SetWindowFullscreenMode(m_window, nullptr);
-                success = SDL_SetWindowFullscreen(m_window, true);
-            }
-            break;
+        m_state.mode = WindowMode::BorderlessFullscreen;
+    } else if (request.mode == WindowMode::ExclusiveFullscreen) {
+        auto closest = displays.FindClosestMode(m_state.display, request.exclusive);
+        if (closest) {
+            SDL_DisplayMode sdlMode{
+                .displayID = m_state.display.value,
+                .format = static_cast<SDL_PixelFormat>(closest->sdlPixelFormat),
+                .w = closest->width,
+                .h = closest->height,
+                .pixel_density = closest->pixelDensity,
+                .refresh_rate = closest->refreshHz,
+                .refresh_rate_numerator = static_cast<int>(closest->refreshNumerator),
+                .refresh_rate_denominator = static_cast<int>(closest->refreshDenominator),
+                .internal = nullptr
+            };
+            (void)SDL_SetWindowFullscreenMode(m_handle, &sdlMode);
         }
+        if (!SDL_SetWindowFullscreen(m_handle, true)) {
+            return Unexpected(MakePlatformError(PlatformErrc::FullscreenFailed));
+        }
+        m_state.mode = WindowMode::ExclusiveFullscreen;
     }
 
-    if (!success) {
-        ENGINE_LOG(Error, Platform, "SDL_SetWindowFullscreen failed: {}", SDL_GetError());
-        return Err(EngineError(SDL_GetError()));
-    }
-
-    // Synchronize window state with OS compositor
-    SDL_SyncWindow(m_window);
-
-    m_mode = mode;
-    RefreshSizes();
+    m_state.transitionPending = true;
+    m_dirty |= WindowChange::Mode;
     return Ok;
 }
 
-Result<void> Window::SetExclusiveDisplayMode(i32 width, i32 height, f32 refreshRate) {
-    if (!m_window) {
-        return Err(EngineError("Window not created"));
-    }
+Result<void, EngineError> Window::SetMode(WindowMode mode) noexcept {
+    static const DisplayTopology emptyTopology{};
+    return SetMode(WindowModeRequest{.mode = mode}, emptyTopology);
+}
 
-    SDL_DisplayID displayId = SDL_GetDisplayForWindow(m_window);
-    if (displayId == 0) {
-        displayId = SDL_GetPrimaryDisplay();
+Result<void, EngineError> Window::SetTitle(std::string_view title) noexcept {
+    if (!m_handle) {
+        return Unexpected(MakePlatformError(PlatformErrc::InvalidState));
     }
-
-    SDL_DisplayMode closest{};
-    if (!SDL_GetClosestFullscreenDisplayMode(displayId, width, height, refreshRate, true, &closest)) {
-        return Err(EngineError("No matching display mode found for requested parameters"));
+    FixedString<256> buf(title);
+    if (!SDL_SetWindowTitle(m_handle, buf.CStr())) {
+        return Unexpected(MakePlatformError(PlatformErrc::InvalidState));
     }
-
-    if (!SDL_SetWindowFullscreenMode(m_window, &closest)) {
-        return Err(EngineError(SDL_GetError()));
-    }
-
-    if (m_mode == WindowMode::ExclusiveFullscreen) {
-        SDL_SyncWindow(m_window);
-        RefreshSizes();
-    }
-
     return Ok;
 }
 
-const SDL_DisplayMode* Window::GetFullscreenMode() const {
-    if (!m_window) return nullptr;
-    return SDL_GetWindowFullscreenMode(m_window);
+Result<void, EngineError> Window::SetMinimumSize(Extent2i size) noexcept {
+    if (!m_handle) {
+        return Unexpected(MakePlatformError(PlatformErrc::InvalidState));
+    }
+    if (!SDL_SetWindowMinimumSize(m_handle, size.w, size.h)) {
+        return Unexpected(MakePlatformError(PlatformErrc::InvalidState));
+    }
+    return Ok;
 }
 
-f32 Window::GetDisplayScale() const noexcept {
-    if (!m_window) return 1.0f;
-    float scale = SDL_GetWindowDisplayScale(m_window);
-    return (scale > 0.0f) ? scale : 1.0f;
-}
-
-f32 Window::GetPixelDensity() const noexcept {
-    if (m_logicalWidth <= 0) return 1.0f;
-    return static_cast<f32>(m_pixelWidth) / static_cast<f32>(m_logicalWidth);
-}
-
-u32 Window::GetDisplayID() const {
-    if (!m_window) return 0;
-    return SDL_GetDisplayForWindow(m_window);
-}
-
-f32 Window::GetRefreshRate() const {
-    if (!m_window) return 60.0f;
-    SDL_DisplayID displayId = SDL_GetDisplayForWindow(m_window);
-    if (displayId == 0) displayId = SDL_GetPrimaryDisplay();
-    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(displayId);
-    if (!mode) mode = SDL_GetDesktopDisplayMode(displayId);
-    return (mode && mode->refresh_rate > 0.0f) ? mode->refresh_rate : 60.0f;
-}
-
-void Window::SetTitle(const char* title) {
-    if (m_window && title) {
-        SDL_SetWindowTitle(m_window, title);
+void Window::Show() noexcept {
+    if (m_handle) {
+        (void)SDL_ShowWindow(m_handle);
     }
 }
 
-void Window::RefreshSizes() {
-    if (!m_window) return;
-    SDL_GetWindowSize(m_window, &m_logicalWidth, &m_logicalHeight);
-    SDL_GetWindowSizeInPixels(m_window, &m_pixelWidth, &m_pixelHeight);
+void Window::RequestAttention() noexcept {
+    if (m_handle) {
+        (void)SDL_FlashWindow(m_handle, SDL_FLASH_UNTIL_FOCUSED);
+    }
 }
 
-void Window::ProcessEvent(const SDL_Event& event) {
-    (void)HandleEvent(event);
+void Window::SetCursorVisible(bool visible) noexcept {
+    if (visible) {
+        (void)SDL_ShowCursor();
+    } else {
+        (void)SDL_HideCursor();
+    }
 }
 
-bool Window::HandleEvent(const SDL_Event& event) {
-    if (!m_window) return false;
+void Window::Resync() noexcept {
+    if (!m_handle) return;
+
+    int w = 0, h = 0;
+    (void)SDL_GetWindowSize(m_handle, &w, &h);
+    m_state.metrics.logicalSize = {w, h};
+
+    int pw = 0, ph = 0;
+    (void)SDL_GetWindowSizeInPixels(m_handle, &pw, &ph);
+    m_state.metrics.pixelSize = {pw, ph};
+
+    m_state.metrics.pixelDensity = SDL_GetWindowPixelDensity(m_handle);
+    m_state.metrics.displayScale = SDL_GetWindowDisplayScale(m_handle);
+
+    int x = 0, y = 0;
+    (void)SDL_GetWindowPosition(m_handle, &x, &y);
+    m_state.position = {x, y};
+
+    m_state.display = DisplayId{SDL_GetDisplayForWindow(m_handle)};
+
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(m_handle);
+    m_state.focused   = (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
+    m_state.minimized = (flags & SDL_WINDOW_MINIMIZED) != 0;
+    m_state.maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+    m_state.occluded  = (flags & SDL_WINDOW_OCCLUDED) != 0;
+    m_state.visible   = (flags & SDL_WINDOW_HIDDEN) == 0;
+}
+
+void Window::ApplyEvent(const SDL_Event& event) noexcept {
+    if (!m_handle || event.window.windowID != m_id.value) return;
 
     switch (event.type) {
+        case SDL_EVENT_WINDOW_RESIZED:
+            m_state.metrics.logicalSize = {event.window.data1, event.window.data2};
+            m_dirty |= WindowChange::Size;
+            break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            m_state.metrics.pixelSize = {event.window.data1, event.window.data2};
+            m_dirty |= WindowChange::PixelSize;
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            m_state.metrics.displayScale = SDL_GetWindowDisplayScale(m_handle);
+            m_state.metrics.pixelDensity = SDL_GetWindowPixelDensity(m_handle);
+            m_dirty |= (WindowChange::DisplayScale | WindowChange::PixelDensity);
+            break;
+        case SDL_EVENT_WINDOW_MOVED:
+            m_state.position = {event.window.data1, event.window.data2};
+            m_dirty |= WindowChange::Position;
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            m_state.display = DisplayId{static_cast<u32>(event.window.data1)};
+            m_dirty |= WindowChange::Display;
+            break;
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
-            m_hasFocus = true;
+            m_state.focused = true;
+            m_dirty |= WindowChange::Focus;
             break;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
-            m_hasFocus = false;
+            m_state.focused = false;
+            m_dirty |= WindowChange::Focus;
             break;
         case SDL_EVENT_WINDOW_MINIMIZED:
-            m_isMinimized = true;
+            m_state.minimized = true;
+            m_dirty |= WindowChange::Visibility;
+            break;
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+            m_state.maximized = true;
+            m_dirty |= WindowChange::Visibility;
             break;
         case SDL_EVENT_WINDOW_RESTORED:
-            m_isMinimized = false;
-            RefreshSizes();
+            m_state.minimized = false;
+            m_state.maximized = false;
+            m_dirty |= WindowChange::Visibility;
             break;
-        case SDL_EVENT_WINDOW_RESIZED:
-        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
-            RefreshSizes();
+        case SDL_EVENT_WINDOW_SHOWN:
+            m_state.visible = true;
+            m_dirty |= WindowChange::Visibility;
+            break;
+        case SDL_EVENT_WINDOW_HIDDEN:
+            m_state.visible = false;
+            m_dirty |= WindowChange::Visibility;
+            break;
+        case SDL_EVENT_WINDOW_OCCLUDED:
+            m_state.occluded = true;
+            m_dirty |= WindowChange::Visibility;
             break;
         case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
-            RefreshSizes();
+            m_state.transitionPending = false;
+            m_dirty |= WindowChange::Mode;
             break;
         case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
-            m_mode = WindowMode::Windowed;
-            RefreshSizes();
+            m_state.transitionPending = false;
+            m_state.mode = WindowMode::Windowed;
+            m_dirty |= WindowChange::Mode;
             break;
-        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-            return true;
         default:
             break;
     }
-
-    return false;
 }
 
 } // namespace EngineN

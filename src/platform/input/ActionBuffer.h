@@ -3,48 +3,58 @@
 #include "core/Types.h"
 #include "platform/input/InputTypes.h"
 #include <array>
+#include <type_traits>
 
 namespace EngineN {
 
 /**
- * ActionBuffer: Input forgiveness and action intent buffering for Metroidvania actions.
- * Retains the latest timestamped intent per action within a sliding window (e.g. 100ms),
- * enforcing single-consumption anti-ghosting to prevent duplicate triggers.
+ * Tick-counted intent buffer for action forgiveness (Jump/Dash buffering, hitstop freeze).
+ * Decoupled from real-world wall clock, zero SDL dependency, fully deterministic.
  */
 class ActionBuffer {
 public:
-    ActionBuffer() = default;
+    void Feed(const TickInput& in, bool frozen = false) noexcept;
 
-    /// Record a press event timestamp into the ring buffer.
-    void RecordAction(InputAction action, u64 timestampNs) noexcept;
-
-    /// Attempts to consume an intent within [currentTimestampNs - maxWindowNs, currentTimestampNs].
-    [[nodiscard]] bool ConsumeAction(
-        InputAction action,
-        u64 currentTimestampNs,
-        u64 maxWindowNs) noexcept;
-    [[nodiscard]] bool ConsumeAction(
-        InputAction action,
-        u64 maxWindowNs = kDefaultBufferWindowNs) noexcept;
-
-    [[nodiscard]] bool HasAction(
-        InputAction action,
-        u64 currentTimestampNs,
-        u64 maxWindowNs) const noexcept;
-    [[nodiscard]] bool HasAction(
-        InputAction action,
-        u64 maxWindowNs = kDefaultBufferWindowNs) const noexcept;
+    [[nodiscard]] bool Peek(ActionId a, u8 windowTicks) const noexcept;
+    [[nodiscard]] bool Consume(ActionId a, u8 windowTicks) noexcept;
+    [[nodiscard]] bool ConsumeRelease(ActionId a, u8 windowTicks) noexcept;
 
     void Clear() noexcept;
-    void ClearAction(InputAction action) noexcept;
+    void Clear(ActionId a) noexcept;
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] bool Peek(E a, u8 windowTicks) const noexcept {
+        return Peek(static_cast<ActionId>(a), windowTicks);
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] bool Consume(E a, u8 windowTicks) noexcept {
+        return Consume(static_cast<ActionId>(a), windowTicks);
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    [[nodiscard]] bool ConsumeRelease(E a, u8 windowTicks) noexcept {
+        return ConsumeRelease(static_cast<ActionId>(a), windowTicks);
+    }
+
+    template <typename E>
+    requires std::is_enum_v<E>
+    void Clear(E a) noexcept {
+        Clear(static_cast<ActionId>(a));
+    }
 
 private:
-    struct Entry {
-        u64 timestampNs = 0;
-        bool pending = false;
-    };
-
-    std::array<Entry, kActionCount> m_entries{};
+    std::array<u8, kMaxActions> m_pressAge{};
+    std::array<u8, kMaxActions> m_releaseAge{};
+    u32 m_pressPending = 0;
+    u32 m_releasePending = 0;
 };
+
+constexpr u8 TicksFromMs(u32 ms) noexcept {
+    return static_cast<u8>((ms * 120 + 500) / 1000);
+}
 
 } // namespace EngineN
