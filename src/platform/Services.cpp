@@ -122,10 +122,6 @@ ClipboardText& ClipboardText::operator=(ClipboardText&& o) noexcept {
     return *this;
 }
 
-std::string_view ClipboardText::View() const noexcept {
-    return m_text ? std::string_view(m_text) : std::string_view{};
-}
-
 void ClipboardText::Reset() noexcept {
     if (m_text) {
         SDL_free(m_text);

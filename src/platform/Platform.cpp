@@ -50,21 +50,10 @@ void Platform::Shutdown() noexcept {
 const PlatformEventQueue& Platform::Pump(Window& window, InputSystem& input) noexcept {
     m_activeWindow = &window;
     m_activeInput = &input;
-    m_events.Clear();
-
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-        m_router.Dispatch(event);
-    }
-
-    m_activeWindow = nullptr;
-    m_activeInput = nullptr;
-    return m_events;
+    return Pump();
 }
 
 const PlatformEventQueue& Platform::Pump() noexcept {
-    m_activeWindow = nullptr;
-    m_activeInput = nullptr;
     m_events.Clear();
 
     SDL_Event event;
@@ -72,6 +61,8 @@ const PlatformEventQueue& Platform::Pump() noexcept {
         m_router.Dispatch(event);
     }
 
+    m_activeWindow = nullptr;
+    m_activeInput = nullptr;
     return m_events;
 }
 

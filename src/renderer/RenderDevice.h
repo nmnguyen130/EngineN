@@ -1,94 +1,54 @@
 #pragma once
 
-#include "renderer/RendererTypes.h"
-#include "renderer/Texture.h"
+#include "core/Result.h"
+#include "core/Error.h"
+#include "platform/Window.h"
 #include "renderer/RenderBackend.h"
+#include "renderer/FramePacket.h"
 
-#include <memory>
+#include <SDL3/SDL.h>
 #include <vector>
 
 namespace EngineN {
 
-class Window;
-
-/// Configuration parameters for initializing RenderDevice.
 struct RenderDeviceConfig {
-    VSyncMode        vsync = VSyncMode::On;
-    PresentationMode presentation = PresentationMode::Letterbox;
-    i32              virtualWidth = 1280;
-    i32              virtualHeight = 720;
-    Color            clearColor = Colors::Black;
-    u32              maxTextures = 1024;
+    bool vsync{true};
 };
 
-/// Manages GPU backend lifecycle, generational texture handles, and frame presentation.
-class RenderDevice {
+/**
+ * RenderDevice: Primary hardware presentation and rasterization coordinator.
+ * Translates FramePacket batches into GPU draw calls with 0 heap allocation per frame.
+ */
+class RenderDevice final : public RenderBackend {
 public:
-    RenderDevice();
-    ~RenderDevice();
+    RenderDevice() noexcept = default;
+    ~RenderDevice() override;
 
     RenderDevice(const RenderDevice&) = delete;
     RenderDevice& operator=(const RenderDevice&) = delete;
-    RenderDevice(RenderDevice&&) noexcept;
-    RenderDevice& operator=(RenderDevice&&) noexcept;
+    RenderDevice(RenderDevice&& other) noexcept;
+    RenderDevice& operator=(RenderDevice&& other) noexcept;
 
-    /// Initialize with hardware window (creates SdlRendererBackend).
-    [[nodiscard]] Result<void> Create(Window& window, const RenderDeviceConfig& cfg = {});
+    [[nodiscard]] Result<void, EngineError> Init(Window& window, const RenderDeviceConfig& config = {}) noexcept;
+    void Shutdown() noexcept;
 
-    /// Initialize headless mock backend for testing and CI without OS window.
-    [[nodiscard]] Result<void> CreateHeadless(const RenderDeviceConfig& cfg = {});
+    // Submits the finalized frame packet to hardware and presents to the window
+    [[nodiscard]] Result<void, EngineError> Submit(const FramePacket& packet) noexcept;
 
-    /// Shutdown device and release all textures.
-    void Destroy();
+    // RenderBackend interface conformance
+    [[nodiscard]] Result<void, EngineError> Execute(const FramePacket& packet) noexcept override {
+        return Submit(packet);
+    }
 
-    [[nodiscard]] bool IsValid() const noexcept { return m_backend != nullptr; }
+    [[nodiscard]] Result<void, EngineError> SetVSync(bool enabled) noexcept;
 
-    // Frame Lifecycle
-    [[nodiscard]] Result<void> BeginFrame();
-    [[nodiscard]] Result<void> Submit(const BatchView& batch);
-    [[nodiscard]] Result<void> Present();
-
-    // Texture Lifecycle (Generational Handles)
-    [[nodiscard]] Result<TextureHandle> CreateTexture(
-        const TextureConfig& cfg,
-        const void* initialPixels = nullptr);
-
-    [[nodiscard]] Result<void> UpdateTexture(
-        TextureHandle handle,
-        const Rect& region,
-        const void* pixels);
-
-    void DestroyTexture(TextureHandle handle);
-
-    [[nodiscard]] bool IsTextureValid(TextureHandle handle) const noexcept;
-    [[nodiscard]] const TextureConfig* GetTextureConfig(TextureHandle handle) const noexcept;
-
-    // Display & Coordinate Queries
-    [[nodiscard]] Result<void> SetVSync(VSyncMode mode);
-    [[nodiscard]] Result<void> SetPresentation(i32 w, i32 h, PresentationMode mode);
-    void SetClearColor(Color color) noexcept { m_cfg.clearColor = color; }
-
-    [[nodiscard]] Vec2 WindowToVirtual(Vec2 windowPx) const noexcept;
-    [[nodiscard]] Vec2 VirtualToWindow(Vec2 virtualPx) const noexcept;
-    [[nodiscard]] FRect GetPresentationRect() const noexcept;
-
-    [[nodiscard]] const BackendCaps& GetCaps() const noexcept;
-    [[nodiscard]] const RenderDeviceConfig& GetConfig() const noexcept { return m_cfg; }
+    [[nodiscard]] bool IsValid() const noexcept { return m_renderer != nullptr; }
+    [[nodiscard]] SDL_Renderer* Native() const noexcept { return m_renderer; }
 
 private:
-    struct TextureSlot {
-        TextureConfig config{};
-        u16           generation = 1;
-        bool          inUse = false;
-    };
-
-    Result<void> InitBuiltInWhiteTexture();
-
-    std::unique_ptr<IRenderBackend> m_backend;
-    RenderDeviceConfig              m_cfg{};
-    std::vector<TextureSlot>        m_textureSlots;
-
-    bool m_isInsideFrame = false;
+    SDL_Renderer*           m_renderer{nullptr};
+    std::vector<SDL_Vertex> m_vertexScratch;
+    std::vector<int>        m_indexScratch;
 };
 
 } // namespace EngineN

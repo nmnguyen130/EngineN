@@ -1,266 +1,187 @@
 #include "renderer/RenderDevice.h"
-#include "renderer/SdlRendererBackend.h"
-#include "platform/Window.h"
+#include "core/Log.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace EngineN {
 
-namespace {
-
-// NullBackend: lightweight headless mock for CI, automated testing, and headless benchmarks
-class NullBackend final : public IRenderBackend {
-public:
-    Result<void> Init(Window*, const RenderDeviceConfig& cfg) override {
-        m_cfg = cfg;
-        return Ok;
-    }
-    void Shutdown() override {}
-    Result<void> CreateTexture(TextureHandle, const TextureConfig&, const void*) override { return Ok; }
-    Result<void> UpdateTexture(TextureHandle, const Rect&, const void*) override { return Ok; }
-    void DestroyTexture(TextureHandle) override {}
-    Result<void> SetVSync(VSyncMode) override { return Ok; }
-    Result<void> SetLogicalPresentation(i32 w, i32 h, PresentationMode m) override {
-        m_cfg.virtualWidth = w;
-        m_cfg.virtualHeight = h;
-        m_cfg.presentation = m;
-        return Ok;
-    }
-    Result<void> BeginFrame(Color) override { return Ok; }
-    Result<void> Submit(const BatchView&) override { return Ok; }
-    Result<void> Present() override { return Ok; }
-    const BackendCaps& GetCaps() const noexcept override {
-        static const BackendCaps caps{
-            .backendName = "NullBackend (Headless)",
-            .maxTextureDimension = 8192,
-            .vsyncAdaptive = true,
-            .supportsCustomShaders = false
-        };
-        return caps;
-    }
-    Vec2 WindowToVirtual(Vec2 windowPx) const noexcept override { return windowPx; }
-    Vec2 VirtualToWindow(Vec2 virtualPx) const noexcept override { return virtualPx; }
-    FRect GetPresentationRect() const noexcept override {
-        return FRect{0.0f, 0.0f, static_cast<f32>(m_cfg.virtualWidth), static_cast<f32>(m_cfg.virtualHeight)};
-    }
-private:
-    RenderDeviceConfig m_cfg{};
-};
-
-} // namespace
-
-RenderDevice::RenderDevice() = default;
-
 RenderDevice::~RenderDevice() {
-    Destroy();
+    Shutdown();
 }
 
-RenderDevice::RenderDevice(RenderDevice&&) noexcept = default;
-RenderDevice& RenderDevice::operator=(RenderDevice&&) noexcept = default;
+RenderDevice::RenderDevice(RenderDevice&& other) noexcept {
+    *this = std::move(other);
+}
 
-Result<void> RenderDevice::Create(Window& window, const RenderDeviceConfig& cfg) {
-    Destroy();
-    m_cfg = cfg;
-    m_textureSlots.resize(std::max(16u, m_cfg.maxTextures));
+RenderDevice& RenderDevice::operator=(RenderDevice&& other) noexcept {
+    if (this != &other) {
+        Shutdown();
+        m_renderer = other.m_renderer;
+        m_vertexScratch = std::move(other.m_vertexScratch);
+        m_indexScratch = std::move(other.m_indexScratch);
+        other.m_renderer = nullptr;
+    }
+    return *this;
+}
 
-    // Initialize hardware backend powered by SDL3
-    m_backend = std::make_unique<SdlRendererBackend>();
-    auto initRes = m_backend->Init(&window, m_cfg);
-    if (!initRes) {
-        m_backend.reset();
-        return initRes;
+Result<void, EngineError> RenderDevice::Init(Window& window, const RenderDeviceConfig& config) noexcept {
+    if (m_renderer != nullptr) {
+        Shutdown();
     }
 
-    return InitBuiltInWhiteTexture();
-}
-
-Result<void> RenderDevice::CreateHeadless(const RenderDeviceConfig& cfg) {
-    Destroy();
-    m_cfg = cfg;
-    m_textureSlots.resize(std::max(16u, m_cfg.maxTextures));
-
-    // Initialize mock backend for headless execution without OS window
-    m_backend = std::make_unique<NullBackend>();
-    auto initRes = m_backend->Init(nullptr, m_cfg);
-    if (!initRes) {
-        return initRes;
+    if (!window.IsValid()) {
+        return Err(EngineError{"Window handle is invalid for RenderDevice initialization"});
     }
 
-    return InitBuiltInWhiteTexture();
+    m_renderer = SDL_CreateRenderer(window.Native(), nullptr);
+    if (!m_renderer) {
+        return Err(EngineError{SDL_GetError()});
+    }
+
+    (void)SDL_SetRenderVSync(m_renderer, config.vsync ? 1 : 0);
+
+    // Pre-allocate scratch storage to guarantee 0 heap allocations per frame
+    constexpr usize kInitialQuadCapacity = 4096;
+    m_vertexScratch.reserve(kInitialQuadCapacity * 4);
+    m_indexScratch.reserve(kInitialQuadCapacity * 6);
+
+    const char* driver = SDL_GetRendererName(m_renderer);
+    ENGINE_LOG(Info, Render, "RenderDevice initialized. Hardware backend: {}", driver ? driver : "Default");
+
+    return {};
 }
 
-void RenderDevice::Destroy() {
-    if (m_backend) {
-        // Invalidate and destroy all in-use textures
-        for (usize i = 0; i < m_textureSlots.size(); ++i) {
-            if (m_textureSlots[i].inUse) {
-                m_backend->DestroyTexture({static_cast<u16>(i), m_textureSlots[i].generation});
-                m_textureSlots[i].inUse = false;
-                m_textureSlots[i].generation++; // Invalidate stale handles
-            }
+void RenderDevice::Shutdown() noexcept {
+    if (m_renderer != nullptr) {
+        SDL_DestroyRenderer(m_renderer);
+        m_renderer = nullptr;
+    }
+    m_vertexScratch.clear();
+    m_indexScratch.clear();
+}
+
+Result<void, EngineError> RenderDevice::SetVSync(bool enabled) noexcept {
+    if (!m_renderer) {
+        return Err(EngineError{"RenderDevice is not initialized"});
+    }
+    if (!SDL_SetRenderVSync(m_renderer, enabled ? 1 : 0)) {
+        return Err(EngineError{SDL_GetError()});
+    }
+    return {};
+}
+
+Result<void, EngineError> RenderDevice::Submit(const FramePacket& packet) noexcept {
+    if (!m_renderer) {
+        return Err(EngineError{"RenderDevice is not initialized"});
+    }
+
+    // 1. Clear background using primary pass clear color
+    Color clearCol = Color::FromRGBA8(18, 18, 24, 255);
+    if (!packet.passes.empty()) {
+        clearCol = packet.passes[0].clearColor;
+    }
+
+    const u8 cr = static_cast<u8>(std::clamp(clearCol.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+    const u8 cg = static_cast<u8>(std::clamp(clearCol.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    const u8 cb = static_cast<u8>(std::clamp(clearCol.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+    const u8 ca = static_cast<u8>(std::clamp(clearCol.a, 0.0f, 1.0f) * 255.0f + 0.5f);
+
+    SDL_SetRenderDrawColor(m_renderer, cr, cg, cb, ca);
+    SDL_RenderClear(m_renderer);
+
+    // 2. Iterate each coalesced draw batch
+    for (const auto& batch : packet.batches) {
+        if (batch.instanceCount == 0) {
+            continue;
         }
-        m_backend->Shutdown();
-        m_backend.reset();
-    }
-    m_textureSlots.clear();
-    m_isInsideFrame = false;
-}
 
-Result<void> RenderDevice::InitBuiltInWhiteTexture() {
-    // Slot 1 is permanently reserved for built-in 1x1 white texture (used by primitive batching)
-    const u32 whitePixel = 0xFFFFFFFF;
-    TextureConfig whiteCfg{
-        .width = 1,
-        .height = 1,
-        .filter = TextureFilter::Nearest,
-        .premultiplyAlpha = false
-    };
-
-    m_textureSlots[1].config = whiteCfg;
-    m_textureSlots[1].generation = 1;
-    m_textureSlots[1].inUse = true;
-
-    return m_backend->CreateTexture(TextureHandle::White(), whiteCfg, &whitePixel);
-}
-
-// Frame Lifecycle
-
-Result<void> RenderDevice::BeginFrame() {
-    if (m_isInsideFrame) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::FrameOrderViolation,
-            "RenderDevice::BeginFrame() called while already inside a frame"));
-    }
-    m_isInsideFrame = true;
-    return m_backend->BeginFrame(m_cfg.clearColor);
-}
-
-Result<void> RenderDevice::Submit(const BatchView& batch) {
-    if (!m_isInsideFrame) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::FrameOrderViolation,
-            "RenderDevice::Submit() called outside of BeginFrame()/Present()"));
-    }
-    return m_backend->Submit(batch);
-}
-
-Result<void> RenderDevice::Present() {
-    if (!m_isInsideFrame) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::FrameOrderViolation,
-            "RenderDevice::Present() called without a matching BeginFrame()"));
-    }
-    m_isInsideFrame = false;
-    return m_backend->Present();
-}
-
-// Texture Lifecycle (Generational Handles)
-
-Result<TextureHandle> RenderDevice::CreateTexture(
-    const TextureConfig& cfg,
-    const void* initialPixels)
-{
-    if (cfg.width == 0 || cfg.height == 0) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::InvalidConfiguration,
-            "Invalid texture dimensions (must be > 0)"));
-    }
-
-    // Find free slot starting at index 2 (0 is Null, 1 is White)
-    u16 freeSlot = 0;
-    for (usize i = 2; i < m_textureSlots.size(); ++i) {
-        if (!m_textureSlots[i].inUse) {
-            freeSlot = static_cast<u16>(i);
-            break;
+        // Configure blending mode
+        switch (static_cast<BlendMode>(batch.blendMode)) {
+            case BlendMode::Additive:
+                SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_ADD);
+                break;
+            case BlendMode::Opaque:
+                SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE);
+                break;
+            case BlendMode::Premultiplied:
+            default:
+                SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND);
+                break;
         }
+
+        const usize quadCount = batch.instanceCount;
+        m_vertexScratch.resize(quadCount * 4);
+        m_indexScratch.resize(quadCount * 6);
+
+        // Expand quad instances into 4 vertices & 6 indices each
+        for (usize i = 0; i < quadCount; ++i) {
+            const auto& q = packet.instances[batch.instanceOffset + i];
+
+            const float cx = q.pos[0];
+            const float cy = q.pos[1];
+            const float hw = q.size[0] * 0.5f;
+            const float hh = q.size[1] * 0.5f;
+            const float cosT = q.rotCosSin[0];
+            const float sinT = q.rotCosSin[1];
+
+            // Local rotated offsets
+            const float lx0 = -hw * cosT - (-hh) * sinT;
+            const float ly0 = -hw * sinT + (-hh) * cosT;
+
+            const float lx1 =  hw * cosT - (-hh) * sinT;
+            const float ly1 =  hw * sinT + (-hh) * cosT;
+
+            const float lx2 =  hw * cosT - hh * sinT;
+            const float ly2 =  hw * sinT + hh * cosT;
+
+            const float lx3 = -hw * cosT - hh * sinT;
+            const float ly3 = -hw * sinT + hh * cosT;
+
+            // Unpack color (premultiplied RGBA8)
+            const float r = static_cast<float>(q.colorPremul & 0xFF) / 255.0f;
+            const float g = static_cast<float>((q.colorPremul >> 8) & 0xFF) / 255.0f;
+            const float b = static_cast<float>((q.colorPremul >> 16) & 0xFF) / 255.0f;
+            const float a = static_cast<float>((q.colorPremul >> 24) & 0xFF) / 255.0f;
+            const SDL_FColor color{r, g, b, a};
+
+            // UV coordinates
+            constexpr float kInv65535 = 1.0f / 65535.0f;
+            const float u0 = static_cast<float>(q.uvRect[0]) * kInv65535;
+            const float v0 = static_cast<float>(q.uvRect[1]) * kInv65535;
+            const float u1 = static_cast<float>(q.uvRect[2]) * kInv65535;
+            const float v1 = static_cast<float>(q.uvRect[3]) * kInv65535;
+
+            const usize vBase = i * 4;
+            m_vertexScratch[vBase + 0] = {{cx + lx0, cy + ly0}, color, {u0, v0}};
+            m_vertexScratch[vBase + 1] = {{cx + lx1, cy + ly1}, color, {u1, v0}};
+            m_vertexScratch[vBase + 2] = {{cx + lx2, cy + ly2}, color, {u1, v1}};
+            m_vertexScratch[vBase + 3] = {{cx + lx3, cy + ly3}, color, {u0, v1}};
+
+            const int iBase = static_cast<int>(vBase);
+            const usize idxOffset = i * 6;
+            m_indexScratch[idxOffset + 0] = iBase + 0;
+            m_indexScratch[idxOffset + 1] = iBase + 1;
+            m_indexScratch[idxOffset + 2] = iBase + 2;
+            m_indexScratch[idxOffset + 3] = iBase + 2;
+            m_indexScratch[idxOffset + 4] = iBase + 3;
+            m_indexScratch[idxOffset + 5] = iBase + 0;
+        }
+
+        // Hardware-accelerated triangle batch draw
+        SDL_RenderGeometry(
+            m_renderer,
+            nullptr, // Slot 0 is untextured solid geometry
+            m_vertexScratch.data(),
+            static_cast<int>(m_vertexScratch.size()),
+            m_indexScratch.data(),
+            static_cast<int>(m_indexScratch.size())
+        );
     }
 
-    if (freeSlot == 0) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::TextureLimitReached,
-            "Texture slot table capacity exhausted"));
-    }
-
-    TextureSlot& slot = m_textureSlots[freeSlot];
-    slot.config = cfg;
-    slot.inUse = true;
-    if (slot.generation == 0) slot.generation = 1;
-
-    const TextureHandle handle{freeSlot, slot.generation};
-
-    auto res = m_backend->CreateTexture(handle, cfg, initialPixels);
-    if (!res) {
-        slot.inUse = false;
-        return Unexpected(res.Error());
-    }
-
-    return handle;
-}
-
-Result<void> RenderDevice::UpdateTexture(
-    TextureHandle handle,
-    const Rect& region,
-    const void* pixels)
-{
-    if (!IsTextureValid(handle)) {
-        return Unexpected(MakeRenderError(
-            RenderErrc::TextureNotFound,
-            "Attempted to update invalid or stale TextureHandle"));
-    }
-    return m_backend->UpdateTexture(handle, region, pixels);
-}
-
-void RenderDevice::DestroyTexture(TextureHandle handle) {
-    if (!IsTextureValid(handle) || handle.index <= 1) {
-        return; // Slot 0 is Null, Slot 1 is permanent White
-    }
-
-    m_backend->DestroyTexture(handle);
-    TextureSlot& slot = m_textureSlots[handle.index];
-    slot.inUse = false;
-    slot.generation++; // Increment generation to catch stale handle dereferences
-    if (slot.generation == 0) slot.generation = 1;
-}
-
-bool RenderDevice::IsTextureValid(TextureHandle handle) const noexcept {
-    if (handle.index == 0 || handle.index >= m_textureSlots.size()) return false;
-    const TextureSlot& slot = m_textureSlots[handle.index];
-    return slot.inUse && slot.generation == handle.generation;
-}
-
-const TextureConfig* RenderDevice::GetTextureConfig(TextureHandle handle) const noexcept {
-    if (!IsTextureValid(handle)) return nullptr;
-    return &m_textureSlots[handle.index].config;
-}
-
-// Display Settings & Coordinate Mapping
-
-Result<void> RenderDevice::SetVSync(VSyncMode mode) {
-    m_cfg.vsync = mode;
-    return m_backend->SetVSync(mode);
-}
-
-Result<void> RenderDevice::SetPresentation(i32 w, i32 h, PresentationMode mode) {
-    m_cfg.virtualWidth = w;
-    m_cfg.virtualHeight = h;
-    m_cfg.presentation = mode;
-    return m_backend->SetLogicalPresentation(w, h, mode);
-}
-
-Vec2 RenderDevice::WindowToVirtual(Vec2 windowPx) const noexcept {
-    return m_backend->WindowToVirtual(windowPx);
-}
-
-Vec2 RenderDevice::VirtualToWindow(Vec2 virtualPx) const noexcept {
-    return m_backend->VirtualToWindow(virtualPx);
-}
-
-FRect RenderDevice::GetPresentationRect() const noexcept {
-    return m_backend->GetPresentationRect();
-}
-
-const BackendCaps& RenderDevice::GetCaps() const noexcept {
-    return m_backend->GetCaps();
+    // Present swapchain to window display
+    SDL_RenderPresent(m_renderer);
+    return {};
 }
 
 } // namespace EngineN

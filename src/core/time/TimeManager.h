@@ -113,9 +113,19 @@ public:
     void Update(double realDtSec) noexcept;
     void Reset() noexcept;
 
-    [[nodiscard]] double GetModifier(HitstopChannel ch) const noexcept;
-    [[nodiscard]] bool IsFrozen(HitstopChannel ch) const noexcept;
-    [[nodiscard]] double GetRemainingSec(HitstopChannel ch) const noexcept;
+    [[nodiscard]] bool IsFrozen(HitstopChannel ch) const noexcept {
+        const auto idx = static_cast<std::size_t>(ch);
+        return (idx < m_remainingSec.size()) && (m_remainingSec[idx] > 1e-9);
+    }
+
+    [[nodiscard]] double GetModifier(HitstopChannel ch) const noexcept {
+        return IsFrozen(ch) ? 0.0 : 1.0;
+    }
+
+    [[nodiscard]] double GetRemainingSec(HitstopChannel ch) const noexcept {
+        const auto idx = static_cast<std::size_t>(ch);
+        return (idx < m_remainingSec.size()) ? m_remainingSec[idx] : 0.0;
+    }
 
 private:
     std::array<double, static_cast<std::size_t>(HitstopChannel::Count)> m_remainingSec{};
@@ -184,10 +194,18 @@ public:
     [[nodiscard]] bool WasTimeDropped() const noexcept { return m_droppedTime; }
 
     // Channel accessors: RealTime is const to ensure gameplay never scales wall clock
-    [[nodiscard]] const TimeChannel& RealTime() const noexcept;
-    [[nodiscard]] TimeChannel& WorldTime() noexcept;
-    [[nodiscard]] TimeChannel& PlayerTime() noexcept;
-    [[nodiscard]] TimeChannel& EnemyTime() noexcept;
+    [[nodiscard]] const TimeChannel& RealTime() const noexcept {
+        return m_channels[static_cast<std::size_t>(ChannelId::Real)];
+    }
+    [[nodiscard]] TimeChannel& WorldTime() noexcept {
+        return m_channels[static_cast<std::size_t>(ChannelId::World)];
+    }
+    [[nodiscard]] TimeChannel& PlayerTime() noexcept {
+        return m_channels[static_cast<std::size_t>(ChannelId::Player)];
+    }
+    [[nodiscard]] TimeChannel& EnemyTime() noexcept {
+        return m_channels[static_cast<std::size_t>(ChannelId::Enemy)];
+    }
 
     // Subsystem accessors
     [[nodiscard]] HitstopEngine& Hitstop() noexcept { return m_hitstop; }

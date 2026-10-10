@@ -46,7 +46,9 @@ public:
     ClipboardText(ClipboardText&& o) noexcept;
     ClipboardText& operator=(ClipboardText&& o) noexcept;
 
-    [[nodiscard]] std::string_view View() const noexcept;
+    [[nodiscard]] std::string_view View() const noexcept {
+        return m_text ? std::string_view(m_text) : std::string_view{};
+    }
     [[nodiscard]] bool Empty() const noexcept { return m_text == nullptr || *m_text == '\0'; }
     [[nodiscard]] usize Size() const noexcept { return View().size(); }
     [[nodiscard]] const char* CStr() const noexcept { return m_text ? m_text : ""; }

@@ -89,20 +89,6 @@ void HitstopEngine::Reset() noexcept {
     m_remainingSec.fill(0.0);
 }
 
-bool HitstopEngine::IsFrozen(HitstopChannel ch) const noexcept {
-    const std::size_t idx = Index(ch);
-    return (idx < m_remainingSec.size()) && (m_remainingSec[idx] > 1e-9);
-}
-
-double HitstopEngine::GetModifier(HitstopChannel ch) const noexcept {
-    return IsFrozen(ch) ? 0.0 : 1.0;
-}
-
-double HitstopEngine::GetRemainingSec(HitstopChannel ch) const noexcept {
-    const std::size_t idx = Index(ch);
-    return (idx < m_remainingSec.size()) ? m_remainingSec[idx] : 0.0;
-}
-
 // FramePacer
 void FramePacer::SetTargetFps(int fps) noexcept {
     m_targetFps = (fps <= 0) ? 0 : std::min(fps, 1000);
@@ -294,22 +280,6 @@ double TimeManager::GetDomainAlpha(ChannelId ch) const noexcept {
     const TimeChannel& d = m_channels[idx];
     const double progress = (static_cast<double>(d.m_accQ16) + m_alpha * static_cast<double>(d.m_effScaleQ16)) / static_cast<double>(kQ16One);
     return std::clamp(progress, 0.0, 1.0);
-}
-
-const TimeChannel& TimeManager::RealTime() const noexcept {
-    return m_channels[Index(ChannelId::Real)];
-}
-
-TimeChannel& TimeManager::WorldTime() noexcept {
-    return m_channels[Index(ChannelId::World)];
-}
-
-TimeChannel& TimeManager::PlayerTime() noexcept {
-    return m_channels[Index(ChannelId::Player)];
-}
-
-TimeChannel& TimeManager::EnemyTime() noexcept {
-    return m_channels[Index(ChannelId::Enemy)];
 }
 
 } // namespace EngineN

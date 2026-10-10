@@ -29,9 +29,9 @@ set(ENGINE_SOURCES
     src/platform/input/InputBindings.cpp
     src/platform/input/InputSystem.cpp
     src/renderer/RenderDevice.cpp
-    src/renderer/RenderQueue.cpp
-    src/renderer/PrimitiveBatch.cpp
-    src/renderer/SdlRendererBackend.cpp
+    src/renderer/FrameArena.cpp
+    src/renderer/Batcher.cpp
+    src/renderer/NullBackend.cpp
 )
 
 add_executable(EngineN ${ENGINE_SOURCES})
@@ -82,10 +82,10 @@ target_link_libraries(TestPlatform PRIVATE SDL3::SDL3)
 set(TEST_RENDERER_SOURCES
     tests/test_renderer.cpp
     src/core/Log.cpp
+    src/renderer/FrameArena.cpp
+    src/renderer/Batcher.cpp
+    src/renderer/NullBackend.cpp
     src/renderer/RenderDevice.cpp
-    src/renderer/RenderQueue.cpp
-    src/renderer/PrimitiveBatch.cpp
-    src/renderer/SdlRendererBackend.cpp
 )
 add_executable(TestRenderer ${TEST_RENDERER_SOURCES})
 target_include_directories(TestRenderer PRIVATE src)
