@@ -2,7 +2,6 @@
 
 #include <SDL3/SDL.h>
 #include <algorithm>
-#include <cmath>
 
 namespace EngineN {
 
@@ -117,13 +116,6 @@ void TimeManager::ResetClocksOnRefocus() noexcept {
     m_accUnits = 0;
     m_alpha = 0.0f;
     m_hitstop.Reset();
-}
-
-void TimeManager::SetTimeScale(u8 channel, f32 scale) noexcept {
-    if (channel >= kMaxTimeChannels || !std::isfinite(scale) || scale < 0.0f) {
-        return;
-    }
-    m_channelScales[channel] = std::clamp(scale, 0.0f, 8.0f);
 }
 
 } // namespace EngineN

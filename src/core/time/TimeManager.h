@@ -4,7 +4,6 @@
 #include "core/time/HitstopEngine.h"
 
 #include <array>
-#include <type_traits>
 
 namespace EngineN {
 
@@ -61,12 +60,12 @@ public:
     [[nodiscard]] u64 GetAccumulatorNs() const noexcept { return m_accUnits / kSimHz; }
 
     // Channel time scaling
-    void SetTimeScale(u8 channel, f32 scale) noexcept;
-
-    template <typename E>
-        requires std::is_enum_v<E>
-    void SetTimeScale(E channel, f32 scale) noexcept {
-        SetTimeScale(static_cast<u8>(channel), scale);
+    template <typename C = u8>
+    void SetTimeScale(C channel, f32 scale) noexcept {
+        const u8 ch = static_cast<u8>(channel);
+        if (ch < kMaxTimeChannels && scale >= 0.0f) {
+            m_channelScales[ch] = (scale > 8.0f) ? 8.0f : scale;
+        }
     }
 
     template <typename C = u8>

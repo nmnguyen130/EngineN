@@ -1,44 +1,72 @@
 ---
 name: enginen-architecture
-description: Architectural standards, conventions, and implementation guidelines for EngineN (C++20/SDL3 2D Action Metroidvania Engine).
+description: Architectural standards, boundaries, and runtime pipeline guidelines for EngineN (C++20/SDL3 2D Action Metroidvania Engine).
 ---
 
-# EngineN — Architecture & Development Skill
+# EngineN — Architecture & Runtime Pipeline
 
-This skill contains the design principles, architectural boundaries, coding standards, and implementation workflows for the **EngineN** codebase.
+Core design principles, golden boundaries, determinism rules, and pipeline lifecycle for EngineN.
 
-## 1. Core Principles & Golden Boundaries
+---
 
-Always uphold the **4 Golden Boundaries**:
-1. **Input ≠ State:** Input events are timestamped and queued in an `InputBuffer`. They never alter player transform or state directly.
-2. **State ≠ Physics:** States in the FSM submit `MotionRequest` objects to the `MotionArbiter`. They do NOT overwrite velocities directly.
-3. **Gameplay ≠ Presentation:** Physics and simulation are decoupled from rendering. The renderer only consumes interpolated visual transforms via `alpha`.
-4. **Physics Correctness ≠ Player Forgiveness:** Pure swept AABB math is isolated from the "Forgiveness Layer" (Coyote Time, Corner Correction, Jump Buffering, Ledge Pop).
+## 1. Golden Boundaries
 
-## 2. Timing & Determinism Rules
+1. **Input != State:** Raw window events are ingested into frame history. Gameplay reads only tick-sliced inputs (`CutTick()`). Input never directly mutates character position or state.
+2. **State != Physics:** FSM state behaviors submit `MotionRequest` objects to the `MotionArbiter`. They do NOT overwrite body velocities directly.
+3. **Simulation != Presentation:** Physics and gameplay run at fixed 120Hz. Rendering runs at display refresh rate, consuming transform snapshots interpolated unconditionally via `alpha`.
+4. **Physics Correctness != Player Forgiveness:** Pure swept AABB collision math is decoupled from the platformer "Forgiveness Layer" (Coyote Time, Corner Correction, Jump Buffering, Ledge Pop).
 
-- **Fixed Timestep:** Simulation MUST run at 120Hz fixed timestep (`FIXED_DT_NS = 8'333'333 ns`, `1/120s`).
-- **Internal Time Unit:** All internal time measurements, accumulators, and durations MUST use `uint64_t` nanoseconds to avoid floating-point drift over time.
-- **Spiral-of-Death Protection:** Accumulator clamped at `MAX_CATCHUP_TICKS = 8` ticks (~66.7ms).
+---
+
+## 2. Timing & Determinism
+
+- **Exact Integer Accumulator:** 
+  - Units: `kNsPerSecond = 1'000'000'000ULL`, `kSimHz = 120`.
+  - Accumulation: `m_accUnits += deltaNs * kSimHz`. Consume tick when `m_accUnits >= kNsPerSecond`.
+  - Guarantees zero rational float drift over arbitrary execution spans.
+- **Spiral-of-Death Protection:** Clamped to `kMaxCatchupTicks = 8` (~66.7ms). Backlog discarded while preserving remainder sub-tick phase.
+- **Tick-Counted Hitstop:** Hitstop durations are measured in integer sim ticks (`u32 ticks`), never wall-clock milliseconds. Hitstop modulates channel `scaledDt` to `0.0f` without skipping ticks or stalling collision checks.
 - **Time Channels:**
-  - `RealTime`: Never scaled (UI, profiler, hitstop decay).
-  - `WorldTime`: Environmental entities, platforms, hazards.
-  - `PlayerTime`: Player locomotion and actions.
-  - `EnemyTime`: Enemies and bosses.
-- **Hitstop Rule:** Hitstop NEVER pauses the simulation loop or skips ticks. It modulates the channel's `scaledDt` to `0.0`, keeping collision checks, input buffers, and tick counts completely deterministic.
+  - `RealTime (0)`: Unscaled (UI, hitstop decay, profiler).
+  - `WorldTime (1)`: Environment, dynamic hazards, platforms.
+  - `PlayerTime (2)`: Player locomotion, combat, states.
+  - `EnemyTime (3)`: AI, enemies, bosses.
 
-## 3. Code Standards & C++20 Conventions
+---
 
-- **Language:** C++20 standard (`-std=c++20`).
-- **Memory Safety:** Prefer value semantics and stack allocation. Avoid unnecessary dynamic heap allocations (`new`/`delete`) in the per-tick hot path.
-- **No Heavy Physics Engine:** Never link or use Box2D or rigid-body physics. EngineN uses custom kinematic swept AABB specifically designed for platformers.
-- **Naming Conventions:**
-  - Types / Classes / Structs: `PascalCase` (e.g., `TimeManager`, `KinematicBody2D`)
-  - Methods: `PascalCase` (e.g., `BeginFrame()`, `ConsumeTick()`)
-  - Member variables: `m_camelCase` (e.g., `m_accumulatorNs`, `m_alpha`)
-  - Enums: `enum class EnumName : uint8_t { MemberOne, MemberTwo };`
+## 3. Runtime Lifecycle Pipeline
 
-## 4. Primary Architecture Documents
+```
+[Window Events] -> Ingest / PublishFrameInput
+  -> Fixed Simulation Loop (120Hz)
+       * BeginFrame / ConsumeTick
+       * Input CutTick (per-tick slice)
+       * Simulation & FSM Tick
+       * Unconditional Transform Snapshot (Interpolated<T>)
+       * HitstopEngine AdvanceTick
+  -> Render Extraction & Interpolation (Display Hz)
+       * Alpha lerp: prev + alpha * (curr - prev)
+       * Extract QuadInstances to FrameArena
+  -> Batching & Sorting
+       * 64-bit Radix SortKey (Layer, Texture, BlendMode)
+  -> GPU Submission & Presenter
+       * Premultiplied Alpha (Additive via alpha-0)
+       * Flip-model presentation pacing
+```
 
-- [`architecture.md`](file:///d:/Coding/Game/EngineN/architecture.md): Complete game system specification.
-- [`TASKS.md`](file:///d:/Coding/Game/EngineN/TASKS.md): Task roadmap and status tracking.
+---
+
+## 4. Performance & Memory Rules
+
+- **Zero-Allocation Hot Path:** No heap allocations (`new`, `malloc`, `std::vector::push_back` reallocation) in `Tick`, `Extract`, `Batch`, `Execute`, or `Present`.
+- **Arena-Backed Render Frames:** All frame transients allocate from a linear reset-per-frame `FrameArena`.
+- **Pure Swept AABB:** Custom kinematic Swept AABB platformer physics only. Never link Box2D or rigid-body physics engines.
+- **Header Purity:** Keep header files lightweight. Defer standard math/algorithms (`<cmath>`, `<algorithm>`) and platform/SDL headers into `.cpp` files.
+
+---
+
+## 5. Architectural References
+
+- [`docs/EngineN_Runtime_Architecture_Audit_Claude.md`](file:///d:/Coding/Game/EngineN/docs/EngineN_Runtime_Architecture_Audit_Claude.md): Runtime audit, defect registry, and subsystem redesign plan.
+- [`architecture.md`](file:///d:/Coding/Game/EngineN/architecture.md): Game system specifications.
+- [`TASKS.md`](file:///d:/Coding/Game/EngineN/TASKS.md): Roadmap and implementation milestones.

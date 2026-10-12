@@ -3,8 +3,6 @@
 #include "core/time/SimEvents.h"
 #include "core/time/TimeManager.h"
 
-#include <type_traits>
-
 namespace EngineN {
 
 /**

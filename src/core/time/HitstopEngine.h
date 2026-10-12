@@ -2,9 +2,7 @@
 
 #include "core/Types.h"
 
-#include <algorithm>
 #include <array>
-#include <type_traits>
 
 namespace EngineN {
 
@@ -18,16 +16,12 @@ inline constexpr u8 kDefaultTimeChannel = 0;
  */
 class HitstopEngine {
 public:
-    void Request(u8 channel, u32 ticks) noexcept {
-        if (channel < kMaxTimeChannels) {
-            m_ticks[channel] = std::max(m_ticks[channel], ticks);
+    template <typename C = u8>
+    void Request(C channel, u32 ticks) noexcept {
+        const u8 ch = static_cast<u8>(channel);
+        if (ch < kMaxTimeChannels) {
+            m_ticks[ch] = (m_ticks[ch] > ticks) ? m_ticks[ch] : ticks;
         }
-    }
-
-    template <typename E>
-        requires std::is_enum_v<E>
-    void Request(E channel, u32 ticks) noexcept {
-        Request(static_cast<u8>(channel), ticks);
     }
 
     void AdvanceTick() noexcept {
@@ -42,34 +36,21 @@ public:
         m_ticks.fill(0);
     }
 
-    [[nodiscard]] bool IsFrozen(u8 channel) const noexcept {
-        return (channel < kMaxTimeChannels) && (m_ticks[channel] > 0);
+    template <typename C = u8>
+    [[nodiscard]] bool IsFrozen(C channel = kDefaultTimeChannel) const noexcept {
+        const u8 ch = static_cast<u8>(channel);
+        return (ch < kMaxTimeChannels) && (m_ticks[ch] > 0);
     }
 
-    template <typename E>
-        requires std::is_enum_v<E>
-    [[nodiscard]] bool IsFrozen(E channel) const noexcept {
-        return IsFrozen(static_cast<u8>(channel));
-    }
-
-    [[nodiscard]] f32 GetModifier(u8 channel) const noexcept {
+    template <typename C = u8>
+    [[nodiscard]] f32 GetModifier(C channel = kDefaultTimeChannel) const noexcept {
         return IsFrozen(channel) ? 0.0f : 1.0f;
     }
 
-    template <typename E>
-        requires std::is_enum_v<E>
-    [[nodiscard]] f32 GetModifier(E channel) const noexcept {
-        return GetModifier(static_cast<u8>(channel));
-    }
-
-    [[nodiscard]] u32 GetRemainingTicks(u8 channel) const noexcept {
-        return (channel < kMaxTimeChannels) ? m_ticks[channel] : 0U;
-    }
-
-    template <typename E>
-        requires std::is_enum_v<E>
-    [[nodiscard]] u32 GetRemainingTicks(E channel) const noexcept {
-        return GetRemainingTicks(static_cast<u8>(channel));
+    template <typename C = u8>
+    [[nodiscard]] u32 GetRemainingTicks(C channel = kDefaultTimeChannel) const noexcept {
+        const u8 ch = static_cast<u8>(channel);
+        return (ch < kMaxTimeChannels) ? m_ticks[ch] : 0U;
     }
 
 private:

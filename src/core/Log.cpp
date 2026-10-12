@@ -37,17 +37,17 @@ constexpr std::string_view kLevelColors[] = {
 };
 
 inline std::string_view LevelToString(LogLevel level) noexcept {
-    const auto idx = static_cast<size_t>(level);
+    const auto idx = static_cast<usize>(level);
     return (idx < std::size(kLevelNames)) ? kLevelNames[idx] : "UNKNOWN";
 }
 
 inline std::string_view CategoryToString(LogCategory category) noexcept {
-    const auto idx = static_cast<size_t>(category);
+    const auto idx = static_cast<usize>(category);
     return (idx < std::size(kCategoryNames)) ? kCategoryNames[idx] : "Unknown";
 }
 
 inline std::string_view LevelColorAnsi(LogLevel level) noexcept {
-    const auto idx = static_cast<size_t>(level);
+    const auto idx = static_cast<usize>(level);
     return (idx < std::size(kLevelColors)) ? kLevelColors[idx] : "\033[0m";
 }
 
@@ -57,7 +57,7 @@ void Logger::Init(std::string_view logFilePath) {
     std::lock_guard<std::mutex> lock(s_logMutex);
     if (!s_fileHandle && !logFilePath.empty()) {
         char pathBuf[512];
-        const size_t len = std::min(logFilePath.size(), sizeof(pathBuf) - 1);
+        const usize len = std::min(logFilePath.size(), sizeof(pathBuf) - 1);
         std::memcpy(pathBuf, logFilePath.data(), len);
         pathBuf[len] = '\0';
         s_fileHandle = std::fopen(pathBuf, "w");

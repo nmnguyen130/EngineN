@@ -1,4 +1,3 @@
-#include "core/Config.h"
 #include "core/Log.h"
 #include "core/EngineContext.h"
 #include "core/GameLoop.h"
@@ -337,6 +336,8 @@ int main(int argc, char* argv[]) {
 
     using namespace EngineN;
 
+    Logger::Init();
+
     // 1. Platform Subsystem
     Platform platform;
     auto platRes = platform.Init();
@@ -425,6 +426,7 @@ int main(int argc, char* argv[]) {
     assets.Shutdown();
     device.Shutdown();
     platform.Shutdown();
+    Logger::Shutdown();
 
     return 0;
 }

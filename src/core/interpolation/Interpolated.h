@@ -2,8 +2,6 @@
 
 #include "core/Types.h"
 #include "math/Vec2.h"
-#include <concepts>
-#include <algorithm>
 
 namespace EngineN {
 
@@ -12,7 +10,7 @@ namespace EngineN {
  */
 template <class T>
 concept Interpolatable = requires(const T& a, const T& b, f32 t) {
-    { Lerp(a, b, t) } -> std::convertible_to<T>;
+    Lerp(a, b, t);
 };
 
 inline constexpr f32 Lerp(f32 a, f32 b, f32 t) noexcept {
@@ -41,7 +39,8 @@ public:
     [[nodiscard]] constexpr const T& Prev() const noexcept { return m_prev; }
 
     [[nodiscard]] constexpr T Get(f32 alpha) const noexcept {
-        return Lerp(m_prev, m_cur, std::clamp(alpha, 0.0f, 1.0f));
+        const f32 t = (alpha < 0.0f) ? 0.0f : ((alpha > 1.0f) ? 1.0f : alpha);
+        return Lerp(m_prev, m_cur, t);
     }
 
 private:

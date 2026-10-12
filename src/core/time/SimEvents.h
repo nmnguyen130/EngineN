@@ -45,7 +45,10 @@ public:
     }
 
     [[nodiscard]] u32 Dropped() const noexcept { return m_dropped; }
-    void Clear() noexcept { m_count = 0; }
+    void Clear() noexcept {
+        m_count = 0;
+        m_dropped = 0;
+    }
 
 private:
     std::array<SimEvent, kCapacity> m_events{};
