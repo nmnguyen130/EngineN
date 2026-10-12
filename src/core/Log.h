@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
+
 #include <format>
 #include <source_location>
 #include <string_view>
@@ -16,40 +17,40 @@ enum class LogLevel : u8 {
     Fatal
 };
 
-enum class LogCategory : u8 {
-    Core = 0,
-    Platform,
-    Physics,
-    Render,
-    Audio,
-    Gameplay,
-    Asset
-};
 
+/**
+ * LogRecord: Stored log entry for in-game debug HUD, console, and telemetry overlays.
+ */
 struct LogRecord {
     LogLevel level = LogLevel::Info;
-    LogCategory category = LogCategory::Core;
-    char message[192] = {};
+    char category[16] = {};
+    char message[256] = {};
     u64 timestampNs = 0;
 };
 
+/**
+ * Logger: Centralized thread-safe diagnostic logging subsystem.
+ * Supports leveled filtering, category tagging, ANSI colors, file output,
+ * and a circular history ring-buffer for in-game debug consoles.
+ */
 class Logger {
 public:
-    static void Init(std::string_view logFilePath = "engine.log");
+    static void Init(std::string_view filePath = "engine.log");
     static void Shutdown();
     static void SetLevel(LogLevel minLevel) noexcept;
     static LogLevel GetLevel() noexcept;
 
     static void LogMessage(LogLevel level,
-                           LogCategory category,
-                           std::string_view formattedMessage,
+                           std::string_view category,
+                           std::string_view message,
                            std::source_location loc) noexcept;
 
+    // Drains recent logs in chronological order (oldest to newest) for in-game overlays
     static usize GetRecentLogs(LogRecord* outBuffer, usize maxCount) noexcept;
 
     template <typename... Args>
     static void Dispatch(LogLevel level,
-                         LogCategory category,
+                         std::string_view category,
                          std::source_location loc,
                          std::format_string<Args...> fmt,
                          Args&&... args) noexcept {
@@ -59,16 +60,22 @@ public:
 
         char buffer[1024];
         auto res = std::format_to_n(buffer, sizeof(buffer) - 1, fmt, std::forward<Args>(args)...);
+        if (res.size >= sizeof(buffer) - 1) {
+            buffer[sizeof(buffer) - 4] = '.';
+            buffer[sizeof(buffer) - 3] = '.';
+            buffer[sizeof(buffer) - 2] = '.';
+        }
         *res.out = '\0';
-        LogMessage(level, category, std::string_view(buffer, res.size), loc);
+        LogMessage(level, category, std::string_view(buffer, static_cast<usize>(res.out - buffer)), loc);
     }
 };
 
 } // namespace EngineN
 
-// Category-explicit macros
+// Category-explicit logging macro
 #define ENGINE_LOG(level, cat, ...) \
-    ::EngineN::Logger::Dispatch(::EngineN::LogLevel::level, ::EngineN::LogCategory::cat, std::source_location::current(), __VA_ARGS__)
+    ::EngineN::Logger::Dispatch(::EngineN::LogLevel::level, #cat, std::source_location::current(), __VA_ARGS__)
+
 
 // Default [Core] category convenience macros
 #define LOG_TRACE(...) ENGINE_LOG(Trace, Core, __VA_ARGS__)

@@ -1,7 +1,8 @@
 #include "core/Log.h"
+
+#include <SDL3/SDL_timer.h>
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -14,53 +15,45 @@ std::atomic<LogLevel> s_minLevel{LogLevel::Trace};
 std::FILE* s_fileHandle = nullptr;
 std::mutex s_logMutex;
 
-constexpr usize kHistoryCapacity = 16;
+// In-game debug overlay ring buffer (32 recent entries)
+constexpr usize kHistoryCapacity = 32;
 LogRecord s_logHistory[kHistoryCapacity];
 usize s_historyHead = 0;
 usize s_historyCount = 0;
 
-constexpr std::string_view kLevelNames[] = {
-    "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
+struct LevelMeta {
+    std::string_view name;
+    std::string_view color;
 };
 
-constexpr std::string_view kCategoryNames[] = {
-    "Core", "Platform", "Physics", "Render", "Audio", "Gameplay", "Asset"
+constexpr LevelMeta kLevelMetas[] = {
+    { "TRACE", "\033[90m" }, // Gray
+    { "DEBUG", "\033[36m" }, // Cyan
+    { "INFO",  "\033[32m" }, // Green
+    { "WARN",  "\033[33m" }, // Yellow
+    { "ERROR", "\033[31m" }, // Red
+    { "FATAL", "\033[35m" }  // Magenta
 };
 
-constexpr std::string_view kLevelColors[] = {
-    "\033[90m", // TRACE (gray)
-    "\033[36m", // DEBUG (cyan)
-    "\033[32m", // INFO  (green)
-    "\033[33m", // WARN  (yellow)
-    "\033[31m", // ERROR (red)
-    "\033[35m"  // FATAL (magenta)
-};
-
-inline std::string_view LevelToString(LogLevel level) noexcept {
+inline const LevelMeta& GetLevelMeta(LogLevel level) noexcept {
     const auto idx = static_cast<usize>(level);
-    return (idx < std::size(kLevelNames)) ? kLevelNames[idx] : "UNKNOWN";
-}
-
-inline std::string_view CategoryToString(LogCategory category) noexcept {
-    const auto idx = static_cast<usize>(category);
-    return (idx < std::size(kCategoryNames)) ? kCategoryNames[idx] : "Unknown";
-}
-
-inline std::string_view LevelColorAnsi(LogLevel level) noexcept {
-    const auto idx = static_cast<usize>(level);
-    return (idx < std::size(kLevelColors)) ? kLevelColors[idx] : "\033[0m";
+    static constexpr LevelMeta kUnknown{ "UNKNOWN", "\033[0m" };
+    return (idx < std::size(kLevelMetas)) ? kLevelMetas[idx] : kUnknown;
 }
 
 } // namespace
 
-void Logger::Init(std::string_view logFilePath) {
+void Logger::Init(std::string_view filePath) {
     std::lock_guard<std::mutex> lock(s_logMutex);
-    if (!s_fileHandle && !logFilePath.empty()) {
+    if (!s_fileHandle && !filePath.empty()) {
         char pathBuf[512];
-        const usize len = std::min(logFilePath.size(), sizeof(pathBuf) - 1);
-        std::memcpy(pathBuf, logFilePath.data(), len);
+        const usize len = std::min(filePath.size(), sizeof(pathBuf) - 1);
+        std::memcpy(pathBuf, filePath.data(), len);
         pathBuf[len] = '\0';
         s_fileHandle = std::fopen(pathBuf, "w");
+        if (!s_fileHandle) {
+            std::fprintf(stderr, "[WARN][Core] Failed to open log file: %s\n", pathBuf);
+        }
     }
 }
 
@@ -82,75 +75,83 @@ LogLevel Logger::GetLevel() noexcept {
 }
 
 void Logger::LogMessage(LogLevel level,
-                        LogCategory category,
-                        std::string_view formattedMessage,
+                        std::string_view category,
+                        std::string_view message,
                         std::source_location loc) noexcept {
     std::lock_guard<std::mutex> lock(s_logMutex);
 
-    const auto lvlStr = LevelToString(level);
-    const auto catStr = CategoryToString(category);
-    const auto colStr = LevelColorAnsi(level);
-    constexpr const char* rstStr = "\033[0m";
+    const auto& meta = GetLevelMeta(level);
+    const bool isWarnOrFatal = (level >= LogLevel::Warn);
 
-    // Console output
-    std::FILE* console = (level >= LogLevel::Warn) ? stderr : stdout;
-    if (level >= LogLevel::Warn) {
+    // 1. Console Output
+    std::FILE* console = isWarnOrFatal ? stderr : stdout;
+    if (isWarnOrFatal) {
         std::fprintf(console,
-                     "%s[%.*s][%.*s]%s %.*s \033[90m(%s:%u)%s\n",
-                     colStr.data(), static_cast<int>(lvlStr.size()), lvlStr.data(),
-                     static_cast<int>(catStr.size()), catStr.data(), rstStr,
-                     static_cast<int>(formattedMessage.size()), formattedMessage.data(),
-                     loc.file_name(), loc.line(), rstStr);
-        std::fflush(console);
+                     "%s[%.*s][%.*s]\033[0m %.*s \033[90m(%s:%u)\033[0m\n",
+                     meta.color.data(), static_cast<int>(meta.name.size()), meta.name.data(),
+                     static_cast<int>(category.size()), category.data(),
+                     static_cast<int>(message.size()), message.data(),
+                     loc.file_name(), loc.line());
     } else {
         std::fprintf(console,
-                     "%s[%.*s][%.*s]%s %.*s\n",
-                     colStr.data(), static_cast<int>(lvlStr.size()), lvlStr.data(),
-                     static_cast<int>(catStr.size()), catStr.data(), rstStr,
-                     static_cast<int>(formattedMessage.size()), formattedMessage.data());
+                     "%s[%.*s][%.*s]\033[0m %.*s\n",
+                     meta.color.data(), static_cast<int>(meta.name.size()), meta.name.data(),
+                     static_cast<int>(category.size()), category.data(),
+                     static_cast<int>(message.size()), message.data());
     }
+    std::fflush(console);
 
-    // Thread-safe file output
+    // 2. Thread-safe file output
     if (s_fileHandle) {
-        if (level >= LogLevel::Warn) {
+        if (isWarnOrFatal) {
             std::fprintf(s_fileHandle,
                          "[%.*s][%.*s] %.*s (%s:%u)\n",
-                         static_cast<int>(lvlStr.size()), lvlStr.data(),
-                         static_cast<int>(catStr.size()), catStr.data(),
-                         static_cast<int>(formattedMessage.size()), formattedMessage.data(),
+                         static_cast<int>(meta.name.size()), meta.name.data(),
+                         static_cast<int>(category.size()), category.data(),
+                         static_cast<int>(message.size()), message.data(),
                          loc.file_name(), loc.line());
         } else {
             std::fprintf(s_fileHandle,
                          "[%.*s][%.*s] %.*s\n",
-                         static_cast<int>(lvlStr.size()), lvlStr.data(),
-                         static_cast<int>(catStr.size()), catStr.data(),
-                         static_cast<int>(formattedMessage.size()), formattedMessage.data());
+                         static_cast<int>(meta.name.size()), meta.name.data(),
+                         static_cast<int>(category.size()), category.data(),
+                         static_cast<int>(message.size()), message.data());
         }
         std::fflush(s_fileHandle);
     }
 
-    // Circular history buffer for HUD
-    LogRecord& rec = s_logHistory[s_historyHead];
-    rec.level = level;
-    rec.category = category;
-    const usize copyLen = std::min(formattedMessage.size(), sizeof(rec.message) - 1);
-    std::memcpy(rec.message, formattedMessage.data(), copyLen);
-    rec.message[copyLen] = '\0';
-    rec.timestampNs = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
+    // 3. Circular history ring-buffer for in-game HUD/debug overlay
+    LogRecord& record = s_logHistory[s_historyHead];
+    record.level = level;
+    record.timestampNs = SDL_GetTicksNS();
+
+    const usize catLen = std::min(category.size(), sizeof(record.category) - 1);
+    std::memcpy(record.category, category.data(), catLen);
+    record.category[catLen] = '\0';
+
+    const usize copyLen = std::min(message.size(), sizeof(record.message) - 1);
+    std::memcpy(record.message, message.data(), copyLen);
+    if (message.size() >= sizeof(record.message) - 1 && copyLen >= 3) {
+        record.message[copyLen - 3] = '.';
+        record.message[copyLen - 2] = '.';
+        record.message[copyLen - 1] = '.';
+    }
+    record.message[copyLen] = '\0';
+
     s_historyHead = (s_historyHead + 1) % kHistoryCapacity;
     if (s_historyCount < kHistoryCapacity) {
-        s_historyCount++;
+        ++s_historyCount;
     }
 }
 
 usize Logger::GetRecentLogs(LogRecord* outBuffer, usize maxCount) noexcept {
-    if (!outBuffer || maxCount == 0) return 0;
+    if (!outBuffer || maxCount == 0) {
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(s_logMutex);
 
     const usize count = std::min(maxCount, s_historyCount);
     for (usize i = 0; i < count; ++i) {
-        // Read oldest to newest
         const usize idx = (s_historyHead + kHistoryCapacity - count + i) % kHistoryCapacity;
         outBuffer[i] = s_logHistory[idx];
     }
