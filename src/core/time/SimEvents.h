@@ -23,8 +23,8 @@ struct SimEvent {
 };
 
 /**
- * SimEvents: Fixed-capacity ring buffer conveying events from simulation to presentation.
- * Has frame lifetime, zero heap allocations, and tracks dropped event counts.
+ * SimEvents: Fixed-capacity ring buffer conveying discrete events from simulation to presentation.
+ * Has frame lifetime, zero heap allocations, and tracks dropped event counts for telemetry.
  */
 class SimEvents {
 public:
@@ -35,7 +35,6 @@ public:
             ++m_dropped;
             return false;
         }
-
         m_events[m_count++] = event;
         return true;
     }
@@ -45,6 +44,7 @@ public:
     }
 
     [[nodiscard]] u32 Dropped() const noexcept { return m_dropped; }
+
     void Clear() noexcept {
         m_count = 0;
         m_dropped = 0;

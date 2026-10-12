@@ -24,8 +24,8 @@ public:
     }
 
     template <typename C = u8>
-    void RequestHitstop(C channel, u32 ticks) noexcept {
-        m_time.Hitstop().Request(channel, ticks);
+    void RequestHitstop(C channel, u32 ticks, f32 intensity = 0.0f) noexcept {
+        m_time.Hitstop().Request(channel, ticks, intensity);
     }
 
     template <typename C = u8>

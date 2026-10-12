@@ -133,7 +133,7 @@ void TestSubTickEdgePreservation() {
     assert(!events.Push(SimEvent{.kind = SimEventKind::Landed, .tick = 1}));
     assert(events.Dropped() == 1);
 
-    // Clear drains buffer and resets dropped counter
+    // Clear drains buffer and resets dropped counter for the next frame
     events.Clear();
     assert(events.View().empty());
     assert(events.Dropped() == 0);
@@ -233,6 +233,15 @@ void TestTimeScaleAndCombatHitstop() {
         hitstop.AdvanceTick();
     }
     assert(!hitstop.IsFrozen(Channel::Enemy));
+    assert(!hitstop.IsActive(Channel::Enemy));
+
+    // Soft hitstop friction (intensity 0.2f slow-motion instead of hard freeze)
+    hitstop.Request(Channel::Enemy, 4, 0.2f);
+    assert(hitstop.IsActive(Channel::Enemy));
+    assert(!hitstop.IsFrozen(Channel::Enemy)); // Not hard-frozen
+    assert(hitstop.GetModifier(Channel::Enemy) == 0.2f);
+    assert(std::abs(tm.GetScaledDt(Channel::Enemy) - (kFixedDtSec * 0.2f)) < 1e-6f);
+    hitstop.Reset();
 }
 
 // 8. Simulation telemetry metrics & presentation FramePacer
