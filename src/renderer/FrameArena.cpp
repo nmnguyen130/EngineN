@@ -22,6 +22,8 @@ void FrameArenaSlot::Reset() noexcept {
     m_viewSlotCount = 0;
     m_passCount = 0;
     m_droppedInstances = 0;
+    m_droppedEntries = 0;
+    m_droppedBatches = 0;
 }
 
 u32 FrameArenaSlot::PushQuads(const QuadInstance* quads, u32 count) noexcept {
@@ -54,8 +56,11 @@ bool FrameArenaSlot::PushQuad(const QuadInstance& quad, const SortKey& key, u16 
 }
 
 bool FrameArenaSlot::PushSortEntry(const SortEntry& entry) noexcept {
-    if (m_sortEntryCount >= kMaxSortEntries) {
-        ENGINE_LOG(Warn, Render, "FrameArenaSlot SortEntry capacity exceeded!");
+    const bool inRange = entry.instanceCount > 0 &&
+                         static_cast<u64>(entry.instanceIndex) + entry.instanceCount <= m_instanceCount;
+    if (m_sortEntryCount >= kMaxSortEntries || !inRange) {
+        ++m_droppedEntries;
+        ENGINE_LOG(Warn, Render, "FrameArenaSlot SortEntry rejected: invalid range or capacity reached");
         return false;
     }
     m_sortEntries[m_sortEntryCount++] = entry;

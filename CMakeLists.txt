@@ -32,10 +32,11 @@ set(ENGINE_SOURCES
     src/renderer/FrameArena.cpp
     src/renderer/Batcher.cpp
     src/renderer/NullBackend.cpp
+    src/asset/AssetManager.cpp
 )
 
 add_executable(EngineN ${ENGINE_SOURCES})
-target_include_directories(EngineN PRIVATE src)
+target_include_directories(EngineN PRIVATE src vendor)
 target_link_libraries(EngineN PRIVATE SDL3::SDL3)
 
 # Automatically copy SDL3.dll to executable directory post-build
@@ -101,4 +102,13 @@ set(TEST_INPUT_SOURCES
 add_executable(TestInput ${TEST_INPUT_SOURCES})
 target_include_directories(TestInput PRIVATE src)
 target_link_libraries(TestInput PRIVATE SDL3::SDL3)
+
+set(TEST_ASSETS_SOURCES
+    tests/test_assets.cpp
+    src/core/Log.cpp
+    src/asset/AssetManager.cpp
+)
+add_executable(TestAssets ${TEST_ASSETS_SOURCES})
+target_include_directories(TestAssets PRIVATE src vendor)
+target_link_libraries(TestAssets PRIVATE SDL3::SDL3)
 

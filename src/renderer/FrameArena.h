@@ -70,8 +70,11 @@ public:
     [[nodiscard]] u32 InstanceCount() const noexcept { return m_instanceCount; }
     [[nodiscard]] u32 SortEntryCount() const noexcept { return m_sortEntryCount; }
     [[nodiscard]] u32 DroppedInstances() const noexcept { return m_droppedInstances; }
+    [[nodiscard]] u32 DroppedEntries() const noexcept { return m_droppedEntries; }
+    [[nodiscard]] u32 DroppedBatches() const noexcept { return m_droppedBatches; }
 
     void SetBatchCount(u32 count) noexcept { m_batchCount = count; }
+    void SetDroppedBatches(u32 count) noexcept { m_droppedBatches = count; }
 
 private:
     std::unique_ptr<QuadInstance[]>   m_instances;
@@ -86,6 +89,8 @@ private:
     u32 m_viewSlotCount{0};
     u32 m_passCount{0};
     u32 m_droppedInstances{0};
+    u32 m_droppedEntries{0};
+    u32 m_droppedBatches{0};
 };
 
 /**

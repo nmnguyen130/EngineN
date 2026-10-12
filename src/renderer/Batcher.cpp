@@ -75,116 +75,106 @@ bool SortEntries(std::span<SortEntry> entries, SortEntry* scratch) noexcept {
 }
 
 /**
- * LinearizeInstances: Orders QuadInstances into contiguous memory matching sorted entries.
- * Bypasses 12 MB scratch copy if submissions are already monotonic and contiguous.
+ * GatherInstances: Returns a span of draw-ordered instances.
+ * Bypasses scratch copying if submissions were already monotonic and contiguous.
+ * Eliminates redundant write-back copy into arena storage.
  */
-u32 LinearizeInstances(FrameArenaSlot& slot, bool wasSorted, QuadInstance* scratch) noexcept {
+std::span<const QuadInstance> GatherInstances(
+    const FrameArenaSlot& slot, bool wasSorted, QuadInstance* scratch) noexcept {
     const auto entries = slot.SortEntries();
-    const auto sourceQuads = slot.Instances();
-    const u32 sortCount = static_cast<u32>(entries.size());
+    const auto src     = slot.Instances();
 
-    // Check if quads already reside in contiguous sorted layout
-    bool isContiguous = true;
-    u32 expectedOffset = 0;
-    for (u32 i = 0; i < sortCount; ++i) {
-        if (entries[i].instanceIndex != expectedOffset) {
-            isContiguous = false;
-            break;
-        }
-        expectedOffset += entries[i].instanceCount;
-    }
-
-    if (!wasSorted && isContiguous) {
-        return std::min(expectedOffset, static_cast<u32>(sourceQuads.size()));
-    }
-
-    // Reorder quads into scratch buffer with boundary clamping
-    u32 totalOutput = 0;
-    for (u32 i = 0; i < sortCount; ++i) {
-        const auto& entry = entries[i];
-        const u32 srcIdx = entry.instanceIndex;
-        const u16 count = entry.instanceCount;
-
-        if (count > 0 && srcIdx < sourceQuads.size()) {
-            const u32 availableSrc = static_cast<u32>(sourceQuads.size() - srcIdx);
-            const u32 copyCount = std::min<u32>(count, availableSrc);
-            const u32 availableDst = (FrameArenaSlot::kMaxInstances > totalOutput)
-                                         ? (FrameArenaSlot::kMaxInstances - totalOutput)
-                                         : 0;
-            const u32 toCopy = std::min(copyCount, availableDst);
-            if (toCopy > 0) {
-                std::memcpy(&scratch[totalOutput], &sourceQuads[srcIdx], toCopy * sizeof(QuadInstance));
-                totalOutput += toCopy;
+    if (!wasSorted) {
+        u32 expected = 0;
+        bool contiguous = true;
+        for (const auto& e : entries) {
+            if (e.instanceIndex != expected) {
+                contiguous = false;
+                break;
             }
+            expected += e.instanceCount;
+        }
+        if (contiguous) {
+            return src.subspan(0, std::min<usize>(expected, src.size()));
         }
     }
 
-    // Write back sorted contiguous instances into arena storage
-    auto destQuads = slot.MutableInstances();
-    if (totalOutput > 0) {
-        const u32 writeCount = std::min(totalOutput, static_cast<u32>(destQuads.size()));
-        std::memcpy(destQuads.data(), scratch, writeCount * sizeof(QuadInstance));
+    u32 out = 0;
+    for (const auto& e : entries) {
+        if (e.instanceIndex >= src.size()) continue;
+        const u32 n = std::min({
+            static_cast<u32>(e.instanceCount),
+            static_cast<u32>(src.size()) - e.instanceIndex,
+            FrameArenaSlot::kMaxInstances - out
+        });
+        std::memcpy(scratch + out, src.data() + e.instanceIndex, n * sizeof(QuadInstance));
+        out += n;
     }
-
-    return totalOutput;
+    return {scratch, out};
 }
+
+struct CoalesceResult {
+    u32 batches = 0;
+    u32 droppedBatches = 0;
+};
 
 /**
  * CoalesceBatches: Merges contiguous sorted entries sharing identical GPU pipeline state.
+ * Once capacity is reached, halts further merging to prevent silent instance corruption.
  */
-u32 CoalesceBatches(FrameArenaSlot& slot) noexcept {
+CoalesceResult CoalesceBatches(FrameArenaSlot& slot) noexcept {
     const auto entries = slot.SortEntries();
     auto batches = slot.MutableBatches();
-    const u32 sortCount = static_cast<u32>(entries.size());
-
-    u32 batchCount = 0;
+    CoalesceResult r{};
     u32 currentOffset = 0;
+    bool overflowed = false;
 
-    for (u32 i = 0; i < sortCount; ++i) {
-        const auto& entry = entries[i];
+    for (const auto& entry : entries) {
         const u32 count = entry.instanceCount;
-        if (count == 0) {
-            continue;
-        }
+        if (count == 0) continue;
 
         const SortKey key{entry.key};
         const u8  passId      = key.GetPass();
         const u8  blendMode   = key.GetBlend();
         const u16 pipelineId  = key.GetPipeline();
         const u16 textureSlot = key.GetTexture();
-        const u16 viewSlot    = entry.viewSlot;
+        const u8  viewSlot    = static_cast<u8>(entry.viewSlot);
 
-        bool merged = false;
-        if (batchCount > 0) {
-            auto& prev = batches[batchCount - 1];
+        if (!overflowed && r.batches > 0) {
+            DrawBatch& prev = batches[r.batches - 1];
             if (prev.passId == passId &&
                 prev.blendMode == blendMode &&
                 prev.pipelineId == pipelineId &&
                 prev.textureSlot == textureSlot &&
                 prev.viewSlot == viewSlot) {
                 prev.instanceCount += count;
-                merged = true;
+                currentOffset += count;
+                continue;
             }
         }
 
-        if (!merged && batchCount < FrameArenaSlot::kMaxBatches) {
-            batches[batchCount++] = DrawBatch{
+        if (r.batches < FrameArenaSlot::kMaxBatches) {
+            batches[r.batches++] = DrawBatch{
                 .instanceOffset = currentOffset,
                 .instanceCount = count,
                 .textureSlot = textureSlot,
                 .pipelineId = pipelineId,
                 .blendMode = blendMode,
                 .passId = passId,
-                .viewSlot = static_cast<u8>(viewSlot),
+                .viewSlot = viewSlot,
                 .reserved = 0
             };
+        } else {
+            overflowed = true;
+            ++r.droppedBatches;
         }
 
         currentOffset += count;
     }
 
-    slot.SetBatchCount(batchCount);
-    return batchCount;
+    slot.SetBatchCount(r.batches);
+    slot.SetDroppedBatches(r.droppedBatches);
+    return r;
 }
 
 } // namespace
@@ -208,6 +198,8 @@ void Batcher::Finalize(FrameArenaSlot& slot, FramePacket& outPacket) noexcept {
             .sortEntryCount = 0,
             .viewSlotCount = static_cast<u32>(slot.ViewSlots().size()),
             .droppedInstances = slot.DroppedInstances(),
+            .droppedBatches = slot.DroppedBatches(),
+            .droppedEntries = slot.DroppedEntries(),
             .wasSorted = false
         };
         return;
@@ -216,23 +208,25 @@ void Batcher::Finalize(FrameArenaSlot& slot, FramePacket& outPacket) noexcept {
     // 1. Sort entries by 64-bit key (radix sort with monotonic skip)
     const bool wasSorted = SortEntries(slot.MutableSortEntries(), m_sortScratch.get());
 
-    // 2. Linearize QuadInstances into sorted order
-    const u32 totalOutputQuads = LinearizeInstances(slot, wasSorted, m_instanceScratch.get());
+    // 2. Gather QuadInstances into draw order without redundant write-back
+    const auto gathered = GatherInstances(slot, wasSorted, m_instanceScratch.get());
 
-    // 3. Coalesce contiguous identical states into DrawBatches
-    const u32 batchCount = CoalesceBatches(slot);
+    // 3. Coalesce contiguous identical states into DrawBatches with overflow guard
+    const auto coalesceRes = CoalesceBatches(slot);
 
     // 4. Fill immutable FramePacket
     outPacket.batches = slot.Batches();
-    outPacket.instances = slot.Instances().subspan(0, totalOutputQuads);
+    outPacket.instances = gathered;
     outPacket.viewSlots = slot.ViewSlots();
     outPacket.passes = slot.Passes();
     outPacket.stats = FrameStats{
-        .instanceCount = totalOutputQuads,
-        .batchCount = batchCount,
+        .instanceCount = static_cast<u32>(gathered.size()),
+        .batchCount = coalesceRes.batches,
         .sortEntryCount = sortCount,
         .viewSlotCount = static_cast<u32>(slot.ViewSlots().size()),
         .droppedInstances = slot.DroppedInstances(),
+        .droppedBatches = coalesceRes.droppedBatches,
+        .droppedEntries = slot.DroppedEntries(),
         .wasSorted = wasSorted
     };
 }

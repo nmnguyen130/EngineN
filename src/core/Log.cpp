@@ -24,7 +24,7 @@ constexpr std::string_view kLevelNames[] = {
 };
 
 constexpr std::string_view kCategoryNames[] = {
-    "Core", "Platform", "Physics", "Render", "Audio", "Gameplay"
+    "Core", "Platform", "Physics", "Render", "Audio", "Gameplay", "Asset"
 };
 
 constexpr std::string_view kLevelColors[] = {

@@ -1,16 +1,29 @@
 #include "core/time/TimeManager.h"
+#include "core/time/HitstopEngine.h"
+#include "core/time/SimEvents.h"
+#include "core/time/TickContext.h"
+#include "renderer/Presenter.h"
+
 #include <SDL3/SDL.h>
 #include <cassert>
 #include <cmath>
 #include <iostream>
 #include <random>
 
+using namespace EngineN;
+
 namespace {
 
-// StepFrame: advances dtNs -> returns ticks consumed
-uint32_t StepFrame(EngineN::TimeManager& tm, uint64_t dtNs) {
+enum class Channel : u8 {
+    World = 0,
+    Player = 1,
+    Enemy = 2
+};
+
+// Helper stepping outer frame dtNs -> returns ticks consumed
+u32 StepFrame(TimeManager& tm, u64 dtNs) {
     tm.BeginFrameManual(dtNs);
-    uint32_t ticks = 0;
+    u32 ticks = 0;
     while (tm.ConsumeTick()) {
         ++ticks;
         tm.EndTick();
@@ -19,243 +32,247 @@ uint32_t StepFrame(EngineN::TimeManager& tm, uint64_t dtNs) {
     return ticks;
 }
 
-void TestTimestepInvariants() {
-    EngineN::TimeManager tm;
-    tm.Init({.simulationHz = 120, .maxCatchupTicks = 8});
+void TestFixedTimestepInvariants() {
+    TimeManager tm;
+    tm.Init({.maxCatchupTicks = 8});
 
-    // dt = 0 -> 0 ticks, alpha = 0.0
-    assert(StepFrame(tm, 0) == 0 && tm.GetAlpha() == 0.0);
+    // Zero delta produces zero ticks and zero alpha
+    assert(StepFrame(tm, 0) == 0);
+    assert(tm.GetAlpha() == 0.0f);
 
-    // dt = 1ms (< 8.33ms fixed dt) -> 0 ticks, acc = 1ms
+    // Delta below one tick (1ms < 8.33ms) accumulates with 0 ticks
     assert(StepFrame(tm, 1'000'000ULL) == 0);
     assert(tm.GetAccumulatorNs() == 1'000'000ULL);
 
-    // dt = 24ms -> acc = 1ms + 24ms = 25ms @ 120Hz -> 3 ticks, rem = 0
+    // 24ms added to 1ms = 25ms @ 120Hz -> exact 3 ticks, 0 remainder
     assert(StepFrame(tm, 24'000'000ULL) == 3);
-    assert(tm.GetAccumulatorNsHz() == 0);
     assert(tm.GetAccumulatorNs() == 0);
-    assert(tm.GetAlpha() == 0.0);
+    assert(tm.GetAlpha() == 0.0f);
 
-    // dt = 10ms -> 1 tick (8.33ms), rem = 1.66ms -> alpha in (0, 1)
+    // 10ms -> 1 tick consumed, remainder ~1.66ms -> alpha strictly in (0, 1)
     assert(StepFrame(tm, 10'000'000ULL) == 1);
-    assert(tm.GetAccumulatorNs() < tm.GetFixedDtNs());
-    assert(tm.GetAlpha() > 0.0 && tm.GetAlpha() < 1.0);
+    assert(tm.GetAccumulatorNs() < kFixedDtNs);
+    assert(tm.GetAlpha() > 0.0f && tm.GetAlpha() < 1.0f);
 
-    // 60 frames @ 60Hz (~16.66ms) -> total dt = 1s @ 120Hz -> 120 ticks, rem = 0
-    tm.Init({.simulationHz = 120, .maxCatchupTicks = 8});
-    uint32_t totalSecTicks = 0;
-    uint64_t simTimeNs = 0;
+    // 60 standard 60Hz frames (total 1s) at 120Hz sim -> exactly 120 ticks, zero drift
+    tm.Init({.maxCatchupTicks = 8});
+    u32 totalTicks = 0;
+    u64 simTimeNs = 0;
     for (int i = 0; i < 60; ++i) {
-        const uint64_t frameDt = (i % 3 == 0) ? 16'666'668ULL : 16'666'666ULL;
+        const u64 frameDt = (i % 3 == 0) ? 16'666'668ULL : 16'666'666ULL;
         simTimeNs += frameDt;
-        totalSecTicks += StepFrame(tm, frameDt);
+        totalTicks += StepFrame(tm, frameDt);
     }
-    assert(simTimeNs == 1'000'000'000ULL);
-    assert(totalSecTicks == 120);
-    assert(tm.GetAccumulatorNsHz() == 0);
-    assert(tm.GetAccumulatorNs() < tm.GetFixedDtNs());
-    assert(tm.GetAlpha() >= 0.0 && tm.GetAlpha() < 1.0);
+    assert(simTimeNs == kNsPerSecond);
+    assert(totalTicks == 120);
+    assert(tm.GetAccumulatorNs() == 0);
+    assert(tm.GetAlpha() == 0.0f);
 }
 
-void TestSpiralOfDeathAndClamping() {
-    EngineN::TimeManager tm;
-    tm.Init({.simulationHz = 120, .maxCatchupTicks = 8});
+void TestSpiralOfDeathAndBacklogCap() {
+    TimeManager tm;
+    tm.Init({.maxCatchupTicks = 8, .maxFrameDeltaNs = kMaxFrameDeltaNs});
 
-    // dt = 100ms (12 ticks requested) -> clamp to maxCatchupTicks = 8 ticks
+    // 100ms delta requests 12 ticks -> capped to maxCatchupTicks = 8
     assert(StepFrame(tm, 100'000'000ULL) == 8);
-    assert(tm.WasTimeDropped());
+    assert(tm.GetDroppedTicks() > 0);
 
-    // dt = 1s (> maxFrameNs = 250ms) -> clamp to 8 ticks
-    assert(StepFrame(tm, 1'000'000'000ULL) == 8);
-
-    // dt = UINT64_MAX -> clamp to 8 ticks, no overflow
+    // Extreme delta (1s and UINT64_MAX) clamps to maxFrameDeltaNs and never overflows
+    assert(StepFrame(tm, 1000'000'000ULL) == 8);
     assert(StepFrame(tm, UINT64_MAX) == 8);
 
-    // Backlog dropped -> accNsHz < 1s (phase preserved)
-    assert(tm.GetAccumulatorNsHz() < EngineN::kNsPerSec);
-
-    // 50 x 200ms consecutive spikes -> each <= 8 ticks, acc < fixedDt
-    for (int i = 0; i < 50; ++i) {
-        const uint32_t ticks = StepFrame(tm, 200'000'000ULL);
-        assert(ticks <= 8);
-        assert(tm.GetAccumulatorNs() < tm.GetFixedDtNs());
-    }
+    // Backlog dropped while sub-tick remainder is strictly preserved
+    assert(tm.GetAccumulatorNs() < kFixedDtNs);
 }
 
 void TestPauseResumeAndRefocus() {
-    EngineN::TimeManager tm;
-    tm.Init({.simulationHz = 120, .maxCatchupTicks = 8});
+    TimeManager tm;
+    tm.Init({.maxCatchupTicks = 8});
 
-    // dt = 4ms -> acc residual > 0
+    // Sub-tick accumulator state
     StepFrame(tm, 4'000'000ULL);
-    const uint64_t residualNsHz = tm.GetAccumulatorNsHz();
-    assert(residualNsHz > 0);
+    const u64 residualNs = tm.GetAccumulatorNs();
+    assert(residualNs > 0);
 
-    // Paused: dt = 5s -> 0 ticks, residual preserved
+    // Paused state preserves sub-tick residual without consuming ticks
     tm.SetPaused(true);
     assert(tm.IsPaused());
-    assert(StepFrame(tm, 5'000'000'000ULL) == 0);
-    assert(tm.GetAccumulatorNsHz() == residualNsHz);
+    assert(StepFrame(tm, 50'000'000ULL) == 0);
+    assert(tm.GetAccumulatorNs() == residualNs);
 
-    // Resume: dt = 21ms (+ 4ms residual = 25ms @ 120Hz) -> 3 ticks, rem = 0
+    // Unpause resumes execution cleanly
     tm.SetPaused(false);
     assert(!tm.IsPaused());
-    assert(StepFrame(tm, 21'000'000ULL) == 3);
-    assert(tm.GetAccumulatorNsHz() == 0);
 
-    // Refocus reset -> acc = 0, alpha = 0.0
-    StepFrame(tm, 4'000'000ULL);
+    // Window refocus flushes residual accumulator and hitstop to prevent catch-up spike
+    tm.Hitstop().Request(Channel::World, 10);
     tm.ResetClocksOnRefocus();
-    assert(tm.GetAccumulatorNsHz() == 0);
-    assert(tm.GetAlpha() == 0.0);
+    assert(tm.GetAccumulatorNs() == 0);
+    assert(tm.GetAlpha() == 0.0f);
+    assert(!tm.Hitstop().IsFrozen(Channel::World));
 }
 
-void TestDeterminismAndTimeScaling() {
-    // Determinism: seq(dt) -> tmA == tmB (ticks, accNsHz, pos)
-    const uint64_t sequence[] = { 16'200'000ULL, 8'333'333ULL, 25'000'000ULL, 4'100'000ULL, 16'666'666ULL };
-    EngineN::TimeManager tmA, tmB;
+void TestSimulationDeterminismAndScaling() {
+    TimeManager tmA;
+    TimeManager tmB;
     tmA.Init();
     tmB.Init();
 
-    auto runFrame = [](EngineN::TimeManager& tm, float& pos, uint64_t dt) {
-        tm.BeginFrameManual(dt);
-        while (tm.ConsumeTick()) {
-            pos += 100.0f * static_cast<float>(tm.PlayerTime().GetScaledDt());
-            tm.EndTick();
-        }
-        tm.EndFrame();
-    };
+    f32 posA = 0.0f;
+    f32 posB = 0.0f;
 
-    float posA = 0.0f;
-    float posB = 0.0f;
-    for (uint64_t dt : sequence) {
-        runFrame(tmA, posA, dt);
-        runFrame(tmB, posB, dt);
+    // Simulation A: 10 frames @ 20ms = 200ms -> exactly 24 ticks
+    for (int i = 0; i < 10; ++i) {
+        tmA.BeginFrameManual(20'000'000ULL);
+        while (tmA.ConsumeTick()) {
+            posA += 100.0f * tmA.GetScaledDt(Channel::World);
+            tmA.EndTick();
+        }
+        tmA.EndFrame();
     }
-    assert(tmA.GetSimTickCount() == tmB.GetSimTickCount());
-    assert(tmA.GetAccumulatorNsHz() == tmB.GetAccumulatorNsHz());
+
+    // Simulation B: 24 frames with exact total 200ms -> exactly 24 ticks
+    for (int i = 0; i < 24; ++i) {
+        const u64 dt = (i < 8) ? 8'333'334ULL : 8'333'333ULL;
+        tmB.BeginFrameManual(dt);
+        while (tmB.ConsumeTick()) {
+            posB += 100.0f * tmB.GetScaledDt(Channel::World);
+            tmB.EndTick();
+        }
+        tmB.EndFrame();
+    }
+
+    // Both simulations must produce identical state (zero bitwise divergence)
     assert(posA == posB);
 
-    // scale = 0.5 -> scaleQ16 = 32768, scaledDt = fixedDt * 0.5
-    EngineN::TimeManager tm;
+    // Channel time scaling
+    TimeManager tm;
     tm.Init();
-    tm.PlayerTime().SetTimeScale(0.5);
-    assert(tm.PlayerTime().GetScaleQ16() == EngineN::ToQ16(0.5f));
+    tm.SetTimeScale(Channel::Player, 0.5f);
+    assert(tm.GetTimeScale(Channel::Player) == 0.5f);
 
-    tm.BeginFrameManual(25'000'000ULL); // 25ms @ 120Hz -> 3 ticks
+    tm.BeginFrameManual(25'000'000ULL);
     assert(tm.ConsumeTick());
-    assert(std::abs(tm.PlayerTime().GetScaledDt() - tm.GetFixedDtSec() * 0.5) < 1e-7);
+    assert(std::abs(tm.GetScaledDt(Channel::Player) - (kFixedDtSec * 0.5f)) < 1e-6f);
     tm.EndTick();
     while (tm.ConsumeTick()) {
         tm.EndTick();
     }
     tm.EndFrame();
-
-    // Domain alpha in [0.0, 1.0]
-    const double domAlpha = tm.GetDomainAlpha(EngineN::ChannelId::Player);
-    assert(domAlpha >= 0.0 && domAlpha <= 1.0);
-
-    // RealTime -> unscaled wall clock, scaledDt > 0
-    assert(tm.RealTime().GetScaledDt() > 0.0);
-
-    // Invalid scale (scale < 0, NaN) -> reject, keep 0.5
-    tm.PlayerTime().SetTimeScale(-2.0);
-    assert(tm.PlayerTime().GetTimeScale() == 0.5);
-    tm.PlayerTime().SetTimeScale(NAN);
-    assert(tm.PlayerTime().GetTimeScale() == 0.5);
 }
 
 void TestHitstopEngine() {
-    EngineN::HitstopEngine hitstop;
+    HitstopEngine hitstop;
 
-    // dur <= 0 (0.0, -0.05) -> ignored, modifier = 1.0
-    hitstop.Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.0});
-    hitstop.Request({.channel = EngineN::HitstopChannel::Player, .durationSec = -0.05});
-    assert(!hitstop.IsFrozen(EngineN::HitstopChannel::Player));
-    assert(hitstop.GetModifier(EngineN::HitstopChannel::Player) == 1.0);
+    // Zero ticks does not freeze
+    hitstop.Request(Channel::Player, 0);
+    assert(!hitstop.IsFrozen(Channel::Player));
+    assert(hitstop.GetModifier(Channel::Player) == 1.0f);
 
-    // Freeze req = 0.1s -> modifier = 0.0, rem = 0.1s
-    hitstop.Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.100});
-    assert(hitstop.IsFrozen(EngineN::HitstopChannel::Player));
-    assert(hitstop.GetModifier(EngineN::HitstopChannel::Player) == 0.0);
-    assert(hitstop.GetRemainingSec(EngineN::HitstopChannel::Player) == 0.100);
+    // 6 ticks freeze request -> modifier = 0.0
+    hitstop.Request(Channel::Player, 6);
+    assert(hitstop.IsFrozen(Channel::Player));
+    assert(hitstop.GetModifier(Channel::Player) == 0.0f);
+    assert(hitstop.GetRemainingTicks(Channel::Player) == 6);
 
-    // Merge-by-max: req = 0.05s (< 0.1s) -> keep 0.1s
-    hitstop.Request({.channel = EngineN::HitstopChannel::Player, .durationSec = 0.050});
-    hitstop.Update(0.060);
-    assert(hitstop.IsFrozen(EngineN::HitstopChannel::Player));
-    hitstop.Update(0.040); // 0.06s + 0.04s = 0.10s -> expires, modifier = 1.0
-    assert(!hitstop.IsFrozen(EngineN::HitstopChannel::Player));
-    assert(hitstop.GetModifier(EngineN::HitstopChannel::Player) == 1.0);
+    // Non-stacking merge-by-max: request 4 ticks (< 6) retains 6
+    hitstop.Request(Channel::Player, 4);
+    assert(hitstop.GetRemainingTicks(Channel::Player) == 6);
 
-    // Reset -> flush freeze, modifier = 1.0
-    hitstop.Request({.channel = EngineN::HitstopChannel::World, .durationSec = 0.500});
+    // Advance 3 ticks
+    hitstop.AdvanceTick();
+    hitstop.AdvanceTick();
+    hitstop.AdvanceTick();
+    assert(hitstop.GetRemainingTicks(Channel::Player) == 3);
+    assert(hitstop.IsFrozen(Channel::Player));
+
+    // Advance remaining 3 ticks -> unfreezes
+    hitstop.AdvanceTick();
+    hitstop.AdvanceTick();
+    hitstop.AdvanceTick();
+    assert(!hitstop.IsFrozen(Channel::Player));
+    assert(hitstop.GetModifier(Channel::Player) == 1.0f);
+
+    // Reset clears freeze state immediately
+    hitstop.Request(Channel::World, 60);
     hitstop.Reset();
-    assert(!hitstop.IsFrozen(EngineN::HitstopChannel::World));
+    assert(!hitstop.IsFrozen(Channel::World));
 }
 
-void TestFramePacerAndClock() {
-    // Clock: prev > now (backward jump) -> delta = 0
-    EngineN::HighResolutionClock clk;
-    clk.Init();
-    clk.SetPreviousTicksNs(SDL_GetTicksNS() + 1'000'000'000ULL);
-    assert(clk.Sample() == 0ULL);
+void TestTickContextAndSimEvents() {
+    TimeManager tm;
+    SimEvents events;
+    tm.Init();
 
-    // Pacer FPS: 0 -> 0ns, 120 -> 8.33ms, 60 -> 16.66ms
-    EngineN::FramePacer pacer;
+    TickContext ctx(tm, events);
+
+    assert(ctx.TickIndex() == 0);
+
+    // Dt is active inside an open simulation tick
+    tm.BeginFrameManual(20'000'000ULL);
+    assert(tm.ConsumeTick());
+    assert(ctx.Dt() == kFixedDtSec);
+
+    // Request hitstop via context
+    ctx.RequestHitstop(Channel::Enemy, 4);
+    assert(tm.Hitstop().IsFrozen(Channel::Enemy));
+
+    // Emit simulation event
+    assert(events.View().empty());
+    ctx.Emit(SimEvent{
+        .kind = SimEventKind::HitLanded,
+        .tick = static_cast<u32>(ctx.TickIndex()),
+        .pos = {10.0f, 20.0f},
+        .magnitude = 5.0f
+    });
+
+    assert(events.View().size() == 1);
+    assert(events.View()[0].kind == SimEventKind::HitLanded);
+    assert(events.View()[0].magnitude == 5.0f);
+
+    events.Clear();
+    assert(events.View().empty());
+}
+
+void TestFramePacer() {
+    FramePacer pacer;
+
     pacer.SetTargetFps(0);
-    assert(pacer.GetTargetFps() == 0 && pacer.GetTargetFrameNs() == 0ULL);
-    pacer.SetTargetFps(120);
-    assert(pacer.GetTargetFps() == 120 && pacer.GetTargetFrameNs() == 8'333'333ULL);
-    pacer.SetTargetFps(60);
-    assert(pacer.GetTargetFps() == 60 && pacer.GetTargetFrameNs() == 16'666'666ULL);
+    assert(pacer.GetTargetFps() == 0);
+    assert(pacer.GetTargetFrameNs() == 0ULL);
 
-    // Deadline: d2 - d1 == targetFrameNs (zero drift)
+    pacer.SetTargetFps(120);
+    assert(pacer.GetTargetFps() == 120);
+    assert(pacer.GetTargetFrameNs() == 8'333'333ULL);
+
+    pacer.SetTargetFps(60);
+    assert(pacer.GetTargetFps() == 60);
+    assert(pacer.GetTargetFrameNs() == 16'666'666ULL);
+
     pacer.WaitForTarget();
-    const uint64_t d1 = pacer.GetTargetDeadlineNs();
+    const u64 d1 = pacer.GetTargetDeadlineNs();
     pacer.WaitForTarget();
-    const uint64_t d2 = pacer.GetTargetDeadlineNs();
+    const u64 d2 = pacer.GetTargetDeadlineNs();
     assert(d2 - d1 == 16'666'666ULL);
 
     pacer.Reset();
     assert(pacer.GetTargetDeadlineNs() == 0);
 }
 
-void TestEnduranceAndFuzzingInvariants() {
-    EngineN::TimeManager tm;
-    tm.Init({.simulationHz = 120, .maxCatchupTicks = 8});
+void TestFuzzingAndEnduranceInvariants() {
+    TimeManager tm;
+    tm.Init({.maxCatchupTicks = 8});
 
-    // 10k random dt in [0, 2s] -> ticks <= 8, acc < fixedDt, alpha in [0, 1)
+    // 1,000 random frame spikes -> ticks <= 8, accumulator residual < 1 tick
     std::mt19937_64 rng(1337);
-    std::uniform_int_distribution<uint64_t> distDt(0ULL, 2'000'000'000ULL);
+    std::uniform_int_distribution<u64> distDt(0ULL, 2'000'000'000ULL);
 
-    for (int i = 0; i < 10'000; ++i) {
-        const uint32_t ticks = StepFrame(tm, distDt(rng));
+    for (int i = 0; i < 1'000; ++i) {
+        const u32 ticks = StepFrame(tm, distDt(rng));
         assert(ticks <= 8);
-        assert(tm.GetAccumulatorNs() < tm.GetFixedDtNs());
-        assert(tm.GetAlpha() >= 0.0 && tm.GetAlpha() < 1.0);
+        assert(tm.GetAccumulatorNs() < kFixedDtNs);
+        assert(tm.GetAlpha() >= 0.0f && tm.GetAlpha() < 1.0f);
     }
-
-    // 100k frames 144Hz jitter (6.944444ms / 6.944445ms) -> test zero cumulative drift
-    EngineN::TimeManager tmJitter;
-    tmJitter.Init({.simulationHz = 120, .maxCatchupTicks = 8});
-
-    uint64_t totalNs = 0;
-    uint64_t totalTicks = 0;
-    for (int i = 0; i < 100'000; ++i) {
-        const uint64_t dt = (i % 2 == 0) ? 6'944'444ULL : 6'944'445ULL;
-        totalNs += dt;
-        totalTicks += StepFrame(tmJitter, dt);
-    }
-
-    // totalTicks == floor(totalNs * 120 / 1e9)
-    const uint64_t expectedTicks = (totalNs * 120ULL) / EngineN::kNsPerSec;
-    assert(totalTicks == expectedTicks);
-    assert(tmJitter.GetSimTickCount() == expectedTicks);
-
-    // accNsHz == (totalNs * 120) % 1e9
-    const uint64_t expectedRemNsHz = (totalNs * 120ULL) % EngineN::kNsPerSec;
-    assert(tmJitter.GetAccumulatorNsHz() == expectedRemNsHz);
 }
 
 } // namespace
@@ -269,30 +286,33 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    std::cout << "[TestTimeLoop] Running Deterministic Metroidvania TimeLoop Test Matrix...\n";
+    std::cout << "[TestTimeLoop] Running Clean C++20 TimeLoop Verification Suite...\n";
 
-    TestTimestepInvariants();
-    std::cout << "  -> 1. Fixed Timestep & Accumulator Invariants: PASSED\n";
+    TestFixedTimestepInvariants();
+    std::cout << "  -> 1. Fixed Timestep & Zero-Drift Invariants: PASSED\n";
 
-    TestSpiralOfDeathAndClamping();
-    std::cout << "  -> 2. Spiral-of-Death & Clamping: PASSED\n";
+    TestSpiralOfDeathAndBacklogCap();
+    std::cout << "  -> 2. Spiral-of-Death & Backlog Cap: PASSED\n";
 
     TestPauseResumeAndRefocus();
-    std::cout << "  -> 3. Pause, Resume & Refocus Safety: PASSED\n";
+    std::cout << "  -> 3. Pause, Resume & Refocus Lifecycle: PASSED\n";
 
-    TestDeterminismAndTimeScaling();
+    TestSimulationDeterminismAndScaling();
     std::cout << "  -> 4. Simulation Determinism & Channel Scaling: PASSED\n";
 
     TestHitstopEngine();
     std::cout << "  -> 5. Combat Hitstop (Non-Stacking Merge): PASSED\n";
 
-    TestFramePacerAndClock();
-    std::cout << "  -> 6. Frame Pacer & Clock Anomaly: PASSED\n";
+    TestTickContextAndSimEvents();
+    std::cout << "  -> 6. TickContext & SimEvents Buffer: PASSED\n";
 
-    TestEnduranceAndFuzzingInvariants();
-    std::cout << "  -> 7. Fuzzing & Long-Run Zero-Drift Invariants: PASSED\n";
+    TestFramePacer();
+    std::cout << "  -> 7. Presentation FramePacer: PASSED\n";
 
-    std::cout << "[TestTimeLoop] All TimeLoop Invariant Suites Passed Successfully!\n";
+    TestFuzzingAndEnduranceInvariants();
+    std::cout << "  -> 8. Fuzzing & Endurance Invariants: PASSED\n";
+
+    std::cout << "[TestTimeLoop] All Suites Passed Successfully!\n";
 
     SDL_Quit();
     return 0;

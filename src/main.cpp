@@ -1,37 +1,122 @@
 #include "core/Config.h"
 #include "core/Log.h"
+#include "core/EngineContext.h"
+#include "core/GameLoop.h"
 #include "core/time/TimeManager.h"
+#include "core/time/TickContext.h"
+#include "core/time/SimEvents.h"
+#include "core/interpolation/Interpolated.h"
 #include "math/Vec2.h"
 #include "platform/Platform.h"
 #include "platform/Window.h"
 #include "platform/EventRouting.h"
 #include "platform/input/InputSystem.h"
+#include "asset/AssetManager.h"
+#include "asset/AssetSet.h"
 #include "renderer/RendererTypes.h"
-#include "renderer/QuadInstance.h"
-#include "renderer/SortKey.h"
-#include "renderer/FramePacket.h"
 #include "renderer/FrameArena.h"
+#include "renderer/RenderQueue.h"
 #include "renderer/Batcher.h"
 #include "renderer/RenderDevice.h"
+#include "renderer/Presenter.h"
 
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <memory>
+#include <vector>
 
 namespace {
 
-struct PlayerEntity {
-    EngineN::Vec2 prevPosition{640.0f, 360.0f};
-    EngineN::Vec2 position{640.0f, 360.0f};
-    EngineN::Vec2 velocity{0.0f, 0.0f};
-    EngineN::Vec2 size{48.0f, 48.0f};
-    float speed{420.0f};
-    bool isAttacking{false};
-    bool isDashing{false};
-    double actionTimer{0.0};
-};
+void EnsureDemoTexturesExist() {
+    std::filesystem::create_directories("assets/textures");
+    const std::string sheetPath = "assets/textures/hero_sheet.tga";
+    if (std::filesystem::exists(sheetPath)) {
+        return;
+    }
+
+    constexpr int kFrameWidth = 32;
+    constexpr int kFrameHeight = 32;
+    constexpr int kFrameCount = 4;
+    constexpr int kTotalWidth = kFrameWidth * kFrameCount;
+    constexpr int kTotalHeight = kFrameHeight;
+
+    std::vector<EngineN::u8> pixels(kTotalWidth * kTotalHeight * 4, 0);
+
+    for (int frame = 0; frame < kFrameCount; ++frame) {
+        const int xOffset = frame * kFrameWidth;
+        const int yBob = (frame == 1 || frame == 3) ? -1 : 0;
+
+        for (int y = 0; y < kFrameHeight; ++y) {
+            for (int x = 0; x < kFrameWidth; ++x) {
+                const int globalX = xOffset + x;
+                const int globalY = y;
+                const int idx = (globalY * kTotalWidth + globalX) * 4;
+                const int localY = y - yBob;
+
+                // 1px Border
+                if (x == 0 || x == 31 || y == 0 || y == 31) {
+                    pixels[idx + 0] = 20;  pixels[idx + 1] = 24;  pixels[idx + 2] = 34;  pixels[idx + 3] = 255;
+                }
+                // Gold helmet
+                else if (localY >= 4 && localY <= 12 && x >= 8 && x <= 23) {
+                    if (localY >= 8 && localY <= 10 && x >= 11 && x <= 20) {
+                        const EngineN::u8 visorR = (frame == 2) ? 255 : 80;
+                        const EngineN::u8 visorG = (frame == 2) ? 120 : 240;
+                        pixels[idx + 0] = visorR; pixels[idx + 1] = visorG; pixels[idx + 2] = 255; pixels[idx + 3] = 255;
+                    } else {
+                        pixels[idx + 0] = 255; pixels[idx + 1] = 200; pixels[idx + 2] = 40;  pixels[idx + 3] = 255;
+                    }
+                }
+                // Cobalt blue chestplate
+                else if (localY >= 13 && localY <= 22 && x >= 6 && x <= 25) {
+                    const bool isTrim = (x == 6 || x == 25 || localY == 13 || localY == 22 || x == 15 || x == 16);
+                    if (isTrim) {
+                        pixels[idx + 0] = 220; pixels[idx + 1] = 230; pixels[idx + 2] = 255; pixels[idx + 3] = 255;
+                    } else {
+                        pixels[idx + 0] = 40;  pixels[idx + 1] = 110; pixels[idx + 2] = 240; pixels[idx + 3] = 255;
+                    }
+                }
+                // Silver greaves
+                else if (localY >= 23 && localY <= 29) {
+                    bool isLeg = false;
+                    if (frame == 0)      isLeg = (x >= 9 && x <= 13) || (x >= 18 && x <= 22);
+                    else if (frame == 1) isLeg = (x >= 7 && x <= 12) || (x >= 18 && x <= 24);
+                    else if (frame == 2) isLeg = (x >= 9 && x <= 14) || (x >= 17 && x <= 22);
+                    else                 isLeg = (x >= 8 && x <= 14) || (x >= 20 && x <= 25);
+
+                    if (isLeg) {
+                        pixels[idx + 0] = 160; pixels[idx + 1] = 170; pixels[idx + 2] = 190; pixels[idx + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    std::FILE* fp = std::fopen(sheetPath.c_str(), "wb");
+    if (fp) {
+        const EngineN::u8 header[18] = {
+            0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            static_cast<EngineN::u8>(kTotalWidth & 0xFF), static_cast<EngineN::u8>((kTotalWidth >> 8) & 0xFF),
+            static_cast<EngineN::u8>(kTotalHeight & 0xFF), static_cast<EngineN::u8>((kTotalHeight >> 8) & 0xFF),
+            32, 8 | 0x20
+        };
+        std::fwrite(header, 1, sizeof(header), fp);
+        std::vector<EngineN::u8> bgra(pixels.size());
+        for (EngineN::usize i = 0; i < pixels.size(); i += 4) {
+            bgra[i + 0] = pixels[i + 2];
+            bgra[i + 1] = pixels[i + 1];
+            bgra[i + 2] = pixels[i + 0];
+            bgra[i + 3] = pixels[i + 3];
+        }
+        std::fwrite(bgra.data(), 1, bgra.size(), fp);
+        std::fclose(fp);
+    }
+}
 
 enum class GameAction : EngineN::ActionId {
     Jump = 0,
@@ -42,14 +127,207 @@ enum class GameAction : EngineN::ActionId {
     Confirm = 5
 };
 
-void SetTargetFps(int fps, EngineN::TimeManager& time, EngineN::RenderDevice& device) {
-    if (time.Pacer().GetTargetFps() == fps) {
-        return;
+enum class GameChannel : EngineN::u8 {
+    World = 0,
+    Player = 1,
+    Enemy = 2
+};
+
+enum class PlayerState : EngineN::u8 {
+    Idle = 0,
+    Run,
+    Attack,
+    Dash
+};
+
+struct PlayerSim {
+    EngineN::Interpolated<EngineN::Vec2> pos{EngineN::Vec2{640.0f, 360.0f}};
+    EngineN::Vec2 vel{};
+    EngineN::Vec2 size{48.0f, 48.0f};
+    PlayerState   state = PlayerState::Idle;
+    EngineN::u32  stateTicks = 0; // Entity-owned clock
+    float         speed = 420.0f;
+    bool          facingLeft = false;
+
+    void BeginTick() noexcept {
+        pos.BeginTick(); // Unconditional snapshot guarantees stillness during hitstop
     }
-    time.Pacer().SetTargetFps(fps);
-    (void)device.SetVSync(fps == 0);
-    LOG_INFO("Target FPS set to {} (VSync: {})", fps, (fps == 0 ? "ON" : "OFF"));
-}
+
+    void Tick(const EngineN::TickInput& in, EngineN::TickContext& ctx) noexcept {
+        using namespace EngineN;
+        const f32 dt = ctx.Dt(GameChannel::Player);
+        if (dt <= 0.0f) {
+            return; // Frozen: pos.prev == pos.cur already, zero drift
+        }
+        ++stateTicks;
+
+        // Combat triggers from TICK input stream (deterministic and replayable)
+        if (state != PlayerState::Attack && in.Pressed(GameAction::Attack)) {
+            state = PlayerState::Attack;
+            stateTicks = 0;
+            ctx.RequestHitstop(GameChannel::Player, 3_f60); // 6 ticks exact freeze
+            ctx.Emit({SimEventKind::AttackStarted, static_cast<u32>(ctx.TickIndex()), pos.Cur(), 1.0f});
+        } else if (state != PlayerState::Dash && (in.Pressed(GameAction::Dash) || in.Pressed(GameAction::Sprint))) {
+            state = PlayerState::Dash;
+            stateTicks = 0;
+            ctx.Emit({SimEventKind::DashStarted, static_cast<u32>(ctx.TickIndex()), pos.Cur(), 1.0f});
+        }
+
+        // Virtual axis movement
+        Vec2 moveDir{in.Axis(0), in.Axis(1)};
+        const float lenSq = moveDir.LengthSquared();
+        if (lenSq > 1.0f) {
+            moveDir = moveDir.Normalized();
+        }
+
+        if (moveDir.x < -0.1f) facingLeft = true;
+        else if (moveDir.x > 0.1f) facingLeft = false;
+
+        const float currentSpeed = speed * (state == PlayerState::Dash ? 2.2f : 1.0f);
+        if (lenSq > 0.0001f) {
+            vel = moveDir * currentSpeed;
+            if (state == PlayerState::Idle) state = PlayerState::Run;
+        } else if (state != PlayerState::Dash) {
+            vel = vel * std::max(0.0f, 1.0f - 12.0f * dt);
+            if (state == PlayerState::Run) state = PlayerState::Idle;
+        }
+
+        pos.Cur() += vel * dt;
+
+        constexpr u32 kAttackTicks = 18_f60;
+        constexpr u32 kDashTicks   = 12_f60;
+        if ((state == PlayerState::Attack && stateTicks >= kAttackTicks) ||
+            (state == PlayerState::Dash   && stateTicks >= kDashTicks)) {
+            state = (lenSq > 0.0001f) ? PlayerState::Run : PlayerState::Idle;
+        }
+
+        // World boundaries in virtual screen space (1280x720)
+        constexpr float kMargin = 40.0f;
+        pos.Cur().x = std::clamp(pos.Cur().x, kMargin, 1280.0f - kMargin - size.x);
+        pos.Cur().y = std::clamp(pos.Cur().y, kMargin, 720.0f - kMargin - size.y);
+    }
+};
+
+struct World {
+    PlayerSim player;
+
+    void BeginTick() noexcept {
+        player.BeginTick();
+    }
+
+    void Tick(const EngineN::TickInput& in, EngineN::TickContext& ctx) noexcept {
+        player.Tick(in, ctx);
+    }
+};
+
+class DemoGame {
+public:
+    explicit DemoGame(EngineN::EngineContext& ctx) noexcept : m_ctx(ctx) {}
+
+    EngineN::Result<void, EngineN::EngineError> Init() noexcept {
+        using namespace EngineN;
+        EnsureDemoTexturesExist();
+
+        m_levelAssets = std::make_unique<AssetSet>(*m_ctx.assets);
+        auto sheet = m_levelAssets->LoadTexture("assets/textures/hero_sheet.tga");
+        if (!sheet) {
+            return Err(sheet.Error());
+        }
+
+        AtlasGridDesc desc{
+            .texture = *sheet,
+            .frameWidth = 32,
+            .frameHeight = 32,
+            .frameCount = 4,
+            .pivotX = 16,
+            .pivotY = 16
+        };
+        auto atlas = m_levelAssets->LoadAtlasGrid("atlases/hero", desc);
+        if (!atlas) {
+            return Err(atlas.Error());
+        }
+        m_heroAtlas = *atlas;
+
+        return {};
+    }
+
+    void Shutdown() noexcept {
+        if (m_levelAssets) {
+            m_levelAssets->Release();
+            m_levelAssets.reset();
+        }
+    }
+
+    void OnFrameInput(const EngineN::FrameInput& fi) noexcept {
+        (void)fi;
+    }
+
+    void BeginTick() noexcept {
+        m_world.BeginTick();
+    }
+
+    void Tick(const EngineN::TickInput& in, EngineN::TickContext& ctx) noexcept {
+        m_world.Tick(in, ctx);
+    }
+
+    void Update(double realDt, float alpha, const EngineN::SimEvents& events) noexcept {
+        (void)realDt;
+        (void)alpha;
+        (void)events;
+    }
+
+    void Extract(EngineN::RenderQueue& q, float alpha, const EngineN::AssetReader& assets) noexcept {
+        using namespace EngineN;
+        q.Begin(ViewTransform2D{}, Color::FromRGBA8(18, 18, 24, 255));
+
+        const Vec2 p = m_world.player.pos.Get(alpha);
+
+        // 1. Dash trail ghost (additive VFX, shares premultiplied batch)
+        if (m_world.player.state == PlayerState::Dash) {
+            q.SetLayer(Layers::Fx);
+            (void)q.Sprite({
+                .sprite = assets.Sprite({m_heroAtlas, 1}),
+                .pos = p + m_world.player.vel * -0.035f + m_world.player.size * 0.5f,
+                .scale = {1.6f, 1.6f},
+                .tint = Color{0.7f, 0.4f, 1.0f, 0.45f},
+                .blend = Blend::Additive
+            });
+        }
+
+        // 2. Player animated sprite
+        q.SetLayer(Layers::Actors);
+        u16 animFrame = 0;
+        if (m_world.player.state == PlayerState::Attack) animFrame = 2;
+        else if (m_world.player.state == PlayerState::Dash) animFrame = 1;
+        else if (m_world.player.state == PlayerState::Run) animFrame = static_cast<u16>((m_world.player.stateTicks / 15) % 4);
+
+        Color playerTint = Colors::White;
+        if (m_ctx.time->Hitstop().IsFrozen(GameChannel::Player)) {
+            playerTint = Color::FromRGBA8(255, 90, 95, 255);
+        } else if (m_world.player.state == PlayerState::Attack) {
+            playerTint = Color::FromRGBA8(255, 215, 0, 255);
+        } else if (m_world.player.state == PlayerState::Dash) {
+            playerTint = Color::FromRGBA8(180, 100, 255, 255);
+        }
+
+        (void)q.Sprite({
+            .sprite = assets.Sprite({m_heroAtlas, animFrame}),
+            .pos = p + m_world.player.size * 0.5f,
+            .scale = {1.5f, 1.5f},
+            .tint = playerTint,
+            .flipX = m_world.player.facingLeft,
+            .sortY = p.y
+        });
+    }
+
+private:
+    EngineN::EngineContext&            m_ctx;
+    World                              m_world;
+    std::unique_ptr<EngineN::AssetSet> m_levelAssets;
+    EngineN::AssetHandle<EngineN::Atlas> m_heroAtlas{};
+};
+
+static_assert(EngineN::GameLoop<DemoGame>);
 
 } // namespace
 
@@ -59,16 +337,7 @@ int main(int argc, char* argv[]) {
 
     using namespace EngineN;
 
-    AppConfig config{
-        .appName = "EngineN — Sandbox Runtime",
-        .windowWidth = 1280,
-        .windowHeight = 720,
-        .simulationHz = 120,
-        .targetRenderFps = 0, // 0 = Uncapped / VSync-driven
-        .maxCatchupTicks = 8
-    };
-
-    // 1. Initialize Platform Subsystem
+    // 1. Platform Subsystem
     Platform platform;
     auto platRes = platform.Init();
     if (!platRes) {
@@ -76,10 +345,10 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // 2. Create Engine Window
+    // 2. Window Subsystem
     WindowConfig winConfig{
-        .title = config.appName,
-        .size = {config.windowWidth, config.windowHeight},
+        .title = "EngineN — Metroidvania Runtime",
+        .size = {1280, 720},
         .mode = WindowMode::Windowed,
         .highDPI = true,
         .resizable = true
@@ -91,265 +360,70 @@ int main(int argc, char* argv[]) {
     }
     Window window = std::move(*winRes);
 
-    // 3. Initialize Hardware RenderDevice
+    // 3. Hardware RenderDevice
     RenderDevice device;
-    auto devRes = device.Init(window, {.vsync = (config.targetRenderFps == 0)});
+    auto devRes = device.Init(window, {.vsync = true});
     if (!devRes) {
         LOG_FATAL("RenderDevice initialization failed: {}", devRes.Error().message);
         return -1;
     }
 
-    // 4. Input Subsystem & Raw Scancode Watcher
-    InputSystem input;
-    std::array<bool, 512> keysJustPressed{};
-
-    struct KeyWatcher {
-        std::array<bool, 512>* keys{nullptr};
-        SinkVerdict OnEvent(const SDL_Event& e) noexcept {
-            if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode < 512) {
-                (*keys)[e.key.scancode] = true;
-            }
-            return SinkVerdict::Continue;
-        }
-    } keyWatcher{&keysJustPressed};
-
-    (void)platform.Router().Add(
-        SinkStage::App,
-        EventSinkRef::Bind<&KeyWatcher::OnEvent>(keyWatcher)
-    );
-
-    // 5. Deterministic 120Hz Time Manager
-    TimeManager time;
-    time.Init({
-        .simulationHz = config.simulationHz,
-        .targetRenderFps = config.targetRenderFps,
-        .maxCatchupTicks = config.maxCatchupTicks
-    });
-
-    // 6. Double-Buffered Zero-Allocation Frame Arena & Batcher
-    FrameArena arena;
-    Batcher batcher;
-    FramePacket packet;
-
-    // Entity State
-    PlayerEntity player;
-    player.position = {config.windowWidth * 0.5f - 24.0f, config.windowHeight * 0.5f - 24.0f};
-    player.prevPosition = player.position;
-
-    bool running = true;
-    bool useInterpolation = true;
-    bool bulletTime = false;
-
-    int framesThisSec = 0;
-    std::uint64_t lastTelemetryNs = SDL_GetTicksNS();
-
-    LOG_INFO("EngineN initialized successfully at 120Hz fixed simulation.");
-
-    while (running) {
-        // [TIME] Begin frame measurement
-        time.BeginFrame();
-
-        // [PLATFORM & INPUT] Single-source SDL event pumping
-        keysJustPressed.fill(false);
-        (void)platform.Pump(window, input);
-        const auto& frameInput = input.PublishFrameInput();
-
-        if (platform.WasQuitRequested() || frameInput.Pressed(GameAction::MenuPause)) {
-            running = false;
-        }
-
-        // Toggle Fullscreen (F11)
-        if (keysJustPressed[SDL_SCANCODE_F11]) {
-            const auto newMode = (window.GetMode() == WindowMode::Windowed)
-                ? WindowMode::BorderlessFullscreen
-                : WindowMode::Windowed;
-            (void)window.SetMode(newMode);
-        }
-
-        // Hotkeys for simulation & performance diagnostics
-        if (keysJustPressed[SDL_SCANCODE_I]) {
-            useInterpolation = !useInterpolation;
-            LOG_INFO("Sub-frame visual interpolation: {}", useInterpolation ? "ON" : "OFF");
-        }
-        if (keysJustPressed[SDL_SCANCODE_H]) {
-            time.Hitstop().Request({.channel = HitstopChannel::Player, .durationSec = 0.080});
-        }
-        if (keysJustPressed[SDL_SCANCODE_B]) {
-            bulletTime = !bulletTime;
-            const double scale = bulletTime ? 0.25 : 1.0;
-            time.PlayerTime().SetTimeScale(scale);
-            time.WorldTime().SetTimeScale(scale);
-            LOG_INFO("Bullet-time {}: time scale = {:.2f}x", bulletTime ? "enabled" : "disabled", scale);
-        }
-        if (keysJustPressed[SDL_SCANCODE_1]) SetTargetFps(60, time, device);
-        if (keysJustPressed[SDL_SCANCODE_2]) SetTargetFps(120, time, device);
-        if (keysJustPressed[SDL_SCANCODE_3]) SetTargetFps(144, time, device);
-        if (keysJustPressed[SDL_SCANCODE_0]) SetTargetFps(0, time, device);
-        if (keysJustPressed[SDL_SCANCODE_F1]) {
-            LOG_INFO("Live diagnostic pulse: Player at ({:.1f}, {:.1f})", player.position.x, player.position.y);
-        }
-
-        // Combat trigger actions
-        if (frameInput.Pressed(GameAction::Attack)) {
-            player.isAttacking = true;
-            player.actionTimer = 0.15;
-            time.Hitstop().Request({.channel = HitstopChannel::Player, .durationSec = 0.040});
-        }
-        if (frameInput.Pressed(GameAction::Dash) || frameInput.Pressed(GameAction::Sprint)) {
-            player.isDashing = true;
-            player.actionTimer = 0.20;
-        }
-
-        // [SIMULATION] Deterministic Fixed Timestep 120Hz Loop
-        while (time.ConsumeTick()) {
-            TickInput tickInput = input.CutTick();
-            const double dt = time.PlayerTime().GetScaledDt();
-            if (dt > 0.0) {
-                const float dtFloat = static_cast<float>(dt);
-                player.prevPosition = player.position;
-
-                // Virtual Axes: 0 = MoveX (A/D), 1 = MoveY (W/S)
-                Vec2 moveDir{tickInput.Axis(0), tickInput.Axis(1)};
-                const float lenSq = moveDir.LengthSquared();
-                if (lenSq > 1.0f) {
-                    moveDir = moveDir.Normalized();
-                }
-
-                const float currentSpeed = player.speed * (player.isDashing ? 2.2f : 1.0f);
-                if (lenSq > 0.0001f) {
-                    player.velocity = moveDir * currentSpeed;
-                } else if (!player.isDashing) {
-                    player.velocity = player.velocity * std::max(0.0f, 1.0f - 12.0f * dtFloat);
-                }
-
-                player.position += player.velocity * dtFloat;
-
-                if (player.actionTimer > 0.0) {
-                    player.actionTimer -= dt;
-                    if (player.actionTimer <= 0.0) {
-                        player.isAttacking = false;
-                        player.isDashing = false;
-                    }
-                }
-
-                // Arena boundary constraints (40px margin)
-                constexpr float kMargin = 40.0f;
-                const float minX = kMargin;
-                const float maxX = static_cast<float>(config.windowWidth) - kMargin - player.size.x;
-                const float minY = kMargin;
-                const float maxY = static_cast<float>(config.windowHeight) - kMargin - player.size.y;
-                player.position.x = std::clamp(player.position.x, minX, maxX);
-                player.position.y = std::clamp(player.position.y, minY, maxY);
-            }
-            time.EndTick();
-        }
-
-        // [RENDER] Variable Rate Presentation with Sub-frame Interpolation Alpha
-        time.EndFrame();
-        const double alpha = time.GetAlpha();
-
-        auto& slot = arena.CurrentSlot();
-        slot.Reset();
-
-        // Configure Primary RenderPass and ViewSlot
-        (void)slot.PushPass(RenderPassDesc{
-            .pass = RenderPass::Scene,
-            .enabled = true,
-            .clearColor = Color::FromRGBA8(18, 18, 24, 255)
-        });
-        (void)slot.PushViewSlot(ViewSlotDesc{
-            .viewport = {0.0f, 0.0f, static_cast<f32>(config.windowWidth), static_cast<f32>(config.windowHeight)}
-        });
-
-        // Compute visually interpolated position
-        const Vec2 visualPos = useInterpolation
-            ? Lerp(player.prevPosition, player.position, static_cast<float>(alpha))
-            : player.position;
-
-        // 1. Arena Background
-        QuadInstance bgQuad{};
-        bgQuad.pos[0] = static_cast<f32>(config.windowWidth) * 0.5f;
-        bgQuad.pos[1] = static_cast<f32>(config.windowHeight) * 0.5f;
-        bgQuad.size[0] = static_cast<f32>(config.windowWidth) - 80.0f;
-        bgQuad.size[1] = static_cast<f32>(config.windowHeight) - 80.0f;
-        bgQuad.SetColor(Color::FromRGBA8(30, 33, 44, 255));
-        (void)slot.PushQuad(bgQuad, SortKey{SortKey::Pack(0, 0, 10, static_cast<u8>(BlendMode::Opaque), 0, 0)}, 0);
-
-        // 2. Dash Motion Ghost (Additive VFX)
-        if (player.isDashing) {
-            QuadInstance trailQuad{};
-            const Vec2 trailPos = visualPos - (player.velocity * 0.035f);
-            trailQuad.pos[0] = trailPos.x + player.size.x * 0.5f;
-            trailQuad.pos[1] = trailPos.y + player.size.y * 0.5f;
-            trailQuad.size[0] = player.size.x * 1.15f;
-            trailQuad.size[1] = player.size.y * 1.15f;
-            trailQuad.SetColor(Color{0.7f, 0.4f, 1.0f, 0.45f});
-            (void)slot.PushQuad(trailQuad, SortKey{SortKey::Pack(0, 0, 40, static_cast<u8>(BlendMode::Additive), 0, 0)}, 0);
-        }
-
-        // 3. Player Sprite Quad (State-reactive coloring)
-        Color playerColor = Color::FromRGBA8(92, 224, 153, 255); // Green: Normal
-        if (time.Hitstop().IsFrozen(HitstopChannel::Player)) {
-            playerColor = Color::FromRGBA8(255, 90, 95, 255);    // Red: Hitstop Freeze
-        } else if (player.isAttacking) {
-            playerColor = Color::FromRGBA8(255, 215, 0, 255);   // Gold: Attack
-        } else if (player.isDashing) {
-            playerColor = Color::FromRGBA8(180, 100, 255, 255); // Purple: Dash
-        } else if (bulletTime) {
-            playerColor = Color::FromRGBA8(100, 220, 255, 255); // Cyan: Bullet Time
-        }
-
-        QuadInstance playerQuad{};
-        playerQuad.pos[0] = visualPos.x + player.size.x * 0.5f;
-        playerQuad.pos[1] = visualPos.y + player.size.y * 0.5f;
-        playerQuad.size[0] = player.size.x;
-        playerQuad.size[1] = player.size.y;
-        playerQuad.SetColor(playerColor);
-        (void)slot.PushQuad(playerQuad, SortKey{SortKey::Pack(0, 0, 50, static_cast<u8>(BlendMode::Premultiplied), 0, 0)}, 0);
-
-        // 4. Attack Slash Effect
-        if (player.isAttacking) {
-            QuadInstance attackQuad{};
-            attackQuad.pos[0] = visualPos.x + player.size.x * 0.5f + 36.0f;
-            attackQuad.pos[1] = visualPos.y + player.size.y * 0.5f;
-            attackQuad.size[0] = 32.0f;
-            attackQuad.size[1] = 48.0f;
-            attackQuad.SetColor(Color{1.0f, 0.85f, 0.1f, 0.75f});
-            (void)slot.PushQuad(attackQuad, SortKey{SortKey::Pack(0, 0, 60, static_cast<u8>(BlendMode::Additive), 0, 0)}, 0);
-        }
-
-        // Finalize batches via Radix Sort and State Coalescence
-        batcher.Finalize(slot, packet);
-
-        // Hardware submission of FramePacket & swapchain present
-        (void)device.Submit(packet);
-
-        arena.AdvanceSlot();
-
-        // 1-second interval diagnostics telemetry
-        framesThisSec++;
-        const std::uint64_t nowNs = SDL_GetTicksNS();
-        if (nowNs - lastTelemetryNs >= 1'000'000'000ULL) {
-            const double fps = static_cast<double>(framesThisSec) * 1'000'000'000.0 /
-                               static_cast<double>(nowNs - lastTelemetryNs);
-            LOG_INFO("FPS: {:.1f} | Frame: {:.2f} ms | Sim Ticks: {} | Batches: {} | Quads: {}",
-                fps,
-                time.GetLastRawDeltaMs(),
-                time.GetSimTickCount(),
-                packet.batches.size(),
-                packet.instances.size()
-            );
-            framesThisSec = 0;
-            lastTelemetryNs = nowNs;
-        }
-
-        // Frame Pacer wait (for targeted framerates)
-        time.Pacer().WaitForTarget();
+    // 4. Asset Subsystem
+    AssetManager assets;
+    auto assetRes = assets.Init(device, {.textureCapacity = 128});
+    if (!assetRes) {
+        LOG_FATAL("AssetManager initialization failed: {}", assetRes.Error().message);
+        return -1;
     }
 
-    // Clean shutdown
+    // 5. Input Subsystem
+    InputSystem input;
+
+    // 6. Deterministic 120Hz Time Manager
+    TimeManager time;
+    time.Init({.maxCatchupTicks = 8});
+
+    // 7. Render Subsystems
+    FrameArena arena;
+    RenderQueue queue{arena.CurrentSlot()};
+    Batcher batcher;
+    Presenter presenter;
+    SimEvents events;
+
+    EngineContext ctx{
+        .platform  = &platform,
+        .window    = &window,
+        .input     = &input,
+        .time      = &time,
+        .assets    = &assets,
+        .arena     = &arena.CurrentSlot(),
+        .queue     = &queue,
+        .batcher   = &batcher,
+        .backend   = &device,
+        .presenter = &presenter,
+        .events    = &events
+    };
+
+    DemoGame game{ctx};
+    if (auto r = game.Init(); !r) {
+        LOG_FATAL("Game initialization failed: {}", r.Error().message);
+        return -1;
+    }
+
+    LOG_INFO("EngineN initialized successfully at 120Hz deterministic simulation.");
+
+    // Primary 14-Step Frame Execution Loop
+    while (!platform.WasQuitRequested()) {
+        if (auto r = RunFrame(ctx, game); !r) {
+            LOG_FATAL("Frame execution aborted: {}", r.Error().message);
+            break;
+        }
+    }
+
+    // Reverse-order teardown
+    game.Shutdown();
+    assets.Shutdown();
     device.Shutdown();
-    window.Destroy();
     platform.Shutdown();
 
     return 0;

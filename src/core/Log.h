@@ -22,7 +22,8 @@ enum class LogCategory : u8 {
     Physics,
     Render,
     Audio,
-    Gameplay
+    Gameplay,
+    Asset
 };
 
 struct LogRecord {

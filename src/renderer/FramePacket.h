@@ -28,6 +28,7 @@ struct DrawBatch {
  * ViewSlotDesc: Camera / layer view uniform pushed when viewSlot changes.
  */
 struct ViewSlotDesc {
+    ViewTransform2D view{};
     f32 viewProjection[16]{
         1.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 1.0f, 0.0f, 0.0f,
@@ -56,6 +57,8 @@ struct FrameStats {
     u32  sortEntryCount{0};
     u32  viewSlotCount{0};
     u32  droppedInstances{0};
+    u32  droppedBatches{0};
+    u32  droppedEntries{0};
     bool wasSorted{false};
 };
 
