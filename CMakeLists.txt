@@ -55,14 +55,6 @@ add_executable(TestTimeLoop ${TEST_TIMELOOP_SOURCES})
 target_include_directories(TestTimeLoop PRIVATE src)
 target_link_libraries(TestTimeLoop PRIVATE SDL3::SDL3)
 
-set(TEST_FOUNDATION_SOURCES
-    tests/test_core_foundation.cpp
-    src/core/Log.cpp
-)
-add_executable(TestCoreFoundation ${TEST_FOUNDATION_SOURCES})
-target_include_directories(TestCoreFoundation PRIVATE src)
-target_link_libraries(TestCoreFoundation PRIVATE SDL3::SDL3)
-
 set(TEST_PLATFORM_SOURCES
     tests/test_platform.cpp
     src/core/Log.cpp

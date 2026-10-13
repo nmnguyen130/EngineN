@@ -12,19 +12,20 @@ union SDL_Event;
 namespace EngineN {
 
 /**
- * Ring buffer queue for timestamped action transitions.
- * Strictly bounded and pre-allocated to guarantee zero heap allocations.
+ * FixedRingQueue: Bounded ring buffer for timestamped transitions.
+ * Pre-allocated with zero heap allocation.
  */
 template <typename T, usize Capacity>
 class FixedRingQueue {
+    static_assert(Capacity >= 2, "ring must hold at least one down/up pair");
+
 public:
     [[nodiscard]] constexpr bool Empty() const noexcept { return m_count == 0; }
     [[nodiscard]] constexpr bool Full() const noexcept { return m_count == Capacity; }
 
     [[nodiscard]] const T& Front() const noexcept { return m_data[m_head]; }
     [[nodiscard]] const T& Back() const noexcept {
-        const usize tail = (m_head + m_count - 1 + Capacity) % Capacity;
-        return m_data[tail];
+        return m_data[(m_head + m_count - 1) % Capacity];
     }
 
     T Pop() noexcept {
@@ -34,17 +35,25 @@ public:
         return val;
     }
 
-    void Push(const T& val) noexcept {
-        const usize tail = (m_head + m_count) % Capacity;
-        m_data[tail] = val;
+    bool Push(const T& val) noexcept {
+        const bool dropped = Full();
+        if (dropped) {
+            DropOldestPair();
+        }
+        m_data[(m_head + m_count) % Capacity] = val;
         ++m_count;
+        return dropped;
     }
 
     void DropOldestPair() noexcept {
-        if (m_count >= 2) {
-            m_head = (m_head + 2) % Capacity;
-            m_count -= 2;
-        }
+        const usize drop = (m_count >= 2) ? 2 : m_count;
+        m_head = (m_head + drop) % Capacity;
+        m_count -= drop;
+    }
+
+    void Clear() noexcept {
+        m_head = 0;
+        m_count = 0;
     }
 
 private:
@@ -53,130 +62,146 @@ private:
     usize m_count = 0;
 };
 
-struct Transition {
-    u64 tsNs = 0;
-    bool down = false;
-};
-
-struct ContextLayer {
-    ContextId context = 0;
-    bool consumes = true;
-};
-
 /**
- * Central Input Subsystem Facade (EngineN::InputSystem / EngineN::Input).
- * Owns bindings, device states, context stack, transition slicing, and frame snapshots.
+ * InputSystem: Central facade owning bindings, device states, context stack, and frame snapshots.
+ * Single-threaded: Ingest, CutTick, PublishFrameInput, and bindings must run on the same thread.
  */
 class InputSystem {
 public:
     InputSystem() noexcept;
 
-    // Direct event ingestion from SDL event pump
     void Ingest(const SDL_Event& event) noexcept;
-    void ProcessEvent(const SDL_Event& event) noexcept { Ingest(event); }
 
-    // Simulation tick cutting at fixed boundary (120Hz)
+    // Simulation tick slicing
     [[nodiscard]] TickInput CutTick() noexcept;
-    [[nodiscard]] TickInput CutTick(u64 tickIndex) noexcept;
     [[nodiscard]] TickInput CutTick(u64 tickIndex, u64 boundaryNs) noexcept;
 
-    // Spiral-of-death catch-up coalescing
+    // Fast-forwards simulation to newBoundaryNs without emitting frame events.
     void Coalesce(u64 newBoundaryNs) noexcept;
 
-    // Render frame input snapshot publisher
+    // Frame snapshots
     [[nodiscard]] const FrameInput& PublishFrameInput() noexcept;
-    [[nodiscard]] const FrameInput& GetCurrentFrameInput() const noexcept { return m_frameInput; }
+    [[nodiscard]] const FrameInput& GetCurrentFrameInput() const noexcept { return m_publishedFrame; }
 
-    // Context management stack
-    [[nodiscard]] Result<void, InputError> PushContext(ContextId ctx, bool consumes = true) noexcept;
-    [[nodiscard]] Result<void, InputError> PopContext() noexcept;
-    [[nodiscard]] ContextId GetActiveContext() const noexcept;
-
-    template <typename EContext>
-    requires std::is_enum_v<EContext>
-    [[nodiscard]] Result<void, InputError> PushContext(EContext ctx, bool consumes = true) noexcept {
-        return PushContext(static_cast<ContextId>(ctx), consumes);
+    // Context stack
+    template <typename C = ContextId>
+    [[nodiscard]] Result<void, InputError> PushContext(C ctx, bool consumes = true) noexcept {
+        return PushContextImpl(static_cast<ContextId>(ctx), consumes);
     }
 
-    // Direct access to binding tables
+    [[nodiscard]] Result<void, InputError> PopContext() noexcept;
+
+    template <typename C = ContextId>
+    [[nodiscard]] C GetActiveContext() const noexcept {
+        return static_cast<C>((m_contextStackDepth == 0) ? 0 : m_contextStack[m_contextStackDepth - 1].context);
+    }
+
+    // Bindings
     [[nodiscard]] const InputBindings& GetBindings() const noexcept { return m_bindings; }
     [[nodiscard]] InputBindings& GetBindings() noexcept { return m_bindings; }
 
-    // Resynchronize actions after focus change or rebind
-    void ResyncActionStates(u64 nowNs) noexcept;
+    // Re-evaluates all held actions against current bindings and context stack.
+    void ResyncActionStates(u64 nowNs = 0) noexcept;
 
-    // Diagnostic queries
+    // Diagnostics
     [[nodiscard]] u32 GetDroppedTransitionsCount() const noexcept { return m_droppedTransitions; }
     [[nodiscard]] bool IsSourcePhysicallyDown(Source src) const noexcept;
 
 private:
+    static constexpr usize kMaxGamepads = 4;
+
+    struct Transition {
+        u64 tsNs = 0;
+        bool down = false;
+    };
+
+    struct ContextLayer {
+        ContextId context = 0;
+        bool consumes = true;
+    };
+
+    struct GamepadDevice {
+        static constexpr usize kMaxAxes = 6; // SDL axis count
+
+        u32 instanceId = 0;
+        bool connected = false;
+        u32 buttonsDown = 0;
+        std::array<i16, kMaxAxes> axes{};
+    };
+
+    [[nodiscard]] Result<void, InputError> PushContextImpl(ContextId ctx, bool consumes) noexcept;
+
+    // Raw device state
+    void SetButton(Source src, bool down, u64 tsNs) noexcept;
+    [[nodiscard]] usize FindGamepad(u32 instanceId) const noexcept;
+    [[nodiscard]] usize FindOrCreateGamepad(u32 instanceId) noexcept;
+    void RemoveGamepad(u32 instanceId, u64 tsNs) noexcept;
+    void ReleaseAll(u64 tsNs) noexcept;
+
+    // Contexts and routing
     [[nodiscard]] bool IsContextActive(ContextId ctx) const noexcept;
-    void RouteSource(Source src, bool down, u64 timestampNs) noexcept;
-    void RecordFrameEvent(u64 timestampNs, ActionId action, Edge edge, bool synthetic) noexcept;
-    void PushTransition(ActionId action, u64 timestampNs, bool down) noexcept;
+    [[nodiscard]] bool ActionHasActiveSource(ActionId action) const noexcept;
+    void RouteSource(Source src, bool down, u64 tsNs) noexcept;
+    [[nodiscard]] bool RouteInContext(ContextId ctx, Source src, bool down, u64 tsNs) noexcept;
+    void SyncBindings() noexcept;
+
+    // Action state ledgers
+    void SetAction(ActionId action, bool down, u64 tsNs, bool synthetic) noexcept;
+    void PushTransition(ActionId action, u64 tsNs, bool down) noexcept;
+    void Drain(u64 boundaryNs, u32& pressed, u32& released) noexcept;
+
+    // Axis evaluation
+    void ResolveContextAxes(ContextId ctx, u32& resolved, std::array<i16, kMaxAxes>& out) const noexcept;
+    [[nodiscard]] std::array<i16, kMaxAxes> ResolveAxes() const noexcept;
+    [[nodiscard]] f32 EvaluateAxis(const AxisBinding& b) const noexcept;
 
     InputBindings m_bindings{};
+    u32 m_seenRevision = 0;
 
     std::array<ContextLayer, kMaxContexts> m_contextStack{};
     usize m_contextStackDepth = 0;
 
-    // Physical device states and latch masks to prevent synthetic edges
-    std::array<bool, kMaxKeyboardKeys> m_keysDown{};
-    std::array<bool, kMaxKeyboardKeys> m_keysLatched{};
-    std::array<bool, kMaxMouseButtons> m_mouseDown{};
-    std::array<bool, kMaxMouseButtons> m_mouseLatched{};
-    std::array<bool, kMaxGamepadButtons> m_gamepadDown{};
-    std::array<bool, kMaxGamepadButtons> m_gamepadLatched{};
+    std::array<bool, Source::kMaxScancodes> m_keysDown{};
+    std::array<bool, Source::kMaxMouseButtons> m_mouseDown{};
+    std::array<GamepadDevice, kMaxGamepads> m_gamepads{};
+    std::array<i8, kMaxAxes> m_lastAxisDir{};
 
-    // TakeNewer digital axis timestamps
-    std::array<u64, kMaxAxes> m_lastNegTs{};
-    std::array<u64, kMaxAxes> m_lastPosTs{};
-
-    // Per-action transition queues
     std::array<FixedRingQueue<Transition, 8>, kMaxActions> m_queues{};
     u32 m_droppedTransitions = 0;
 
-    // Simulation tick state
     u32 m_simHeld = 0;
     std::array<u16, kMaxActions> m_simHeldTicks{};
     u64 m_autoTickIndex = 0;
     u64 m_autoBoundaryNs = 0;
 
-    // Frame state
-    FrameInput m_frameInput{};
-    u32 m_frameHeld = 0;
-    u32 m_framePressed = 0;
-    u32 m_frameReleased = 0;
-    Vec2 m_currentMousePos{0.0f, 0.0f};
-    Vec2 m_accumMouseDelta{0.0f, 0.0f};
-    Vec2 m_accumMouseWheel{0.0f, 0.0f};
-    u64 m_frameIndex = 0;
+    FrameInput m_publishedFrame{};
+    FrameInput m_accumFrame{};
 };
 
 /**
- * RAII helper for scoped context activation.
+ * ScopedContext: RAII helper for scoped context activation.
+ * Automatically pops on destruction if activation succeeded.
  */
 class ScopedContext {
 public:
-    ScopedContext(InputSystem& input, ContextId ctx, bool consumes = true) noexcept
-        : m_input(input) {
-        (void)m_input.PushContext(ctx, consumes);
-    }
-
-    template <typename EContext>
-    requires std::is_enum_v<EContext>
-    ScopedContext(InputSystem& input, EContext ctx, bool consumes = true) noexcept
-        : ScopedContext(input, static_cast<ContextId>(ctx), consumes) {}
+    template <typename C = ContextId>
+    ScopedContext(InputSystem& input, C ctx, bool consumes = true) noexcept
+        : m_input(input), m_active(input.PushContext(ctx, consumes).HasValue()) {}
 
     ~ScopedContext() noexcept {
-        (void)m_input.PopContext();
+        if (m_active) {
+            (void)m_input.PopContext();
+        }
     }
+
+    [[nodiscard]] bool IsActive() const noexcept { return m_active; }
 
     ScopedContext(const ScopedContext&) = delete;
     ScopedContext& operator=(const ScopedContext&) = delete;
 
 private:
     InputSystem& m_input;
+    bool m_active = false;
 };
 
 } // namespace EngineN

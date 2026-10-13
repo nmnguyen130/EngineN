@@ -6,7 +6,6 @@
 #include <array>
 #include <cmath>
 #include <span>
-#include <type_traits>
 
 namespace EngineN {
 
@@ -14,14 +13,9 @@ using ActionId = u8;
 using AxisId = u8;
 using ContextId = u8;
 
-constexpr usize kMaxActions = 16;
-constexpr usize kMaxAxes = 4;
-constexpr usize kMaxContexts = 4;
-constexpr u16 kMaxKeyboardKeys = 512;
-constexpr u16 kMaxMouseButtons = 8;
-constexpr u16 kMaxGamepadButtons = 32;
-constexpr u32 kMaxFrameLogEvents = 64;
-constexpr u64 kDefaultTickDurationNs = 8'333'333ULL;
+inline constexpr usize kMaxActions = 16;
+inline constexpr usize kMaxAxes = 4;
+inline constexpr usize kMaxContexts = 4; // Context stack depth
 
 enum class Device : u8 {
     None = 0,
@@ -39,51 +33,72 @@ enum class InputError : u8 {
     InvalidSource = 0,
     TableFull,
     Duplicate,
-    ContextStackFull,
-    ContextStackEmpty,
-    NotFound
+    NotFound,
+    StackFull,
+    StackEmpty,
+    InvalidParam
+};
+
+enum class GamepadAxis : u8 {
+    None = 0,
+    LeftX,
+    LeftY,
+    RightX,
+    RightY,
+    LeftTrigger,
+    RightTrigger
 };
 
 /**
  * Validated physical input source across all device types.
- * Strictly range-checked to prevent out-of-bounds reads on state arrays.
+ * Gamepad bindings can target a specific instance ID or kAnyGamepad.
  */
 struct Source {
+    static constexpr u32 kAnyGamepad = ~0u;
+    static constexpr u16 kMaxScancodes = 512;
+    static constexpr u16 kMaxMouseButtons = 8;
+    static constexpr u16 kMaxGamepadButtons = 32;
+
     Device device = Device::None;
-    u16 code = 0;
+    u16    code   = 0;
+    u32    gamepad = kAnyGamepad;
 
     [[nodiscard]] constexpr bool IsValid() const noexcept {
         switch (device) {
-            case Device::Keyboard:
-                return code > 0 && code < kMaxKeyboardKeys;
-            case Device::Mouse:
-                return code >= 1 && code < kMaxMouseButtons;
-            case Device::Gamepad:
-                return code < kMaxGamepadButtons;
-            default:
-                return false;
+            case Device::Keyboard: return code > 0 && code < kMaxScancodes;
+            case Device::Mouse:    return code > 0 && code < kMaxMouseButtons;
+            case Device::Gamepad:  return code < kMaxGamepadButtons;
+            default:               return false;
         }
     }
 
-    [[nodiscard]] constexpr bool operator==(const Source& other) const noexcept = default;
+    [[nodiscard]] constexpr bool Matches(const Source& physical) const noexcept {
+        if (device != physical.device || code != physical.code) {
+            return false;
+        }
+        return device != Device::Gamepad || gamepad == kAnyGamepad || gamepad == physical.gamepad;
+    }
+
+    [[nodiscard]] constexpr bool operator==(const Source&) const noexcept = default;
 };
 
-inline constexpr f32 ApplyAxialDeadzone(f32 value, f32 deadzone) noexcept {
-    const f32 absVal = std::abs(value);
-    if (absVal <= deadzone) {
+[[nodiscard]] inline f32 ApplyAxialDeadzone(f32 value, f32 deadzone) noexcept {
+    if (!std::isfinite(value)) {
         return 0.0f;
     }
-    const f32 sign = (value > 0.0f) ? 1.0f : -1.0f;
-    return sign * (absVal - deadzone) / (1.0f - deadzone);
+    deadzone = std::clamp(deadzone, 0.0f, 0.99f);
+    value = std::clamp(value, -1.0f, 1.0f);
+    const f32 mag = std::abs(value);
+    if (mag <= deadzone) {
+        return 0.0f;
+    }
+    return std::copysign((mag - deadzone) / (1.0f - deadzone), value);
 }
 
-inline Vec2 ApplyRadialDeadzone(Vec2 input, f32 deadzone) noexcept {
-    const f32 mag = input.Length();
-    if (mag <= deadzone) {
-        return Vec2{0.0f, 0.0f};
+namespace detail {
+    [[nodiscard]] constexpr bool IsBitSet(u32 mask, usize bit) noexcept {
+        return bit < kMaxActions && ((mask >> bit) & 1u) != 0;
     }
-    const f32 normMag = std::min(1.0f, (mag - deadzone) / (1.0f - deadzone));
-    return (input / mag) * normMag;
 }
 
 /**
@@ -95,54 +110,46 @@ struct TickInput {
     u32 held = 0;
     u32 pressed = 0;
     u32 released = 0;
-    i16 axis[kMaxAxes]{};
-    u16 heldTicks[kMaxActions]{};
+    std::array<i16, kMaxAxes> axis{};
+    std::array<u16, kMaxActions> heldTicks{};
 
-    [[nodiscard]] constexpr bool Held(ActionId a) const noexcept {
-        return a < kMaxActions && ((held & (1u << a)) != 0);
-    }
-    [[nodiscard]] constexpr bool Pressed(ActionId a) const noexcept {
-        return a < kMaxActions && ((pressed & (1u << a)) != 0);
-    }
-    [[nodiscard]] constexpr bool Released(ActionId a) const noexcept {
-        return a < kMaxActions && ((released & (1u << a)) != 0);
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Held(A a) const noexcept {
+        return detail::IsBitSet(held, static_cast<usize>(a));
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Held(E a) const noexcept {
-        return Held(static_cast<ActionId>(a));
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Pressed(A a) const noexcept {
+        return detail::IsBitSet(pressed, static_cast<usize>(a));
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Pressed(E a) const noexcept {
-        return Pressed(static_cast<ActionId>(a));
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Released(A a) const noexcept {
+        return detail::IsBitSet(released, static_cast<usize>(a));
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Released(E a) const noexcept {
-        return Released(static_cast<ActionId>(a));
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr u16 HeldTicks(A a) const noexcept {
+        const usize idx = static_cast<usize>(a);
+        return (idx < kMaxActions) ? heldTicks[idx] : 0;
     }
 
-    [[nodiscard]] constexpr f32 Axis(AxisId a) const noexcept {
-        return (a < kMaxAxes) ? (static_cast<f32>(axis[a]) / 32767.0f) : 0.0f;
+    template <typename A = AxisId>
+    [[nodiscard]] constexpr f32 Axis(A a) const noexcept {
+        const usize ax = static_cast<usize>(a);
+        if (ax >= kMaxAxes) {
+            return 0.0f;
+        }
+        return std::clamp(static_cast<f32>(axis[ax]) / 32767.0f, -1.0f, 1.0f);
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr f32 Axis(E a) const noexcept {
-        return Axis(static_cast<AxisId>(a));
-    }
-
-    [[nodiscard]] Vec2 Stick(AxisId axisX, AxisId axisY) const noexcept {
+    template <typename X = AxisId, typename Y = AxisId>
+    [[nodiscard]] constexpr Vec2 Stick(X axisX, Y axisY) const noexcept {
         return Vec2{Axis(axisX), Axis(axisY)};
     }
 };
 
-static_assert(std::is_trivially_copyable_v<TickInput>);
-static_assert(sizeof(TickInput) <= 64, "TickInput must fit in a 64-byte cache line");
+static_assert(sizeof(TickInput) <= 64, "TickInput must stay within 64 bytes");
 
 /**
  * Diagnostic or UI action transition record within a single render frame.
@@ -156,9 +163,11 @@ struct ActionEvent {
 
 /**
  * Immutable per-frame input snapshot consumed by UI, cursor, and dev tools.
- * Populated at the end of Platform::Pump without interfering with simulation queues.
+ * Snapshot contents remain valid until the next PublishFrameInput() call.
  */
 struct FrameInput {
+    static constexpr usize kMaxEvents = 64;
+
     u64 frameIndex = 0;
     u64 timestampNs = 0;
     u32 held = 0;
@@ -167,40 +176,27 @@ struct FrameInput {
     Vec2 mousePosition{0.0f, 0.0f};
     Vec2 mouseDelta{0.0f, 0.0f};
     Vec2 mouseWheel{0.0f, 0.0f};
-    std::array<ActionEvent, kMaxFrameLogEvents> events{};
+    std::array<ActionEvent, kMaxEvents> events{};
     u32 eventCount = 0;
     u32 droppedEvents = 0;
 
     [[nodiscard]] std::span<const ActionEvent> Events() const noexcept {
-        return std::span<const ActionEvent>(events.data(), eventCount);
+        return {events.data(), std::min<usize>(eventCount, events.size())};
     }
 
-    [[nodiscard]] constexpr bool Held(ActionId a) const noexcept {
-        return a < kMaxActions && ((held & (1u << a)) != 0);
-    }
-    [[nodiscard]] constexpr bool Pressed(ActionId a) const noexcept {
-        return a < kMaxActions && ((pressed & (1u << a)) != 0);
-    }
-    [[nodiscard]] constexpr bool Released(ActionId a) const noexcept {
-        return a < kMaxActions && ((released & (1u << a)) != 0);
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Held(A a) const noexcept {
+        return detail::IsBitSet(held, static_cast<usize>(a));
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Held(E a) const noexcept {
-        return Held(static_cast<ActionId>(a));
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Pressed(A a) const noexcept {
+        return detail::IsBitSet(pressed, static_cast<usize>(a));
     }
 
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Pressed(E a) const noexcept {
-        return Pressed(static_cast<ActionId>(a));
-    }
-
-    template <typename E>
-    requires std::is_enum_v<E>
-    [[nodiscard]] constexpr bool Released(E a) const noexcept {
-        return Released(static_cast<ActionId>(a));
+    template <typename A = ActionId>
+    [[nodiscard]] constexpr bool Released(A a) const noexcept {
+        return detail::IsBitSet(released, static_cast<usize>(a));
     }
 };
 

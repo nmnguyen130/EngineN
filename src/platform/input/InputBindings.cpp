@@ -1,124 +1,137 @@
 #include "platform/input/InputBindings.h"
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_scancode.h>
+#include <cmath>
 
 namespace EngineN {
 
-Result<void, InputError> InputBindings::BindAction(ContextId ctx, Source src, ActionId action) noexcept {
-    if (!src.IsValid() || action >= kMaxActions) {
-        return Err(InputError::InvalidSource);
-    }
-
-    // Check duplicate binding
-    for (usize i = 0; i < m_actionBindingCount; ++i) {
-        const auto& b = m_actionBindings[i];
+Result<void, InputError> InputBindings::BindActionImpl(ContextId ctx, Source src, ActionId action) noexcept {
+    for (usize i = 0; i < m_actionCount; ++i) {
+        const auto& b = m_actions[i];
         if (b.context == ctx && b.source == src && b.action == action) {
             return Err(InputError::Duplicate);
         }
     }
 
-    if (m_actionBindingCount >= kMaxActionBindings) {
+    if (m_actionCount >= kMaxActionBindings) {
         return Err(InputError::TableFull);
     }
 
-    m_actionBindings[m_actionBindingCount++] = ActionBinding{
-        .context = ctx,
-        .source = src,
-        .action = action
-    };
+    m_actions[m_actionCount++] = {.source = src, .context = ctx, .action = action};
+    ++m_revision;
     return Ok;
 }
 
-Result<void, InputError> InputBindings::UnbindAction(ContextId ctx, Source src, ActionId action) noexcept {
-    for (usize i = 0; i < m_actionBindingCount; ++i) {
-        const auto& b = m_actionBindings[i];
+Result<void, InputError> InputBindings::UnbindActionImpl(ContextId ctx, Source src, ActionId action) noexcept {
+    for (usize i = 0; i < m_actionCount; ++i) {
+        const auto& b = m_actions[i];
         if (b.context == ctx && b.source == src && b.action == action) {
-            // Shift remaining elements to preserve order
-            for (usize j = i; j + 1 < m_actionBindingCount; ++j) {
-                m_actionBindings[j] = m_actionBindings[j + 1];
-            }
-            --m_actionBindingCount;
+            m_actions[i] = m_actions[--m_actionCount]; // swap-with-last; order not preserved
+            ++m_revision;
             return Ok;
         }
     }
     return Err(InputError::NotFound);
 }
 
-Result<void, InputError> InputBindings::BindAxis(ContextId ctx, Source neg, Source pos, AxisId axis) noexcept {
-    if (axis >= kMaxAxes) {
-        return Err(InputError::InvalidSource);
-    }
-
-    const bool negValid = neg.IsValid();
-    const bool posValid = pos.IsValid();
-    const bool negOk = (neg.device == Device::None) || negValid;
-    const bool posOk = (pos.device == Device::None) || posValid;
-
-    if (!negOk || !posOk || (!negValid && !posValid) || (negValid && posValid && neg == pos)) {
-        return Err(InputError::InvalidSource);
-    }
-
-    // Replace if binding for this context and axis already exists
-    for (usize i = 0; i < m_axisBindingCount; ++i) {
-        if (m_axisBindings[i].context == ctx && m_axisBindings[i].axis == axis) {
-            m_axisBindings[i].negativeSource = neg;
-            m_axisBindings[i].positiveSource = pos;
-            return Ok;
-        }
-    }
-
-    if (m_axisBindingCount >= kMaxAxisBindings) {
+Result<void, InputError> InputBindings::BindAxisImpl(ContextId ctx, Source neg, Source pos, AxisId axis) noexcept {
+    AxisBinding* b = AcquireAxis(ctx, axis);
+    if (!b) {
         return Err(InputError::TableFull);
     }
 
-    m_axisBindings[m_axisBindingCount++] = AxisBinding{
-        .context = ctx,
-        .negativeSource = neg,
-        .positiveSource = pos,
-        .axis = axis
-    };
+    b->negativeSource = neg;
+    b->positiveSource = pos;
+    ++m_revision;
     return Ok;
 }
 
-Result<void, InputError> InputBindings::UnbindAxis(ContextId ctx, AxisId axis) noexcept {
-    for (usize i = 0; i < m_axisBindingCount; ++i) {
-        if (m_axisBindings[i].context == ctx && m_axisBindings[i].axis == axis) {
-            for (usize j = i; j + 1 < m_axisBindingCount; ++j) {
-                m_axisBindings[j] = m_axisBindings[j + 1];
-            }
-            --m_axisBindingCount;
+Result<void, InputError> InputBindings::BindGamepadAxisImpl(
+    ContextId ctx,
+    GamepadAxis gpAxis,
+    AxisId targetAxis,
+    f32 deadzone,
+    f32 scale,
+    bool inverted,
+    u32 gamepad) noexcept {
+    const bool validDeadzone = std::isfinite(deadzone) && deadzone >= 0.0f && deadzone < 1.0f;
+    if (gpAxis > GamepadAxis::RightTrigger || !validDeadzone || !std::isfinite(scale)) {
+        return Err(InputError::InvalidParam);
+    }
+
+    AxisBinding* b = AcquireAxis(ctx, targetAxis);
+    if (!b) {
+        return Err(InputError::TableFull);
+    }
+
+    b->gamepadAxis = gpAxis;
+    b->gamepad     = gamepad;
+    b->deadzone    = deadzone;
+    b->scale       = scale;
+    b->inverted    = inverted;
+    ++m_revision;
+    return Ok;
+}
+
+Result<void, InputError> InputBindings::UnbindAxisImpl(ContextId ctx, AxisId axis) noexcept {
+    for (usize i = 0; i < m_axisCount; ++i) {
+        if (m_axes[i].context == ctx && m_axes[i].axis == axis) {
+            m_axes[i] = m_axes[--m_axisCount]; // swap-with-last; order not preserved
+            ++m_revision;
             return Ok;
         }
     }
     return Err(InputError::NotFound);
+}
+
+AxisBinding* InputBindings::AcquireAxis(ContextId ctx, AxisId axis) noexcept {
+    for (usize i = 0; i < m_axisCount; ++i) {
+        if (m_axes[i].context == ctx && m_axes[i].axis == axis) {
+            return &m_axes[i];
+        }
+    }
+
+    if (m_axisCount >= kMaxAxisBindings) {
+        return nullptr;
+    }
+
+    m_axes[m_axisCount] = {.context = ctx, .axis = axis};
+    return &m_axes[m_axisCount++];
 }
 
 void InputBindings::Clear() noexcept {
-    m_actionBindingCount = 0;
-    m_axisBindingCount = 0;
+    m_actionCount = 0;
+    m_axisCount   = 0;
+    ++m_revision;
 }
 
 void InputBindings::SetDefaultBindings() noexcept {
     Clear();
 
-    // Axis 0: MoveX (A / D, Left / Right)
+    // Context 0: Base Gameplay (Axes)
     (void)BindAxis(0, Source{Device::Keyboard, SDL_SCANCODE_A}, Source{Device::Keyboard, SDL_SCANCODE_D}, 0);
-    // Axis 1: MoveY (W / S, Up / Down)
     (void)BindAxis(0, Source{Device::Keyboard, SDL_SCANCODE_W}, Source{Device::Keyboard, SDL_SCANCODE_S}, 1);
+    (void)BindGamepadAxis(0, GamepadAxis::LeftX, 0, 0.15f);
+    (void)BindGamepadAxis(0, GamepadAxis::LeftY, 1, 0.15f);
 
-    // Action 0: Primary Action (Space / Gamepad A)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_SPACE}, 0);
-    // Action 1: Secondary Action (J / Mouse Left)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_J}, 1);
-    (void)BindAction(0, Source{Device::Mouse, 1}, 1);
-    // Action 2: Tertiary Action (K / Mouse Right)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_K}, 2);
-    (void)BindAction(0, Source{Device::Mouse, 3}, 2);
-    // Action 3: Dash / Sprint (Left Shift)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_LSHIFT}, 3);
-    // Action 4: Menu / Pause (Escape)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_ESCAPE}, 4);
-    // Action 5: Confirm (Return)
-    (void)BindAction(0, Source{Device::Keyboard, SDL_SCANCODE_RETURN}, 5);
+    // Context 0: Base Gameplay (Actions)
+    static constexpr ActionBinding kDefaults[] = {
+        {.source = {Device::Keyboard, SDL_SCANCODE_SPACE},                .context = 0, .action = 0},
+        {.source = {Device::Gamepad,  SDL_GAMEPAD_BUTTON_SOUTH},          .context = 0, .action = 0},
+        {.source = {Device::Keyboard, SDL_SCANCODE_J},                    .context = 0, .action = 1},
+        {.source = {Device::Mouse,    1},                                 .context = 0, .action = 1},
+        {.source = {Device::Gamepad,  SDL_GAMEPAD_BUTTON_WEST},           .context = 0, .action = 1},
+        {.source = {Device::Keyboard, SDL_SCANCODE_K},                    .context = 0, .action = 2},
+        {.source = {Device::Mouse,    3},                                 .context = 0, .action = 2},
+        {.source = {Device::Gamepad,  SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, .context = 0, .action = 2},
+        {.source = {Device::Keyboard, SDL_SCANCODE_LSHIFT},               .context = 0, .action = 3},
+        {.source = {Device::Keyboard, SDL_SCANCODE_ESCAPE},               .context = 0, .action = 4},
+        {.source = {Device::Keyboard, SDL_SCANCODE_RETURN},               .context = 0, .action = 5},
+    };
+
+    for (const auto& d : kDefaults) {
+        (void)BindAction(d.context, d.source, d.action);
+    }
 }
 
 } // namespace EngineN
