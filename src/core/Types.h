@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace EngineN {
+namespace en {
 
 // Fixed-width integer types
 using u8  = std::uint8_t;
@@ -23,9 +23,5 @@ using isize = std::ptrdiff_t;
 using f32 = float;
 using f64 = double;
 
-// Memory size user-defined literals
-constexpr usize operator""_KB(unsigned long long val) noexcept { return static_cast<usize>(val * 1024ULL); }
-constexpr usize operator""_MB(unsigned long long val) noexcept { return static_cast<usize>(val * 1024ULL * 1024ULL); }
-constexpr usize operator""_GB(unsigned long long val) noexcept { return static_cast<usize>(val * 1024ULL * 1024ULL * 1024ULL); }
+} // namespace en
 
-} // namespace EngineN

@@ -2,7 +2,7 @@
 
 #include "core/time/ChannelModulator.h"
 
-namespace EngineN {
+namespace en::time {
 
 /**
  * SimStepView: Scoped view passed to simulation systems during a fixed 120Hz tick.
@@ -77,4 +77,4 @@ struct RenderTimeView {
     }
 };
 
-} // namespace EngineN
+} // namespace en::time

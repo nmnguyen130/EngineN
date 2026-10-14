@@ -1,153 +1,178 @@
 #pragma once
 
 #include "core/Types.h"
-#include <algorithm>
-#include <cmath>
 
-namespace EngineN {
+#include <span>
 
-/**
- * Normalized 32-bit float RGBA color with premultiplied alpha support.
- */
-struct Color {
-    f32 r{0.0f};
-    f32 g{0.0f};
-    f32 b{0.0f};
+namespace en::renderer {
+
+enum class RendererErrc : u8 {
+    DeviceInitFailed,
+    TextureCreateFailed,
+    TextureUpdateFailed,
+    InvalidHandle,
+    PoolExhausted,
+    InvalidDimension
+};
+
+// Generational handle for GPU textures managed by Renderer (Asset Sink).
+// Slot 0 (generation 1) is permanently bound to the built-in 1x1 opaque white texture.
+struct TextureHandle {
+    u16 index{0};
+    u16 generation{0};
+
+    [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0; }
+    constexpr bool operator==(const TextureHandle&) const noexcept = default;
+};
+
+inline constexpr TextureHandle kWhiteTexture{0, 1};
+
+enum class TextureFormat : u8 { RGBA8, BGRA8 };
+enum class TextureFilter : u8 { Nearest, Linear };
+enum class BlendMode : u8 { AlphaPMA = 0, Additive = 1, Multiply = 2, Opaque = 3 };
+enum class PresentMode : u8 { VSync, Immediate, Adaptive };
+
+// Descriptor passed by Asset Manager or procedural generators into Renderer::CreateTexture.
+struct TextureDesc {
+    u16 width{0};
+    u16 height{0};
+    TextureFormat format{TextureFormat::RGBA8};
+    TextureFilter filter{TextureFilter::Nearest};
+    std::span<const u8> pixels{};
+    u32 pitch{0};
+};
+
+// Premultiplied linear float color matching SDL_FColor binary layout (16 bytes).
+struct alignas(16) Color {
+    f32 r{1.0f};
+    f32 g{1.0f};
+    f32 b{1.0f};
     f32 a{1.0f};
 
-    constexpr Color() = default;
-    constexpr Color(f32 inR, f32 inG, f32 inB, f32 inA = 1.0f) noexcept
-        : r(inR), g(inG), b(inB), a(inA) {}
+    [[nodiscard]] static constexpr Color Premultiplied(f32 r, f32 g, f32 b, f32 a = 1.0f) noexcept {
+        return {r * a, g * a, b * a, a};
+    }
 
-    [[nodiscard]] static constexpr Color FromRGBA8(u8 inR, u8 inG, u8 inB, u8 inA = 255) noexcept {
-        constexpr f32 kInv255 = 1.0f / 255.0f;
+    [[nodiscard]] static constexpr Color FromRGBA8(u8 r, u8 g, u8 b, u8 a = 255) noexcept {
+        constexpr f32 kInv = 1.0f / 255.0f;
+        const f32 fa = static_cast<f32>(a) * kInv;
         return {
-            static_cast<f32>(inR) * kInv255,
-            static_cast<f32>(inG) * kInv255,
-            static_cast<f32>(inB) * kInv255,
-            static_cast<f32>(inA) * kInv255
+            static_cast<f32>(r) * kInv * fa,
+            static_cast<f32>(g) * kInv * fa,
+            static_cast<f32>(b) * kInv * fa,
+            fa
         };
     }
 
-    [[nodiscard]] constexpr u32 ToPremultipliedRGBA8() const noexcept {
-        const f32 clampedA = std::clamp(a, 0.0f, 1.0f);
-        const u32 pr = static_cast<u32>(std::clamp(r * clampedA, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pg = static_cast<u32>(std::clamp(g * clampedA, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pb = static_cast<u32>(std::clamp(b * clampedA, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pa = static_cast<u32>(clampedA * 255.0f + 0.5f);
-        return (pa << 24) | (pb << 16) | (pg << 8) | pr;
-    }
-
-    [[nodiscard]] constexpr u32 ToStraightRGBA8() const noexcept {
-        const u32 pr = static_cast<u32>(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pg = static_cast<u32>(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pb = static_cast<u32>(std::clamp(b, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const u32 pa = static_cast<u32>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f);
-        return (pa << 24) | (pb << 16) | (pg << 8) | pr;
-    }
+    constexpr bool operator==(const Color&) const noexcept = default;
 };
+static_assert(sizeof(Color) == 16);
 
 namespace Colors {
-    inline constexpr Color White{1.0f, 1.0f, 1.0f, 1.0f};
-    inline constexpr Color Black{0.0f, 0.0f, 0.0f, 1.0f};
-    inline constexpr Color Transparent{0.0f, 0.0f, 0.0f, 0.0f};
-    inline constexpr Color Red{1.0f, 0.0f, 0.0f, 1.0f};
-    inline constexpr Color Green{0.0f, 1.0f, 0.0f, 1.0f};
-    inline constexpr Color Blue{0.0f, 0.0f, 1.0f, 1.0f};
-    inline constexpr Color Yellow{1.0f, 1.0f, 0.0f, 1.0f};
+    inline constexpr Color White       = Color::Premultiplied(1.0f, 1.0f, 1.0f, 1.0f);
+    inline constexpr Color Black       = Color::Premultiplied(0.0f, 0.0f, 0.0f, 1.0f);
+    inline constexpr Color Transparent = Color::Premultiplied(0.0f, 0.0f, 0.0f, 0.0f);
+    inline constexpr Color Red         = Color::Premultiplied(1.0f, 0.0f, 0.0f, 1.0f);
+    inline constexpr Color Green       = Color::Premultiplied(0.0f, 1.0f, 0.0f, 1.0f);
+    inline constexpr Color Blue        = Color::Premultiplied(0.0f, 0.0f, 1.0f, 1.0f);
 }
 
-/**
- * 2D floating-point rectangle.
- */
 struct FRect {
     f32 x{0.0f};
     f32 y{0.0f};
     f32 w{0.0f};
     f32 h{0.0f};
 
-    constexpr FRect() = default;
-    constexpr FRect(f32 inX, f32 inY, f32 inW, f32 inH) noexcept
-        : x(inX), y(inY), w(inW), h(inH) {}
+    [[nodiscard]] constexpr bool IsEmpty() const noexcept { return w <= 0.0f || h <= 0.0f; }
+    constexpr bool operator==(const FRect&) const noexcept = default;
+};
 
-    [[nodiscard]] constexpr bool Contains(f32 px, f32 py) const noexcept {
-        return px >= x && px < (x + w) && py >= y && py < (y + h);
+// Binary-compatible with SDL_Vertex (32 bytes = 2 vertices per 64-byte cache line).
+struct alignas(16) Vertex2D {
+    f32 x{0.0f};
+    f32 y{0.0f};
+    Color color{};
+    f32 u{0.0f};
+    f32 v{0.0f};
+};
+static_assert(sizeof(Vertex2D) == 32);
+
+struct QuadCmd {
+    f32 x{0.0f};
+    f32 y{0.0f};
+    f32 w{0.0f};
+    f32 h{0.0f};
+    f32 cosRot{1.0f};
+    f32 sinRot{0.0f};
+    FRect uv{0.0f, 0.0f, 1.0f, 1.0f};
+    Color color{Colors::White};
+    TextureHandle texture{kWhiteTexture};
+    u16 depth{32768};
+    u8 passId{0};
+    u8 layer{0};
+    u8 viewSlot{0};
+    BlendMode blend{BlendMode::AlphaPMA};
+    bool flipX{false};
+    bool flipY{false};
+};
+
+// 64-bit self-contained sort key embedding the 16-bit quad index in bits [0..15].
+// Bit layout: [Pass:4][Layer:8][Depth:16][Blend:2][View:4][TextureIdx:14][QuadIdx:16]
+struct SortKey {
+    static constexpr u64 kBatchStateMask =
+        (0x0FULL << 60) |
+        (0x03ULL << 30) |
+        (0x0FULL << 26) |
+        (0x3FFFULL << 16);
+
+    [[nodiscard]] static constexpr u64 Pack(const QuadCmd& cmd, u16 quadIdx) noexcept {
+        return (static_cast<u64>(cmd.passId & 0x0Fu) << 60) |
+               (static_cast<u64>(cmd.layer) << 52) |
+               (static_cast<u64>(cmd.depth) << 36) |
+               (static_cast<u64>(static_cast<u8>(cmd.blend) & 0x03u) << 30) |
+               (static_cast<u64>(cmd.viewSlot & 0x0Fu) << 26) |
+               (static_cast<u64>(cmd.texture.index & 0x3FFFu) << 16) |
+               static_cast<u64>(quadIdx);
     }
 
-    [[nodiscard]] constexpr bool Intersects(const FRect& o) const noexcept {
-        return x < (o.x + o.w) && (x + w) > o.x && y < (o.y + o.h) && (y + h) > o.y;
-    }
+    [[nodiscard]] static constexpr u16 QuadIndex(u64 key) noexcept { return static_cast<u16>(key & 0xFFFFu); }
+    [[nodiscard]] static constexpr u16 TextureIndex(u64 key) noexcept { return static_cast<u16>((key >> 16) & 0x3FFFu); }
+    [[nodiscard]] static constexpr u8 ViewSlot(u64 key) noexcept { return static_cast<u8>((key >> 26) & 0x0Fu); }
+    [[nodiscard]] static constexpr BlendMode Blend(u64 key) noexcept { return static_cast<BlendMode>((key >> 30) & 0x03u); }
+    [[nodiscard]] static constexpr u8 PassId(u64 key) noexcept { return static_cast<u8>((key >> 60) & 0x0Fu); }
 };
 
-/**
- * Generational texture handle to safely invalidate recycled GPU descriptors.
- */
-struct TextureHandle {
-    u16 slot{0};
-    u16 generation{0};
-
-    [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0; }
-    [[nodiscard]] static constexpr TextureHandle Invalid() noexcept { return {0, 0}; }
-    [[nodiscard]] static constexpr TextureHandle White() noexcept { return {1, 1}; }
-
-    constexpr auto operator<=>(const TextureHandle&) const = default;
+struct DrawBatch {
+    u32 firstQuad{0};
+    u32 quadCount{0};
+    TextureHandle texture{kWhiteTexture};
+    u8 passId{0};
+    u8 viewSlot{0};
+    BlendMode blend{BlendMode::AlphaPMA};
 };
 
-enum class RenderPass : u8 {
-    Scene      = 0,
-    Distortion = 1,
-    Lights     = 2,
-    Bloom      = 3,
-    Composite  = 4,
-    Ui         = 5,
-    DevTools   = 6,
-    Count      = 7
-};
-
-enum class BlendMode : u8 {
-    Premultiplied = 0,
-    Additive      = 1,
-    Multiply      = 2,
-    Opaque        = 3,
-    Max           = 4,
-    Count         = 5
-};
-
-enum class PresentMode : u8 {
-    VSync     = 0, // FIFO
-    Immediate = 1, // Immediate uncapped
-    Mailbox   = 2  // Lowest latency uncapped without tearing
-};
-
-enum class ScaleMode : u8 {
-    Fit        = 0, // Letterbox preserving aspect ratio
-    IntegerFit = 1, // Pixel-perfect integer ratio letterbox
-    Cover      = 2  // Fill screen cropping excess
-};
-
-enum class PipelineKind : u16 {
-    Sprite    = 0,
-    SDFShape  = 1,
-    MSDFText  = 2,
-    Composite = 3,
-    Count     = 4
-};
-
-/**
- * Passive 2D view transformation consumed by the presentation layer.
- */
-struct ViewTransform2D {
-    f32 viewProjection[16]{
-        1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 1.0f
-    };
-    f32 viewport[4]{0.0f, 0.0f, 1280.0f, 720.0f};
+struct Camera2D {
+    f32 worldCenterX{0.0f};
+    f32 worldCenterY{0.0f};
     f32 zoom{1.0f};
-    f32 rotation{0.0f};
-    FRect visibleFrustumWorldBounds{0.0f, 0.0f, 1280.0f, 720.0f};
-    bool screenSpaceBypass{false};
+    FRect viewport{};
+    FRect scissor{};
+    bool screenSpace{false};
 };
 
-} // namespace EngineN
+struct RenderPassDesc {
+    Color clearColor{Colors::Black};
+    bool clear{false};
+    bool enabled{true};
+};
+
+struct RenderStats {
+    u32 submittedQuads{0};
+    u32 culledQuads{0};
+    u32 droppedQuads{0};
+    u32 drawBatches{0};
+    u32 radixPassesRun{0};
+    bool monotonicFastPath{false};
+};
+
+} // namespace en::renderer

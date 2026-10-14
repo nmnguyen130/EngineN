@@ -3,16 +3,16 @@
 
 #include <SDL3/SDL.h>
 
-namespace EngineN {
+namespace en::platform {
 
-EngineError MakePlatformError(PlatformErrc code, std::string_view detail) noexcept {
+Error MakePlatformError(PlatformErrc code, std::string_view detail) noexcept {
     if (!detail.empty()) {
-        return EngineError(detail, static_cast<i32>(code));
+        return Error{detail, static_cast<i32>(code)};
     }
     if (const char* sdlErr = SDL_GetError(); sdlErr && sdlErr[0] != '\0') {
-        return EngineError(sdlErr, static_cast<i32>(code));
+        return Error{sdlErr, static_cast<i32>(code)};
     }
-    return EngineError("Platform error", static_cast<i32>(code));
+    return Error{"Platform error", static_cast<i32>(code)};
 }
 
 namespace {
@@ -282,4 +282,4 @@ void Platform::ShowErrorBox(std::string_view title, std::string_view message, co
     (void)SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, t.CStr(), m.CStr(), nativeParent);
 }
 
-} // namespace EngineN
+} // namespace en::platform

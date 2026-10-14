@@ -5,7 +5,7 @@
 struct SDL_Window;
 union SDL_Event;
 
-namespace EngineN {
+namespace en::platform {
 
 enum class WindowMode : u8 {
     Windowed,
@@ -102,4 +102,4 @@ private:
     WindowState m_state{};
 };
 
-} // namespace EngineN
+} // namespace en::platform

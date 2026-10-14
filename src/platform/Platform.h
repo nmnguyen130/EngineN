@@ -9,7 +9,7 @@
 struct SDL_Gamepad;
 union SDL_Event;
 
-namespace EngineN {
+namespace en::platform {
 
 // Bitmask returned by EventTap to block Press/Motion events from reaching InputPipeline
 // while allowing Release events through to guarantee zero stuck keys.
@@ -94,4 +94,4 @@ private:
     FilePath m_prefPath{};
 };
 
-} // namespace EngineN
+} // namespace en::platform

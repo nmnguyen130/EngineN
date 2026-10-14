@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace EngineN {
+namespace en::time {
 
 /**
  * ChannelModulator: Evaluates per-channel time scales, hitstop freezes, and slow-motion ramps.
@@ -148,4 +148,4 @@ private:
     std::array<RampState, kMaxTimeChannels>    m_ramps{};
 };
 
-} // namespace EngineN
+} // namespace en::time

@@ -6,7 +6,7 @@
 #include <array>
 #include <string_view>
 
-namespace EngineN {
+namespace en::platform {
 
 enum class PlatformErrc : u8 {
     SdlInitFailed,
@@ -18,7 +18,7 @@ enum class PlatformErrc : u8 {
     InvalidState,
 };
 
-[[nodiscard]] EngineError MakePlatformError(PlatformErrc code, std::string_view detail = {}) noexcept;
+[[nodiscard]] Error MakePlatformError(PlatformErrc code, std::string_view detail = {}) noexcept;
 
 struct Extent2i {
     i32 w{0};
@@ -62,4 +62,4 @@ private:
 inline constexpr usize kMaxPathBytes = 1024;
 using FilePath = FixedString<kMaxPathBytes>;
 
-} // namespace EngineN
+} // namespace en::platform

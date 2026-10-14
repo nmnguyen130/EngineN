@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace EngineN {
+namespace en::time {
 
 struct TimePipelineConfig {
     u32  maxCatchupTicks   = 8;
@@ -200,4 +200,4 @@ private:
     bool          m_inTick        = false;
 };
 
-} // namespace EngineN
+} // namespace en::time

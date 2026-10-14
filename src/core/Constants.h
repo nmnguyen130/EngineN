@@ -3,7 +3,7 @@
 #include "core/Types.h"
 #include <numbers>
 
-namespace EngineN {
+namespace en {
 
 // Math Constants
 inline constexpr f32 kPi        = std::numbers::pi_v<f32>;
@@ -17,4 +17,4 @@ inline constexpr f32 kEpsilon   = 1e-6f;
 inline constexpr u32   kInvalidEntityId = ~0u;
 inline constexpr usize kInvalidIndex    = static_cast<usize>(~0ULL);
 
-} // namespace EngineN
+} // namespace en

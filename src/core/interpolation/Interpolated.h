@@ -3,7 +3,7 @@
 #include "core/Types.h"
 #include "math/Vec2.h"
 
-namespace EngineN {
+namespace en {
 
 /**
  * Concept for values that can be linearly interpolated with a floating-point alpha in [0, 1].
@@ -48,4 +48,4 @@ private:
     T m_cur{};
 };
 
-} // namespace EngineN
+} // namespace en

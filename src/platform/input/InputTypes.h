@@ -8,7 +8,7 @@
 #include <concepts>
 #include <type_traits>
 
-namespace EngineN {
+namespace en::input {
 
 inline constexpr usize kMaxActions         = 16;
 inline constexpr usize kMaxAxes            = 4;
@@ -234,4 +234,4 @@ struct alignas(64) FrameInput {
 
 static_assert(sizeof(FrameInput) == 64);
 
-} // namespace EngineN
+} // namespace en::input

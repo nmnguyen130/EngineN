@@ -7,7 +7,7 @@
 
 #include <utility>
 
-namespace EngineN {
+namespace en::platform {
 
 Window::~Window() noexcept {
     Destroy();
@@ -205,4 +205,4 @@ WindowFlags Window::ProcessEvent(const SDL_Event& ev) noexcept {
     }
 }
 
-} // namespace EngineN
+} // namespace en::platform

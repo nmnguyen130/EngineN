@@ -1,7 +1,7 @@
 #include "platform/input/SdlInput.h"
 #include <SDL3/SDL.h>
 
-namespace EngineN {
+namespace en::input {
 
 static_assert(
     static_cast<int>(GamepadAxis::LeftX) - 1 == SDL_GAMEPAD_AXIS_LEFTX &&
@@ -69,4 +69,4 @@ void IngestSdlEvent(InputPipeline& pipeline, const SDL_Event& event) noexcept {
     }
 }
 
-} // namespace EngineN
+} // namespace en::input

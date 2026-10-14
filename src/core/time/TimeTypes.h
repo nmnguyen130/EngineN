@@ -6,7 +6,7 @@
 #include <concepts>
 #include <type_traits>
 
-namespace EngineN {
+namespace en::time {
 
 inline constexpr u32 kSimHz           = 120;
 inline constexpr u64 kNsPerSecond     = 1'000'000'000ULL;
@@ -72,4 +72,4 @@ struct alignas(32) BakedRenderState {
     std::array<f32, kMaxTimeChannels> alpha{};
 };
 
-} // namespace EngineN
+} // namespace en::time

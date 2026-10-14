@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace EngineN {
+namespace en::math {
 
 struct Vec2 {
     float x = 0.0f;
@@ -56,4 +56,4 @@ inline constexpr Vec2 Lerp(const Vec2& a, const Vec2& b, float t) {
     return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
 }
 
-} // namespace EngineN
+} // namespace en::math

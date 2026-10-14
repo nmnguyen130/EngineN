@@ -5,7 +5,7 @@
 #include <array>
 #include <bit>
 
-namespace EngineN {
+namespace en::input {
 
 // Deterministic tick-counted intent buffer for jump/dash forgiveness and hitstop freeze retention.
 // Self-contained 40-byte value type; pairs with SimStepView::IsFrozen(ch).
@@ -82,4 +82,4 @@ private:
     Channel m_release{};
 };
 
-} // namespace EngineN
+} // namespace en::input

@@ -1,90 +1,51 @@
-# EngineN — Renderer Architecture Context
+# EngineN — Renderer Subsystem Context (`renderer/`)
 
-> **Audience:** Future AI assistants & human contributors.  
-> **Purpose:** Single-source-of-truth reference for the 2D Presentation and Renderer subsystem. Consult this document to understand lifecycle, dataflow, and boundaries without re-reading source code.
+## 1. Architecture & Invariants
+- **Standard:** C++23, zero heap allocation in hot paths, minimal 5-file footprint (`RendererTypes.h`, `RenderList.h/.cpp`, `Renderer.h/.cpp`), two-layer separation (Pure C++ Core + SDL3 Hardware Adapter).
+- **Two-Layer Zero-Virtual Seam:**
+  - **Layer 1 (`RendererTypes.h`, `RenderList.h/.cpp`):** Pure C++23 command recorder, view-space frustum culler, 6-byte LSD radix sorter, state coalescer, and SIMD-friendly vertex expander. Zero OS or SDL dependencies; 100% testable in headless CI via `RenderList::ComputeAuditHash()`.
+  - **Layer 2 (`Renderer.h/.cpp`):** Thin SDL3 hardware presentation coordinator and **Asset Sink**. Owns `SDL_Renderer` and a generational `SDL_Texture` slot pool (`kMaxTextures = 4096`). `<SDL3/SDL_*.h>` headers are strictly confined to `Renderer.cpp`.
+- **Self-Contained 64-Bit `SortKey` (In-Register Sorting):**
+  - Layout: `Pass (4b) > Layer (8b) > Depth (16b) > Blend (2b) > View (4b) > TextureIdx (14b) > QuadIndex (16b)`.
+  - Embedding `QuadIndex` in the lowest 16 bits eliminates separate `SortEntry` structs (50% memory reduction), preserves strict submission order as a tie-breaker, and restricts LSD Radix Sort to bytes `[2..7]` (at most 6 passes).
+- **O(1) Histogram Accumulation & Pass Skipping:** Byte histograms (`m_histograms[6][256]`) are accumulated on insertion during `PushQuad`. During `Compile()`, monotonic frames bypass sorting entirely, and any radix byte where `hist[firstByte] == m_quadCount` is skipped in $O(1)$.
+- **Early View-Space Frustum Culling:** `RenderList::PushQuad` transforms quads into view-space and performs a branchless $L_1$ bounding-radius AABB check against the active `Camera2D::viewport` prior to allocation. Culled quads incur zero sorting or vertex expansion cost.
+- **Zero-Conversion Hardware Submission:** `Vertex2D` (32B) and `Color` (16B premultiplied float) match `SDL_Vertex` and `SDL_FColor` binary layouts 1:1. `Renderer::Submit` streams chunked vertices (`4096` quads/chunk) and a `consteval` `u16` static index buffer (`SharedQuadIndices`) directly into `SDL_RenderGeometryRaw(..., size_indices = 2)`.
+- **Generational Asset Sink & Slot 0 White Texture:** Slot `0` (`kWhiteTexture = {0, 1}`) is permanently initialized as a `1x1` opaque white texture. Unloaded or stale `TextureHandle` references automatically fall back to Slot `0` without crashing.
 
----
+## 2. Core Types (`renderer/RendererTypes.h`)
+- **Handles & Descriptors:**
+  - `struct TextureHandle { u16 index{0}; u16 generation{0}; };` (`kWhiteTexture = {0, 1}`).
+  - `struct TextureDesc`: `width`, `height`, `format` (`RGBA8`, `BGRA8`), `filter` (`Nearest`, `Linear`), `pixels` (`std::span<const u8>`), `pitch`.
+  - `enum class RendererErrc : u8`: `DeviceInitFailed`, `TextureCreateFailed`, `TextureUpdateFailed`, `InvalidHandle`, `PoolExhausted`, `InvalidDimension`.
+- **Rendering Primitives:**
+  - `struct alignas(16) Color`: Premultiplied linear float `{r, g, b, a}` (`sizeof == 16`). Helpers: `Color::Premultiplied()`, `Color::FromRGBA8()`.
+  - `struct alignas(16) Vertex2D`: `{x, y, Color, u, v}` (`sizeof == 32`).
+  - `struct QuadCmd`: World/screen center `(x, y)`, size `(w, h)`, precomputed `(cosRot, sinRot)`, `uv`, `color`, `texture`, `depth`, `passId`, `layer`, `viewSlot`, `blend`, `flipX`, `flipY`.
+  - `struct Camera2D`: `worldCenterX`, `worldCenterY`, `zoom`, `viewport`, `scissor`, `screenSpace`.
 
-## 1. Architectural Philosophy & Golden Rules
+## 3. Public Interfaces & Signatures
+### `RenderList` (`renderer/RenderList.h` — Pure C++ Command Buffer & Batch Compiler)
+- `void Reset(platform::Extent2i defaultViewport) noexcept`
+- `void SetPass(u8 passId, const RenderPassDesc& desc) noexcept`, `void SetView(u8 viewSlot, const Camera2D& cam) noexcept`
+- `void PushQuad(const QuadCmd& cmd) noexcept`
+- `void PushRect(FRect rect, Color color, u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept`
+- `void PushLine(f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, Color color, u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept`
+- `void Compile() noexcept`
+- `void ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D> outVertices) const noexcept`
+- `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
 
-1. **Single-Source Hardware Seam:**
-   * `RenderDevice::Submit(packet)` is the **only** place in the engine allowed to execute drawing commands and call `SDL_RenderPresent`.
-   * Neither `FrameArena`, `Batcher`, nor gameplay code may ever touch SDL rendering or GPU contexts directly.
-2. **Deterministic 3-Stage Batching Pipeline (`Batcher`):**
-   * Raw draw submissions flow strictly through 3 compilation stages:
-     `Stage 0: Monotonic Check` ➔ `Stage 1: Radix Sort` ➔ `Stage 2: Linearize` ➔ `Stage 3: Coalesce`
-   * Monotonically ordered submissions bypass Stage 1 and Stage 2 scratch copies completely via an $O(N)$ fast-path.
-3. **Visual Order Priority Rule (High-Bits Invariant):**
-   * Visual layering strictly takes precedence over GPU state grouping:
-     `Pass (4b) > Layer (8b) > Depth (16b) > Blend (3b) > Pipeline (12b) > Texture (16b) > Spare (5b)`
-   * State changes (`Blend`, `Pipeline`, `Texture`) are only grouped when visual order is identical, preventing visual flickering and z-fighting.
-4. **Zero Heap Allocation in Hot Path:**
-   * Zero `malloc`, `new`, `std::vector`, or `std::string` reallocations during per-frame rendering.
-   * All buffers use boot-time pre-allocated static slots (`FrameArenaSlot`: 131,072 instances, 65,536 sort entries, 4,096 batches) and scratch arrays (`m_sortScratch`, `m_instanceScratch`, `m_vertexScratch`).
-   * When capacity is exceeded, excess draws are dropped cleanly with logged telemetry rather than dynamically reallocated.
-5. **Gameplay ≠ Presentation State:**
-   * Simulation runs at a strict **120Hz fixed timestep**.
-   * The presentation subsystem receives **pre-interpolated visual transforms** (`Pos = Lerp(prev, curr, alpha)`), never raw simulation ticks or physics velocities.
-
----
-
-## 2. System Data Flow
-
-```mermaid
-flowchart TD
-    Sim([120Hz Simulation Loop]) -->|Sub-frame Alpha| Extract[Visual State Extraction\nPos = Lerp Prev, Curr, Alpha]
-    Extract --> Arena[FrameArena::CurrentSlot\nDouble-Buffered Linear Storage]
-    Arena --> Finalize[Batcher::Finalize\n3-Phase Compilation Engine]
-
-    subgraph Pipeline [Deterministic 3-Stage Batching Pipeline]
-        Finalize --> P0{Stage 0: Monotonic Check}
-        P0 -->|Non-Monotonic| P1[Stage 1: 8-Bit LSD Radix Sort\nVarying Key Bytes Only]
-        P0 -->|Monotonic| P2[Stage 2: Linearize Instances\nIn-Place Fast-Path]
-        P1 --> P2
-        P2 --> P3[Stage 3: Coalesce Batches\nMerge Matching GPU States]
-    end
-
-    P3 --> Packet[FramePacket\nCanonical Data Seam: Batches, Instances, Views, Passes]
-
-    Packet --> Device[RenderDevice::Submit\nHardware Presentation Coordinator]
-    Packet -.->|Headless CI / Tests| Null[NullBackend::Execute\nDeterministic FNV-1a Hash Audit]
-
-    Device --> Clear[Pass Clear\nSDL_RenderClear Color Target]
-    Clear --> Geo[GPU Rasterization\nSDL_RenderGeometry Batch]
-    Geo --> Present[Swapchain Present\nHardware VSync Frame Buffer]
-    Null --> Audit[Ordering Invariants & Golden Hash]
-```
-
----
-
-## 3. Module Breakdown & Responsibilities
-
-### Presentation Core & Storage (`src/renderer/`)
-
-| File / Component | Responsibility & Ownership |
-| :--- | :--- |
-| **`RendererTypes.h`** | Canonical foundational types: float `Color` (with premultiplied/straight conversions), `Colors` palette constants, `FRect` (AABB clipping), `TextureHandle` (generational safety slot), `RenderPass`, `BlendMode`, `PresentMode`. |
-| **`QuadInstance.h`** | Canonical 48-byte layout (`alignas(16)`): center position, size, pre-calculated `rotCosSin` (zero runtime trigonometry), unorm16 UV rect, packed premultiplied color, `QuadKind`, and flags (`FlipX`, `FlipY`). |
-| **`SortKey.h`** | 64-bit packed sort key packing and bitfield queries. Defines the 16-byte aligned `SortEntry` linking key, instance offset, count, and view slot. |
-| **`FramePacket.h`** | The clean boundary seam between CPU recording and GPU rendering. Houses `DrawBatch`, `ViewSlotDesc` (camera uniforms), `RenderPassDesc` (clear color), and `FramePacket` (`std::span` views). |
-| **`FrameArena.h / .cpp`** | Double-buffered memory arena (`FrameArenaSlot[2]`). Provides atomic `PushQuad(quad, key, viewSlot)` and batch `PushQuads` methods with zero per-frame allocation and capacity drop safeguards. |
-
-### Compilation & Execution Backend (`src/renderer/`)
-
-| File / Component | Responsibility & Ownership |
-| :--- | :--- |
-| **`Batcher.h / .cpp`** | High-throughput sorter & coalescer. Performs 8-bit LSD Radix Sort across dynamically varying key bytes with monotonic bypass, linearizes instance memory, and merges compatible runs into contiguous `DrawBatch`es. |
-| **`RenderBackend.h`** | Pure virtual interface defining `Result<void, EngineError> Execute(const FramePacket& packet)`. Enables seamless polymorphic swapping between hardware and test backends. |
-| **`RenderDevice.h / .cpp`** | **Primary hardware presentation coordinator.** Wraps SDL3's GPU-accelerated `SDL_Renderer`. Translates `FramePacket` batches into `SDL_RenderGeometry` draw calls, manages VSync, clears passes, and presents the swapchain. |
-| **`NullBackend.h / .cpp`** | Deterministic headless backend for CI and automated tests (`TestRenderer`). Audits ordering invariants and computes a 64-bit FNV-1a packet hash without requiring an OS window or GPU context. |
-
----
-
-## 4. Key Boundaries & Invariants
-
-* **Visual Ordering vs. State Coalescing:** High bits guarantee visual layering correctness. Two adjacent entries collapse into a single `DrawBatch` if and only if all GPU states match:
-  $$\text{passId}_A = \text{passId}_B \quad\land\quad \text{viewSlot}_A = \text{viewSlot}_B \quad\land\quad \text{blendMode}_A = \text{blendMode}_B \quad\land\quad \text{pipelineId}_A = \text{pipelineId}_B \quad\land\quad \text{textureSlot}_A = \text{textureSlot}_B$$
-* **Capacity Drop Policy:** When `FrameArenaSlot` capacity is reached, excess draws return `~0u` and are dropped with counter telemetry (`DroppedInstances`). Memory is never dynamically resized during gameplay.
-* **Premultiplied Alpha Contract:** All color arithmetic and quad layouts use **Premultiplied Alpha**. Straight alpha colors must be converted via `Color::ToPremultipliedRGBA8()` before entering the arena.
-* **Double-Buffered Overlap:** `FrameArena` manages 2 distinct slots (`SlotIndex() % 2`). Slot 0 records frame $N$ while slot 1 is consumed by the backend. Advancing happens strictly via `arena.AdvanceSlot()` at frame boundaries.
-* **Thread Model:** All presentation recording, sorting, and submission code runs deterministically on the **Main Thread**. No background worker threads or lock contention.
+### `Renderer` (`renderer/Renderer.h` — Move-Only RAII Hardware Adapter & Asset Sink)
+- Lifecycle & Viewport:
+  - `[[nodiscard]] std::expected<void, RendererErrc> Init(platform::Window& window, const RendererConfig& cfg = {}) noexcept`
+  - `void Shutdown() noexcept`
+  - `void ResizeViewport(platform::Extent2i pixelSize) noexcept`
+  - `[[nodiscard]] std::expected<void, RendererErrc> SetPresentMode(PresentMode mode) noexcept`
+- Asset Sink API (For Asset Manager Integration):
+  - `[[nodiscard]] std::expected<TextureHandle, RendererErrc> CreateTexture(const TextureDesc& desc) noexcept`
+  - `[[nodiscard]] std::expected<void, RendererErrc> UpdateTexture(TextureHandle handle, FRect region, std::span<const u8> pixels, u32 pitch = 0) noexcept`
+  - `void DestroyTexture(TextureHandle handle) noexcept`
+  - `[[nodiscard]] constexpr bool IsTextureValid(TextureHandle handle) const noexcept`
+- Frame Execution:
+  - `[[nodiscard]] RenderList& BeginFrame() noexcept`
+  - `void Submit() noexcept`, `void Submit(RenderList& list) noexcept`

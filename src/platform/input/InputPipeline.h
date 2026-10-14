@@ -6,7 +6,7 @@
 #include <array>
 #include <bit>
 
-namespace EngineN {
+namespace en::input {
 
 // Stateless-routing, pull-evaluated input pipeline for 120Hz simulation and variable render frames.
 // Zero heap allocation, 100% constexpr, and immune to stuck-key bugs on binding or mask changes.
@@ -327,4 +327,4 @@ private:
     FrameInput m_frame{};
 };
 
-} // namespace EngineN
+} // namespace en::input

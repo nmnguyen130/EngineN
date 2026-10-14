@@ -4,7 +4,7 @@
 
 #include <SDL3/SDL.h>
 
-namespace EngineN {
+namespace en::time {
 
 /**
  * SdlClock: Production wall-clock source querying SDL3's nanosecond timer.
@@ -30,4 +30,4 @@ struct ManualClock {
 
 using TimeManager = TimePipeline<SdlClock>;
 
-} // namespace EngineN
+} // namespace en::time
