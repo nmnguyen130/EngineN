@@ -3,61 +3,83 @@
 #include "core/Types.h"
 #include "platform/input/InputTypes.h"
 #include <array>
+#include <bit>
 
 namespace EngineN {
 
-/**
- * ActionBuffer: Tick-counted intent buffer for action forgiveness (Jump/Dash buffering, hitstop freeze).
- * Decoupled from wall clock, zero SDL dependency, fully deterministic across replays.
- */
+// Deterministic tick-counted intent buffer for jump/dash forgiveness and hitstop freeze retention.
+// Self-contained 40-byte value type; pairs with SimStepView::IsFrozen(ch).
+// Invariant: Ages never exceed kMaxBufferTicks; expired bits are automatically cleared.
 class ActionBuffer {
 public:
-    static constexpr u8  kMaxBufferTicks = 60; // 500ms at 120Hz
-    static constexpr u32 kActionMask = (1u << kMaxActions) - 1u;
+    static constexpr u8 kMaxBufferTicks = 60;
 
-    void Feed(const TickInput& in, bool frozen = false) noexcept;
-    void Clear() noexcept;
-
-    template <typename A = ActionId>
-    [[nodiscard]] bool Peek(A a, u8 windowTicks) const noexcept {
-        return PeekImpl(m_press, static_cast<usize>(a), windowTicks);
+    constexpr void Feed(const TickInput& in, bool channelFrozen = false) noexcept {
+        StepChannel(m_press, in.pressed, channelFrozen);
+        StepChannel(m_release, in.released, channelFrozen);
     }
 
-    template <typename A = ActionId>
-    [[nodiscard]] bool PeekRelease(A a, u8 windowTicks) const noexcept {
-        return PeekImpl(m_release, static_cast<usize>(a), windowTicks);
+    constexpr void Clear() noexcept {
+        m_press   = {};
+        m_release = {};
     }
 
-    template <typename A = ActionId>
-    [[nodiscard]] bool Consume(A a, u8 windowTicks) noexcept {
-        return ConsumeImpl(m_press, static_cast<usize>(a), windowTicks);
+    [[nodiscard]] constexpr bool Peek(InputId auto a, u8 windowTicks) const noexcept {
+        return Check(m_press, ToInputIndex(a), windowTicks);
     }
 
-    template <typename A = ActionId>
-    [[nodiscard]] bool ConsumeRelease(A a, u8 windowTicks) noexcept {
-        return ConsumeImpl(m_release, static_cast<usize>(a), windowTicks);
+    [[nodiscard]] constexpr bool PeekRelease(InputId auto a, u8 windowTicks) const noexcept {
+        return Check(m_release, ToInputIndex(a), windowTicks);
     }
 
-    template <typename A = ActionId>
-    void Clear(A a) noexcept {
-        const usize act = static_cast<usize>(a);
-        ClearImpl(m_press, act);
-        ClearImpl(m_release, act);
+    [[nodiscard]] constexpr bool Consume(InputId auto a, u8 windowTicks) noexcept {
+        return Take(m_press, ToInputIndex(a), windowTicks);
+    }
+
+    [[nodiscard]] constexpr bool ConsumeRelease(InputId auto a, u8 windowTicks) noexcept {
+        return Take(m_release, ToInputIndex(a), windowTicks);
     }
 
 private:
     struct Channel {
-        u32 pending = 0;
+        u16 pending = 0;
         std::array<u8, kMaxActions> age{};
     };
 
-    static void FeedImpl(Channel& ch, u32 edges, bool frozen) noexcept;
-    [[nodiscard]] static bool PeekImpl(const Channel& ch, usize a, u8 window) noexcept;
-    [[nodiscard]] static bool ConsumeImpl(Channel& ch, usize a, u8 window) noexcept;
-    static void ClearImpl(Channel& ch, usize a) noexcept;
+    static constexpr void StepChannel(Channel& ch, u16 edges, bool frozen) noexcept {
+        for (u32 m = edges; m != 0; m &= m - 1) {
+            ch.age[static_cast<usize>(std::countr_zero(m))] = 0;
+        }
+        ch.pending |= edges;
 
-    Channel m_press;
-    Channel m_release;
+        if (frozen) {
+            return;
+        }
+
+        for (u32 m = static_cast<u32>(ch.pending & ~edges); m != 0; m &= m - 1) {
+            const usize i = static_cast<usize>(std::countr_zero(m));
+            if (++ch.age[i] > kMaxBufferTicks) {
+                ch.pending &= static_cast<u16>(~(1u << i));
+                ch.age[i]   = 0;
+            }
+        }
+    }
+
+    [[nodiscard]] static constexpr bool Check(const Channel& ch, u8 i, u8 window) noexcept {
+        return i < kMaxActions && ((ch.pending >> i) & 1u) != 0 && ch.age[i] <= window;
+    }
+
+    [[nodiscard]] static constexpr bool Take(Channel& ch, u8 i, u8 window) noexcept {
+        if (!Check(ch, i, window)) {
+            return false;
+        }
+        ch.pending &= static_cast<u16>(~(1u << i));
+        ch.age[i]   = 0;
+        return true;
+    }
+
+    Channel m_press{};
+    Channel m_release{};
 };
 
 } // namespace EngineN

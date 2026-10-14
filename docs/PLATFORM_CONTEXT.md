@@ -1,86 +1,77 @@
-# EngineN — Platform & Input Architecture Context
+# EngineN — Platform Subsystem Context (`platform/`)
 
-> **Audience:** Future AI assistants & human contributors.  
-> **Purpose:** Single-source-of-truth reference for the Platform and Input subsystems. Consult this document to understand lifecycle, dataflow, and boundaries without re-reading source code.
+## 1. Architecture & Invariants
+- **Standard:** C++23, zero heap allocation, minimal 5-file footprint (`PlatformTypes.h`, `Window.h/.cpp`, `Platform.h/.cpp`), SOLID/DOD compliant.
+- **Deterministic Single-Pass Pump:** `Platform::Pump()` drives the entire per-frame OS lifecycle in a single pass: `input.BeginFrame()` $\rightarrow$ `SDL_PollEvent` loop (`EventTap` $\rightarrow$ System/Gamepad/Display $\rightarrow$ `Window::ProcessEvent` $\rightarrow$ High-DPI Mouse Scaling $\rightarrow$ `IngestSdlEvent`) $\rightarrow$ `input.EndFrame()`.
+- **Anti-Sticking Capture Filter (`ShouldSuppressInput`):** DevTools/UI overlays (`EventTap`) return an `EventCapture` bitmask (`Keyboard | Mouse | Gamepad`). Only initiating/continuous events (`KEY_DOWN`, `MOUSE_BUTTON_DOWN`, `MOUSE_MOTION`, `MOUSE_WHEEL`, `GAMEPAD_BUTTON_DOWN`) are suppressed when captured; release edges (`KEY_UP`, `MOUSE_BUTTON_UP`, `GAMEPAD_BUTTON_UP`) and axis motions always pass through to `InputPipeline`, guaranteeing zero stuck physical bits or ghost latched taps.
+- **Focus & Suspend Safety:** On `WindowFlags::FocusLost` (Alt-Tab) or `SDL_EVENT_WILL_ENTER_BACKGROUND`, `Platform::Pump()` automatically invokes `StopAllRumble()` and `input.ClearPhysicalState()`.
+- **High-DPI Pixel Normalization:** Mouse coordinates and deltas (`motion.x/y/xrel/yrel`, `button.x/y`) are automatically scaled by `WindowState::pixelDensity` prior to `IngestSdlEvent`, ensuring `FrameInput::mousePos` maps 1:1 to the physical render viewport.
+- **Encapsulation:** `<SDL3/SDL_*.h>` headers are strictly confined to `.cpp` implementation files; public headers expose only forward-declared `SDL_Window`, `SDL_Gamepad`, and `SDL_Event`.
 
----
+## 2. Core Types (`platform/PlatformTypes.h` & `platform/Window.h`)
+- **Primitives & Errors:**
+  - `enum class PlatformErrc : u8`: `SdlInitFailed`, `WindowCreateFailed`, `FullscreenFailed`, `PathUnavailable`, `PathRejected`, `ClipboardFailed`, `InvalidState`.
+  - `struct Extent2i { i32 w{0}; i32 h{0}; };`
+  - `FixedString<N>`: Non-allocating, NUL-terminated inline string buffer (`FilePath = FixedString<1024>`).
+- **Window Configuration & Modes:**
+  - `enum class WindowMode : u8 { Windowed, Borderless, ExclusiveFullscreen };`
+  - `enum class GraphicsApi : u8 { None, OpenGL, Vulkan, Metal };`
+  - `struct WindowConfig`: `title`, `size{1280, 720}`, `minSize{640, 360}`, `mode`, `api`, `resizable{true}`, `highDpi{true}`.
+- **Frame Event Bitmasks (`sizeof == 1`):**
+  - `enum class WindowFlags : u8`: `None`, `Resized` (logical, pixel, or DPI scale changed), `DisplayChanged` (monitor moved or refresh rate changed), `FocusGained`, `FocusLost`. Queried via `constexpr bool HasFlag(WindowFlags val, WindowFlags mask) noexcept`.
+  - `enum class EventCapture : u8`: `None`, `Keyboard`, `Mouse`, `Gamepad`. Queried via `constexpr bool HasCapture(EventCapture val, EventCapture mask) noexcept`.
+- **Synchronous Window Metrics (`WindowState`):**
+  - `Extent2i logicalSize`, `Extent2i pixelSize`, `f32 pixelDensity{1.0f}`, `f32 refreshHz{60.0f}`, `WindowMode mode`, `bool focused{true}`, `bool suspended{false}` (`minimized || occluded || hidden`).
+  - Helpers: `constexpr bool IsPresentable() const noexcept` (`!suspended && pixelSize.w > 0 && pixelSize.h > 0`), `constexpr f32 AspectRatio() const noexcept`.
 
-## 1. Architectural Philosophy & Golden Rules
+## 3. Public Interfaces & Signatures
+### `Window` (`platform/Window.h` — Move-Only RAII Handle)
+- Lifecycle & State:
+  - `[[nodiscard]] Result<void, EngineError> Create(const WindowConfig& cfg = {}) noexcept`
+  - `void Destroy() noexcept`
+  - `[[nodiscard]] constexpr bool IsValid() const noexcept`, `SDL_Window* Native() const noexcept`, `u32 Id() const noexcept`
+  - `[[nodiscard]] constexpr const WindowState& State() const noexcept`
+- Runtime Mutators:
+  - `[[nodiscard]] Result<void, EngineError> SetMode(WindowMode mode) noexcept` (auto-queries native desktop mode for `ExclusiveFullscreen` and syncs metrics)
+  - `[[nodiscard]] Result<void, EngineError> SetTitle(std::string_view title) noexcept`
+  - `[[nodiscard]] Result<void, EngineError> SetRelativeMouse(bool enabled) noexcept`
+  - `void SetCursorVisible(bool visible) noexcept`, `void SetTextInput(bool enabled) noexcept`
+  - `[[nodiscard]] WindowFlags ProcessEvent(const SDL_Event& ev) noexcept`, `void RefreshMetrics() noexcept`
 
-1. **Single-Source Event Pump:**
-   * `Platform::Pump(window, input)` is the **only** place in the engine allowed to call `SDL_PollEvent`.
-   * Neither `Window`, `InputSystem`, nor gameplay code may ever poll or drain OS events directly.
-2. **Deterministic 4-Stage Routing Pipeline (`EventRouter`):**
-   * Events flow strictly through 4 priority stages:
-     `Stage 0: DevTools` ➔ `Stage 1: Window` ➔ `Stage 2: Input` ➔ `Stage 3: App`
-   * A stage returning `SinkVerdict::Handled` suppresses the event from downstream stages.
-3. **Anti-Sticking Suppression Rule:**
-   * When DevTools (ImGui / debug console) captures input, **Press/Continuous** events are suppressed, but **Release / Neutral** events **ALWAYS** pass through to guarantee player inputs never get permanently stuck held down.
-4. **Zero Heap Allocation in Hot Path:**
-   * Zero `malloc`, `new`, `std::vector`, or `std::string` during per-frame event processing.
-   * All buffers use fixed inline capacity: `FixedVector<T, N>`, `FixedString<N>`, and delegate pointers `EventSinkRef`.
-5. **Input ≠ Simulation State:**
-   * Raw inputs are timestamped in integer nanoseconds (`u64 timestampNs`).
-   * `InputSystem` evaluates physical device edges into logical actions (`ActionId`) and publishes 120Hz fixed-timestep tick batches (`ConsumeTick`) and visual frame snapshots (`PublishFrameSnapshot`).
+### `Platform` & `EventTap` (`platform/Platform.h` — OS Coordinator)
+- `struct EventTap`: Zero-allocation delegate (`EventTap::Bind<&T::Method>(instance)`) returning `EventCapture`.
+- Lifecycle & Frame Pump:
+  - `[[nodiscard]] Result<void, EngineError> Init(std::string_view appName = "EngineN", std::string_view orgName = "EngineN") noexcept`
+  - `void Shutdown() noexcept`
+  - `WindowFlags Pump(Window& window, InputPipeline& input, EventTap tap = {}) noexcept`
+  - `[[nodiscard]] constexpr bool ShouldQuit() const noexcept`, `constexpr void RequestQuit() noexcept`
+- Hardware & OS Services:
+  - `bool RumbleGamepad(u8 padSlot, u16 lowFreq, u16 highFreq, u32 durationMs) noexcept`, `void StopAllRumble() noexcept` (manages up to `kMaxGamepads = 4` hot-plugged `SDL_Gamepad*` handles)
+  - `[[nodiscard]] Result<FilePath, EngineError> ResolveAsset(std::string_view relative) const noexcept` (sandboxed to `SDL_GetBasePath()`, rejects `..`, leading slashes, and drive letters)
+  - `[[nodiscard]] Result<FilePath, EngineError> ResolveUser(std::string_view relative) const noexcept` (sandboxed to `SDL_GetPrefPath()`)
+  - `[[nodiscard]] static std::string_view GetClipboard(std::span<char> outBuf) noexcept`, `static Result<void, EngineError> SetClipboard(std::string_view utf8) noexcept`
+  - `static void ShowErrorBox(std::string_view title, std::string_view message, const Window* parent = nullptr) noexcept`
 
----
+## 4. Canonical Main Loop Usage
+```cpp
+while (!m_platform.ShouldQuit()) {
+    const WindowFlags winChanges = m_platform.Pump(m_window, m_input, m_devToolsTap);
 
-## 2. System Data Flow
+    if (HasFlag(winChanges, WindowFlags::Resized)) {
+        m_renderer.ResizeViewport(m_window.State().pixelSize);
+    }
+    if (HasFlag(winChanges, WindowFlags::DisplayChanged)) {
+        m_time.SetDisplayRefreshRate(m_window.State().refreshHz);
+    }
 
-```mermaid
-flowchart TD
-    SDL([SDL3 Event Queue]) -->|SDL_PollEvent| Pump[Platform::Pump]
-    Pump --> Router[EventRouter::Dispatch]
+    m_time.BeginFrame();
+    while (const auto step = m_time.PollTick()) {
+        const TickInput tickInput = m_input.PollTick(step.TickIndex());
+        m_actionBuffer.Feed(tickInput, step.IsFrozen(TimeChannel::Player));
+        m_world.Tick(step, tickInput, m_actionBuffer);
+    }
 
-    subgraph Pipeline [Prioritized 4-Stage Pipeline]
-        Router --> S0[Stage 0: DevTools]
-        S0 -->|Continue| S1[Stage 1: Window]
-        S1 -->|Continue| S2[Stage 2: Input]
-        S2 -->|Continue| S3[Stage 3: App / System]
-        
-        S0 -.->|Handled / Suppressed| X1[Drop Event]
-        S1 -.->|Handled| X2[Drop Event]
-    end
-
-    S1 --> WinState[Window::ApplyEvent\nUpdate metrics, dirty flags, mode]
-    S2 --> Ingest[InputSystem::Ingest\nTimestamped physical edges]
-    S3 --> PlatEvents[PlatformEventQueue\nQuitRequested, Gamepad/Audio plug]
-
-    Ingest --> Bindings[InputBindings\nActive Context Layers]
-    Bindings --> TickQueue[120Hz Action Transitions\nConsumed by Gameplay in TickLoop]
-    Bindings --> FrameSnap[Render Input Snapshot\nConsumed by Camera / UI in Frame]
-```
-
----
-
-## 3. Module Breakdown & Responsibilities
-
-### Platform Module (`src/platform/`)
-
-| File / Component | Responsibility & Ownership |
-| :--- | :--- |
-| **`PlatformTypes.h / .cpp`** | Strong IDs (`WindowId`, `DisplayId`, `GamepadId`, `AudioDeviceId`), fixed containers (`FixedString`, `FixedVector`), `PlatformEvent`, error factory `MakePlatformError`. |
-| **`Platform.h / .cpp`** | **Central coordinator.** Owns and initializes all subsystems (`Displays`, `Gamepads`, `AudioDevices`, `Paths`, `Clipboard`, `Specs`, `Router`). Executes single-source `Pump()`. |
-| **`Window.h / .cpp`** | RAII wrapper over `SDL_Window`. State mirrored in `WindowState` (size, DPI scale, mode, focus). Tracks dirty bits via `WindowChange`. |
-| **`Display.h / .cpp`** | `DisplayTopology`: Queries monitor topology, desktop modes, and refresh rates. Selects closest fullscreen mode (`FindClosestMode`). |
-| **`Devices.h / .cpp`** | `GamepadRegistry` (tracks 8 player slots, rumble) + `AudioDeviceDirectory` (tracks audio playback/recording endpoints). |
-| **`Services.h / .cpp`** | `PathService` (sandboxed paths), `Clipboard` (RAII string), `SystemSpecs` (hardware cores/RAM), `Dialogs` (crash message box). |
-| **`EventRouting.h`** | `EventRouter` (4 stages), `EventSinkRef` (delegate function pointer), `DevToolsSink` (anti-sticking capture rule). |
-
-### Input Module (`src/platform/input/`)
-
-| File / Component | Responsibility & Ownership |
-| :--- | :--- |
-| **`InputTypes.h`** | Definitions of physical keys (`KeyCode`, `MouseButton`, `GamepadButton`, `GamepadAxis`), logical `ActionId`, `AxisId`, `InputState`. |
-| **`InputBindings.h`** | Multi-context binding tables (e.g. Gameplay, Menu, Cutscene) supporting prioritized layering and chording. |
-| **`ActionBuffer.h`** | Sub-tick ring buffer recording timestamped action transitions for forgiveness mechanics (jump buffer, coyote time). |
-| **`InputSystem.h / .cpp`** | Core input coordinator: receives raw SDL events from `Stage 2`, resolves digital/analog axes via `TakeNewer`, feeds 120Hz fixed ticks (`ConsumeTick`) and frame interpolation snapshots. |
-
----
-
-## 4. Key Boundaries & Invariants
-
-* **Window Mode Requests:** Switching modes (`Windowed`, `BorderlessFullscreen`, `ExclusiveFullscreen`) goes through `Window::SetMode(request, displays)`. The renderer consumes updated pixel dimensions via `window.State().metrics.pixelSize`.
-* **Audio Readiness:** `AudioDeviceDirectory` acts as a passive hardware inventory. Audio playback initialization is deliberately separated to prevent headless CI/test environment crashes.
-* **No OS Dialogs in Gameplay:** File dialogs and native popups are strictly relegated to crash handlers (`Dialogs::ShowFatal`) or future editor tools. Game runtime never opens modal OS dialogs.
-* **Thread Model:** All Platform and Input code runs deterministically on the **Main Thread**. No background worker threads or lock contention.
+    if (m_window.State().IsPresentable()) {
+        m_renderer.Render(m_world, m_time.GetRenderView(), m_input.GetFrameView());
+    }
+}
