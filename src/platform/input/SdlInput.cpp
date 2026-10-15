@@ -1,5 +1,6 @@
 #include "platform/input/SdlInput.h"
-#include <SDL3/SDL.h>
+
+#include <SDL3/SDL_events.h>
 
 namespace en::input {
 

@@ -19,22 +19,22 @@
     └── Texture                  ✅ DONE
 
 04. Asset
-    ├── AssetHandle
-    ├── AssetManager
-    ├── Texture loading
+    ├── AssetHandle              ✅ DONE
+    ├── AssetManager             ✅ DONE
+    ├── Texture loading          ✅ DONE
     └── Future: audio/font/shader
 
 05. Scene / World
-    ├── Entity
-    ├── Component
-    ├── World
-    └── Transform hierarchy
+    ├── Entity                   ✅ DONE
+    ├── Component                ✅ DONE
+    ├── World                    ✅ DONE
+    └── Transform hierarchy      ✅ DONE
 
 06. Gameplay
-    ├── Physics / Collision
-    ├── Character controller
-    ├── Camera
-    └── Animation
+    ├── Physics / Collision      ✅ DONE
+    ├── Character controller     ✅ DONE
+    ├── Camera                   ✅ DONE
+    └── Animation                ✅ DONE
 
 07. Audio
     ├── AudioDevice

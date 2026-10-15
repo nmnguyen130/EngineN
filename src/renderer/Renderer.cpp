@@ -279,7 +279,10 @@ void Renderer::DestroyTexture(TextureHandle handle) noexcept {
 }
 
 RenderList& Renderer::BeginFrame() noexcept {
-    m_list.Reset(m_viewportSize);
+    m_list.Reset(
+        static_cast<f32>(m_viewportSize.w),
+        static_cast<f32>(m_viewportSize.h)
+    );
     return m_list;
 }
 

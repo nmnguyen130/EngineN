@@ -1,7 +1,13 @@
 #include "platform/Platform.h"
 #include "platform/input/SdlInput.h"
 
-#include <SDL3/SDL.h>
+#include <SDL3/SDL_clipboard.h>
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_messagebox.h>
 
 namespace en::platform {
 

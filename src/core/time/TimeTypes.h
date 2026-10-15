@@ -4,7 +4,6 @@
 
 #include <array>
 #include <concepts>
-#include <type_traits>
 
 namespace en::time {
 
@@ -20,29 +19,23 @@ consteval u32 operator""_f60(unsigned long long frames) noexcept {
     return static_cast<u32>(frames * (kSimHz / 60));
 }
 
-consteval u32 operator""_ticks(unsigned long long ticks) noexcept {
-    return static_cast<u32>(ticks);
-}
-
 /**
  * TimeChannel: Discrete simulation and presentation timelines.
  * Enables independent time dilation (e.g. hitstop on Player while World continues).
  */
 enum class TimeChannel : u8 {
-    World      = 0,
-    Player     = 1,
-    Enemy      = 2,
-    Projectile = 3,
-    Vfx        = 4,
-    Camera     = 5,
-    Ui         = 6,
-    Custom     = 7
+    World = 0,
+    Player,
+    Enemy,
+    Projectile,
+    Vfx,
+    Camera,
+    Ui,
+    Custom
 };
 
 template <typename T>
-concept ChannelId = std::same_as<T, TimeChannel> ||
-                    (std::is_scoped_enum_v<T> && std::same_as<std::underlying_type_t<T>, u8>) ||
-                    std::unsigned_integral<T>;
+concept ChannelId = std::same_as<T, TimeChannel> || std::unsigned_integral<T>;
 
 [[nodiscard]] constexpr u8 ToChannelIndex(ChannelId auto ch) noexcept {
     const auto idx = static_cast<u8>(ch);

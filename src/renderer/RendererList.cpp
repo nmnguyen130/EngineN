@@ -1,7 +1,6 @@
 #include "renderer/RendererList.h"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -36,7 +35,7 @@ constexpr void HashBytesFNV1a(u64& hash, const void* data, std::size_t len) noex
 
 } // namespace
 
-void RenderList::Reset(platform::Extent2i defaultViewport) noexcept {
+void RenderList::Reset(f32 viewportWidth, f32 viewportHeight) noexcept {
     m_quadCount   = 0;
     m_batchCount  = 0;
     m_prevKey     = 0;
@@ -49,8 +48,8 @@ void RenderList::Reset(platform::Extent2i defaultViewport) noexcept {
     const FRect fullVp{
         0.0f,
         0.0f,
-        static_cast<f32>(defaultViewport.w),
-        static_cast<f32>(defaultViewport.h)
+        viewportWidth,
+        viewportHeight
     };
 
     for (u32 i = 0; i < kMaxViews; ++i) {

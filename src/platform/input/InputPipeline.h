@@ -1,10 +1,9 @@
 #pragma once
 
-#include "core/Types.h"
 #include "platform/input/InputTypes.h"
+
 #include <algorithm>
 #include <array>
-#include <bit>
 
 namespace en::input {
 
@@ -124,6 +123,13 @@ public:
             if (value > kGamepadWakeThreshold || value < -kGamepadWakeThreshold) {
                 m_frame.activeDevice = Device::Gamepad;
             }
+        }
+    }
+    
+    constexpr void FeedGamepadButton(u32 instanceId, u16 button, bool down) noexcept {
+        const u8 slot = AcquireGamepadSlot(instanceId);
+        if (slot < kMaxGamepads) {
+            FeedButton(Source::Pad(button, slot), down);
         }
     }
 
@@ -301,14 +307,6 @@ private:
             out[i] = static_cast<i16>(val >= 0.0f ? (val * 32767.0f + 0.5f) : (val * 32767.0f - 0.5f));
         }
         return out;
-    }
-
-    public:
-    constexpr void FeedGamepadButton(u32 instanceId, u16 button, bool down) noexcept {
-        const u8 slot = AcquireGamepadSlot(instanceId);
-        if (slot < kMaxGamepads) {
-            FeedButton(Source::Pad(button, slot), down);
-        }
     }
 
 private:

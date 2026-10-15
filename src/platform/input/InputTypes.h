@@ -2,6 +2,7 @@
 
 #include "core/Types.h"
 #include "math/Vec2.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>

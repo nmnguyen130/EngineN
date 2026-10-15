@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/Types.h"
 #include "platform/input/InputTypes.h"
+
 #include <array>
 #include <bit>
 

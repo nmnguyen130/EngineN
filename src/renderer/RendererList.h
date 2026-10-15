@@ -1,6 +1,5 @@
 #pragma once
 
-#include "platform/PlatformTypes.h"
 #include "renderer/RendererTypes.h"
 
 #include <array>
@@ -37,7 +36,7 @@ public:
     };
     static_assert(sizeof(PreparedQuad) == 64);
 
-    void Reset(platform::Extent2i defaultViewport) noexcept;
+    void Reset(f32 viewportWidth, f32 viewportHeight) noexcept;
 
     void SetPass(u8 passId, const RenderPassDesc& desc) noexcept;
     void SetView(u8 viewSlot, const Camera2D& cam) noexcept;
