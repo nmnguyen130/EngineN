@@ -1,106 +1,73 @@
-cmake_minimum_required(VERSION 3.20)
-project(EngineN CXX)
+cmake_minimum_required(VERSION 3.28)
+project(EngineN LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Set output directory for the final executable
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# Automatically fetch and link latest SDL3
 include(FetchContent)
 FetchContent_Declare(
     SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG main
     GIT_SHALLOW TRUE
+    SYSTEM
 )
 FetchContent_MakeAvailable(SDL3)
 
-# Engine source files
-set(ENGINE_SOURCES
-    src/main.cpp
-    src/core/Log.cpp
-    src/core/time/TimeManager.cpp
-    src/platform/PlatformTypes.cpp
-    src/platform/Display.cpp
-    src/platform/Window.cpp
-    src/platform/Devices.cpp
-    src/platform/Services.cpp
-    src/platform/Platform.cpp
-    src/platform/input/ActionBuffer.cpp
-    src/platform/input/InputBindings.cpp
-    src/platform/input/InputSystem.cpp
-    src/renderer/RenderDevice.cpp
-    src/renderer/FrameArena.cpp
-    src/renderer/Batcher.cpp
-    src/renderer/NullBackend.cpp
-    src/asset/AssetManager.cpp
+# Engine Library
+add_library(engine STATIC
+    # Core
+    engine/core/Log.cpp
+
+    # Input
+    engine/input/SdlInput.cpp
+
+    # Platform
+    engine/platform/Platform.cpp
+    engine/platform/Window.cpp
+
+    # Renderer
+    engine/renderer/RendererList.cpp
+    engine/renderer/Renderer.cpp
+
+    # Assets
+    engine/assets/AssetBank.cpp
+    engine/assets/AssetSystem.cpp
+
+    # World
+    engine/world/TransformSolver.cpp
+    engine/world/World.cpp
+    engine/world/WorldExtractor.cpp
 )
 
-add_executable(EngineN ${ENGINE_SOURCES})
-target_include_directories(EngineN PRIVATE src vendor)
-target_link_libraries(EngineN PRIVATE SDL3::SDL3)
+target_compile_features(engine PUBLIC cxx_std_23)
+set_target_properties(engine PROPERTIES CXX_EXTENSIONS OFF)
 
-# Automatically copy SDL3.dll to executable directory post-build
-add_custom_command(TARGET EngineN POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:SDL3::SDL3-shared>
-    $<TARGET_FILE_DIR:EngineN>
+target_compile_options(engine PUBLIC
+    $<$<CXX_COMPILER_ID:MSVC>:/utf-8 /W4 /permissive->
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
 )
 
-# Automated Verification Test Suites
-set(TEST_TIMELOOP_SOURCES
-    tests/test_timeloop.cpp
-    src/core/time/TimeManager.cpp
+target_include_directories(engine PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor
 )
-add_executable(TestTimeLoop ${TEST_TIMELOOP_SOURCES})
-target_include_directories(TestTimeLoop PRIVATE src)
-target_link_libraries(TestTimeLoop PRIVATE SDL3::SDL3)
 
-set(TEST_PLATFORM_SOURCES
-    tests/test_platform.cpp
-    src/core/Log.cpp
-    src/platform/PlatformTypes.cpp
-    src/platform/Display.cpp
-    src/platform/Window.cpp
-    src/platform/Devices.cpp
-    src/platform/Services.cpp
-    src/platform/Platform.cpp
-    src/platform/input/ActionBuffer.cpp
-    src/platform/input/InputBindings.cpp
-    src/platform/input/InputSystem.cpp
-)
-add_executable(TestPlatform ${TEST_PLATFORM_SOURCES})
-target_include_directories(TestPlatform PRIVATE src)
-target_link_libraries(TestPlatform PRIVATE SDL3::SDL3)
+target_link_libraries(engine PUBLIC SDL3::SDL3)
 
-set(TEST_RENDERER_SOURCES
-    tests/test_renderer.cpp
-    src/core/Log.cpp
-    src/renderer/FrameArena.cpp
-    src/renderer/Batcher.cpp
-    src/renderer/NullBackend.cpp
-    src/renderer/RenderDevice.cpp
-)
-add_executable(TestRenderer ${TEST_RENDERER_SOURCES})
-target_include_directories(TestRenderer PRIVATE src)
-target_link_libraries(TestRenderer PRIVATE SDL3::SDL3)
+# Unit Tests
+enable_testing()
 
-set(TEST_INPUT_SOURCES
-    tests/test_input.cpp
-    src/core/Log.cpp
-    src/platform/input/ActionBuffer.cpp
-    src/platform/input/InputBindings.cpp
-    src/platform/input/InputSystem.cpp
-)
-add_executable(TestInput ${TEST_INPUT_SOURCES})
-target_include_directories(TestInput PRIVATE src)
-target_link_libraries(TestInput PRIVATE SDL3::SDL3)
+function(add_engine_test TEST_NAME)
+    add_executable(${TEST_NAME} tests/${TEST_NAME}.cpp)
+    target_link_libraries(${TEST_NAME} PRIVATE engine)
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+endfunction()
 
-set(TEST_ASSETS_SOURCES
-    tests/test_assets.cpp
-    src/core/Log.cpp
-    src/asset/AssetManager.cpp
-)
-add_executable(TestAssets ${TEST_ASSETS_SOURCES})
-target_include_directories(TestAssets PRIVATE src vendor)
-target_link_libraries(TestAssets PRIVATE SDL3::SDL3)
-
+add_engine_test(TestTimeLoop)
+add_engine_test(TestInput)
+add_engine_test(TestPlatform)
+add_engine_test(TestRenderer)
+add_engine_test(TestAssets)
+add_engine_test(TestWorld)
