@@ -3,7 +3,6 @@
 #include "core/Result.h"
 #include "core/Types.h"
 #include "core/time/TimeTypes.h"
-#include "assets/AssetTypes.h"
 #include "renderer/RendererTypes.h"
 
 #include <cmath>
@@ -37,8 +36,8 @@ struct EntityId {
 
 inline constexpr EntityId kNullEntity{0, 0};
 inline constexpr u16 kInvalidDenseIndex = 0xFFFF;
-inline constexpr u8 kMaxComponentTypes = 64;
-inline constexpr u8 kMaxHierarchyDepth = 32;
+inline constexpr u8 kMaxComponentTypes  = 64;
+inline constexpr u8 kMaxHierarchyDepth  = 32;
 
 using ComponentMask = u64;
 
@@ -138,28 +137,32 @@ enum class SpriteFlags : u8 {
 };
 
 // 32B cache-aligned visual quad descriptor (2 per 64B cache line).
+// Stores raw 1-hop sprite table index & generation to keep Layer 1 decoupled from AssetTypes.h.
 struct alignas(32) Sprite2D {
     static constexpr u8 kTypeId = 2;
 
-    renderer::Color tint{1.0f, 1.0f, 1.0f, 1.0f}; // Offset 0..15  (16B, alignas(16) satisfied at offset 0)
-    assets::SpriteHandle sprite{};                // Offset 16..19 (4B)
-    u16 baseDepth{32768};                         // Offset 20..21 (2B)
-    i16 ySortScale{0};                            // Offset 22..23 (2B)
-    i16 localOffsetX{0};                          // Offset 24..25 (2B: pixel/sub-pixel visual offset X)
-    i16 localOffsetY{0};                          // Offset 26..27 (2B: pixel/sub-pixel visual offset Y)
-    u8 passId{0};                                 // Offset 28     (1B)
-    u8 layer{0};                                  // Offset 29     (1B)
-    u8 viewSlot{0};                               // Offset 30     (1B)
-    u8 blendAndFlags{0};                          // Offset 31     (1B: Bits 0..2 SpriteFlags, Bits 3..4 BlendMode)
+    renderer::Color tint{1.0f, 1.0f, 1.0f, 1.0f};
+    u16 spriteIndex{0};
+    u16 spriteGeneration{0};
+    u16 baseDepth{32768};
+    i16 ySortScale{0};
+    i16 localOffsetX{0};
+    i16 localOffsetY{0};
+    u8 passId{0};
+    u8 layer{0};
+    u8 viewSlot{0};
+    u8 blendAndFlags{0};
 };
 static_assert(sizeof(Sprite2D) == 32);
 
-// 16B Q8.8 fixed-point 120 Hz atlas frame animator (4 per 64B cache line).
+// 16B Q8.8 fixed-point 120 Hz frame animator (4 per 64B cache line).
+// Uses pre-resolved baseSpriteIndex so 120 Hz stepping requires zero AssetBank calls.
 struct alignas(16) SpriteAnimator2D {
     static constexpr u8 kTypeId = 3;
     static constexpr u16 kSubTicksPerTick = 256;
 
-    assets::AtlasHandle atlas{};
+    u16 baseSpriteIndex{0};
+    u16 spriteGeneration{0};
     u16 firstFrame{0};
     u16 frameCount{1};
     u16 currentFrame{0};
@@ -193,7 +196,7 @@ struct EntitySpawnDesc {
 };
 
 struct WorldConfig {
-    u16 maxEntities{16384}; // Must be a multiple of 64, <= 65534
+    u16 maxEntities{16384};
     u32 commandBufferBytes{262144};
     u16 defaultComponentPoolCapacity{4096};
 };
@@ -201,7 +204,9 @@ struct WorldConfig {
 [[nodiscard]] constexpr f32 NormalizeAngleRad(f32 rad) noexcept {
     constexpr f32 kTwoPi    = 6.2831853071795864769f;
     constexpr f32 kInvTwoPi = 0.15915494309189533577f;
-    return rad - kTwoPi * std::nearbyint(rad * kInvTwoPi);
+    const f32 turns = rad * kInvTwoPi;
+    const i32 rounded = static_cast<i32>(turns + (turns >= 0.0f ? 0.5f : -0.5f));
+    return rad - kTwoPi * static_cast<f32>(rounded);
 }
 
 [[nodiscard]] constexpr f32 ShortestAngleDelta(f32 fromRad, f32 toRad) noexcept {

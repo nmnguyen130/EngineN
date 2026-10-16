@@ -43,7 +43,7 @@ struct TextureDesc {
     u32 pitch{0};
 };
 
-// Premultiplied linear float color matching SDL_FColor binary layout (16 bytes).
+// Premultiplied linear float color matching SDL_FColor binary layout (16 bytes, 4-byte aligned).
 struct Color {
     f32 r{1.0f};
     f32 g{1.0f};
@@ -76,7 +76,7 @@ struct Color {
 
     constexpr bool operator==(const Color&) const noexcept = default;
 };
-static_assert(sizeof(Color) == 16);
+static_assert(sizeof(Color) == 16 && alignof(Color) == 4);
 
 namespace Colors {
     inline constexpr Color White       = Color::Premultiplied(1.0f, 1.0f, 1.0f, 1.0f);
@@ -98,7 +98,7 @@ struct FRect {
 };
 
 // Binary-compatible with SDL_Vertex (32 bytes = 2 vertices per 64-byte cache line).
-struct Vertex2D {
+struct alignas(16) Vertex2D {
     f32 x{0.0f};
     f32 y{0.0f};
     Color color{};

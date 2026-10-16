@@ -1,7 +1,8 @@
 #include "world/WorldExtractor.h"
-#include "renderer/RendererList.h"
+#include "renderer/RenderList.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace en::world {
@@ -12,35 +13,45 @@ void WorldExtractor::Extract(
     time::RenderTimeView timeView,
     renderer::RenderList& outRenderList) noexcept {
 
+    // Precompute interpolation alphas across all 8 TimeChannels once per frame
+    alignas(32) std::array<f32, 8> chAlphas{};
+    for (u8 c = 0; c < 8; ++c) {
+        chAlphas[c] = timeView.Alpha(static_cast<time::TimeChannel>(c));
+    }
+
+    const auto* __restrict currSpan = world.WorldTransforms().data();
+    const auto* __restrict prevSpan = world.PrevWorldTransforms().data();
+    const auto* __restrict chSpan   = world.TimeChannels().data();
+
     // 1. Extract active CameraRig2D views into RenderList
-    const auto& camPool     = world.GetPool<CameraRig2D>();
-    const auto camEntities  = camPool.Entities();
-    const auto camRigs      = camPool.Components();
+    const auto& camPool    = world.GetPool<CameraRig2D>();
+    const auto camEntities = camPool.Entities();
+    const auto camRigs     = camPool.Components();
 
     for (usize i = 0; i < camEntities.size(); ++i) {
         const CameraRig2D& rig = camRigs[i];
         if (!rig.active) {
             continue;
         }
-        const u16 idx   = camEntities[i].index;
-        const f32 alpha = timeView.Alpha(world.GetTimeChannelByIndex(idx));
-        const PrevWorldSnapshot2D& prev = world.GetPrevWorldByIndex(idx);
-        const WorldTransform2D& curr    = world.GetWorldByIndex(idx);
+        const u16 idx                   = camEntities[i].index;
+        const f32 alpha                 = chAlphas[static_cast<u8>(chSpan[idx])];
+        const PrevWorldSnapshot2D& prev = prevSpan[idx];
+        const WorldTransform2D& curr    = currSpan[idx];
 
-        renderer::Camera2D cam{};
-        cam.worldCenterX = prev.x + alpha * (curr.x - prev.x);
-        cam.worldCenterY = prev.y + alpha * (curr.y - prev.y);
-        cam.zoom         = rig.zoom;
-        cam.viewport     = rig.viewport;
-        cam.scissor      = rig.scissor;
-        cam.screenSpace  = rig.screenSpace;
-        outRenderList.SetView(rig.viewSlot, cam);
+        outRenderList.SetView(rig.viewSlot, renderer::Camera2D{
+            .worldCenterX = prev.x + alpha * (curr.x - prev.x),
+            .worldCenterY = prev.y + alpha * (curr.y - prev.y),
+            .zoom         = rig.zoom,
+            .viewport     = rig.viewport,
+            .scissor      = rig.scissor,
+            .screenSpace  = rig.screenSpace,
+        });
     }
 
-    // 2. Linearly sweep dense Sprite2D array with 1:1 direct spatial lookup
-    const auto& spritePool     = world.GetPool<Sprite2D>();
-    const auto spriteEntities  = spritePool.Entities();
-    const auto sprites         = spritePool.Components();
+    // 2. Linearly sweep dense Sprite2D array with direct pointer indexing
+    const auto& spritePool    = world.GetPool<Sprite2D>();
+    const auto spriteEntities = spritePool.Entities();
+    const auto sprites        = spritePool.Components();
 
     for (usize i = 0; i < spriteEntities.size(); ++i) {
         const Sprite2D& sp = sprites[i];
@@ -48,10 +59,10 @@ void WorldExtractor::Extract(
             continue;
         }
 
-        const u16 idx   = spriteEntities[i].index;
-        const f32 alpha = timeView.Alpha(world.GetTimeChannelByIndex(idx));
-        const PrevWorldSnapshot2D& t0 = world.GetPrevWorldByIndex(idx);
-        const WorldTransform2D& t1    = world.GetWorldByIndex(idx);
+        const u16 idx                  = spriteEntities[i].index;
+        const f32 alpha                = chAlphas[static_cast<u8>(chSpan[idx])];
+        const PrevWorldSnapshot2D& t0  = prevSpan[idx];
+        const WorldTransform2D& t1     = currSpan[idx];
 
         const f32 wx = t0.x + alpha * (t1.x - t0.x);
         const f32 wy = t0.y + alpha * (t1.y - t0.y);
@@ -66,7 +77,10 @@ void WorldExtractor::Extract(
             FastSinCos(lerpedAngle, cosR, sinR);
         }
 
-        const assets::SpriteFrame& frame = assetBank.GetSprite(sp.sprite);
+        const assets::SpriteFrame& frame = assetBank.GetSprite(assets::SpriteHandle{
+            .spriteIndex = sp.spriteIndex,
+            .generation  = sp.spriteGeneration,
+        });
         const f32 quadW = static_cast<f32>(frame.width) * std::abs(sx);
         const f32 quadH = static_cast<f32>(frame.height) * std::abs(sy);
 
@@ -76,29 +90,28 @@ void WorldExtractor::Extract(
         const f32 pivX = flipX ? (1.0f - frame.pivotX) : frame.pivotX;
         const f32 pivY = flipY ? (1.0f - frame.pivotY) : frame.pivotY;
 
-        const f32 offsetX = (0.5f - pivX) * quadW + static_cast<f32>(sp.localOffsetX);
-        const f32 offsetY = (0.5f - pivY) * quadH + static_cast<f32>(sp.localOffsetY);
+        const f32 offsetX  = (0.5f - pivX) * quadW + static_cast<f32>(sp.localOffsetX);
+        const f32 offsetY  = (0.5f - pivY) * quadH + static_cast<f32>(sp.localOffsetY);
         const f32 rawDepth = static_cast<f32>(sp.baseDepth) + wd + wy * static_cast<f32>(sp.ySortScale);
 
-        renderer::QuadCmd cmd{};
-        cmd.x        = wx + (offsetX * cosR - offsetY * sinR);
-        cmd.y        = wy + (offsetX * sinR + offsetY * cosR);
-        cmd.w        = quadW;
-        cmd.h        = quadH;
-        cmd.cosRot   = cosR;
-        cmd.sinRot   = sinR;
-        cmd.uv       = frame.uv;
-        cmd.color    = sp.tint;
-        cmd.texture  = frame.gpuTexture;
-        cmd.depth    = static_cast<u16>(std::clamp(rawDepth, 0.0f, 65535.0f));
-        cmd.passId   = sp.passId;
-        cmd.layer    = sp.layer;
-        cmd.viewSlot = sp.viewSlot;
-        cmd.blend    = static_cast<renderer::BlendMode>((sp.blendAndFlags >> 3) & 0x03u);
-        cmd.flipX    = flipX;
-        cmd.flipY    = flipY;
-
-        outRenderList.PushQuad(cmd);
+        outRenderList.PushQuad(renderer::QuadCmd{
+            .x        = wx + (offsetX * cosR - offsetY * sinR),
+            .y        = wy + (offsetX * sinR + offsetY * cosR),
+            .w        = quadW,
+            .h        = quadH,
+            .cosRot   = cosR,
+            .sinRot   = sinR,
+            .uv       = frame.uv,
+            .color    = sp.tint,
+            .texture  = frame.gpuTexture,
+            .depth    = static_cast<u16>(std::clamp(rawDepth, 0.0f, 65535.0f)),
+            .passId   = sp.passId,
+            .layer    = sp.layer,
+            .viewSlot = sp.viewSlot,
+            .blend    = static_cast<renderer::BlendMode>((sp.blendAndFlags >> 3) & 0x03u),
+            .flipX    = flipX,
+            .flipY    = flipY,
+        });
     }
 }
 
@@ -127,32 +140,41 @@ Result<EntityId, WorldErrc> WorldExtractor::InstantiatePrefab(
 
     for (u16 i = 0; i < count; ++i) {
         const CookedPrefabEntityRecord& rec = records[i];
-        EntitySpawnDesc desc{};
-        desc.localTransform  = (i == 0) ? rootTransform : rec.localTransform;
-        desc.timeChannel     = static_cast<time::TimeChannel>(rec.timeChannel & 0x07u);
-        desc.hasSpatial      = true;
-        desc.isStaticSpatial = (rec.flags & 0x04u) != 0;
-        if (rec.parentLocalIndex < i) {
-            desc.parent = localStackIds[rec.parentLocalIndex];
-        }
+        const EntitySpawnDesc desc{
+            .localTransform  = (i == 0) ? rootTransform : rec.localTransform,
+            .timeChannel     = static_cast<time::TimeChannel>(rec.timeChannel & 0x07u),
+            .parent          = (rec.parentLocalIndex < i) ? localStackIds[rec.parentLocalIndex] : kNullEntity,
+            .hasSpatial      = true,
+            .isStaticSpatial = (rec.flags & 0x04u) != 0,
+        };
 
         auto spawned = world.Spawn(desc);
         if (!spawned) [[unlikely]] {
             return Err(spawned.error());
         }
-        localStackIds[i] = *spawned;
+        const EntityId entityId = *spawned;
+        localStackIds[i] = entityId;
         if (i < outSpawnedEntities.size()) {
-            outSpawnedEntities[i] = *spawned;
+            outSpawnedEntities[i] = entityId;
         }
 
         if ((rec.flags & 0x01u) != 0) {
-            Sprite2D sp{};
-            sp.tint        = rec.tint;
-            sp.baseDepth   = rec.baseDepth;
-            sp.ySortScale  = rec.ySortScale;
-            sp.passId      = rec.passId;
-            sp.layer       = rec.layer;
-            (void)world.Emplace<Sprite2D>(*spawned, sp);
+            (void)world.Emplace<Sprite2D>(entityId, Sprite2D{
+                .tint       = rec.tint,
+                .baseDepth  = rec.baseDepth,
+                .ySortScale = rec.ySortScale,
+                .passId     = rec.passId,
+                .layer      = rec.layer,
+            });
+        }
+        if ((rec.flags & 0x02u) != 0) {
+            (void)world.Emplace<SpriteAnimator2D>(entityId, SpriteAnimator2D{
+                .firstFrame    = rec.firstFrame,
+                .frameCount    = std::max<u16>(1u, rec.frameCount),
+                .ticksPerFrame = std::max<u16>(1u, rec.ticksPerFrame),
+                .loop          = 1,
+                .playing       = 1,
+            });
         }
     }
 

@@ -1,7 +1,6 @@
-#include "input/InputPipeline.h"
-#include "input/SdlInput.h"
 #include "platform/Platform.h"
-#include "platform/Window.h"
+
+#include "input/InputPipeline.h"
 
 #include <SDL3/SDL_clipboard.h>
 #include <SDL3/SDL_error.h>
@@ -13,8 +12,18 @@
 
 namespace en::platform {
 
+using input::GamepadAxis;
 using input::InputPipeline;
-using input::IngestSdlEvent;
+using input::Source;
+using math::Vec2;
+
+static_assert(Platform::kMaxGamepads == input::kMaxGamepads);
+static_assert(
+    static_cast<int>(GamepadAxis::LeftX) - 1 == SDL_GAMEPAD_AXIS_LEFTX &&
+    static_cast<int>(GamepadAxis::RightTrigger) - 1 == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER &&
+    6 == SDL_GAMEPAD_AXIS_COUNT,
+    "GamepadAxis enum must match SDL3 gamepad axis layout"
+);
 
 Error MakePlatformError(PlatformErrc code, std::string_view detail) noexcept {
     if (!detail.empty()) {
@@ -75,30 +84,68 @@ namespace {
         case SDL_EVENT_KEY_DOWN:
             return (ev.key.windowID != 0 && ev.key.windowID != winId) ||
                    HasCapture(cap, EventCapture::Keyboard);
-
         case SDL_EVENT_KEY_UP:
             return (ev.key.windowID != 0 && ev.key.windowID != winId);
-
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             return (ev.button.windowID != 0 && ev.button.windowID != winId) ||
                    HasCapture(cap, EventCapture::Mouse);
-
         case SDL_EVENT_MOUSE_BUTTON_UP:
             return (ev.button.windowID != 0 && ev.button.windowID != winId);
-
         case SDL_EVENT_MOUSE_MOTION:
             return (ev.motion.windowID != 0 && ev.motion.windowID != winId) ||
                    HasCapture(cap, EventCapture::Mouse);
-
         case SDL_EVENT_MOUSE_WHEEL:
             return (ev.wheel.windowID != 0 && ev.wheel.windowID != winId) ||
                    HasCapture(cap, EventCapture::Mouse);
-
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             return HasCapture(cap, EventCapture::Gamepad);
-
         default:
             return false;
+    }
+}
+
+constexpr void DispatchInputEvent(InputPipeline& input, const SDL_Event& ev, f32 density) noexcept {
+    switch (ev.type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+            if (!ev.key.repeat) {
+                input.FeedButton(Source::Key(static_cast<u16>(ev.key.scancode)), ev.key.down);
+            }
+            break;
+
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            if (ev.button.which != SDL_TOUCH_MOUSEID) {
+                input.FeedButton(Source::Mouse(ev.button.button), ev.button.down);
+            }
+            break;
+
+        case SDL_EVENT_MOUSE_MOTION:
+            if (ev.motion.which != SDL_TOUCH_MOUSEID) {
+                input.FeedMouseMotion(
+                    Vec2{ev.motion.x * density, ev.motion.y * density},
+                    Vec2{ev.motion.xrel * density, ev.motion.yrel * density});
+            }
+            break;
+
+        case SDL_EVENT_MOUSE_WHEEL:
+            if (ev.wheel.which != SDL_TOUCH_MOUSEID) {
+                const f32 flip = (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -1.0f : 1.0f;
+                input.FeedMouseWheel(Vec2{ev.wheel.x * flip, ev.wheel.y * flip});
+            }
+            break;
+
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+            input.FeedGamepadButton(static_cast<u32>(ev.gbutton.which), ev.gbutton.button, ev.gbutton.down);
+            break;
+
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            input.FeedGamepadAxis(static_cast<u32>(ev.gaxis.which), ev.gaxis.axis, ev.gaxis.value);
+            break;
+
+        default:
+            break;
     }
 }
 
@@ -187,29 +234,40 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
     WindowFlags flags = WindowFlags::None;
     input.BeginFrame();
 
+    const u32 winId = window.Id();
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         const EventCapture capture = tap.callback ? tap.callback(tap.user, ev) : EventCapture::None;
+
+        if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) {
+            const WindowFlags winFlags = window.ProcessEvent(ev);
+            flags |= winFlags;
+            if (HasFlag(winFlags, WindowFlags::FocusLost)) {
+                StopAllRumble();
+                input.ClearPhysicalState();
+            }
+            continue;
+        }
 
         switch (ev.type) {
             case SDL_EVENT_QUIT:
             case SDL_EVENT_TERMINATING:
                 m_quit = true;
-                break;
+                continue;
 
             case SDL_EVENT_WILL_ENTER_BACKGROUND:
                 StopAllRumble();
                 input.ClearPhysicalState();
-                break;
+                continue;
 
             case SDL_EVENT_GAMEPAD_ADDED:
                 OpenGamepad(ev.gdevice.which);
-                break;
+                continue;
 
             case SDL_EVENT_GAMEPAD_REMOVED:
                 input.DisconnectGamepad(ev.gdevice.which);
                 CloseGamepad(ev.gdevice.which);
-                break;
+                continue;
 
             case SDL_EVENT_DISPLAY_ADDED:
             case SDL_EVENT_DISPLAY_REMOVED:
@@ -218,34 +276,14 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
             case SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED:
                 window.RefreshMetrics();
                 flags |= WindowFlags::DisplayChanged | WindowFlags::Resized;
-                break;
+                continue;
 
             default:
                 break;
         }
 
-        const WindowFlags winFlags = window.ProcessEvent(ev);
-        flags |= winFlags;
-
-        if (HasFlag(winFlags, WindowFlags::FocusLost)) {
-            StopAllRumble();
-            input.ClearPhysicalState();
-        }
-
-        if (!ShouldSuppressInput(ev, capture, window.Id())) {
-            const f32 density = window.State().pixelDensity;
-            if (density != 1.0f) {
-                if (ev.type == SDL_EVENT_MOUSE_MOTION) {
-                    ev.motion.x    *= density;
-                    ev.motion.y    *= density;
-                    ev.motion.xrel *= density;
-                    ev.motion.yrel *= density;
-                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN || ev.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-                    ev.button.x *= density;
-                    ev.button.y *= density;
-                }
-            }
-            IngestSdlEvent(input, ev);
+        if (!ShouldSuppressInput(ev, capture, winId)) {
+            DispatchInputEvent(input, ev, window.State().pixelDensity);
         }
     }
 

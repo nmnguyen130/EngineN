@@ -1,4 +1,3 @@
-#include "assets/AssetBank.h"
 #include "world/World.h"
 
 #include <algorithm>
@@ -7,6 +6,18 @@
 
 namespace en::world {
 
+namespace {
+[[nodiscard]] constexpr u8 BuildActiveChannelMask(time::SimStepView step) noexcept {
+    u8 mask = 0;
+    for (u8 c = 0; c < 8; ++c) {
+        if (!step.IsFrozen(static_cast<time::TimeChannel>(c))) {
+            mask |= static_cast<u8>(1u << c);
+        }
+    }
+    return mask;
+}
+} // namespace
+
 Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     if (cfg.maxEntities < 64 || (cfg.maxEntities & 63u) != 0 || cfg.maxEntities > 65534) [[unlikely]] {
         return Err(WorldErrc::InvalidConfig);
@@ -14,7 +25,6 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     Shutdown();
     m_cfg = cfg;
 
-    // Reserve a single 16 MB contiguous slab for all SoA spine tables, bitsets, command tape, and pools
     m_arenaCapacity = 16u * 1024u * 1024u;
     m_arenaSlab = std::make_unique_for_overwrite<u8[]>(m_arenaCapacity);
     if (!m_arenaSlab) [[unlikely]] {
@@ -67,7 +77,6 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     m_poolOps.fill(PoolOps{});
     Clear();
 
-    // Pre-register built-in EngineN component pools
     if (auto r = RegisterComponentPool<Velocity2D>(maxEnt); !r) return r;
     if (auto r = RegisterComponentPool<Sprite2D>(maxEnt); !r) return r;
     if (auto r = RegisterComponentPool<SpriteAnimator2D>(maxEnt); !r) return r;
@@ -85,7 +94,7 @@ void World::Shutdown() noexcept {
 
 void World::Clear() noexcept {
     std::fill(m_generations.begin(), m_generations.end(), u16{1});
-    m_generations[0] = 0; // Slot 0 sentinel is permanently invalid
+    m_generations[0] = 0;
     std::fill(m_flags.begin(), m_flags.end(), EntityFlags::None);
     std::fill(m_timeChannels.begin(), m_timeChannels.end(), time::TimeChannel::World);
     std::fill(m_componentMasks.begin(), m_componentMasks.end(), ComponentMask{0});
@@ -157,15 +166,13 @@ bool World::Destroy(EntityId id) noexcept {
 
     constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
     if ((mask & kAnimGroupMask) == kAnimGroupMask) {
-        SyncLockstepAnimationGroupOnRemove(id);
+        SyncLockstepAnimationGroupOnRemove(idx);
     }
 
     while (mask != 0) {
         const u32 tid = static_cast<u32>(std::countr_zero(mask));
         mask &= (mask - 1u);
-        if (m_poolOps[tid].poolInstance && m_poolOps[tid].removeUncheckedFn) {
-            m_poolOps[tid].removeUncheckedFn(m_poolOps[tid].poolInstance, id);
-        }
+        m_poolOps[tid].removeUncheckedFn(m_poolOps[tid].poolInstance, id);
     }
     m_componentMasks[idx] = 0;
 
@@ -192,28 +199,20 @@ bool World::Destroy(EntityId id) noexcept {
     return true;
 }
 
-void World::SyncLockstepAnimationGroupOnAdd(EntityId id) noexcept {
+void World::SyncLockstepAnimationGroupOnAdd(u16 entityIndex) noexcept {
     auto& spritePool = GetPool<Sprite2D>();
     auto& animPool   = GetPool<SpriteAnimator2D>();
 
-    const u16 spriteGroupSlot = spritePool.PromoteToGroup(id);
-    const u16 animGroupSlot   = animPool.PromoteToGroup(id);
-    if (spriteGroupSlot != animGroupSlot) {
-        animPool.SwapDenseSlots(animGroupSlot, spriteGroupSlot);
+    const u16 spriteSlot = spritePool.PromoteToGroup(entityIndex);
+    const u16 animSlot   = animPool.PromoteToGroup(entityIndex);
+    if (spriteSlot != animSlot) {
+        animPool.SwapDenseSlots(animSlot, spriteSlot);
     }
 }
 
-void World::SyncLockstepAnimationGroupOnRemove(EntityId id) noexcept {
-    auto& spritePool = GetPool<Sprite2D>();
-    auto& animPool   = GetPool<SpriteAnimator2D>();
-
-    const u16 groupLast = static_cast<u16>(spritePool.GroupSize() - 1u);
-    const u16 currentIdx = spritePool.DenseIndexOf(id.index);
-    if (currentIdx < spritePool.GroupSize()) {
-        spritePool.DemoteFromGroup(id);
-        animPool.DemoteFromGroup(id);
-        (void)groupLast;
-    }
+void World::SyncLockstepAnimationGroupOnRemove(u16 entityIndex) noexcept {
+    GetPool<Sprite2D>().DemoteFromGroup(entityIndex);
+    GetPool<SpriteAnimator2D>().DemoteFromGroup(entityIndex);
 }
 
 void World::Teleport(EntityId id, const LocalTransform2D& local) noexcept {
@@ -264,7 +263,9 @@ Result<void, WorldErrc> World::DeferSetParent(EntityId child, EntityId parent) n
 }
 
 Result<void, WorldErrc> World::FlushCommands() noexcept {
+    constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
     u32 offset = 0;
+
     while (offset < m_cmdWriteOffset) {
         const auto* hdr = reinterpret_cast<const WorldCmdHeader*>(m_cmdTape.data() + offset);
         const void* payload = m_cmdTape.data() + offset + sizeof(WorldCmdHeader);
@@ -281,19 +282,20 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
             }
             case WorldCmdOp::SetTimeChannel:
                 if (IsAlive(hdr->target)) {
-                    m_timeChannels[hdr->target.index] = * static_cast<const time::TimeChannel*>(payload);
+                    m_timeChannels[hdr->target.index] = *static_cast<const time::TimeChannel*>(payload);
                 }
                 break;
             case WorldCmdOp::EmplaceComponent: {
                 const u8 tid = hdr->componentTypeId;
-                if (IsAlive(hdr->target) && m_poolOps[tid].poolInstance && m_poolOps[tid].emplaceRawFn) {
+                if (IsAlive(hdr->target) && m_poolOps[tid].poolInstance) {
                     if (m_poolOps[tid].emplaceRawFn(m_poolOps[tid].poolInstance, hdr->target, payload)) {
-                        const ComponentMask prevMask = m_componentMasks[hdr->target.index];
-                        const ComponentMask newMask = prevMask | (ComponentMask{1} << tid);
-                        m_componentMasks[hdr->target.index] = newMask;
-                        constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
-                        if ((prevMask & kAnimGroupMask) != kAnimGroupMask && (newMask & kAnimGroupMask) == kAnimGroupMask) {
-                            SyncLockstepAnimationGroupOnAdd(hdr->target);
+                        const u16 idx = hdr->target.index;
+                        const ComponentMask prevMask = m_componentMasks[idx];
+                        const ComponentMask newMask  = prevMask | (ComponentMask{1} << tid);
+                        m_componentMasks[idx] = newMask;
+                        if ((prevMask & kAnimGroupMask) != kAnimGroupMask &&
+                            (newMask & kAnimGroupMask) == kAnimGroupMask) {
+                            SyncLockstepAnimationGroupOnAdd(idx);
                         }
                     }
                 }
@@ -302,13 +304,13 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
             case WorldCmdOp::RemoveComponent: {
                 const u8 tid = hdr->componentTypeId;
                 const ComponentMask bit = ComponentMask{1} << tid;
-                if (IsAlive(hdr->target) && (m_componentMasks[hdr->target.index] & bit) != 0) {
-                    constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
-                    if ((m_componentMasks[hdr->target.index] & kAnimGroupMask) == kAnimGroupMask &&
+                const u16 idx = hdr->target.index;
+                if (IsAlive(hdr->target) && (m_componentMasks[idx] & bit) != 0) {
+                    if ((m_componentMasks[idx] & kAnimGroupMask) == kAnimGroupMask &&
                         (tid == Sprite2D::kTypeId || tid == SpriteAnimator2D::kTypeId)) {
-                        SyncLockstepAnimationGroupOnRemove(hdr->target);
+                        SyncLockstepAnimationGroupOnRemove(idx);
                     }
-                    m_componentMasks[hdr->target.index] &= ~bit;
+                    m_componentMasks[idx] &= ~bit;
                     m_poolOps[tid].removeUncheckedFn(m_poolOps[tid].poolInstance, hdr->target);
                 }
                 break;
@@ -322,49 +324,43 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
 }
 
 void World::BeginTick(time::SimStepView step) noexcept {
-    u8 activeChannelMask = 0;
-    for (u8 c = 0; c < 8; ++c) {
-        if (!step.IsFrozen(static_cast<time::TimeChannel>(c))) {
-            activeChannelMask |= static_cast<u8>(1u << c);
-        }
-    }
-    m_transforms.SnapshotPreviousTransforms(m_maxAllocatedIndex, activeChannelMask, m_timeChannels);
+    m_transforms.SnapshotPreviousTransforms(m_maxAllocatedIndex, BuildActiveChannelMask(step), m_timeChannels);
 }
 
-void World::StepKinematicsAndAnimations(
-    time::SimStepView step,
-    const assets::AssetBank& assetBank) noexcept {
+void World::StepKinematicsAndAnimations(time::SimStepView step) noexcept {
+    const u8 activeChannelMask = BuildActiveChannelMask(step);
+    if (activeChannelMask == 0) {
+        return;
+    }
 
     alignas(32) std::array<f32, 8> chDt{};
     alignas(16) std::array<u16, 8> chSubTicks{};
-    u8 activeChannelMask = 0;
 
     for (u8 c = 0; c < 8; ++c) {
-        const auto ch = static_cast<time::TimeChannel>(c);
-        if (!step.IsFrozen(ch)) {
-            activeChannelMask |= static_cast<u8>(1u << c);
+        if ((activeChannelMask & (1u << c)) != 0) {
+            const auto ch = static_cast<time::TimeChannel>(c);
             chDt[c] = step.Dt(ch);
             chSubTicks[c] = static_cast<u16>(
                 std::lround(step.EffectiveScale(ch) * static_cast<f32>(SpriteAnimator2D::kSubTicksPerTick))
             );
         }
     }
-    if (activeChannelMask == 0) {
-        return;
-    }
 
-    auto& velPool = GetPool<Velocity2D>();
+    const auto* __restrict channels = m_timeChannels.data();
+
+    // 1. Integrate non-colliding Velocity2D entities
+    auto& velPool          = GetPool<Velocity2D>();
     const auto velEntities = velPool.Entities();
-    auto velocities = velPool.Components();
+    auto velocities        = velPool.Components();
 
     for (usize i = 0; i < velEntities.size(); ++i) {
         const u16 idx = velEntities[i].index;
-        const u8 ch = static_cast<u8>(m_timeChannels[idx]);
+        const u8 ch   = static_cast<u8>(channels[idx]);
         if ((activeChannelMask & (1u << ch)) == 0) {
             continue;
         }
-        const f32 dt = chDt[ch];
-        Velocity2D& v = velocities[i];
+        const f32 dt          = chDt[ch];
+        Velocity2D& v         = velocities[i];
         LocalTransform2D& loc = m_transforms.ModifyLocal(idx);
 
         loc.x += v.vx * dt;
@@ -377,20 +373,20 @@ void World::StepKinematicsAndAnimations(
         }
     }
 
-    auto& spritePool = GetPool<Sprite2D>();
-    auto& animPool   = GetPool<SpriteAnimator2D>();
-    const u16 groupCount = spritePool.GroupSize();
+    // 2. Step lockstep [Sprite2D + SpriteAnimator2D] group with zero AssetBank calls
+    auto& spritePool         = GetPool<Sprite2D>();
+    auto& animPool           = GetPool<SpriteAnimator2D>();
+    const u16 groupCount     = spritePool.GroupSize();
     const auto groupEntities = animPool.Entities();
-    auto sprites = spritePool.Components();
-    auto anims   = animPool.Components();
+    auto sprites             = spritePool.Components();
+    auto anims               = animPool.Components();
 
     for (u16 i = 0; i < groupCount; ++i) {
         SpriteAnimator2D& anim = anims[i];
         if (!anim.playing || anim.frameCount <= 1) {
             continue;
         }
-        const u16 entityIdx = groupEntities[i].index;
-        const u16 deltaSub = chSubTicks[static_cast<u8>(m_timeChannels[entityIdx])];
+        const u16 deltaSub = chSubTicks[static_cast<u8>(channels[groupEntities[i].index])];
         if (deltaSub == 0) {
             continue;
         }
@@ -413,10 +409,8 @@ void World::StepKinematicsAndAnimations(
             } else {
                 anim.currentFrame = static_cast<u16>(nextFrame);
             }
-            sprites[i].sprite = assetBank.GetSpriteHandle(
-                anim.atlas,
-                static_cast<u16>(anim.firstFrame + anim.currentFrame)
-            );
+            sprites[i].spriteIndex      = static_cast<u16>(anim.baseSpriteIndex + anim.firstFrame + anim.currentFrame);
+            sprites[i].spriteGeneration = anim.spriteGeneration;
         }
         anim.subTickAccum = static_cast<u16>(accum);
     }
@@ -426,7 +420,6 @@ void World::EndTick(time::SimStepView /*step*/) noexcept {
     (void)FlushCommands();
     m_transforms.Propagate(m_maxAllocatedIndex);
 
-    // Synchronize PrevWorldSnapshot2D for newly spawned or teleported entities via 64-bit word scan
     const u32 wordCount = (static_cast<u32>(m_maxAllocatedIndex) + 63u) >> 6;
     for (u32 w = 0; w < wordCount; ++w) {
         u64 tele = m_teleportedWords[w] & m_aliveWords[w];
@@ -444,9 +437,9 @@ void World::EndTick(time::SimStepView /*step*/) noexcept {
     }
 }
 
-void World::Tick(time::SimStepView step, const assets::AssetBank& assetBank) noexcept {
+void World::Tick(time::SimStepView step) noexcept {
     BeginTick(step);
-    StepKinematicsAndAnimations(step, assetBank);
+    StepKinematicsAndAnimations(step);
     EndTick(step);
 }
 
@@ -460,6 +453,7 @@ u64 World::ComputeAuditHash() const noexcept {
     };
 
     const u32 wordCount = (static_cast<u32>(m_maxAllocatedIndex) + 63u) >> 6;
+    const auto worldTransforms = m_transforms.WorldSpan();
     for (u32 w = 0; w < wordCount; ++w) {
         u64 alive = m_aliveWords[w];
         while (alive != 0) {
@@ -471,7 +465,7 @@ u64 World::ComputeAuditHash() const noexcept {
             mixBytes(&m_generations[idx], sizeof(u16));
             mixBytes(&m_timeChannels[idx], sizeof(u8));
             mixBytes(&m_componentMasks[idx], sizeof(ComponentMask));
-            mixBytes(&m_transforms.GetWorld(idx), sizeof(WorldTransform2D));
+            mixBytes(&worldTransforms[idx], sizeof(WorldTransform2D));
         }
     }
 

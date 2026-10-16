@@ -8,8 +8,7 @@
 
 namespace en::world {
 
-// Non-virtual function pointer table for type-erased pool operations (cleanup, command flush, audit hash).
-// Eliminates all virtual dispatch and vtable pointers from ComponentPool<T>.
+// Non-virtual function pointer table for type-erased pool operations.
 struct PoolOps {
     void* poolInstance{nullptr};
     void (*removeUncheckedFn)(void* pool, EntityId id) noexcept {nullptr};
@@ -40,7 +39,7 @@ public:
     void Clear() noexcept {
         std::fill(m_sparse.begin(), m_sparse.end(), kInvalidDenseIndex);
         std::fill(m_presenceWords.begin(), m_presenceWords.end(), 0ULL);
-        m_size = 0;
+        m_size       = 0;
         m_groupCount = 0;
     }
 
@@ -58,7 +57,6 @@ public:
         return static_cast<decltype(&self.m_denseComponents[0])>(nullptr);
     }
 
-    // Unchecked 1-hop read after bitmask or presence-word verification.
     template <typename Self>
     [[nodiscard]] constexpr auto& DirectAtEntityIndex(this Self&& self, u16 entityIndex) noexcept {
         return self.m_denseComponents[self.m_sparse[entityIndex]];
@@ -77,36 +75,27 @@ public:
         const u16 denseIdx = m_size++;
         m_sparse[id.index] = denseIdx;
         m_presenceWords[id.index >> 6] |= (1ULL << (id.index & 63u));
-        m_denseEntities[denseIdx] = id;
+        m_denseEntities[denseIdx]   = id;
         m_denseComponents[denseIdx] = T{std::forward<Args>(args)...};
         return &m_denseComponents[denseIdx];
     }
 
     bool Remove(EntityId id) noexcept {
         const u16 denseIdx = m_sparse[id.index];
-        if (denseIdx >= m_size || m_denseEntities[denseIdx] != id) {
+        if (denseIdx >= m_size || m_denseEntities[denseIdx] != id) [[unlikely]] {
             return false;
         }
-        // If element is inside the lockstep owning-group partition [0, m_groupCount),
-        // swap it to the partition boundary (m_groupCount - 1) first to preserve group contiguity.
-        u16 targetIdx = denseIdx;
-        if (targetIdx < m_groupCount) {
-            const u16 groupLast = --m_groupCount;
-            if (targetIdx != groupLast) {
-                SwapDenseSlots(targetIdx, groupLast);
-                targetIdx = groupLast;
-            }
-        }
-        const u16 lastIdx = --m_size;
-        if (targetIdx != lastIdx) {
-            SwapDenseSlots(targetIdx, lastIdx);
-        }
-        m_sparse[id.index] = kInvalidDenseIndex;
-        m_presenceWords[id.index >> 6] &= ~(1ULL << (id.index & 63u));
+        RemoveAtDense(denseIdx, id.index);
         return true;
     }
 
-    // Swaps two dense slots and updates sparse back-pointers (used by OwningGroup lockstep partition).
+    void RemoveUnchecked(EntityId id) noexcept {
+        const u16 denseIdx = m_sparse[id.index];
+        if (denseIdx < m_size) [[likely]] {
+            RemoveAtDense(denseIdx, id.index);
+        }
+    }
+
     constexpr void SwapDenseSlots(u16 idxA, u16 idxB) noexcept {
         if (idxA == idxB) {
             return;
@@ -119,19 +108,17 @@ public:
         m_sparse[entB.index] = idxA;
     }
 
-    // Promotes an existing entity into the lockstep owning group partition [0, m_groupCount).
-    constexpr u16 PromoteToGroup(EntityId id) noexcept {
-        const u16 currentIdx = m_sparse[id.index];
-        const u16 groupSlot = m_groupCount++;
+    constexpr u16 PromoteToGroup(u16 entityIndex) noexcept {
+        const u16 currentIdx = m_sparse[entityIndex];
+        const u16 groupSlot  = m_groupCount++;
         if (currentIdx != groupSlot) {
             SwapDenseSlots(currentIdx, groupSlot);
         }
         return groupSlot;
     }
 
-    // Demotes an entity out of the lockstep owning group partition without removing it from the pool.
-    constexpr void DemoteFromGroup(EntityId id) noexcept {
-        const u16 currentIdx = m_sparse[id.index];
+    constexpr void DemoteFromGroup(u16 entityIndex) noexcept {
+        const u16 currentIdx = m_sparse[entityIndex];
         if (currentIdx < m_groupCount) {
             const u16 groupLast = --m_groupCount;
             if (currentIdx != groupLast) {
@@ -152,6 +139,22 @@ public:
     }
 
 private:
+    constexpr void RemoveAtDense(u16 targetIdx, u16 entityIndex) noexcept {
+        if (targetIdx < m_groupCount) {
+            const u16 groupLast = --m_groupCount;
+            if (targetIdx != groupLast) {
+                SwapDenseSlots(targetIdx, groupLast);
+                targetIdx = groupLast;
+            }
+        }
+        const u16 lastIdx = --m_size;
+        if (targetIdx != lastIdx) {
+            SwapDenseSlots(targetIdx, lastIdx);
+        }
+        m_sparse[entityIndex] = kInvalidDenseIndex;
+        m_presenceWords[entityIndex >> 6] &= ~(1ULL << (entityIndex & 63u));
+    }
+
     std::span<u16> m_sparse{};
     std::span<u64> m_presenceWords{};
     std::span<EntityId> m_denseEntities{};

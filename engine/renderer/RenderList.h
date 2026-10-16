@@ -19,8 +19,8 @@ public:
     static constexpr u32 kMaxPasses  = 16;
     static constexpr u32 kChunkQuads = 4096;
 
-    // Pre-transformed view-space quad for branchless 4-vertex expansion.
-    struct alignas(16) PreparedQuad {
+    // Pre-transformed view-space quad occupying exactly one 64-byte cache line.
+    struct alignas(64) PreparedQuad {
         f32 cx{0.0f};
         f32 cy{0.0f};
         f32 hxX{0.0f};
@@ -34,7 +34,7 @@ public:
         Color color{};
         u16 textureGen{1};
     };
-    static_assert(sizeof(PreparedQuad) == 64);
+    static_assert(sizeof(PreparedQuad) == 64 && alignof(PreparedQuad) == 64);
 
     void Reset(platform::Extent2i size) noexcept;
 

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "input/InputTypes.h"
 #include "platform/PlatformTypes.h"
 #include "platform/Window.h"
+
 #include <span>
 
 struct SDL_Gamepad;
@@ -47,9 +47,11 @@ struct EventTap {
 };
 
 // Owns SDL3 subsystem lifecycle, gamepad handles, sandboxed filesystem paths, and frame event pumping.
+// Single-instance OS coordinator; non-copyable and non-movable.
+// Invariant: All active SDL_Gamepad handles are closed prior to SDL_Quit().
 class Platform {
 public:
-    static constexpr usize kMaxGamepads = input::kMaxGamepads;
+    static constexpr usize kMaxGamepads = 4;
 
     constexpr Platform() noexcept = default;
     ~Platform() noexcept;
@@ -62,7 +64,6 @@ public:
         std::string_view orgName = "EngineN") noexcept;
     void Shutdown() noexcept;
 
-    // Polls all pending OS events, updates Window state, and feeds InputPipeline.
     WindowFlags Pump(Window& window, input::InputPipeline& input, EventTap tap = {}) noexcept;
 
     [[nodiscard]] constexpr bool ShouldQuit() const noexcept { return m_quit; }

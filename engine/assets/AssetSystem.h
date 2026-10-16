@@ -3,7 +3,6 @@
 #include "assets/AssetBank.h"
 
 #include <memory>
-#include <string>
 #include <string_view>
 
 struct SDL_AsyncIO;
@@ -41,7 +40,6 @@ public:
     [[nodiscard]] Result<void, AssetErrc> Init(const AssetSystemConfig& cfg = {}) noexcept;
     void Shutdown() noexcept;
 
-    // Mounts a cooked .enpak file (either via zero-copy memory view or SDL_AsyncIO file handle).
     [[nodiscard]] Result<void, AssetErrc> MountPackMemory(
         std::span<const u8> mappedPak,
         u8 priority = 0) noexcept;
@@ -73,18 +71,14 @@ public:
         AssetId id,
         Residency residency = Residency::Presentation) noexcept;
 
-    // Drains completed async reads in deterministic request order and uploads textures to Renderer.
     void Pump(renderer::Renderer& renderer, const PumpBudget& budget = {}) noexcept;
-
-    // Headless pump for CI unit tests without an active SDL_Renderer.
     void PumpHeadless(const PumpBudget& budget = {}) noexcept;
 
     [[nodiscard]] Result<void, AssetErrc> WaitSimReady(
         ScopeId scope,
         renderer::Renderer* optionalRenderer = nullptr) noexcept;
 
-    [[nodiscard]] constexpr const AssetBank& Bank() const noexcept { return m_bank; }
-    [[nodiscard]] constexpr AssetBank& Bank() noexcept { return m_bank; }
+    [[nodiscard]] constexpr auto&& Bank(this auto&& self) noexcept { return self.m_bank; }
 
 private:
     struct MountTocSlot {
@@ -111,7 +105,6 @@ private:
         u32 stagingOffset{0};
         u32 stagingReserve{0};
         u16 slot{0};
-        u16 depTextureSlot{0};
         u8 mountIndex{0};
         bool ioComplete{false};
         bool ioSuccess{false};
@@ -144,7 +137,6 @@ private:
     std::unique_ptr<u8[]> m_stagingRing;
     u32 m_ringCap{0};
     u32 m_ringWrite{0};
-    u32 m_ringRead{0};
     u32 m_ringUsed{0};
 
     std::unique_ptr<PendingJob[]> m_jobs;

@@ -100,7 +100,7 @@ inline constexpr ScopeId kInvalidScope = 0xFF;
 inline constexpr u32 kMaxScopes        = 32;
 
 // Cache-line half-sized (32B) hot sprite record consumed directly by RenderList extraction.
-// Embeds the resolved GPU TextureHandle so rendering requires a single array read.
+// Packs generation into the trailing 4 bytes so SpriteHandle validation requires zero extra arrays.
 struct alignas(32) SpriteFrame {
     renderer::FRect uv{0.0f, 0.0f, 1.0f, 1.0f};
     f32 width{1.0f};
@@ -109,7 +109,7 @@ struct alignas(32) SpriteFrame {
     i16 pivotY{0};
     renderer::TextureHandle gpuTexture{renderer::kWhiteTexture};
 };
-static_assert(sizeof(SpriteFrame) == 32);
+static_assert(sizeof(SpriteFrame) == 32 && alignof(SpriteFrame) == 32);
 
 struct TextureRecord {
     renderer::TextureHandle gpu{renderer::kWhiteTexture};

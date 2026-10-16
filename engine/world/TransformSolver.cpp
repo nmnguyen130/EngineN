@@ -1,6 +1,7 @@
 #include "world/TransformSolver.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace en::world {
@@ -56,7 +57,8 @@ void TransformSolver::InitSlot(u16 idx, const LocalTransform2D& initialLocal, bo
 
     f32 c = 1.0f;
     f32 s = 0.0f;
-    FastSinCos(initialLocal.rotationRad, c, s);
+    const f32 normRot = NormalizeAngleRad(initialLocal.rotationRad);
+    FastSinCos(normRot, c, s);
 
     m_world[idx] = WorldTransform2D{
         .x           = initialLocal.x,
@@ -65,7 +67,7 @@ void TransformSolver::InitSlot(u16 idx, const LocalTransform2D& initialLocal, bo
         .scaleY      = initialLocal.scaleY,
         .cosRot      = c,
         .sinRot      = s,
-        .worldRotRad = initialLocal.rotationRad,
+        .worldRotRad = normRot,
         .worldDepth  = initialLocal.depthOffset,
     };
     SyncPrevToCurrent(idx);
@@ -194,9 +196,9 @@ void TransformSolver::AppendSubtreeDFS(u16 parentIdx) noexcept {
     }
 }
 
-void TransformSolver::RebuildHierarchyOrder() noexcept {
+void TransformSolver::RebuildHierarchyOrder(u16 maxAllocatedIndex) noexcept {
     m_childCount = 0;
-    const u32 wordCount = static_cast<u32>(m_spatialAliveWords.size());
+    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
     for (u32 w = 0; w < wordCount; ++w) {
         u64 alive = m_spatialAliveWords[w];
         while (alive != 0) {
@@ -219,15 +221,26 @@ void TransformSolver::SnapshotPreviousTransforms(
         return;
     }
     const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
+    const auto* __restrict worldPtr = m_world.data();
+    auto* __restrict prevPtr        = m_prev.data();
+    const auto* __restrict chPtr    = entityChannels.data();
+
     for (u32 w = 0; w < wordCount; ++w) {
         u64 mask = m_spatialAliveWords[w] & m_spatialDynamicWords[w];
         while (mask != 0) {
             const u32 bit = static_cast<u32>(std::countr_zero(mask));
             mask &= (mask - 1u);
             const u16 idx = static_cast<u16>((w << 6) + bit);
-            const u8 ch = static_cast<u8>(entityChannels[idx]);
-            if ((activeChannelMask & (1u << ch)) != 0) {
-                SyncPrevToCurrent(idx);
+            if ((activeChannelMask & (1u << static_cast<u8>(chPtr[idx]))) != 0) {
+                const WorldTransform2D& cur = worldPtr[idx];
+                prevPtr[idx] = PrevWorldSnapshot2D{
+                    .x           = cur.x,
+                    .y           = cur.y,
+                    .scaleX      = cur.scaleX,
+                    .scaleY      = cur.scaleY,
+                    .worldRotRad = cur.worldRotRad,
+                    .worldDepth  = cur.worldDepth,
+                };
             }
         }
     }
@@ -235,7 +248,7 @@ void TransformSolver::SnapshotPreviousTransforms(
 
 void TransformSolver::Propagate(u16 maxAllocatedIndex) noexcept {
     if (m_orderDirty) [[unlikely]] {
-        RebuildHierarchyOrder();
+        RebuildHierarchyOrder(maxAllocatedIndex);
     }
 
     const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
@@ -284,7 +297,7 @@ void TransformSolver::Propagate(u16 maxAllocatedIndex) noexcept {
         if (!parentDirty && !childDirty) {
             continue;
         }
-        m_childDirtyWords[cw]  &= ~cb;
+        m_childDirtyWords[cw]   &= ~cb;
         m_subtreeDirtyWords[cw] |= cb;
 
         const WorldTransform2D& p = m_world[parentIdx];

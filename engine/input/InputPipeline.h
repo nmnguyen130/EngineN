@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 
 namespace en::input {
 
@@ -17,7 +18,6 @@ public:
 
     constexpr InputPipeline() noexcept = default;
 
-    // 1. Call before polling OS events each render frame
     constexpr void BeginFrame() noexcept {
         m_frame.pressed     = 0;
         m_frame.released    = 0;
@@ -26,14 +26,13 @@ public:
         m_frame.mouseWheel  = {};
     }
 
-    // 2. Call once after OS event polling completes to publish UI/Render FrameInput
     [[nodiscard]] constexpr const FrameInput& EndFrame() noexcept {
-        const u16 liveHeld = EvaluateLiveHeld() & m_actionMask;
-        // Include m_latchedTap so a sub-frame tap also registers as pressed for UI
-        const u16 effectiveHeld = liveHeld | (m_latchedTap & m_actionMask);
+        const u16 liveHeld      = EvaluateLiveHeld() & m_actionMask;
+        const u16 maskedTap     = m_latchedTap & m_actionMask;
+        const u16 effectiveHeld = liveHeld | maskedTap;
 
         ++m_frame.frameIndex;
-        m_frame.pressed  = static_cast<u16>((effectiveHeld & ~m_prevFrameHeld) | (m_latchedTap & m_actionMask));
+        m_frame.pressed  = static_cast<u16>((effectiveHeld & ~m_prevFrameHeld) | maskedTap);
         m_frame.released = static_cast<u16>(~liveHeld & (m_prevFrameHeld | m_frame.pressed));
         m_frame.held     = liveHeld;
         m_prevFrameHeld  = liveHeld;
@@ -44,24 +43,23 @@ public:
         return m_frame;
     }
 
-    // 3. Call inside `while (const auto step = m_time.PollTick())`
     [[nodiscard]] constexpr TickInput PollTick(u64 tickIndex) noexcept {
         const u16 liveHeld = EvaluateLiveHeld() & m_actionMask;
         const u16 tapMask  = m_latchedTap & m_actionMask;
         m_latchedTap       = 0;
 
-        // If a button was tapped and already released before this tick, force it held for 1 tick
-        // so simulation sees a clean Press on Tick N and the Release on Tick N+1.
+        // Force sub-frame tap held for 1 tick so simulation sees Press on Tick N and Release on Tick N+1.
         const u16 tickHeld = liveHeld | tapMask;
         const u16 pressed  = static_cast<u16>((tickHeld & ~m_prevTickHeld) | tapMask);
         const u16 released = static_cast<u16>(~tickHeld & m_prevTickHeld);
         m_prevTickHeld     = tickHeld;
 
-        for (usize a = 0; a < kMaxActions; ++a) {
-            const u16 bit = static_cast<u16>(1u << a);
-            if ((tickHeld & bit) == 0) {
-                m_heldTicks[a] = 0;
-            } else if ((pressed & bit) != 0) {
+        for (u32 m = static_cast<u32>(~tickHeld & 0xFFFFu); m != 0; m &= m - 1) {
+            m_heldTicks[static_cast<usize>(std::countr_zero(m))] = 0;
+        }
+        for (u32 m = tickHeld; m != 0; m &= m - 1) {
+            const usize a = static_cast<usize>(std::countr_zero(m));
+            if (((pressed >> a) & 1u) != 0) {
                 m_heldTicks[a] = 1;
             } else if (m_heldTicks[a] < 0xFFFFu) {
                 ++m_heldTicks[a];
@@ -78,17 +76,11 @@ public:
         };
     }
 
-    // Configuration & Context Masking
-    [[nodiscard]] constexpr InputMap& Map() noexcept { return m_map; }
-    [[nodiscard]] constexpr const InputMap& Map() const noexcept { return m_map; }
+    [[nodiscard]] constexpr auto&& Map(this auto&& self) noexcept { return self.m_map; }
 
-    constexpr void SetActionMask(u16 enabledActionsMask) noexcept {
-        m_actionMask = enabledActionsMask;
-    }
-
+    constexpr void SetActionMask(u16 enabledActionsMask) noexcept { m_actionMask = enabledActionsMask; }
     [[nodiscard]] constexpr u16 GetActionMask() const noexcept { return m_actionMask; }
 
-    // Physical Hardware Feeders (Called by SdlInput or Unit Tests)
     constexpr void FeedButton(Source src, bool down) noexcept {
         if (!src.IsValid() || IsPhysicallyDown(src) == down) {
             return;
@@ -124,7 +116,7 @@ public:
             }
         }
     }
-    
+
     constexpr void FeedGamepadButton(u32 instanceId, u16 button, bool down) noexcept {
         const u8 slot = AcquireGamepadSlot(instanceId);
         if (slot < kMaxGamepads) {
@@ -175,6 +167,20 @@ public:
         }
     }
 
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
+        u64 h = 14695981039346656037ull;
+        auto mix = [&](u64 v) constexpr noexcept {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(m_actionMask);
+        mix(m_latchedTap);
+        mix(m_prevTickHeld);
+        for (const u16 ht : m_heldTicks) mix(ht);
+        for (const i8 dir : m_lastAxisDir) mix(static_cast<u8>(dir));
+        return h;
+    }
+
 private:
     struct GamepadState {
         static constexpr usize kMaxAxes = 6;
@@ -199,7 +205,7 @@ private:
         return freeSlot;
     }
 
-    constexpr void SetPhysicalBit(Source& src, bool down) noexcept {
+    constexpr void SetPhysicalBit(Source src, bool down) noexcept {
         switch (src.device) {
             case Device::Keyboard: {
                 const u64 mask = 1ull << (src.code & 63);
@@ -226,7 +232,7 @@ private:
     }
 
     constexpr void RecordTapAndSocd(Source pressedSrc) noexcept {
-        const auto matches = [&](Source binding) constexpr noexcept {
+        const auto matches = [pressedSrc](Source binding) constexpr noexcept {
             return binding.device == pressedSrc.device &&
                    binding.code == pressedSrc.code &&
                    (binding.device != Device::Gamepad ||
@@ -238,6 +244,7 @@ private:
             for (const Source s : m_map.actions[a]) {
                 if (s.IsValid() && matches(s)) {
                     m_latchedTap |= static_cast<u16>(1u << a);
+                    break;
                 }
             }
         }
@@ -290,25 +297,24 @@ private:
                         continue;
                     }
                     const i16 raw  = m_pads[p].axes[axIdx];
-                    const f32 norm = (raw < 0) ? (static_cast<f32>(raw) / 32768.0f) : (static_cast<f32>(raw) / 32767.0f);
+                    const f32 norm = (raw < 0)
+                        ? (static_cast<f32>(raw) * (1.0f / 32768.0f))
+                        : (static_cast<f32>(raw) * (1.0f / 32767.0f));
                     f32 v = ApplyAxialDeadzone(norm, cfg.deadzone);
                     if (cfg.inverted) v = -v;
                     v = std::clamp(v * cfg.scale, -1.0f, 1.0f);
-                    if ((v < 0.0f ? -v : v) > (analog < 0.0f ? -analog : analog)) {
+                    if (std::abs(v) > std::abs(analog)) {
                         analog = v;
                     }
                 }
             }
 
-            const f32 val = ((analog < 0.0f ? -analog : analog) > (digital < 0.0f ? -digital : digital))
-                          ? analog
-                          : digital;
+            const f32 val = (std::abs(analog) > std::abs(digital)) ? analog : digital;
             out[i] = static_cast<i16>(val >= 0.0f ? (val * 32767.0f + 0.5f) : (val * 32767.0f - 0.5f));
         }
         return out;
     }
 
-private:
     alignas(64) std::array<u64, Source::kMaxScancodes / 64> m_keyBits{};
     u8 m_mouseBits = 0;
     std::array<i8, kMaxAxes> m_lastAxisDir{};

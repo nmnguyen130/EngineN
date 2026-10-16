@@ -46,6 +46,8 @@ public:
     [[nodiscard]] constexpr const LocalTransform2D& GetLocal(u16 idx) const noexcept { return m_local[idx]; }
     [[nodiscard]] constexpr const WorldTransform2D& GetWorld(u16 idx) const noexcept { return m_world[idx]; }
     [[nodiscard]] constexpr const PrevWorldSnapshot2D& GetPrevWorld(u16 idx) const noexcept { return m_prev[idx]; }
+    [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldSpan() const noexcept { return m_world; }
+    [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevWorldSpan() const noexcept { return m_prev; }
     [[nodiscard]] constexpr u16 GetParentIndex(u16 idx) const noexcept { return m_tree[idx].parent; }
     [[nodiscard]] constexpr u8 GetDepth(u16 idx) const noexcept { return m_depths[idx]; }
 
@@ -72,12 +74,12 @@ public:
     constexpr void SyncPrevToCurrent(u16 idx) noexcept {
         const WorldTransform2D& w = m_world[idx];
         m_prev[idx] = PrevWorldSnapshot2D{
-            .x = w.x,
-            .y = w.y,
-            .scaleX = w.scaleX,
-            .scaleY = w.scaleY,
+            .x           = w.x,
+            .y           = w.y,
+            .scaleX      = w.scaleX,
+            .scaleY      = w.scaleY,
             .worldRotRad = w.worldRotRad,
-            .worldDepth = w.worldDepth,
+            .worldDepth  = w.worldDepth,
         };
     }
 
@@ -93,7 +95,7 @@ public:
 
 private:
     void UnlinkFromParent(u16 childIdx) noexcept;
-    void RebuildHierarchyOrder() noexcept;
+    void RebuildHierarchyOrder(u16 maxAllocatedIndex) noexcept;
     void AppendSubtreeDFS(u16 parentIdx) noexcept;
 
     std::span<LocalTransform2D> m_local{};

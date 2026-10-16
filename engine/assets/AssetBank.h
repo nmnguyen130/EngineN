@@ -26,7 +26,7 @@ public:
 
     [[nodiscard]] Result<ScopeId, AssetErrc> BeginScope() noexcept;
     void EndScope(ScopeId scope) noexcept;
-    void AdvanceFrame(u32 frameIndex) noexcept { m_currentFrame = frameIndex; }
+    constexpr void AdvanceFrame(u32 frameIndex) noexcept { m_currentFrame = frameIndex; }
 
     [[nodiscard]] Result<u16, AssetErrc> AcquireSlot(
         AssetId id,
@@ -38,27 +38,16 @@ public:
     [[nodiscard]] u16 FindSlot(AssetId id) const noexcept;
 
     [[nodiscard]] constexpr TextureAssetHandle ToTextureHandle(u16 slot) const noexcept {
-        return (slot < m_slotCap && m_slots[slot].kind == AssetKind::Texture)
-                   ? TextureAssetHandle{m_slots[slot].payloadSlot, m_slots[slot].generation}
-                   : TextureAssetHandle{};
+        return ToHandle<TextureAssetHandle>(slot, AssetKind::Texture);
     }
-
     [[nodiscard]] constexpr AtlasHandle ToAtlasHandle(u16 slot) const noexcept {
-        return (slot < m_slotCap && m_slots[slot].kind == AssetKind::Atlas)
-                   ? AtlasHandle{m_slots[slot].payloadSlot, m_slots[slot].generation}
-                   : AtlasHandle{};
+        return ToHandle<AtlasHandle>(slot, AssetKind::Atlas);
     }
-
     [[nodiscard]] constexpr BlobHandle ToBlobHandle(u16 slot) const noexcept {
-        return (slot < m_slotCap && m_slots[slot].kind == AssetKind::Blob)
-                   ? BlobHandle{m_slots[slot].payloadSlot, m_slots[slot].generation}
-                   : BlobHandle{};
+        return ToHandle<BlobHandle>(slot, AssetKind::Blob);
     }
-
     [[nodiscard]] constexpr AudioHandle ToAudioHandle(u16 slot) const noexcept {
-        return (slot < m_slotCap && m_slots[slot].kind == AssetKind::Audio)
-                   ? AudioHandle{m_slots[slot].payloadSlot, m_slots[slot].generation}
-                   : AudioHandle{};
+        return ToHandle<AudioHandle>(slot, AssetKind::Audio);
     }
 
     [[nodiscard]] constexpr const SpriteFrame& GetSprite(SpriteHandle h) const noexcept {
@@ -126,11 +115,10 @@ public:
 
     void MarkFailed(u16 slot) noexcept;
 
-    // Collects unpinned TextureHandles exceeding VRAM budget and grace period for GPU destruction.
     [[nodiscard]] u32 EvictUnpinned(std::span<renderer::TextureHandle> outDestroyedTextures) noexcept;
 
     [[nodiscard]] bool IsScopeSimReady(ScopeId scope) const noexcept;
-    [[nodiscard]] u64 CurrentVramBytes() const noexcept { return m_currentVramBytes; }
+    [[nodiscard]] constexpr u64 CurrentVramBytes() const noexcept { return m_currentVramBytes; }
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
     [[nodiscard]] static Result<u32, AssetErrc> DecompressLz4(
@@ -151,8 +139,18 @@ private:
         u16 masterSlot{0};
     };
 
+    template <typename H>
+    [[nodiscard]] constexpr H ToHandle(u16 slot, AssetKind expected) const noexcept {
+        return (slot < m_slotCap && m_slots[slot].kind == expected)
+                   ? H{m_slots[slot].payloadSlot, m_slots[slot].generation}
+                   : H{};
+    }
+
     void InsertHash(u64 key, u16 slotIndex) noexcept;
     void RemoveHash(u64 key) noexcept;
+    [[nodiscard]] Result<const u8*, AssetErrc> ResolveArenaPayload(
+        std::span<const u8> rawPayload,
+        bool isMemoryMapped) noexcept;
 
     AssetBankConfig m_cfg{};
     u32 m_activeScopesMask{0};

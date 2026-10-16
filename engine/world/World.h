@@ -11,8 +11,6 @@
 #include <span>
 #include <tuple>
 
-namespace en::assets { class AssetBank; }
-
 namespace en::world {
 
 enum class WorldCmdOp : u8 {
@@ -47,11 +45,11 @@ public:
     class Iterator final {
     public:
         constexpr Iterator(
-            WorldPtr world,
+            const ComponentMask* masks,
             PoolTuple pools,
             std::span<const EntityId> leadEntities,
             usize idx) noexcept
-            : m_world(world), m_pools(pools), m_lead(leadEntities), m_idx(idx) {
+            : m_masks(masks), m_pools(pools), m_lead(leadEntities), m_idx(idx) {
             AdvanceToValid();
         }
 
@@ -80,8 +78,7 @@ public:
     private:
         constexpr void AdvanceToValid() noexcept {
             while (m_idx < m_lead.size()) {
-                const u16 entityIdx = m_lead[m_idx].index;
-                const ComponentMask mask = m_world->GetComponentMaskByIndex(entityIdx);
+                const ComponentMask mask = m_masks[m_lead[m_idx].index];
                 if (((mask & kIncludeMask) == kIncludeMask) && ((mask & kExcludeMask) == 0)) [[likely]] {
                     break;
                 }
@@ -89,20 +86,20 @@ public:
             }
         }
 
-        WorldPtr m_world;
+        const ComponentMask* m_masks{nullptr};
         PoolTuple m_pools;
         std::span<const EntityId> m_lead;
         usize m_idx{0};
     };
 
-    constexpr WorldView(WorldPtr world, PoolTuple pools, std::span<const EntityId> lead) noexcept
-        : m_world(world), m_pools(pools), m_lead(lead) {}
+    constexpr WorldView(const ComponentMask* masks, PoolTuple pools, std::span<const EntityId> lead) noexcept
+        : m_masks(masks), m_pools(pools), m_lead(lead) {}
 
-    [[nodiscard]] constexpr Iterator begin() const noexcept { return Iterator(m_world, m_pools, m_lead, 0); }
-    [[nodiscard]] constexpr Iterator end() const noexcept { return Iterator(m_world, m_pools, m_lead, m_lead.size()); }
+    [[nodiscard]] constexpr Iterator begin() const noexcept { return Iterator(m_masks, m_pools, m_lead, 0); }
+    [[nodiscard]] constexpr Iterator end() const noexcept { return Iterator(m_masks, m_pools, m_lead, m_lead.size()); }
 
 private:
-    WorldPtr m_world;
+    const ComponentMask* m_masks{nullptr};
     PoolTuple m_pools;
     std::span<const EntityId> m_lead;
 };
@@ -154,11 +151,11 @@ public:
         m_poolOps[tid] = PoolOps{
             .poolInstance = pool,
             .removeUncheckedFn = [](void* p, EntityId id) noexcept {
-                static_cast<ComponentPool<T>*>(p)->Remove(id);
+                static_cast<ComponentPool<T>*>(p)->RemoveUnchecked(id);
             },
             .emplaceRawFn = [](void* p, EntityId id, const void* raw) noexcept -> Result<void, WorldErrc> {
                 auto res = static_cast<ComponentPool<T>*>(p)->Emplace(id, *static_cast<const T*>(raw));
-                if (!res) {
+                if (!res) [[unlikely]] {
                     return Err(res.error());
                 }
                 return {};
@@ -203,8 +200,7 @@ public:
         if (m_poolOps[tid].poolInstance == nullptr) [[unlikely]] {
             return Err(WorldErrc::ComponentNotRegistered);
         }
-        auto& pool = GetPool<T>();
-        auto res = pool.Emplace(id, std::forward<Args>(args)...);
+        auto res = GetPool<T>().Emplace(id, std::forward<Args>(args)...);
         if (!res) [[unlikely]] {
             return res;
         }
@@ -215,7 +211,7 @@ public:
         if constexpr (tid == Sprite2D::kTypeId || tid == SpriteAnimator2D::kTypeId) {
             constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
             if ((prevMask & kAnimGroupMask) != kAnimGroupMask && (newMask & kAnimGroupMask) == kAnimGroupMask) {
-                SyncLockstepAnimationGroupOnAdd(id);
+                SyncLockstepAnimationGroupOnAdd(id.index);
             }
         }
         return res;
@@ -234,11 +230,12 @@ public:
         if constexpr (tid == Sprite2D::kTypeId || tid == SpriteAnimator2D::kTypeId) {
             constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
             if ((m_componentMasks[id.index] & kAnimGroupMask) == kAnimGroupMask) {
-                SyncLockstepAnimationGroupOnRemove(id);
+                SyncLockstepAnimationGroupOnRemove(id.index);
             }
         }
         m_componentMasks[id.index] &= ~bit;
-        return GetPool<T>().Remove(id);
+        GetPool<T>().RemoveUnchecked(id);
+        return true;
     }
 
     template <Component T, typename Self>
@@ -263,7 +260,6 @@ public:
         return *static_cast<PoolPtr>(self.m_poolOps[T::kTypeId].poolInstance);
     }
 
-    // Deferred Command Tape API
     [[nodiscard]] Result<void, WorldErrc> DeferDestroy(EntityId id) noexcept;
     [[nodiscard]] Result<void, WorldErrc> DeferSetParent(EntityId child, EntityId parent) noexcept;
 
@@ -279,7 +275,6 @@ public:
 
     [[nodiscard]] Result<void, WorldErrc> FlushCommands() noexcept;
 
-    // Direct O(1) Spatial & Metadata Accessors
     [[nodiscard]] constexpr const LocalTransform2D& GetLocalTransform(EntityId id) const noexcept {
         return m_transforms.GetLocal(id.index);
     }
@@ -293,14 +288,14 @@ public:
     [[nodiscard]] constexpr const WorldTransform2D& GetWorldTransform(EntityId id) const noexcept {
         return m_transforms.GetWorld(id.index);
     }
-    [[nodiscard]] constexpr const WorldTransform2D& GetWorldByIndex(u16 idx) const noexcept {
-        return m_transforms.GetWorld(idx);
+    [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldTransforms() const noexcept {
+        return m_transforms.WorldSpan();
     }
-    [[nodiscard]] constexpr const PrevWorldSnapshot2D& GetPrevWorldByIndex(u16 idx) const noexcept {
-        return m_transforms.GetPrevWorld(idx);
+    [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevWorldTransforms() const noexcept {
+        return m_transforms.PrevWorldSpan();
     }
-    [[nodiscard]] constexpr time::TimeChannel GetTimeChannelByIndex(u16 idx) const noexcept {
-        return m_timeChannels[idx];
+    [[nodiscard]] constexpr std::span<const time::TimeChannel> TimeChannels() const noexcept {
+        return m_timeChannels;
     }
     [[nodiscard]] constexpr ComponentMask GetComponentMaskByIndex(u16 idx) const noexcept {
         return m_componentMasks[idx];
@@ -328,14 +323,16 @@ public:
             pools
         );
 
-        return WorldView<decltype(&self), Exclude<ExcludeTs...>, IncludeTs...>(&self, pools, smallestLead);
+        return WorldView<decltype(&self), Exclude<ExcludeTs...>, IncludeTs...>(
+            self.m_componentMasks.data(), pools, smallestLead
+        );
     }
 
-    // 120 Hz Simulation Tick Pipeline
+    // 120 Hz Pure Layer-1 Simulation Pipeline (Zero AssetBank dependency)
     void BeginTick(time::SimStepView step) noexcept;
-    void StepKinematicsAndAnimations(time::SimStepView step, const assets::AssetBank& assetBank) noexcept;
+    void StepKinematicsAndAnimations(time::SimStepView step) noexcept;
     void EndTick(time::SimStepView step) noexcept;
-    void Tick(time::SimStepView step, const assets::AssetBank& assetBank) noexcept;
+    void Tick(time::SimStepView step) noexcept;
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
@@ -355,15 +352,14 @@ private:
     [[nodiscard]] Result<void, WorldErrc> PushRawCommand(
         WorldCmdOp op, u8 componentTypeId, EntityId target, const void* payload, u16 payloadBytes) noexcept;
 
-    void SyncLockstepAnimationGroupOnAdd(EntityId id) noexcept;
-    void SyncLockstepAnimationGroupOnRemove(EntityId id) noexcept;
+    void SyncLockstepAnimationGroupOnAdd(u16 entityIndex) noexcept;
+    void SyncLockstepAnimationGroupOnRemove(u16 entityIndex) noexcept;
 
     WorldConfig m_cfg{};
     std::unique_ptr<u8[]> m_arenaSlab{};
     usize m_arenaCapacity{0};
     usize m_arenaOffset{0};
 
-    // Split SoA Entity Metadata Planes
     std::span<u16> m_generations{};
     std::span<EntityFlags> m_flags{};
     std::span<time::TimeChannel> m_timeChannels{};
@@ -371,7 +367,6 @@ private:
     std::span<u64> m_aliveWords{};
     std::span<u64> m_teleportedWords{};
 
-    // FIFO Recycled Slot Ring Buffer
     std::span<u16> m_freeRing{};
     u32 m_freeHead{0};
     u32 m_freeTail{0};
@@ -380,7 +375,6 @@ private:
     u16 m_maxAllocatedIndex{0};
     u32 m_aliveCount{0};
 
-    // Deferred Command Tape
     std::span<u8> m_cmdTape{};
     u32 m_cmdWriteOffset{0};
 

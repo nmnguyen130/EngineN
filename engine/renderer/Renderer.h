@@ -1,12 +1,14 @@
 #pragma once
 
-#include "platform/Window.h"
-#include "renderer/RendererList.h"
+#include "platform/PlatformTypes.h"
+#include "renderer/RenderList.h"
 
 #include <array>
 
 struct SDL_Renderer;
 struct SDL_Texture;
+
+namespace en::platform { class Window; }
 
 namespace en::renderer {
 
@@ -38,7 +40,6 @@ public:
     void ResizeViewport(platform::Extent2i pixelSize) noexcept;
     [[nodiscard]] Result<void, RendererErrc> SetPresentMode(PresentMode mode) noexcept;
 
-    // Asset Sink API (Consumed by Asset Manager for texture lifecycle management)
     [[nodiscard]] Result<TextureHandle, RendererErrc> CreateTexture(const TextureDesc& desc) noexcept;
     [[nodiscard]] Result<void, RendererErrc> UpdateTexture(
         TextureHandle handle,
@@ -48,7 +49,6 @@ public:
     void DestroyTexture(TextureHandle handle) noexcept;
     [[nodiscard]] constexpr bool IsTextureValid(TextureHandle handle) const noexcept;
 
-    // Per-frame recording and execution entry points
     [[nodiscard]] RenderList& BeginFrame() noexcept;
     void Submit() noexcept;
     void Submit(RenderList& list) noexcept;

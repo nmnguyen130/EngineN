@@ -23,24 +23,24 @@ struct alignas(16) CookedPrefabHeader {
 static_assert(sizeof(CookedPrefabHeader) == 16);
 
 struct alignas(16) CookedPrefabEntityRecord {
-    LocalTransform2D localTransform{};              // 24B
-    renderer::Color tint{1.0f, 1.0f, 1.0f, 1.0f};   // 16B
-    assets::AssetId atlasOrTextureId{};             // 8B: Resolved via AssetBank on spawn
-    u16 parentLocalIndex{0xFFFF};                   // 2B: 0xFFFF = Root of prefab
-    u16 firstFrame{0};                              // 2B
-    u16 frameCount{1};                              // 2B
-    u16 ticksPerFrame{12};                          // 2B
-    u16 baseDepth{32768};                           // 2B
-    i16 ySortScale{0};                              // 2B
-    u8 timeChannel{0};                              // 1B
-    u8 layer{0};                                    // 1B
-    u8 passId{0};                                   // 1B
-    u8 flags{0};                                    // 1B: Bit 0 = HasSprite, Bit 1 = HasAnimator, Bit 2 = StaticSpatial
+    LocalTransform2D localTransform{};
+    renderer::Color tint{1.0f, 1.0f, 1.0f, 1.0f};
+    assets::AssetId atlasOrTextureId{};
+    u16 parentLocalIndex{0xFFFF};
+    u16 firstFrame{0};
+    u16 frameCount{1};
+    u16 ticksPerFrame{12};
+    u16 baseDepth{32768};
+    i16 ySortScale{0};
+    u8 timeChannel{0};
+    u8 layer{0};
+    u8 passId{0};
+    u8 flags{0}; // Bit 0 = HasSprite, Bit 1 = HasAnimator, Bit 2 = StaticSpatial
 };
 static_assert(sizeof(CookedPrefabEntityRecord) == 64);
 
 // Layer 2 stateless bridge: extracts interpolated render commands and instantiates cooked binary prefabs.
-// Non-owning utility; mutates only outRenderList during Extract() or target World during SpawnPrefab().
+// Non-owning utility; mutates only outRenderList during Extract() or target World during InstantiatePrefab().
 class WorldExtractor final {
 public:
     static void Extract(

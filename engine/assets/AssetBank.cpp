@@ -163,7 +163,7 @@ void AssetBank::Shutdown() noexcept {
 Result<ScopeId, AssetErrc> AssetBank::BeginScope() noexcept {
     const int freeBit = std::countr_one(m_activeScopesMask);
     if (freeBit >= static_cast<int>(kMaxScopes)) {
-        return std::unexpected(AssetErrc::ScopeExhausted);
+        return Err(AssetErrc::ScopeExhausted);
     }
     m_activeScopesMask |= (1u << freeBit);
     return static_cast<ScopeId>(freeBit);
@@ -262,7 +262,7 @@ Result<u16, AssetErrc> AssetBank::AcquireSlot(
     bool& outNeedsLoad) noexcept {
     outNeedsLoad = false;
     if (!id.IsValid()) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
 
     const u32 scopeBit = (scope < kMaxScopes) ? (1u << scope) : 0u;
@@ -285,33 +285,33 @@ Result<u16, AssetErrc> AssetBank::AcquireSlot(
     }
 
     if (m_freeSlotTop == 0) {
-        return std::unexpected(AssetErrc::PoolExhausted);
+        return Err(AssetErrc::PoolExhausted);
     }
 
     u16 payloadIdx = 0;
     switch (kind) {
         case AssetKind::Texture:
-            if (m_freeTexTop == 0) return std::unexpected(AssetErrc::PoolExhausted);
+            if (m_freeTexTop == 0) return Err(AssetErrc::PoolExhausted);
             payloadIdx = m_freeTex[--m_freeTexTop];
             m_textures[payloadIdx] = m_textures[0];
             break;
         case AssetKind::Atlas:
-            if (m_freeAtlasTop == 0) return std::unexpected(AssetErrc::PoolExhausted);
+            if (m_freeAtlasTop == 0) return Err(AssetErrc::PoolExhausted);
             payloadIdx = m_freeAtlases[--m_freeAtlasTop];
             m_atlases[payloadIdx] = m_atlases[0];
             break;
         case AssetKind::Blob:
-            if (m_freeBlobTop == 0) return std::unexpected(AssetErrc::PoolExhausted);
+            if (m_freeBlobTop == 0) return Err(AssetErrc::PoolExhausted);
             payloadIdx = m_freeBlobs[--m_freeBlobTop];
             m_blobs[payloadIdx] = m_blobs[0];
             break;
         case AssetKind::Audio:
-            if (m_freeAudioTop == 0) return std::unexpected(AssetErrc::PoolExhausted);
+            if (m_freeAudioTop == 0) return Err(AssetErrc::PoolExhausted);
             payloadIdx = m_freeAudio[--m_freeAudioTop];
             m_audio[payloadIdx] = m_audio[0];
             break;
         default:
-            return std::unexpected(AssetErrc::NotFound);
+            return Err(AssetErrc::NotFound);
     }
 
     const u16 slot = m_freeSlots[--m_freeSlotTop];
@@ -349,7 +349,7 @@ Result<void, AssetErrc> AssetBank::CommitTexture(
     u16 height,
     u32 vramBytes) noexcept {
     if (slot == 0 || slot >= m_slotCap || m_slots[slot].kind != AssetKind::Texture) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
 
     SlotMeta& meta = m_slots[slot];
@@ -380,10 +380,10 @@ Result<void, AssetErrc> AssetBank::CommitAtlas(
     u16 backingTextureSlot,
     std::span<const u8> rawPayload) noexcept {
     if (slot == 0 || slot >= m_slotCap || m_slots[slot].kind != AssetKind::Atlas) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
     if (rawPayload.size() < sizeof(CookedAtlasHeader)) {
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
 
     CookedAtlasHeader hdr{};
@@ -392,7 +392,7 @@ Result<void, AssetErrc> AssetBank::CommitAtlas(
     const std::size_t framesBytes = static_cast<std::size_t>(hdr.spriteCount) * sizeof(SpriteFrame);
     const std::size_t namesBytes  = static_cast<std::size_t>(hdr.namedFrameCount) * sizeof(CookedFrameName);
     if (hdr.spriteCount == 0 || rawPayload.size() < sizeof(CookedAtlasHeader) + framesBytes + namesBytes) {
-        return std::unexpected(AssetErrc::CorruptedPayload);
+        return Err(AssetErrc::CorruptedPayload);
     }
 
     SlotMeta& meta = m_slots[slot];
@@ -403,7 +403,7 @@ Result<void, AssetErrc> AssetBank::CommitAtlas(
     u16 firstSprite = rec.firstSprite;
     if (firstSprite == 0 || rec.spriteCount != hdr.spriteCount) {
         if (m_spriteCount + hdr.spriteCount > m_spriteCap) {
-            return std::unexpected(AssetErrc::PoolExhausted);
+            return Err(AssetErrc::PoolExhausted);
         }
         firstSprite = static_cast<u16>(m_spriteCount);
         m_spriteCount += hdr.spriteCount;
@@ -427,7 +427,7 @@ Result<void, AssetErrc> AssetBank::CommitAtlas(
 
     if (hdr.namedFrameCount > 0) {
         if (m_namedFrameCount + hdr.namedFrameCount > m_namedFrameCap) {
-            return std::unexpected(AssetErrc::PoolExhausted);
+            return Err(AssetErrc::PoolExhausted);
         }
         const u32 firstNamed = m_namedFrameCount;
         std::memcpy(&m_namedFrames[firstNamed], framesSrc + framesBytes, namesBytes);
@@ -445,29 +445,38 @@ Result<void, AssetErrc> AssetBank::CommitAtlas(
     return {};
 }
 
+Result<const u8*, AssetErrc> AssetBank::ResolveArenaPayload(
+    std::span<const u8> rawPayload,
+    bool isMemoryMapped) noexcept {
+    if (isMemoryMapped || rawPayload.empty()) {
+        return rawPayload.data();
+    }
+    const u32 alignedHead = (m_blobArenaHead + 15u) & ~15u;
+    if (alignedHead + rawPayload.size() > m_blobArenaCap) {
+        return Err(AssetErrc::PoolExhausted);
+    }
+    std::memcpy(&m_blobArena[alignedHead], rawPayload.data(), rawPayload.size());
+    m_blobArenaHead = alignedHead + static_cast<u32>(rawPayload.size());
+    return &m_blobArena[alignedHead];
+}
+
 Result<void, AssetErrc> AssetBank::CommitBlob(
     u16 slot,
     std::span<const u8> rawPayload,
     u32 schemaHash,
     bool isMemoryMapped) noexcept {
     if (slot == 0 || slot >= m_slotCap || m_slots[slot].kind != AssetKind::Blob) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
 
-    const u8* targetPtr = rawPayload.data();
-    if (!isMemoryMapped && !rawPayload.empty()) {
-        const u32 alignedHead = (m_blobArenaHead + 15u) & ~15u;
-        if (alignedHead + rawPayload.size() > m_blobArenaCap) {
-            return std::unexpected(AssetErrc::PoolExhausted);
-        }
-        std::memcpy(&m_blobArena[alignedHead], rawPayload.data(), rawPayload.size());
-        targetPtr = &m_blobArena[alignedHead];
-        m_blobArenaHead = alignedHead + static_cast<u32>(rawPayload.size());
+    auto ptrRes = ResolveArenaPayload(rawPayload, isMemoryMapped);
+    if (!ptrRes) {
+        return Err(ptrRes.error());
     }
 
     SlotMeta& meta = m_slots[slot];
     m_blobs[meta.payloadSlot] = BlobRecord{
-        targetPtr ? targetPtr : kFallbackZeroBlob,
+        *ptrRes ? *ptrRes : kFallbackZeroBlob,
         static_cast<u32>(rawPayload.size()),
         schemaHash};
     meta.state = AssetState::Ready;
@@ -482,24 +491,18 @@ Result<void, AssetErrc> AssetBank::CommitAudio(
     u8 channels,
     bool isMemoryMapped) noexcept {
     if (slot == 0 || slot >= m_slotCap || m_slots[slot].kind != AssetKind::Audio) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
 
-    const u8* targetPtr = rawPayload.data();
-    if (!isMemoryMapped && !rawPayload.empty()) {
-        const u32 alignedHead = (m_blobArenaHead + 15u) & ~15u;
-        if (alignedHead + rawPayload.size() > m_blobArenaCap) {
-            return std::unexpected(AssetErrc::PoolExhausted);
-        }
-        std::memcpy(&m_blobArena[alignedHead], rawPayload.data(), rawPayload.size());
-        targetPtr = &m_blobArena[alignedHead];
-        m_blobArenaHead = alignedHead + static_cast<u32>(rawPayload.size());
+    auto ptrRes = ResolveArenaPayload(rawPayload, isMemoryMapped);
+    if (!ptrRes) {
+        return Err(ptrRes.error());
     }
 
     const u32 divisor = static_cast<u32>(sizeof(i16)) * (channels > 0 ? channels : 1u);
     SlotMeta& meta = m_slots[slot];
     m_audio[meta.payloadSlot] = AudioRecord{
-        targetPtr ? reinterpret_cast<const i16*>(targetPtr) : kFallbackSilencePcm,
+        *ptrRes ? reinterpret_cast<const i16*>(*ptrRes) : kFallbackSilencePcm,
         static_cast<u32>(rawPayload.size()) / divisor,
         sampleRate,
         channels,
@@ -563,6 +566,35 @@ u32 AssetBank::EvictUnpinned(std::span<renderer::TextureHandle> outDestroyedText
         const u16 tIdx = victim.payloadSlot;
         outDestroyedTextures[evictedCount++] = m_textures[tIdx].gpu;
 
+        // Scrub dependent atlas frames and evict unpinned dependent atlases so future re-pins reload cleanly.
+        for (u16 a = 1; a < m_atlasCap; ++a) {
+            if (m_atlases[a].textureSlot != tIdx) {
+                continue;
+            }
+            if (m_atlases[a].firstSprite != 0) {
+                const u32 end = static_cast<u32>(m_atlases[a].firstSprite) + m_atlases[a].spriteCount;
+                for (u32 s = m_atlases[a].firstSprite; s < end; ++s) {
+                    m_sprites[s].gpuTexture = renderer::kWhiteTexture;
+                }
+            }
+            m_atlases[a].textureSlot = 0;
+
+            const u16 atlasMaster = m_atlasCold[a].masterSlot;
+            if (atlasMaster != 0 && m_slots[atlasMaster].scopeMask == 0) {
+                SlotMeta& aMeta = m_slots[atlasMaster];
+                RemoveHash(m_slotIds[atlasMaster].value);
+                m_slotIds[atlasMaster] = AssetId{};
+                aMeta.state = AssetState::Empty;
+                aMeta.kind  = AssetKind::None;
+                if (aMeta.generation < 0xFFFFu) {
+                    ++aMeta.generation;
+                    m_atlasGens[a] = aMeta.generation;
+                    m_freeAtlases[m_freeAtlasTop++] = a;
+                    m_freeSlots[m_freeSlotTop++]    = atlasMaster;
+                }
+            }
+        }
+
         m_currentVramBytes -= m_texVramBytes[tIdx];
         m_texVramBytes[tIdx] = 0;
         m_textures[tIdx] = m_textures[0];
@@ -572,7 +604,6 @@ u32 AssetBank::EvictUnpinned(std::span<renderer::TextureHandle> outDestroyedText
         victim.state = AssetState::Empty;
         victim.kind = AssetKind::None;
 
-        // Retire slot permanently on 16-bit generation wrap to guarantee zero ABA aliasing.
         if (victim.generation < 0xFFFFu) {
             ++victim.generation;
             m_texGens[tIdx] = victim.generation;
@@ -652,14 +683,14 @@ Result<u32, AssetErrc> AssetBank::DecompressLz4(
         if (literalLen == 15) {
             u8 s = 0;
             do {
-                if (ip >= iend) return std::unexpected(AssetErrc::CorruptedPayload);
+                if (ip >= iend) return Err(AssetErrc::CorruptedPayload);
                 s = *ip++;
                 literalLen += s;
             } while (s == 255);
         }
 
         if (ip + literalLen > iend || op + literalLen > oend) {
-            return std::unexpected(AssetErrc::CorruptedPayload);
+            return Err(AssetErrc::CorruptedPayload);
         }
         std::memcpy(op, ip, literalLen);
         ip += literalLen;
@@ -670,27 +701,27 @@ Result<u32, AssetErrc> AssetBank::DecompressLz4(
         }
 
         if (ip + 2 > iend) {
-            return std::unexpected(AssetErrc::CorruptedPayload);
+            return Err(AssetErrc::CorruptedPayload);
         }
         const u16 offset = static_cast<u16>(ip[0] | (static_cast<u16>(ip[1]) << 8));
         ip += 2;
 
         if (offset == 0 || op - offset < dst.data()) {
-            return std::unexpected(AssetErrc::CorruptedPayload);
+            return Err(AssetErrc::CorruptedPayload);
         }
 
         std::size_t matchLen = (token & 0x0Fu) + 4u;
         if (matchLen == 19) {
             u8 s = 0;
             do {
-                if (ip >= iend) return std::unexpected(AssetErrc::CorruptedPayload);
+                if (ip >= iend) return Err(AssetErrc::CorruptedPayload);
                 s = *ip++;
                 matchLen += s;
             } while (s == 255);
         }
 
         if (op + matchLen > oend) {
-            return std::unexpected(AssetErrc::CorruptedPayload);
+            return Err(AssetErrc::CorruptedPayload);
         }
 
         const u8* match = op - offset;

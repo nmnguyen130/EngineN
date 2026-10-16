@@ -40,6 +40,19 @@ public:
         return Take(m_release, ToInputIndex(a), windowTicks);
     }
 
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
+        u64 h = 14695981039346656037ull;
+        auto mix = [&](u64 v) constexpr noexcept {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(m_press.pending);
+        for (const u8 a : m_press.age) mix(a);
+        mix(m_release.pending);
+        for (const u8 a : m_release.age) mix(a);
+        return h;
+    }
+
 private:
     struct Channel {
         u16 pending = 0;

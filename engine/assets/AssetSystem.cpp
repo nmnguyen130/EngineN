@@ -1,4 +1,6 @@
 #include "assets/AssetSystem.h"
+
+#include "platform/PlatformTypes.h"
 #include "renderer/Renderer.h"
 
 #include <SDL3/SDL_asyncio.h>
@@ -31,11 +33,10 @@ AssetSystem::AssetSystem(AssetSystem&& other) noexcept
     , m_bank(std::move(other.m_bank))
     , m_ioQueue(std::exchange(other.m_ioQueue, nullptr))
     , m_mounts(std::move(other.m_mounts))
-    , m_mountCount( std::exchange(other.m_mountCount, 0) )
+    , m_mountCount(std::exchange(other.m_mountCount, 0))
     , m_stagingRing(std::move(other.m_stagingRing))
     , m_ringCap(std::exchange(other.m_ringCap, 0))
     , m_ringWrite(std::exchange(other.m_ringWrite, 0))
-    , m_ringRead(std::exchange(other.m_ringRead, 0))
     , m_ringUsed(std::exchange(other.m_ringUsed, 0))
     , m_jobs(std::move(other.m_jobs))
     , m_nextSequence(other.m_nextSequence)
@@ -53,7 +54,6 @@ AssetSystem& AssetSystem::operator=(AssetSystem&& other) noexcept {
         m_stagingRing = std::move(other.m_stagingRing);
         m_ringCap = std::exchange(other.m_ringCap, 0);
         m_ringWrite = std::exchange(other.m_ringWrite, 0);
-        m_ringRead = std::exchange(other.m_ringRead, 0);
         m_ringUsed = std::exchange(other.m_ringUsed, 0);
         m_jobs = std::move(other.m_jobs);
         m_nextSequence = other.m_nextSequence;
@@ -96,7 +96,7 @@ Result<void, AssetErrc> AssetSystem::Init(const AssetSystemConfig& cfg) noexcept
 
     m_ioQueue = SDL_CreateAsyncIOQueue();
     if (!m_ioQueue) {
-        return std::unexpected(AssetErrc::IoFailure);
+        return Err(AssetErrc::IoFailure);
     }
 
     m_mounts = std::make_unique_for_overwrite<PakMount[]>(cfg.maxMounts);
@@ -108,7 +108,6 @@ Result<void, AssetErrc> AssetSystem::Init(const AssetSystemConfig& cfg) noexcept
     m_ringCap = cfg.stagingRingBytes;
     m_stagingRing = std::make_unique_for_overwrite<u8[]>(m_ringCap);
     m_ringWrite = 0;
-    m_ringRead = 0;
     m_ringUsed = 0;
 
     m_jobs = std::make_unique_for_overwrite<PendingJob[]>(cfg.maxInFlightJobs);
@@ -145,21 +144,21 @@ Result<void, AssetErrc> AssetSystem::MountPackMemory(
     std::span<const u8> mappedPak,
     u8 priority) noexcept {
     if (m_mountCount >= m_cfg.maxMounts) {
-        return std::unexpected(AssetErrc::PoolExhausted);
+        return Err(AssetErrc::PoolExhausted);
     }
     if (mappedPak.size() < sizeof(PakHeader)) {
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
 
     PakHeader hdr{};
     std::memcpy(&hdr, mappedPak.data(), sizeof(PakHeader));
     if (hdr.magic != kPakMagic || hdr.version != kPakVersion) {
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
 
     const std::size_t tocBytes = static_cast<std::size_t>(hdr.entryCount) * sizeof(PakEntry);
     if (hdr.tocOffset + tocBytes > mappedPak.size()) {
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
 
     PakMount& m = m_mounts[m_mountCount++];
@@ -188,20 +187,24 @@ Result<void, AssetErrc> AssetSystem::MountPackFile(
     std::string_view filePath,
     u8 priority) noexcept {
     if (m_mountCount >= m_cfg.maxMounts) {
-        return std::unexpected(AssetErrc::PoolExhausted);
+        return Err(AssetErrc::PoolExhausted);
     }
 
-    const std::string pathStr(filePath);
-    SDL_IOStream* syncIo = SDL_IOFromFile(pathStr.c_str(), "rb");
+    platform::FilePath pathBuf;
+    if (!pathBuf.Assign(filePath) || pathBuf.Empty()) {
+        return Err(AssetErrc::InvalidMount);
+    }
+
+    SDL_IOStream* syncIo = SDL_IOFromFile(pathBuf.CStr(), "rb");
     if (!syncIo) {
-        return std::unexpected(AssetErrc::IoFailure);
+        return Err(AssetErrc::IoFailure);
     }
 
     PakHeader hdr{};
     if (SDL_ReadIO(syncIo, &hdr, sizeof(PakHeader)) != sizeof(PakHeader) ||
         hdr.magic != kPakMagic || hdr.version != kPakVersion) {
         SDL_CloseIO(syncIo);
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
 
     auto entries = std::make_unique_for_overwrite<PakEntry[]>(hdr.entryCount);
@@ -209,13 +212,13 @@ Result<void, AssetErrc> AssetSystem::MountPackFile(
     if (SDL_SeekIO(syncIo, static_cast<Sint64>(hdr.tocOffset), SDL_IO_SEEK_SET) < 0 ||
         SDL_ReadIO(syncIo, entries.get(), tocBytes) != tocBytes) {
         SDL_CloseIO(syncIo);
-        return std::unexpected(AssetErrc::CorruptedHeader);
+        return Err(AssetErrc::CorruptedHeader);
     }
     SDL_CloseIO(syncIo);
 
-    SDL_AsyncIO* asyncFile = SDL_AsyncIOFromFile(pathStr.c_str(), "r");
+    SDL_AsyncIO* asyncFile = SDL_AsyncIOFromFile(pathBuf.CStr(), "r");
     if (!asyncFile) {
-        return std::unexpected(AssetErrc::IoFailure);
+        return Err(AssetErrc::IoFailure);
     }
 
     PakMount& m = m_mounts[m_mountCount++];
@@ -283,7 +286,6 @@ bool AssetSystem::AllocateStaging(u32 size, u32& outOffset, u32& outReserve) noe
         return true;
     }
 
-    // Wrap to index 0 if contiguous space at the end of the ring is insufficient.
     if (tailSpace + alignedSize > m_ringCap - m_ringUsed) {
         return false;
     }
@@ -302,7 +304,7 @@ Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
     u8 mountIdx = 0;
     PakEntry entry{};
     if (!LocateEntry(id, mountIdx, entry) || entry.kind != expectedKind) {
-        return std::unexpected(AssetErrc::NotFound);
+        return Err(AssetErrc::NotFound);
     }
 
     bool needsLoad = false;
@@ -317,9 +319,13 @@ Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
 
     const PakMount& mount = m_mounts[mountIdx];
 
-    // Fast path: Zero-copy synchronous commit for uncompressed memory-mapped blobs and audio.
+    // Zero-copy synchronous commit for uncompressed memory-mapped blobs and audio.
     if (mount.mappedBase && entry.codec == AssetCodec::Raw &&
         (expectedKind == AssetKind::Blob || expectedKind == AssetKind::Audio)) {
+        if (entry.offset + entry.rawSize > mount.mappedSize) {
+            m_bank.MarkFailed(slot);
+            return Err(AssetErrc::CorruptedPayload);
+        }
         const std::span<const u8> slice{mount.mappedBase + entry.offset, entry.rawSize};
         if (expectedKind == AssetKind::Blob) {
             (void)m_bank.CommitBlob(slot, slice, entry.metaA, true);
@@ -338,14 +344,13 @@ Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
     }
     if (jobIdx == 0xFFFFu) {
         m_bank.MarkFailed(slot);
-        return std::unexpected(AssetErrc::PoolExhausted);
+        return Err(AssetErrc::PoolExhausted);
     }
 
     PendingJob& job = m_jobs[jobIdx];
     job.entry = entry;
     job.sequence = m_nextSequence++;
     job.slot = slot;
-    job.depTextureSlot = 0;
     job.mountIndex = mountIdx;
     job.active = true;
 
@@ -361,7 +366,7 @@ Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
         if (!AllocateStaging(requiredStaging, job.stagingOffset, job.stagingReserve)) {
             job.active = false;
             m_bank.MarkFailed(slot);
-            return std::unexpected(AssetErrc::StagingOverflow);
+            return Err(AssetErrc::StagingOverflow);
         }
 
         job.ioComplete = false;
@@ -376,7 +381,7 @@ Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
             job.active = false;
             m_ringUsed -= job.stagingReserve;
             m_bank.MarkFailed(slot);
-            return std::unexpected(AssetErrc::IoFailure);
+            return Err(AssetErrc::IoFailure);
         }
     }
 
@@ -389,7 +394,7 @@ Result<TextureAssetHandle, AssetErrc> AssetSystem::PinTexture(
     Residency residency) noexcept {
     auto slotRes = EnqueueLoad(id, AssetKind::Texture, scope, residency);
     if (!slotRes) {
-        return std::unexpected(slotRes.error());
+        return Err(slotRes.error());
     }
     return m_bank.ToTextureHandle(*slotRes);
 }
@@ -400,7 +405,7 @@ Result<AtlasHandle, AssetErrc> AssetSystem::PinAtlas(
     Residency residency) noexcept {
     auto slotRes = EnqueueLoad(id, AssetKind::Atlas, scope, residency);
     if (!slotRes) {
-        return std::unexpected(slotRes.error());
+        return Err(slotRes.error());
     }
     return m_bank.ToAtlasHandle(*slotRes);
 }
@@ -411,7 +416,7 @@ Result<BlobHandle, AssetErrc> AssetSystem::PinBlob(
     Residency residency) noexcept {
     auto slotRes = EnqueueLoad(id, AssetKind::Blob, scope, residency);
     if (!slotRes) {
-        return std::unexpected(slotRes.error());
+        return Err(slotRes.error());
     }
     return m_bank.ToBlobHandle(*slotRes);
 }
@@ -422,7 +427,7 @@ Result<AudioHandle, AssetErrc> AssetSystem::PinAudio(
     Residency residency) noexcept {
     auto slotRes = EnqueueLoad(id, AssetKind::Audio, scope, residency);
     if (!slotRes) {
-        return std::unexpected(slotRes.error());
+        return Err(slotRes.error());
     }
     return m_bank.ToAudioHandle(*slotRes);
 }
@@ -471,13 +476,14 @@ void AssetSystem::FinalizeJob(PendingJob& job, renderer::Renderer* renderer) noe
             renderer::TextureHandle gpuHandle{m_headlessTexCounter++, 1};
 
             if (renderer) {
-                renderer::TextureDesc desc{};
-                desc.width = w;
-                desc.height = h;
-                desc.format = static_cast<renderer::TextureFormat>(entry.metaB & 0xFFu);
-                desc.filter = static_cast<renderer::TextureFilter>((entry.metaB >> 8) & 0xFFu);
-                desc.pixels = decodedSpan;
-                desc.pitch = static_cast<u32>(w) * 4u;
+                renderer::TextureDesc desc{
+                    .width  = w,
+                    .height = h,
+                    .format = static_cast<renderer::TextureFormat>(entry.metaB & 0xFFu),
+                    .filter = static_cast<renderer::TextureFilter>((entry.metaB >> 8) & 0xFFu),
+                    .pixels = decodedSpan,
+                    .pitch  = static_cast<u32>(w) * 4u
+                };
 
                 auto texRes = renderer->CreateTexture(desc);
                 if (!texRes) {
@@ -547,17 +553,24 @@ void AssetSystem::PumpInternal(renderer::Renderer* renderer, const PumpBudget& b
     u32 uploadsDone = 0;
     u32 bytesUploaded = 0;
 
-    // Finalize completed jobs strictly sorted by request sequence number for deterministic state transitions.
+    // Finalize completed jobs strictly in request sequence order; skip only over-budget Textures
+    // so non-GPU jobs (Blobs, Audio, Atlases) never starve behind a large Texture upload.
     for (;;) {
         u16 bestIdx = 0xFFFFu;
         u64 bestSeq = ~0ULL;
 
         for (u16 i = 0; i < m_cfg.maxInFlightJobs; ++i) {
             const PendingJob& j = m_jobs[i];
-            if (j.active && j.ioComplete && j.sequence < bestSeq) {
-                bestSeq = j.sequence;
-                bestIdx = i;
+            if (!j.active || !j.ioComplete || j.sequence >= bestSeq) {
+                continue;
             }
+            if (j.ioSuccess && j.entry.kind == AssetKind::Texture &&
+                (uploadsDone >= budget.maxGpuUploads ||
+                 (uploadsDone > 0 && bytesUploaded + j.entry.rawSize > budget.maxUploadBytes))) {
+                continue;
+            }
+            bestSeq = j.sequence;
+            bestIdx = i;
         }
 
         if (bestIdx == 0xFFFFu) {
@@ -565,11 +578,6 @@ void AssetSystem::PumpInternal(renderer::Renderer* renderer, const PumpBudget& b
         }
 
         PendingJob& job = m_jobs[bestIdx];
-        if (job.entry.kind == AssetKind::Texture &&
-            (uploadsDone >= budget.maxGpuUploads || bytesUploaded + job.entry.rawSize > budget.maxUploadBytes)) {
-            break;
-        }
-
         if (job.ioSuccess) {
             FinalizeJob(job, renderer);
             if (job.entry.kind == AssetKind::Texture) {
@@ -583,7 +591,6 @@ void AssetSystem::PumpInternal(renderer::Renderer* renderer, const PumpBudget& b
         m_ringUsed -= job.stagingReserve;
         if (m_ringUsed == 0) {
             m_ringWrite = 0;
-            m_ringRead = 0;
         }
         job.active = false;
     }
