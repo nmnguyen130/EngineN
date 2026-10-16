@@ -26,8 +26,8 @@
 - **Cache-Aligned Arena Records (Zero Padding):**
   - `struct alignas(32) DebugShapeCmd` (`sizeof == 32`, 2 shapes per 64B cache line): `x0`, `y0`, `rgba8`, `expireTick`, `kind`, `auxParam`, `thicknessQ8`, and 12B union (`geom { x1, y1, headSize }` or `inlineText[12]`).
   - `struct alignas(64) FrameProfileSample` (`sizeof == 128`, 2 cache lines): `frameIndex`, `simTickIndex`, `scopeUs[12]` (`u16`), `aliveEntities`, `submittedQuads`, `culledQuads`, `drawBatches`, `channelScaleQ8[8]`, `audioCpuPermille`, `audioPeakL_Q10`, `audioPeakR_Q10`, `catchupTicks`, `activePhysVoices`, `activeVirtVoices`, `frozenChannelMask`, `audioUnderruns`, `radixPassesExecuted`.
-  - `struct alignas(64) ActorTickRecord` (`sizeof == 64`, 1 cache line): `tickIndex`, `entityId`, `inputHeld/Pressed/Released`, `actionBufferMask`, `axisX/Y`, `worldX/Y`, `velX/Y`, `cancelMask`, `stateTicks`, `stateId`, `animClipId`, `animFrame`, `contactFlags`, `activeSliceIdx`, `iframeTicks`, `hp`, `hurtboxQ8[4]`, `hitboxQ8[4]`.
-  - `struct alignas(32) ConsoleSymbol` (`sizeof == 32`, 2 symbols per 64B cache line): `nameHash` (64-bit FNV-1a), `namePtr`, `targetPtr`, 8B union (`cmdFn`, `f32Bounds`, `i32Bounds`), `kind`, `nameLen`.
+  - `struct alignas(64) ActorTickRecord` (`sizeof == 64`, 1 cache line): `tickIndex` (`u32`), `entityId`, `inputHeld/Pressed/Released`, `actionBufferMask`, `axisX/Y`, `worldX/Y`, `velX/Y`, `cancelMask`, `stateTicks`, `stateId`, `animClipId`, `animFrame`, `contactFlags`, `activeSliceIdx`, `iframeTicks`, `hp`, `hurtboxQ8[4]`, `hitboxQ8[4]`.
+  - `struct alignas(32) ConsoleSymbol` (`sizeof == 32`, 2 symbols per 64B cache line): `nameHash` (32-bit FNV-1a with Fibonacci slot index), `namePtr`, `targetPtr`, 8B union (`cmdFn`, `f32Bounds`, `i32Bounds`), `kind`, `nameLen`.
   - `struct LogEntryMeta` (`sizeof == 8`): `textOffset`, `tickLow16`, `textLength`, `severity`.
 
 ## 3. Public Interfaces & Signatures
@@ -46,11 +46,11 @@
   - `void EmitAndExpire(u64 currentTickIndex, renderer::TextureHandle debugAtlas, renderer::RenderList& outList) noexcept`, `[[nodiscard]] constexpr u32 ActiveCount() const noexcept`
 
 ### `DebugInspector` (`debug/DebugInspector.h` — Read-Only Spatial Extractor, Picker & Flight Scrubber)
-- `void RecordActorTick(const world::World& world, u64 tickIndex, const platform::input::TickInput& tickInput, const platform::input::ActionBuffer& actionBuffer) noexcept`
-- `world::EntityId PickEntityAtScreenPos(const world::World& world, core::time::RenderTimeView timeView, platform::input::Vec2 mousePos, platform::Extent2i viewportSize) noexcept`
+- `void RecordActorTick(const world::World& world, u64 tickIndex, const input::TickInput& tickInput, const input::ActionBuffer& actionBuffer) noexcept`
+- `world::EntityId PickEntityAtScreenPos(const world::World& world, time::RenderTimeView timeView, input::Vec2 mousePos, platform::Extent2i viewportSize) noexcept`
 - `constexpr void SetPinnedEntity(world::EntityId id) noexcept`, `[[nodiscard]] constexpr world::EntityId PinnedEntity() const noexcept`
 - `constexpr void StepScrubOffset(i32 deltaTicks) noexcept`, `constexpr void ResetScrubOffset() noexcept`, `[[nodiscard]] constexpr u8 ScrubOffset() const noexcept`
-- `void EmitWorldAndInspectorOverlays(OverlayFlags flags, const world::World& world, const gameplay::GameplayPipeline& gameplay, const audio::AudioSystem& audio, const assets::AssetBank& assetBank, core::time::RenderTimeView timeView, const platform::input::FrameInput& frameInput, platform::Extent2i viewportSize, renderer::TextureHandle debugAtlas, renderer::RenderList& outList) const noexcept`
+- `void EmitWorldAndInspectorOverlays(OverlayFlags flags, const world::World& world, const gameplay::GameplayPipeline& gameplay, const audio::AudioSystem& audio, const assets::AssetBank& assetBank, time::RenderTimeView timeView, const input::FrameInput& frameInput, platform::Extent2i viewportSize, renderer::TextureHandle debugAtlas, renderer::RenderList& outList) const noexcept`
 
 ### `DebugProfiler` & `DebugConsole` (`debug/DebugProfilerAndConsole.h`)
 - `DebugProfiler` (`kHistoryFrames = 256`, `kBucketCount = 64`, + `ScopedProfileTimer<ClockT>`):
@@ -59,17 +59,17 @@
   - `void RecordSubsystemTelemetry(u8 catchupTicks, u16 aliveEntities, u16 submittedQuads, u16 culledQuads, u16 drawBatches, u8 radixPasses, const audio::AudioTelemetrySnapshot& audioSnap, std::span<const f32, 8> channelScales, u8 frozenChannelMask) noexcept`
   - `[[nodiscard]] u32 ComputePercentileUs(u32 targetRankOutOf256) const noexcept`, `[[nodiscard]] constexpr const FrameProfileSample& Latest() const noexcept`
 - `DebugConsole` (`kMaxSymbols = 256`, `kMaxLogEntries = 512`, `kLogTextBytes = 16384`):
-  - `[[nodiscard]] std::expected<void, DebugErrc> RegisterCommand(std::string_view staticName, ConsoleCmdCallback fn, void* userCtx = nullptr) noexcept`
-  - `[[nodiscard]] std::expected<void, DebugErrc> RegisterCVarF32(std::string_view staticName, f32* target, f32 minVal, f32 maxVal) noexcept` / `RegisterCVarI32` / `RegisterCVarBool`
+  - `[[nodiscard]] Result<void, DebugErrc> RegisterCommand(std::string_view staticName, ConsoleCmdCallback fn, void* userCtx = nullptr) noexcept`
+  - `[[nodiscard]] Result<void, DebugErrc> RegisterCVarF32(std::string_view staticName, f32* target, f32 minVal, f32 maxVal) noexcept` / `RegisterCVarI32` / `RegisterCVarBool`
   - `void Print(LogSeverity severity, std::string_view msg, u64 tickIndex = 0) noexcept`, `void EnqueueCommandLine(std::string_view line) noexcept`, `void ExecuteImmediate(std::string_view line, u64 currentTickIndex = 0) noexcept`
 
 ### `DebugSystem` (`debug/DebugSystem.h` — Move-Only RAII Coordinator)
-- `[[nodiscard]] std::expected<void, DebugErrc> Init(renderer::Renderer& renderer, const DebugSystemConfig& cfg = {}) noexcept`
+- `[[nodiscard]] Result<void, DebugErrc> Init(renderer::Renderer& renderer, const DebugSystemConfig& cfg = {}) noexcept`
 - `void Shutdown(renderer::Renderer* renderer = nullptr) noexcept`
-- `bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl, platform::input::InputPipeline& input) noexcept`, `bool OnPlatformTextInput(std::string_view textUtf8) noexcept`
-- `template <core::time::ClockSource ClockT> void BeginFrame(core::time::TimePipeline<ClockT>& time, world::World& world, gameplay::GameplayPipeline& gameplay, audio::AudioSystem& audio, const platform::input::FrameInput& frameInput, platform::Extent2i viewportSize) noexcept`
-- `void EndSimTick(const world::World& world, core::time::SimStepView step, const platform::input::TickInput& tickInput, const platform::input::ActionBuffer& actionBuffer) noexcept`
-- `void EmitOverlays(const world::World& world, const gameplay::GameplayPipeline& gameplay, const audio::AudioSystem& audio, const assets::AssetBank& assetBank, core::time::RenderTimeView timeView, const platform::input::FrameInput& frameInput, platform::Extent2i viewportSize, renderer::RenderList& outList) noexcept`
+- `bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl, input::InputPipeline& input) noexcept`, `bool OnPlatformTextInput(std::string_view textUtf8) noexcept`
+- `template <time::ClockSource ClockT> void BeginFrame(time::TimePipeline<ClockT>& time, world::World& world, gameplay::GameplayPipeline& gameplay, audio::AudioSystem& audio, const input::FrameInput& frameInput, platform::Extent2i viewportSize) noexcept`
+- `void EndSimTick(const world::World& world, time::SimStepView step, const input::TickInput& tickInput, const input::ActionBuffer& actionBuffer) noexcept`
+- `void EmitOverlays(const world::World& world, const gameplay::GameplayPipeline& gameplay, const audio::AudioSystem& audio, const assets::AssetBank& assetBank, time::RenderTimeView timeView, const input::FrameInput& frameInput, platform::Extent2i viewportSize, renderer::RenderList& outList) noexcept`
 - Accessors: `Shapes()`, `Inspector()`, `Profiler()`, `Console()`, `ActiveOverlays()`, `SetActiveOverlays(OverlayFlags)`.
 
 ## 4. Canonical Main Loop Usage

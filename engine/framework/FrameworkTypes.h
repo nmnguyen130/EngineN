@@ -4,12 +4,12 @@
 #include "audio/AudioSystem.h"
 #include "core/Result.h"
 #include "core/Types.h"
-#include "core/time/TimePipeline.h"
+#include "core/time/SdlClock.h"
 #include "gameplay/GameplayPipeline.h"
 #include "platform/Platform.h"
 #include "platform/Window.h"
-#include "platform/input/ActionBuffer.h"
-#include "platform/input/InputPipeline.h"
+#include "input/ActionBuffer.h"
+#include "input/InputPipeline.h"
 #include "renderer/Renderer.h"
 #include "world/World.h"
 
@@ -93,8 +93,8 @@ struct alignas(64) SimContext {
     const assets::AssetBank& assetBank;
     audio::AudioSystem& audio;
     platform::Platform& platform;
-    platform::input::ActionBuffer& actionBuffer;
-    const platform::input::TickInput* tickInput{nullptr};
+    input::ActionBuffer& actionBuffer;
+    const input::TickInput* tickInput{nullptr};
     void* userState{nullptr};
     time::SimStepView step{};
 };
@@ -107,7 +107,7 @@ struct alignas(64) RenderContext {
     const gameplay::GameplayPipeline& gameplay;
     const assets::AssetBank& assetBank;
     renderer::RenderList& renderList;
-    const platform::input::FrameInput& frameInput;
+    const input::FrameInput& frameInput;
     const platform::WindowState& windowState;
     void* userState{nullptr};
     time::RenderTimeView timeView{};

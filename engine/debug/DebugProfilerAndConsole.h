@@ -4,6 +4,7 @@
 #include "debug/DebugBatcher.h"
 #include "core/time/TimeTypes.h"
 #include "audio/AudioTypes.h"
+#include "platform/PlatformTypes.h"
 
 #include <array>
 #include <span>
@@ -100,7 +101,10 @@ using ConsoleCmdCallback = void (*)(void* ctx, const ConsoleArgs& args, DebugCon
 
 // Exact 32-byte cache-aligned unified symbol entry (2 symbols per 64B cache line).
 struct alignas(32) ConsoleSymbol {
-    u64 nameHash{0};
+    u32 nameHash{0};
+    SymbolKind kind{SymbolKind::Empty};
+    u8 nameLen{0};
+    u16 reserved{0};
     const char* namePtr{nullptr};
     void* targetPtr{nullptr};
     union {
@@ -108,9 +112,6 @@ struct alignas(32) ConsoleSymbol {
         struct { f32 minVal; f32 maxVal; } f32Bounds;
         struct { i32 minVal; i32 maxVal; } i32Bounds;
     };
-    SymbolKind kind{SymbolKind::Empty};
-    u8 nameLen{0};
-    std::array<u8, 6> reserved{};
 };
 static_assert(sizeof(ConsoleSymbol) == 32);
 

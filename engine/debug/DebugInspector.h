@@ -1,14 +1,15 @@
 #pragma once
 
-#include "core/time/TimeTypes.h"
+#include "core/time/TimeViews.h"
 #include "debug/DebugBatcher.h"
 #include "debug/DebugTypes.h"
-#include "platform/input/InputTypes.h"
+#include "input/InputTypes.h"
+#include "platform/PlatformTypes.h"
 
 namespace en::assets { class AssetBank; }
 namespace en::audio { class AudioSystem; }
 namespace en::gameplay { class GameplayPipeline; }
-namespace en::platform::input { class ActionBuffer; }
+namespace en::input { class ActionBuffer; }
 namespace en::world { class World; }
 
 namespace en::debug {

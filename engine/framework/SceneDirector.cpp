@@ -42,7 +42,7 @@ Result<void, FrameworkErrc> SceneDirector::Init(assets::AssetSystem& assets) noe
     m_pausedClockMask = 0;
     m_cmdCount = 0;
     m_phase = TransitionPhase::Idle;
-    return Ok;
+    return {};
 }
 
 void SceneDirector::Shutdown(assets::AssetSystem& assets, audio::AudioSystem& audio) noexcept {
@@ -83,7 +83,7 @@ Result<void, FrameworkErrc> SceneDirector::PushState(const StateLayerDesc& desc)
         return Err(FrameworkErrc::StateStackOverflow);
     }
     m_cmdQueue[m_cmdCount++] = PendingStateCmd{.desc = desc, .kind = StateCmdKind::Push};
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkErrc> SceneDirector::PopState() noexcept {
@@ -91,7 +91,7 @@ Result<void, FrameworkErrc> SceneDirector::PopState() noexcept {
         return Err(FrameworkErrc::StateStackOverflow);
     }
     m_cmdQueue[m_cmdCount++] = PendingStateCmd{.desc = {}, .kind = StateCmdKind::Pop};
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkErrc> SceneDirector::SwitchState(const StateLayerDesc& desc) noexcept {
@@ -99,7 +99,7 @@ Result<void, FrameworkErrc> SceneDirector::SwitchState(const StateLayerDesc& des
         return Err(FrameworkErrc::StateStackOverflow);
     }
     m_cmdQueue[m_cmdCount++] = PendingStateCmd{.desc = desc, .kind = StateCmdKind::Switch};
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkErrc> SceneDirector::ClearAndPushState(const StateLayerDesc& desc) noexcept {
@@ -107,7 +107,7 @@ Result<void, FrameworkErrc> SceneDirector::ClearAndPushState(const StateLayerDes
         return Err(FrameworkErrc::StateStackOverflow);
     }
     m_cmdQueue[m_cmdCount++] = PendingStateCmd{.desc = desc, .kind = StateCmdKind::ClearAndPush};
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkErrc> SceneDirector::RequestSceneTransition(
@@ -136,7 +136,7 @@ Result<void, FrameworkErrc> SceneDirector::RequestSceneTransition(
         }
         m_stagedManifestBlob = *mh;
         m_phase = TransitionPhase::WaitingManifestBlob;
-        return Ok;
+        return {};
     }
 
     CookedSceneManifestHeader inlineHdr{
@@ -210,7 +210,7 @@ Result<void, FrameworkErrc> SceneDirector::PinManifestPayload(
     m_phase = (m_pendingScene.waitPolicy == SceneWaitPolicy::ImmediateBarrier)
                   ? TransitionPhase::ReadyToActivate
                   : TransitionPhase::StreamingSceneAssets;
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkErrc> SceneDirector::AdvanceSceneStreaming(
@@ -224,7 +224,7 @@ Result<void, FrameworkErrc> SceneDirector::AdvanceSceneStreaming(
                 return Err(FrameworkErrc::SimAssetWaitFailed);
             }
         } else if (!IsBlobReady(bank, m_stagedManifestBlob)) {
-            return Ok;
+            return {};
         }
 
         const auto& blob = bank.GetBlob(m_stagedManifestBlob);
@@ -265,12 +265,12 @@ Result<void, FrameworkErrc> SceneDirector::AdvanceSceneStreaming(
         }
     }
 
-    return Ok;
+    return {};
 }
 
 Result<bool, FrameworkErrc> SceneDirector::CommitSafeFramePoint(
     SceneLoadContext& loadCtx,
-    platform::input::InputPipeline& input,
+    input::InputPipeline& input,
     time::TimeManager& time) noexcept {
     bool sceneActivated = false;
 
@@ -362,7 +362,7 @@ Result<bool, FrameworkErrc> SceneDirector::CommitSafeFramePoint(
 }
 
 void SceneDirector::RebakeStackMasks(
-    platform::input::InputPipeline& input,
+    input::InputPipeline& input,
     time::TimeManager& time) noexcept {
     if (m_stackDepth == 0) {
         m_activeSimMask = 0;
@@ -493,7 +493,7 @@ Result<void, FrameworkErrc> SceneDirector::ActivatePendingScene(
         }
     }
 
-    return Ok;
+    return {};
 }
 
 void SceneDirector::DispatchSimTick(SimContext& simCtx) const noexcept {
@@ -527,7 +527,7 @@ u64 SceneDirector::ComputeAuditHash() const noexcept {
     return h;
 }
 
-constexpr u64 SceneDirector::CombineAuditHashes(
+u64 SceneDirector::CombineAuditHashes(
     u64 tickIndex,
     u64 worldHash,
     u64 gameplayHash,
@@ -535,8 +535,8 @@ constexpr u64 SceneDirector::CombineAuditHashes(
     u64 audioHash,
     u64 renderHash,
     u64 directorHash) noexcept {
-    auto fold = [](u64 seed, u64 val) constexpr noexcept -> u64 {
-        return seed ^ ( SplitMix64(val) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2) );
+    auto fold = [](u64 seed, u64 val) noexcept -> u64 {
+        return seed ^ (SplitMix64(val) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
     };
 
     u64 seed = 0x517cc1b727220a95ULL;

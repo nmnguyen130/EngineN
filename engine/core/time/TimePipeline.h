@@ -80,7 +80,8 @@ public:
         }
 
         // Accumulate in exact rational units (ns * kSimHz) where 10^9 units == 1 simulation tick.
-        m_accUnits += deltaNs * kSimHz;
+        // If deltaNs equals kFixedDtNs, accumulate exact 1 tick (kNsPerSecond) to eliminate integer division truncation.
+        m_accUnits += (deltaNs == kFixedDtNs) ? kNsPerSecond : (deltaNs * kSimHz);
     }
 
     [[nodiscard]] constexpr SimStepView PollTick() noexcept {

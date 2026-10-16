@@ -35,7 +35,7 @@ constexpr void HashBytesFNV1a(u64& hash, const void* data, std::size_t len) noex
 
 } // namespace
 
-void RenderList::Reset(f32 viewportWidth, f32 viewportHeight) noexcept {
+void RenderList::Reset(platform::Extent2i size) noexcept {
     m_quadCount   = 0;
     m_batchCount  = 0;
     m_prevKey     = 0;
@@ -48,8 +48,8 @@ void RenderList::Reset(f32 viewportWidth, f32 viewportHeight) noexcept {
     const FRect fullVp{
         0.0f,
         0.0f,
-        viewportWidth,
-        viewportHeight
+        static_cast<f32>(size.w),
+        static_cast<f32>(size.h)
     };
 
     for (u32 i = 0; i < kMaxViews; ++i) {

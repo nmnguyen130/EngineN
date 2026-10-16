@@ -4,7 +4,7 @@
 #include "core/Types.h"
 #include "core/time/TimeTypes.h"
 #include "core/time/TimeViews.h"
-#include "platform/input/InputTypes.h"
+#include "input/InputTypes.h"
 #include "assets/AssetTypes.h"
 #include "world/WorldTypes.h"
 

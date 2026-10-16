@@ -3,8 +3,8 @@
 #include "assets/AssetBank.h"
 #include "audio/AudioSystem.h"
 #include "gameplay/GameplayPipeline.h"
-#include "platform/input/ActionBuffer.h"
-#include "platform/input/InputPipeline.h"
+#include "input/ActionBuffer.h"
+#include "input/InputPipeline.h"
 #include "renderer/Renderer.h"
 #include "renderer/RendererList.h"
 #include "world/World.h"
@@ -92,7 +92,7 @@ void CmdWorldTp(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexc
 
     world::World& w = *sys->ActiveWorld();
     const u16 targetIdx = static_cast<u16>(*idxRes);
-    for (const world::EntityId id : w.View<world::LocalTransform2D>()) {
+    for (auto [id, ltRef] : w.View<world::LocalTransform2D>()) {
         if (id.index == targetIdx) {
             world::LocalTransform2D lt = w.GetLocalTransform(id);
             lt.x = *xRes;
@@ -270,7 +270,7 @@ Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer,
     m_toggleConsoleScancode = cfg.toggleConsoleScancode;
 
     RegisterBuiltInCommands();
-    return Ok;
+    return {};
 }
 
 void DebugSystem::Shutdown(renderer::Renderer* renderer) noexcept {
@@ -388,7 +388,7 @@ void DebugSystem::EmitOverlays(const world::World& world,
     hudCam.worldCenterX = static_cast<f32>(viewportSize.w) * 0.5f;
     hudCam.worldCenterY = static_cast<f32>(viewportSize.h) * 0.5f;
     hudCam.zoom         = 1.0f;
-    hudCam.viewport     = {0.0f, 0.0f, static_cast<f32>(viewportSize.width), static_cast<f32>(viewportSize.height)};
+    hudCam.viewport     = {0.0f, 0.0f, static_cast<f32>(viewportSize.w), static_cast<f32>(viewportSize.h)};
     hudCam.scissor      = hudCam.viewport;
     hudCam.screenSpace  = true;
     outList.SetView(kDebugHudViewSlot, hudCam);

@@ -4,12 +4,14 @@
 #include "audio/AudioSystem.h"
 #include "gameplay/GameplayPipeline.h"
 #include "gameplay/GameplayTypes.h"
-#include "platform/input/ActionBuffer.h"
+#include "input/ActionBuffer.h"
 #include "renderer/RendererList.h"
 #include "world/World.h"
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
+#include <utility>
 
 namespace en::debug {
 
@@ -40,8 +42,8 @@ struct ActiveCameraView {
     const f32 halfW = static_cast<f32>(viewportSize.w) * 0.5f;
     const f32 halfH = static_cast<f32>(viewportSize.h) * 0.5f;
 
-    for (const world::EntityId id : world.View<world::CameraRig2D>()) {
-        const auto* rig = world.TryGet<world::CameraRig2D>(id);
+    for (auto [id, rigRef] : world.View<world::CameraRig2D>()) {
+        const auto* rig = &rigRef;
         if (rig != nullptr && rig->active && rig->viewSlot == 0 && !rig->screenSpace) {
             const auto& wt = world.GetWorldTransform(id);
             out.centerX = wt.x;
@@ -86,7 +88,7 @@ void DebugInspector::RecordActorTick(const world::World& world,
 
     world::EntityId targetId = m_pinnedEntity;
     if (!world.IsAlive(targetId)) {
-        for (const world::EntityId id : world.View<gameplay::KinematicMotor2D, gameplay::StateMachine2D>()) {
+        for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
             targetId = id;
             break;
         }
@@ -129,10 +131,11 @@ void DebugInspector::RecordActorTick(const world::World& world,
         }
         if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(targetId)) {
             rec.activeSliceIdx = rig->activeSliceIndex;
-            rec.hurtboxQ8      = {rig->hurtbox.offsetX_q8, rig->hurtbox.offsetY_q8,
-                                  rig->hurtbox.halfW_q8,   rig->hurtbox.halfH_q8};
-            rec.hitboxQ8       = {rig->primaryHitbox.offsetX_q8, rig->primaryHitbox.offsetY_q8,
-                                  rig->primaryHitbox.halfW_q8,   rig->primaryHitbox.halfH_q8};
+            auto packBox = [](const auto& box) noexcept -> std::array<i16, 4> {
+                return {box.offsetX_q8, box.offsetY_q8, static_cast<i16>(box.halfW_q8), static_cast<i16>(box.halfH_q8)};
+            };
+            rec.hurtboxQ8 = packBox(rig->hurtbox);
+            rec.hitboxQ8  = packBox(rig->primaryHitbox);
         }
         if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(targetId)) {
             rec.hp          = static_cast<i16>(dmg->hp);
@@ -159,8 +162,8 @@ world::EntityId DebugInspector::PickEntityAtScreenPos(const world::World& world,
     world::EntityId bestEntity = world::kNullEntity;
     f32 bestArea = 1e30f;
 
-    for (const world::EntityId id : world.View<gameplay::KinematicMotor2D>()) {
-        const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(id);
+    for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
+        const auto* motor = &motorRef;
         if (motor == nullptr) continue;
         const auto& wt = world.GetWorldTransform(id);
         const f32 cx = wt.x + UnpackQ8(motor->bounds.offsetX_q8);
@@ -201,8 +204,8 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
 
     if (HasOverlay(flags, OverlayFlags::KinematicBounds) ||
         HasOverlay(flags, OverlayFlags::VelocityVectors)) {
-        for (const world::EntityId id : world.View<gameplay::KinematicMotor2D>()) {
-            const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(id);
+        for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
+            const auto* motor = &motorRef;
             if (motor == nullptr) continue;
             const auto& wt = world.GetWorldTransform(id);
 
@@ -253,8 +256,8 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
     }
 
     if (HasOverlay(flags, OverlayFlags::CombatHitboxes)) {
-        for (const world::EntityId id : world.View<gameplay::HitboxRig2D>()) {
-            const auto* rig = world.TryGet<gameplay::HitboxRig2D>(id);
+        for (auto [id, rigRef] : world.View<gameplay::HitboxRig2D>()) {
+            const auto* rig = &rigRef;
             if (rig == nullptr) continue;
             const auto& wt = world.GetWorldTransform(id);
 
@@ -291,8 +294,8 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
     }
 
     if (HasOverlay(flags, OverlayFlags::SafeBreadcrumbs)) {
-        for (const world::EntityId id : world.View<gameplay::SafeGroundBreadcrumb2D>()) {
-            const auto* bc = world.TryGet<gameplay::SafeGroundBreadcrumb2D>(id);
+        for (auto [id, bcRef] : world.View<gameplay::SafeGroundBreadcrumb2D>()) {
+            const auto* bc = &bcRef;
             if (bc == nullptr) continue;
             worldBatcher.PushLine(bc->prevSafeX, bc->prevSafeY, bc->safeX, bc->safeY,
                                   linePx, renderer::Color::FromRGBA8(0x44FF88AAu));
@@ -302,8 +305,8 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
     }
 
     if (HasOverlay(flags, OverlayFlags::CameraRigOverlay)) {
-        for (const world::EntityId id : world.View<gameplay::CameraController2D>()) {
-            const auto* ctrl = world.TryGet<gameplay::CameraController2D>(id);
+        for (auto [id, ctrlRef] : world.View<gameplay::CameraController2D>()) {
+            const auto* ctrl = &ctrlRef;
             if (ctrl == nullptr) continue;
             const auto& wt = world.GetWorldTransform(id);
             const f32 dzW = static_cast<f32>(ctrl->deadzoneHalfW_q4) * (1.0f / 16.0f);
@@ -344,14 +347,21 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
     std::array<char, 64> buf{};
     char* end = buf.data() + buf.size();
 
-    auto emitLine = [&](f32 yOff, std::string_view prefix, i64 v0, i64 v1, renderer::Color col) {
+    auto emitLine = [&](f32 yOff, std::string_view prefix, auto v0, auto v1, renderer::Color col) {
+        auto toI64 = [](auto val) noexcept -> i64 {
+            if constexpr (std::is_enum_v<decltype(val)>) {
+                return static_cast<i64>(std::to_underlying(val));
+            } else {
+                return static_cast<i64>(val);
+            }
+        };
         char* p = buf.data();
         for (char c : prefix) {
             if (p < end) *p++ = c;
         }
-        p = DebugBatcher::FormatI64(p, end, v0);
+        p = DebugBatcher::FormatI64(p, end, toI64(v0));
         if (p < end) *p++ = ':';
-        p = DebugBatcher::FormatI64(p, end, v1);
+        p = DebugBatcher::FormatI64(p, end, toI64(v1));
         hudBatcher.PushText(panelX + 8.0f, panelY + yOff,
                             std::string_view(buf.data(), static_cast<usize>(p - buf.data())), col);
     };
@@ -381,7 +391,7 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
                             std::string_view(buf.data(), static_cast<usize>(p - buf.data())),
                             renderer::Color::FromRGBA8(0xFFFF66FF));
 
-        emitLine(56.0f, "CONTACTS:CH    ", static_cast<u8>(motor->contacts), motor->timeChannel,
+        emitLine(56.0f, "CONTACTS:CH    ", motor->contacts, motor->timeChannel,
                  renderer::Color::FromRGBA8(0x88DDFFFF));
     }
 

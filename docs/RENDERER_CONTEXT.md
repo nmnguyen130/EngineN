@@ -26,7 +26,7 @@
 
 ## 3. Public Interfaces & Signatures
 ### `RenderList` (`renderer/RenderList.h` — Pure C++ Command Buffer & Batch Compiler)
-- `void Reset(platform::Extent2i defaultViewport) noexcept`
+- `void Reset(platform::Extent2i size) noexcept`
 - `void SetPass(u8 passId, const RenderPassDesc& desc) noexcept`, `void SetView(u8 viewSlot, const Camera2D& cam) noexcept`
 - `void PushQuad(const QuadCmd& cmd) noexcept`
 - `void PushRect(FRect rect, Color color, u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept`

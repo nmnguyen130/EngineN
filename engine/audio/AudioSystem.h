@@ -3,6 +3,7 @@
 #include "audio/AudioMixer.h"
 #include "audio/AudioTypes.h"
 #include "core/time/TimeViews.h"
+#include "world/WorldTypes.h"
 
 #include <array>
 #include <atomic>
@@ -137,6 +138,7 @@ private:
     AudioSystemConfig m_cfg{};
     SDL_AudioStream* m_stream{nullptr};
     u8* m_arenaSlab{nullptr};
+    usize m_arenaBytes{0};
     SharedBridgeState* m_bridge{nullptr};
     AudioMixer m_mixer{};
 

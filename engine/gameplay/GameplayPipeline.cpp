@@ -131,7 +131,7 @@ Result<void, GameplayErrc> GameplayPipeline::Init(
         return Err(GameplayErrc::WorldRegistrationFailed);
     }
 
-    return Ok;
+    return {};
 }
 
 void GameplayPipeline::Shutdown() noexcept {

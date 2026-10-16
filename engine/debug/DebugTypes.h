@@ -159,40 +159,40 @@ static_assert(sizeof(FrameProfileSample) == 128);
 
 // 64-byte (1 cache line) per-tick flight recorder snapshot for frame-by-frame hitbox/input scrubbing.
 struct alignas(64) ActorTickRecord {
-    u64 tickIndex{0};
+    u32 tickIndex{0};
     world::EntityId entityId{world::kNullEntity};
+    f32 worldX{0.0f};
+    f32 worldY{0.0f};
+    f32 velX{0.0f};
+    f32 velY{0.0f};
     u16 inputHeld{0};
     u16 inputPressed{0};
     u16 inputReleased{0};
     u16 actionBufferMask{0};
     i16 axisX{0};
     i16 axisY{0};
-    f32 worldX{0.0f};
-    f32 worldY{0.0f};
-    f32 velX{0.0f};
-    f32 velY{0.0f};
     u16 cancelMask{0};
     u16 stateTicks{0};
+    i16 hp{0};
+    std::array<i16, 4> hurtboxQ8{};
+    std::array<i16, 4> hitboxQ8{};
     u8  stateId{0};
     u8  animClipId{0};
     u8  animFrame{0};
     u8  contactFlags{0};
     u8  activeSliceIdx{0};
     u8  iframeTicks{0};
-    i16 hp{0};
-    std::array<i16, 4> hurtboxQ8{};
-    std::array<i16, 4> hitboxQ8{};
 };
 static_assert(sizeof(ActorTickRecord) == 64);
 
-// Computes 64-bit FNV-1a hash at compile time or runtime for ConsoleSymbol lookup.
-[[nodiscard]] constexpr u64 HashSymbolName(std::string_view str) noexcept {
-    u64 hash = 14695981039346656037ull;
+// Computes 32-bit FNV-1a hash at compile time or runtime for ConsoleSymbol lookup.
+[[nodiscard]] constexpr u32 HashSymbolName(std::string_view str) noexcept {
+    u32 hash = 2166136261u;
     for (const char c : str) {
-        hash ^= static_cast<u64>(static_cast<u8>(c));
-        hash *= 1099511628211ull;
+        hash ^= static_cast<u32>(static_cast<u8>(c));
+        hash *= 16777619u;
     }
-    return hash == 0 ? 1ull : hash;
+    return hash == 0 ? 1u : hash;
 }
 
 // 96 printable ASCII 8x8 1-bit glyphs (0x20 Space .. 0x7F Del), MSB = left pixel.

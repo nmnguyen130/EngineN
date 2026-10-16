@@ -28,6 +28,9 @@ Result<void, FrameworkError> Application::Init(
     m_cfg = cfg;
     m_hooks = hooks;
     m_headless = cfg.headless;
+    if (m_headless) {
+        m_cfg.audio.headlessMode = true;
+    }
     m_frameIndex = 0;
     m_cachedCameraEntity = world::kNullEntity;
 
@@ -41,7 +44,6 @@ Result<void, FrameworkError> Application::Init(
             return Err(FrameworkError{
                 FrameworkErrc::WindowCreateFailed, SubSystemStage::Window, 0});
         }
-        m_time.SetDisplayRefreshRate(m_window.State().refreshHz);
 
         if (auto res = m_renderer.Init(m_window, cfg.renderer); !res) {
             Shutdown();
@@ -71,7 +73,7 @@ Result<void, FrameworkError> Application::Init(
         }
     }
 
-    if (auto res = m_audio.Init(cfg.audio); !res) {
+    if (auto res = m_audio.Init(m_cfg.audio); !res) {
         Shutdown();
         return Err(FrameworkError{
             FrameworkErrc::AudioInitFailed, SubSystemStage::Audio,
@@ -117,7 +119,7 @@ Result<void, FrameworkError> Application::Init(
         }
     }
 
-    return Ok;
+    return {};
 }
 
 void Application::Shutdown() noexcept {
@@ -150,7 +152,7 @@ Result<void, FrameworkError> Application::Run() noexcept {
             return res;
         }
     }
-    return Ok;
+    return {};
 }
 
 Result<void, FrameworkError> Application::StepFrame() noexcept {
@@ -160,7 +162,7 @@ Result<void, FrameworkError> Application::StepFrame() noexcept {
     const platform::WindowFlags winFlags =
         m_platform.Pump(m_window, m_input, m_hooks.devToolsTap);
     if (m_platform.ShouldQuit()) {
-        return Ok;
+        return {};
     }
     HandleWindowEvents(winFlags);
 
@@ -211,7 +213,7 @@ Result<void, FrameworkError> Application::StepFrame() noexcept {
         m_renderer.Submit(list);
     }
 
-    return Ok;
+    return {};
 }
 
 Result<FrameAuditDigest, FrameworkError> Application::StepHeadless(
@@ -275,9 +277,6 @@ void Application::HandleWindowEvents(platform::WindowFlags flags) noexcept {
     if (platform::HasFlag(flags, platform::WindowFlags::Resized)) {
         m_renderer.ResizeViewport(m_window.State().pixelSize);
     }
-    if (platform::HasFlag(flags, platform::WindowFlags::DisplayChanged)) {
-        m_time.SetDisplayRefreshRate(m_window.State().refreshHz);
-    }
     if (platform::HasFlag(flags, platform::WindowFlags::FocusGained)) {
         m_time.OnWindowRefocus();
     }
@@ -303,7 +302,7 @@ void Application::RunSimTicks(u32& outTicksExecuted) noexcept {
     u32 count = 0;
     while (const auto step = m_time.PollTick()) {
         ++count;
-        const platform::input::TickInput tickInput = m_input.PollTick(step.TickIndex());
+        const input::TickInput tickInput = m_input.PollTick(step.TickIndex());
         m_actionBuffer.Feed(tickInput, step.IsFrozen(time::TimeChannel::Player));
 
         m_world.BeginTick(step);

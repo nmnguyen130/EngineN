@@ -50,7 +50,7 @@ public:
     // Advances non-blocking scene streaming, activates ready scenes, and commits queued state commands.
     [[nodiscard]] Result<bool, FrameworkErrc> CommitSafeFramePoint(
         SceneLoadContext& loadCtx,
-        platform::input::InputPipeline& input,
+        input::InputPipeline& input,
         time::TimeManager& time) noexcept;
 
     // O(popcount) branchless intrinsic dispatch using std::countr_zero over pre-baked bitmasks.
@@ -66,7 +66,7 @@ public:
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
-    [[nodiscard]] static constexpr u64 CombineAuditHashes(
+    [[nodiscard]] static u64 CombineAuditHashes(
         u64 tickIndex,
         u64 worldHash,
         u64 gameplayHash,
@@ -76,7 +76,7 @@ public:
         u64 directorHash) noexcept;
 
 private:
-    void RebakeStackMasks(platform::input::InputPipeline& input, time::TimeManager& time) noexcept;
+    void RebakeStackMasks(input::InputPipeline& input, time::TimeManager& time) noexcept;
     [[nodiscard]] Result<void, FrameworkErrc> AdvanceSceneStreaming(SceneLoadContext& loadCtx) noexcept;
     [[nodiscard]] Result<void, FrameworkErrc> PinManifestPayload(
         const CookedSceneManifestHeader& hdr,

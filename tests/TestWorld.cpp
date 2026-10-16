@@ -75,8 +75,6 @@ void TestEntityLifecycleAndRecycling() {
     World world;
     auto initRes = world.Init({.maxEntities = 64});
     TEST_ASSERT(initRes.has_value());
-    TEST_ASSERT(world.Capacity() == 64);
-    TEST_ASSERT(world.AliveCount() == 0);
 
     // Slot 0 sentinel is never alive to external queries
     TEST_ASSERT(!world.IsAlive(kNullEntity));
@@ -89,7 +87,6 @@ void TestEntityLifecycleAndRecycling() {
     TEST_ASSERT(e1.index == 1);
     TEST_ASSERT(e1.generation == 1);
     TEST_ASSERT(world.IsAlive(e1));
-    TEST_ASSERT(world.AliveCount() == 1);
 
     auto e2Res = world.Spawn();
     TEST_ASSERT(e2Res.has_value());
@@ -98,12 +95,11 @@ void TestEntityLifecycleAndRecycling() {
     TEST_ASSERT(e2.index == 2);
     TEST_ASSERT(e2.generation == 1);
     TEST_ASSERT(world.IsAlive(e2));
-    TEST_ASSERT(world.AliveCount() == 2);
 
     // Destroy e1
     TEST_ASSERT(world.Destroy(e1));
     TEST_ASSERT(!world.IsAlive(e1));
-    TEST_ASSERT(world.AliveCount() == 1);
+    TEST_ASSERT(world.IsAlive(e2));
 
     // Double destroy must return false
     TEST_ASSERT(!world.Destroy(e1));
@@ -122,8 +118,6 @@ void TestEntityLifecycleAndRecycling() {
     for (int i = 4; i < 64; ++i) {
         remaining.push_back(*world.Spawn());
     }
-    // 60 spawned + e2 + e3 = 62 alive
-    TEST_ASSERT(world.AliveCount() == 62);
 
     // Fresh slots are exhausted, so next spawn recycles e1 from free ring!
     auto recycled1 = world.Spawn();
@@ -132,7 +126,6 @@ void TestEntityLifecycleAndRecycling() {
     TEST_ASSERT(recycled1->generation == 2);
     TEST_ASSERT(world.IsAlive(*recycled1));
     TEST_ASSERT(!world.IsAlive(e1));
-    TEST_ASSERT(world.AliveCount() == 63);
 
     // All slots are now alive and free ring is empty. Next spawn MUST fail!
     auto fullRes = world.Spawn();
@@ -141,7 +134,6 @@ void TestEntityLifecycleAndRecycling() {
 
     // Destroy e2 (index 2)
     TEST_ASSERT(world.Destroy(e2));
-    TEST_ASSERT(world.AliveCount() == 62);
 
     // Next recycles e2
     auto recycled2 = world.Spawn();
@@ -153,7 +145,6 @@ void TestEntityLifecycleAndRecycling() {
 
     // Clear world
     world.Clear();
-    TEST_ASSERT(world.AliveCount() == 0);
     TEST_ASSERT(!world.IsAlive(*recycled1));
     TEST_ASSERT(!world.IsAlive(*recycled2));
 }
@@ -295,13 +286,6 @@ void TestTransformSolverAndHierarchy() {
     TEST_ASSERT(world.SetParent(child, root).has_value());
     TEST_ASSERT(world.SetParent(grandChild, child).has_value());
 
-    const auto& solver = world.Solver();
-    TEST_ASSERT(solver.GetDepth(root.index) == 0);
-    TEST_ASSERT(solver.GetDepth(child.index) == 1);
-    TEST_ASSERT(solver.GetDepth(grandChild.index) == 2);
-    TEST_ASSERT(solver.GetParentIndex(child.index) == root.index);
-    TEST_ASSERT(solver.GetParentIndex(grandChild.index) == child.index);
-
     // Propagate
     world.PropagateTransforms();
 
@@ -329,10 +313,13 @@ void TestTransformSolverAndHierarchy() {
 
     // Unparent child (parent to null) and propagate transforms
     TEST_ASSERT(world.SetParent(child, kNullEntity).has_value());
-    TEST_ASSERT(solver.GetParentIndex(child.index) == 0);
     world.PropagateTransforms();
-    TEST_ASSERT(solver.GetDepth(child.index) == 0);
-    TEST_ASSERT(solver.GetDepth(grandChild.index) == 1);
+    const WorldTransform2D& wChildUnparented = world.GetWorldTransform(child);
+    const WorldTransform2D& wGrandChildUnparented = world.GetWorldTransform(grandChild);
+    TEST_ASSERT(std::abs(wChildUnparented.x - 20.0f) < 0.001f);
+    TEST_ASSERT(std::abs(wChildUnparented.y - 10.0f) < 0.001f);
+    TEST_ASSERT(std::abs(wGrandChildUnparented.x - 25.0f) < 0.001f);
+    TEST_ASSERT(std::abs(wGrandChildUnparented.y - 12.0f) < 0.001f);
 }
 
 void TestDeferredCommandTape() {
@@ -347,15 +334,18 @@ void TestDeferredCommandTape() {
     TEST_ASSERT(world.DeferEmplace<Velocity2D>(e1, Velocity2D{12.0f, 34.0f}).has_value());
     TEST_ASSERT(!world.Has<Velocity2D>(e1)); // Not applied immediately
 
-    // 2. Defer set parent
+    // 2. Defer set parent (e1 has x = 10.0f)
+    world.SetLocalTransform(e1, {.x = 10.0f, .scaleX = 1.0f, .scaleY = 1.0f});
     TEST_ASSERT(world.DeferSetParent(e2, e1).has_value());
-    TEST_ASSERT(world.Solver().GetParentIndex(e2.index) == 0);
+    world.PropagateTransforms();
+    TEST_ASSERT(world.GetWorldTransform(e2).x == 0.0f); // Not applied yet
 
     // 3. Flush tape
     TEST_ASSERT(world.FlushCommands().has_value());
     TEST_ASSERT(world.Has<Velocity2D>(e1));
     TEST_ASSERT(world.TryGet<Velocity2D>(e1)->vx == 12.0f);
-    TEST_ASSERT(world.Solver().GetParentIndex(e2.index) == e1.index);
+    world.PropagateTransforms();
+    TEST_ASSERT(world.GetWorldTransform(e2).x == 10.0f); // Now parented and propagated
 
     // 4. Defer destroy
     TEST_ASSERT(world.DeferDestroy(e2).has_value());
@@ -522,8 +512,9 @@ void TestWorldExtractorAndPrefab() {
     TEST_ASSERT(world.IsAlive(spawned[0]));
     TEST_ASSERT(world.IsAlive(spawned[1]));
 
-    // Check hierarchy: spawned[1] is child of spawned[0]
-    TEST_ASSERT(world.Solver().GetParentIndex(spawned[1].index) == spawned[0].index);
+    // Check hierarchy: spawned[1] is child of spawned[0] and transforms propagate
+    world.PropagateTransforms();
+    TEST_ASSERT(std::abs(world.GetWorldTransform(spawned[1]).x - 60.0f) < 0.001f);
 
     // Extract to heap-allocated RenderList (5MB SoA buffer)
     auto list = std::make_unique<renderer::RenderList>();

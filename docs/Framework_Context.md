@@ -48,13 +48,13 @@
   - `[[nodiscard]] std::expected<void, FrameworkErrc> ClearAndPushState(const StateLayerDesc& desc) noexcept`
 - Scene Streaming, Frame Barrier & Hot Dispatch:
   - `[[nodiscard]] std::expected<void, FrameworkErrc> RequestSceneTransition(const SceneTransitionDesc& desc, assets::AssetSystem& assets) noexcept`
-  - `[[nodiscard]] std::expected<bool, FrameworkErrc> CommitSafeFramePoint(SceneLoadContext& loadCtx, platform::input::InputPipeline& input, core::time::TimeManager& time) noexcept`
+  - `[[nodiscard]] std::expected<bool, FrameworkErrc> CommitSafeFramePoint(SceneLoadContext& loadCtx, input::InputPipeline& input, time::TimeManager& time) noexcept`
   - `void DispatchSimTick(SimContext& simCtx) const noexcept`
   - `void DispatchRenderExtract(RenderContext& renderCtx) const noexcept`
 - Queries & Determinism Audit:
   - `[[nodiscard]] constexpr TransitionPhase Phase() const noexcept`, `ActiveSceneScope() const noexcept`, `PersistentScope() const noexcept`, `ActiveSceneId() const noexcept`, `StateDepth() const noexcept`, `IsClockPausedByState() const noexcept`
   - `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
-  - `[[nodiscard]] static constexpr u64 CombineAuditHashes(u64 tickIndex, u64 worldHash, u64 gameplayHash, u64 assetHash, u64 audioHash, u64 renderHash, u64 directorHash) noexcept`
+  - `[[nodiscard]] static u64 CombineAuditHashes(u64 tickIndex, u64 worldHash, u64 gameplayHash, u64 assetHash, u64 audioHash, u64 renderHash, u64 directorHash) noexcept`
 
 ### `Application` (`framework/Application.h` — Move-Only RAII Engine Runtime Coordinator)
 - Lifecycle & Execution Entry Points:

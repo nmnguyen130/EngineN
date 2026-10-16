@@ -5,12 +5,12 @@
 #include "debug/DebugInspector.h"
 #include "debug/DebugProfilerAndConsole.h"
 #include "debug/DebugTypes.h"
-#include "platform/input/InputTypes.h"
+#include "input/InputTypes.h"
 
 namespace en::assets { class AssetBank; }
 namespace en::audio { class AudioSystem; }
 namespace en::gameplay { class GameplayPipeline; }
-namespace en::platform::input { class ActionBuffer; class InputPipeline; }
+namespace en::input { class ActionBuffer; class InputPipeline; }
 namespace en::renderer { class Renderer; class RenderList; }
 namespace en::world { class World; }
 
@@ -52,7 +52,7 @@ public:
                     world::World& world,
                     gameplay::GameplayPipeline& gameplay,
                     audio::AudioSystem& audio,
-                    const platform::input::FrameInput& frameInput,
+                    const input::FrameInput& frameInput,
                     platform::Extent2i viewportSize) noexcept {
         BindActiveFrameContext(&world, &gameplay, &audio);
         if (m_pendingStepTicks > 0) {
@@ -114,18 +114,18 @@ public:
         renderer::Renderer&, const DebugSystemConfig& = {}) noexcept { return Ok; }
     constexpr void Shutdown(renderer::Renderer* = nullptr) noexcept {}
     constexpr bool OnPlatformKeyEvent(u16, bool, bool, bool,
-                                      platform::input::InputPipeline&) noexcept { return false; }
+                                      input::InputPipeline&) noexcept { return false; }
     constexpr bool OnPlatformTextInput(std::string_view) noexcept { return false; }
     template <time::ClockSource ClockT>
     constexpr void BeginFrame(time::TimePipeline<ClockT>&, world::World&,
                               gameplay::GameplayPipeline&, audio::AudioSystem&,
-                              const platform::input::FrameInput&, platform::Extent2i) noexcept {}
+                              const input::FrameInput&, platform::Extent2i) noexcept {}
     constexpr void EndSimTick(const world::World&, time::SimStepView,
-                              const platform::input::TickInput&,
-                              const platform::input::ActionBuffer&) noexcept {}
+                              const input::TickInput&,
+                              const input::ActionBuffer&) noexcept {}
     constexpr void EmitOverlays(const world::World&, const gameplay::GameplayPipeline&,
                                 const audio::AudioSystem&, const assets::AssetBank&,
-                                time::RenderTimeView, const platform::input::FrameInput&,
+                                time::RenderTimeView, const input::FrameInput&,
                                 platform::Extent2i, renderer::RenderList&) noexcept {}
 #endif
 

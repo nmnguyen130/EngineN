@@ -83,7 +83,7 @@ Result<void, AudioErrc> AudioMixer::Init(std::span<u8> arenaSlice) noexcept {
     m_busScratchR = reinterpret_cast<f32*>(cursor);
 
     Reset();
-    return Ok;
+    return {};
 }
 
 void AudioMixer::Reset() noexcept {

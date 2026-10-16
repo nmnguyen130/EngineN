@@ -38,6 +38,26 @@ add_library(engine STATIC
     engine/world/TransformSolver.cpp
     engine/world/World.cpp
     engine/world/WorldExtractor.cpp
+
+    # Gameplay
+    engine/gameplay/SpatialIndex2D.cpp
+    engine/gameplay/KinematicSolver2D.cpp
+    engine/gameplay/StateAndCombatSolver.cpp
+    engine/gameplay/GameplayPipeline.cpp
+
+    # Audio
+    engine/audio/AudioMixer.cpp
+    engine/audio/AudioSystem.cpp
+
+    # Framework
+    engine/framework/SceneDirector.cpp
+    engine/framework/Application.cpp
+
+    # Debug
+    engine/debug/DebugBatcher.cpp
+    engine/debug/DebugInspector.cpp
+    engine/debug/DebugProfilerAndConsole.cpp
+    engine/debug/DebugSystem.cpp
 )
 
 target_compile_features(engine PUBLIC cxx_std_23)
@@ -71,3 +91,7 @@ add_engine_test(TestPlatform)
 add_engine_test(TestRenderer)
 add_engine_test(TestAssets)
 add_engine_test(TestWorld)
+add_engine_test(TestGameplay)
+add_engine_test(TestAudio)
+add_engine_test(TestFramework)
+add_engine_test(TestDebug)

@@ -61,7 +61,7 @@ while (!m_platform.ShouldQuit()) {
         m_renderer.ResizeViewport(m_window.State().pixelSize);
     }
     if (HasFlag(winChanges, WindowFlags::DisplayChanged)) {
-        m_time.SetDisplayRefreshRate(m_window.State().refreshHz);
+        // Display refresh rate changes are dynamically accommodated by TimePipeline clock deltas
     }
 
     m_time.BeginFrame();

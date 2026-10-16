@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -113,6 +112,7 @@ AudioSystem::AudioSystem(AudioSystem&& other) noexcept
     : m_cfg(other.m_cfg)
     , m_stream(std::exchange(other.m_stream, nullptr))
     , m_arenaSlab(std::exchange(other.m_arenaSlab, nullptr))
+    , m_arenaBytes(std::exchange(other.m_arenaBytes, 0))
     , m_bridge(std::exchange(other.m_bridge, nullptr))
     , m_mixer(std::exchange(other.m_mixer, AudioMixer{}))
     , m_listenerX(other.m_listenerX)
@@ -129,6 +129,7 @@ AudioSystem& AudioSystem::operator=(AudioSystem&& other) noexcept {
         m_cfg                   = other.m_cfg;
         m_stream                = std::exchange(other.m_stream, nullptr);
         m_arenaSlab             = std::exchange(other.m_arenaSlab, nullptr);
+        m_arenaBytes            = std::exchange(other.m_arenaBytes, 0);
         m_bridge                = std::exchange(other.m_bridge, nullptr);
         m_mixer                 = std::exchange(other.m_mixer, AudioMixer{});
         m_listenerX             = other.m_listenerX;
@@ -147,18 +148,19 @@ Result<void, AudioErrc> AudioSystem::Init(const AudioSystemConfig& cfg) noexcept
     m_cfg = cfg;
 
     const usize minBytes = sizeof(SharedBridgeState) + AudioMixer::RequiredArenaBytes() + 128u;
-    const usize slabSize = std::max<usize>(cfg.arenaBytes, minBytes);
+    m_arenaBytes         = (std::max<usize>(cfg.arenaBytes, minBytes) + 63u) & ~usize(63u);
 
-    void* rawMem = std::aligned_alloc(64u, (slabSize + 63u) & ~usize(63u));
+    void* rawMem = ::operator new(m_arenaBytes, std::align_val_t{64}, std::nothrow);
     if (!rawMem) {
+        m_arenaBytes = 0;
         return Err(AudioErrc::ArenaExhausted);
     }
-    std::memset(rawMem, 0, slabSize);
+    std::memset(rawMem, 0, m_arenaBytes);
     m_arenaSlab = static_cast<u8*>(rawMem);
 
     m_bridge = std::construct_at(reinterpret_cast<SharedBridgeState*>(m_arenaSlab));
-    u8* mixerStart = m_arenaSlab + sizeof(SharedBridgeState);
-    const usize mixerBytes = slabSize - sizeof(SharedBridgeState);
+    u8* mixerStart         = m_arenaSlab + sizeof(SharedBridgeState);
+    const usize mixerBytes = m_arenaBytes - sizeof(SharedBridgeState);
 
     if (auto res = m_mixer.Init(std::span<u8>(mixerStart, mixerBytes)); !res) {
         Shutdown();
@@ -204,7 +206,7 @@ Result<void, AudioErrc> AudioSystem::Init(const AudioSystemConfig& cfg) noexcept
         SDL_ResumeAudioStreamDevice(m_stream);
     }
 
-    return Ok;
+    return {};
 }
 
 void AudioSystem::Shutdown() noexcept {
@@ -213,9 +215,10 @@ void AudioSystem::Shutdown() noexcept {
         m_stream = nullptr;
     }
     if (m_arenaSlab) {
-        std::free(m_arenaSlab);
-        m_arenaSlab = nullptr;
-        m_bridge    = nullptr;
+        ::operator delete(m_arenaSlab, m_arenaBytes, std::align_val_t{64});
+        m_arenaSlab  = nullptr;
+        m_arenaBytes = 0;
+        m_bridge     = nullptr;
     }
 }
 
@@ -243,13 +246,13 @@ Result<void, AudioErrc> AudioSystem::RegisterCueDef(
         CueHashSlot& existing = m_bridge->cueHashTable[slotIdx];
         if (existing.psl == 0u) {
             existing = incoming;
-            return Ok;
+            return {};
         }
         if (existing.key == incoming.key) {
             m_bridge->cueDefs[existing.cueIdx]   = def;
             m_bridge->cueScopes[existing.cueIdx] = owningScope;
             --m_bridge->cueCount;
-            return Ok;
+            return {};
         }
         if (incoming.psl > existing.psl) {
             std::swap(incoming, existing);
@@ -265,7 +268,7 @@ Result<void, AudioErrc> AudioSystem::RegisterMusicTrackDef(const MusicTrackDef& 
         return Err(AudioErrc::CueTableFull);
     }
     m_bridge->musicTracks[m_bridge->musicTrackCount++] = def;
-    return Ok;
+    return {};
 }
 
 Result<void, AudioErrc> AudioSystem::RegisterCueBank(
@@ -301,7 +304,7 @@ Result<void, AudioErrc> AudioSystem::RegisterCueBank(
             return res;
         }
     }
-    return Ok;
+    return {};
 }
 
 const SoundCueDef* AudioSystem::FindCueDef(SoundCueId id, u16& outIndex) const noexcept {

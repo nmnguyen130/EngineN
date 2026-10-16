@@ -93,7 +93,7 @@ void TestRendererTypes() {
 
 void TestRenderListRecordingAndCulling() {
     auto list = std::make_unique<RenderList>();
-    list->Reset(800.0f, 600.0f);
+    list->Reset({800, 600});
 
     TEST_ASSERT(list->Stats().submittedQuads == 0);
     TEST_ASSERT(list->Stats().culledQuads == 0);
@@ -116,7 +116,7 @@ void TestRenderListRecordingAndCulling() {
 
 void TestRenderListRadixSortAndBatching() {
     auto list = std::make_unique<RenderList>();
-    list->Reset(800.0f, 600.0f);
+    list->Reset({800, 600});
 
     // Record quads with differing texture handles to force separate batches
     QuadCmd q1{};
@@ -157,7 +157,7 @@ void TestRenderListRadixSortAndBatching() {
 
 void TestRenderListVertexExpansion() {
     auto list = std::make_unique<RenderList>();
-    list->Reset(800.0f, 600.0f);
+    list->Reset({800, 600});
 
     list->PushRect(FRect{10.0f, 20.0f, 30.0f, 40.0f}, Colors::Red);
     list->Compile();
@@ -180,13 +180,13 @@ void TestRenderListVertexExpansion() {
 
 void TestRenderListAuditHashDeterminism() {
     auto a = std::make_unique<RenderList>();
-    a->Reset(800.0f, 600.0f);
+    a->Reset({800, 600});
     a->PushRect(FRect{10.0f, 20.0f, 30.0f, 40.0f}, Colors::Red);
     a->PushRect(FRect{50.0f, 60.0f, 70.0f, 80.0f}, Colors::Blue);
     a->Compile();
 
     auto b = std::make_unique<RenderList>();
-    b->Reset(800.0f, 600.0f);
+    b->Reset({800, 600});
     b->PushRect(FRect{10.0f, 20.0f, 30.0f, 40.0f}, Colors::Red);
     b->PushRect(FRect{50.0f, 60.0f, 70.0f, 80.0f}, Colors::Blue);
     b->Compile();

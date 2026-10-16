@@ -65,6 +65,15 @@ struct Color {
         };
     }
 
+    [[nodiscard]] static constexpr Color FromRGBA8(u32 rgba8) noexcept {
+        return FromRGBA8(
+            static_cast<u8>((rgba8 >> 24u) & 0xFFu),
+            static_cast<u8>((rgba8 >> 16u) & 0xFFu),
+            static_cast<u8>((rgba8 >> 8u) & 0xFFu),
+            static_cast<u8>(rgba8 & 0xFFu)
+        );
+    }
+
     constexpr bool operator==(const Color&) const noexcept = default;
 };
 static_assert(sizeof(Color) == 16);

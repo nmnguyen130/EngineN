@@ -94,11 +94,11 @@ void DebugProfiler::EndFrame() noexcept {
 
 u32 DebugProfiler::ComputePercentileUs(u32 targetRankOutOf256) const noexcept {
     if (m_validFrames == 0) return 0;
-    const u32 scaledTarget = (targetRankOutOf256 * m_validFrames) / kHistoryFrames;
+    const u32 scaledTarget = (targetRankOutOf256 * m_validFrames + 255u) >> 8u;
     u32 accum = 0;
     for (u32 b = 0; b < kBucketCount; ++b) {
         accum += m_buckets[b];
-        if (accum > scaledTarget) {
+        if (accum >= scaledTarget) {
             return (b << 8u) + 128u;
         }
     }
@@ -332,9 +332,9 @@ Result<ConsoleSymbol*, DebugErrc> DebugConsole::InsertSymbolSlot(std::string_vie
     if (m_symbols.empty() || staticName.empty() || staticName.size() > 255u) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const u64 h = HashSymbolName(staticName);
-    // Fibonacci hashing multiplier for 256-slot table (shift 64 - 8 = 56).
-    u32 slot = static_cast<u32>((h * 11400714819323198485ull) >> 56u);
+    const u32 h = HashSymbolName(staticName);
+    // Fibonacci hashing multiplier for 256-slot table (shift 32 - 8 = 24).
+    u32 slot = (h * 2654435769u) >> 24u;
 
     for (usize probe = 0; probe < kMaxSymbols; ++probe) {
         ConsoleSymbol& entry = m_symbols[slot];
@@ -355,8 +355,8 @@ Result<ConsoleSymbol*, DebugErrc> DebugConsole::InsertSymbolSlot(std::string_vie
 
 ConsoleSymbol* DebugConsole::FindSymbol(std::string_view name) noexcept {
     if (m_symbols.empty() || name.empty()) return nullptr;
-    const u64 h = HashSymbolName(name);
-    u32 slot = static_cast<u32>((h * 11400714819323198485ull) >> 56u);
+    const u32 h = HashSymbolName(name);
+    u32 slot = (h * 2654435769u) >> 24u;
 
     for (usize probe = 0; probe < kMaxSymbols; ++probe) {
         ConsoleSymbol& entry = m_symbols[slot];
@@ -383,7 +383,7 @@ Result<void, DebugErrc> DebugConsole::RegisterCommand(
     sym->kind      = SymbolKind::Command;
     sym->targetPtr = userCtx;
     sym->cmdFn     = fn;
-    return Ok;
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarF32(
@@ -396,7 +396,7 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarF32(
     sym->kind      = SymbolKind::CVarF32;
     sym->targetPtr = target;
     sym->f32Bounds = {minVal, maxVal};
-    return Ok;
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarI32(
@@ -409,7 +409,7 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarI32(
     sym->kind      = SymbolKind::CVarI32;
     sym->targetPtr = target;
     sym->i32Bounds = {minVal, maxVal};
-    return Ok;
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarBool(
@@ -421,7 +421,7 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarBool(
     ConsoleSymbol* sym = *slotRes;
     sym->kind      = SymbolKind::CVarBool;
     sym->targetPtr = target;
-    return Ok;
+    return {};
 }
 
 void DebugConsole::Print(LogSeverity severity, std::string_view msg, u64 tickIndex) noexcept {

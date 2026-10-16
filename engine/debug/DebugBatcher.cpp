@@ -45,7 +45,7 @@ DebugBatcher::DebugBatcher(renderer::RenderList& list,
     m_templateQuad.passId   = passId;
     m_templateQuad.layer    = 0;
     m_templateQuad.viewSlot = viewSlot;
-    m_templateQuad.blend    = renderer::BlendMode::PremultipliedAlpha;
+    m_templateQuad.blend    = renderer::BlendMode::AlphaPMA;
     m_templateQuad.flipX    = false;
     m_templateQuad.flipY    = false;
 }

@@ -32,8 +32,11 @@ struct alignas(8) WorldCmdHeader {
 static_assert(sizeof(WorldCmdHeader) == 8);
 
 // Bitmask-accelerated multi-component view selecting the smallest dense pool as lead iterator.
-template <typename WorldPtr, Component... IncludeTs, Component... ExcludeTs>
-class WorldView final {
+template <typename WorldPtr, typename ExcludeTag, Component... IncludeTs>
+class WorldView;
+
+template <typename WorldPtr, Component... ExcludeTs, Component... IncludeTs>
+class WorldView<WorldPtr, Exclude<ExcludeTs...>, IncludeTs...> final {
     static_assert(sizeof...(IncludeTs) >= 1, "WorldView requires at least one Include component.");
     static constexpr ComponentMask kIncludeMask = MakeComponentMask<IncludeTs...>();
     static constexpr ComponentMask kExcludeMask = MakeComponentMask<ExcludeTs...>();
@@ -64,9 +67,13 @@ public:
 
         [[nodiscard]] constexpr auto operator*() const noexcept {
             const EntityId id = m_lead[m_idx];
-            return std::tuple<EntityId, decltype(std::get<IncludeTs*>(m_pools)->DirectAtEntityIndex(id.index))...>(
-                id,
-                std::get<decltype(&m_world->template GetPool<IncludeTs>())>(m_pools)->DirectAtEntityIndex(id.index)...
+            return std::apply(
+                [id](auto*... poolPtrs) noexcept {
+                    return std::tuple<EntityId, decltype(poolPtrs->DirectAtEntityIndex(id.index))...>(
+                        id, poolPtrs->DirectAtEntityIndex(id.index)...
+                    );
+                },
+                m_pools
             );
         }
 
@@ -303,17 +310,25 @@ public:
 
     template <Component... IncludeTs, Component... ExcludeTs, typename Self>
     [[nodiscard]] constexpr auto View(this Self&& self, Exclude<ExcludeTs...> = {}) noexcept {
+        static_assert(sizeof...(IncludeTs) >= 1, "View requires at least one Include component.");
         auto pools = std::make_tuple(&self.template GetPool<IncludeTs>()...);
         std::span<const EntityId> smallestLead{};
         usize minSize = ~usize{0};
-        auto pickSmallest = [&](const auto* poolPtr) noexcept {
-            if (poolPtr->Size() < minSize) {
-                minSize = poolPtr->Size();
-                smallestLead = poolPtr->Entities();
-            }
-        };
-        (pickSmallest(std::get<decltype(&self.template GetPool<IncludeTs>())>(pools)), ...);
-        return WorldView<decltype(&self), IncludeTs..., ExcludeTs...>(&self, pools, smallestLead);
+
+        std::apply(
+            [&](const auto*... poolPtrs) noexcept {
+                auto pickSmallest = [&](const auto* poolPtr) noexcept {
+                    if (poolPtr->Size() < minSize) {
+                        minSize = poolPtr->Size();
+                        smallestLead = poolPtr->Entities();
+                    }
+                };
+                (pickSmallest(poolPtrs), ...);
+            },
+            pools
+        );
+
+        return WorldView<decltype(&self), Exclude<ExcludeTs...>, IncludeTs...>(&self, pools, smallestLead);
     }
 
     // 120 Hz Simulation Tick Pipeline

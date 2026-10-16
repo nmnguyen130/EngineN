@@ -83,8 +83,8 @@ private:
     // Strict member declaration order guarantees forward construction and reverse destruction.
     platform::Platform m_platform{};
     platform::Window m_window{};
-    platform::input::InputPipeline m_input{};
-    platform::input::ActionBuffer m_actionBuffer{};
+    input::InputPipeline m_input{};
+    input::ActionBuffer m_actionBuffer{};
     time::TimeManager m_time{};
     renderer::Renderer m_renderer{};
     renderer::RenderList m_headlessRenderList{};

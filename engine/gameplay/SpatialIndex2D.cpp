@@ -175,7 +175,7 @@ Result<void, GameplayErrc> SpatialIndex2D::BindCollisionMapBlob(
 
     m_tileSize = static_cast<f32>(hdr->tileSize_q8) * (1.0f / 256.0f);
     m_invTileSize = 1.0f / m_tileSize;
-    return Ok;
+    return {};
 }
 
 void SpatialIndex2D::ClearCollisionMap() noexcept {
@@ -781,6 +781,12 @@ u32 SpatialIndex2D::GatherCombatOverlaps(
                 if (a.attacker.index != b.attacker.index) return a.attacker.index < b.attacker.index;
                 return a.damageMultiplier_q8 > b.damageMultiplier_q8;
             });
+
+        const auto it = std::unique(outHits.begin(), outHits.begin() + hitCount,
+            [](const ResolvedHitEvent& a, const ResolvedHitEvent& b) noexcept {
+                return a.defender == b.defender && a.attacker == b.attacker;
+            });
+        hitCount = static_cast<u32>(std::distance(outHits.begin(), it));
     }
 
     return hitCount;
