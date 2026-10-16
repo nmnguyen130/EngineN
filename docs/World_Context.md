@@ -71,14 +71,14 @@
   - `[[nodiscard]] std::expected<void, WorldErrc> SetParent(EntityId child, EntityId parent) noexcept`, `void PropagateTransforms() noexcept`
   - `template <Component... IncludeTs, Component... ExcludeTs, typename Self> [[nodiscard]] constexpr auto View(this Self&& self, Exclude<ExcludeTs...> = {}) noexcept`
 - 120 Hz Simulation Tick & Determinism Audit:
-  - `void BeginTick(core::time::SimStepView step) noexcept`
-  - `void StepKinematicsAndAnimations(core::time::SimStepView step, const assets::AssetBank& assetBank) noexcept`
-  - `void EndTick(core::time::SimStepView step) noexcept`
-  - `void Tick(core::time::SimStepView step, const assets::AssetBank& assetBank) noexcept`
+  - `void BeginTick(time::SimStepView step) noexcept`
+  - `void StepKinematicsAndAnimations(time::SimStepView step, const assets::AssetBank& assetBank) noexcept`
+  - `void EndTick(time::SimStepView step) noexcept`
+  - `void Tick(time::SimStepView step, const assets::AssetBank& assetBank) noexcept`
   - `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
 
 ### `WorldExtractor` (`world/WorldExtractor.h` — Stateless Render & Prefab Bridge)
-- `static void Extract(const World& world, const assets::AssetBank& assetBank, core::time::RenderTimeView timeView, renderer::RenderList& outRenderList) noexcept`
+- `static void Extract(const World& world, const assets::AssetBank& assetBank, time::RenderTimeView timeView, renderer::RenderList& outRenderList) noexcept`
 - `[[nodiscard]] static std::expected<EntityId, WorldErrc> InstantiatePrefab(World& world, const assets::AssetBank& assetBank, assets::BlobHandle prefabBlob, const LocalTransform2D& rootTransform = {}, std::span<EntityId> outSpawnedEntities = {}) noexcept`
 
 ## 4. Canonical Main Loop Usage

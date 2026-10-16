@@ -87,7 +87,7 @@ std::array<f32, 8> channelScales{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}
 m_time.BeginFrame();
 while (const auto step = m_time.PollTick()) {
     const auto tickInput = m_input.PollTick(step.TickIndex());
-    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::core::time::TimeChannel::Player));
+    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::time::TimeChannel::Player));
 
     m_world.BeginTick(step);
     m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);

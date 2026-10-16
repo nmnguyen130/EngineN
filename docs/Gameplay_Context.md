@@ -42,16 +42,16 @@
 - `[[nodiscard]] u32 GatherCombatOverlaps(const world::World& world, const assets::AssetBank& assetBank, std::span<ResolvedHitEvent> outHits) const noexcept`
 
 ### `KinematicSolver2D` & `StateAndCombatSolver` (`gameplay/KinematicSolver2D.h` & `StateAndCombatSolver.h`)
-- `static void KinematicSolver2D::StepCarriersAndRiders(world::World& world, const SpatialIndex2D& spatial, core::time::SimStepView step) noexcept`
-- `static void KinematicSolver2D::StepMotorsAndMotionStacks(world::World& world, const SpatialIndex2D& spatial, core::time::SimStepView step, const KinematicStepConfig& cfg = {}) noexcept`
-- `static void StateAndCombatSolver::DispatchAnimationFrameDirectives(world::World& world, const assets::AssetBank& assetBank, core::time::SimStepView step, GameplayPipeline& pipeline) noexcept`
-- `static void StateAndCombatSolver::ResolveCombatHits(world::World& world, core::time::SimStepView step, std::span<const ResolvedHitEvent> hits, const GameplayPolicyTable& policies, GameplayPipeline& pipeline) noexcept`
+- `static void KinematicSolver2D::StepCarriersAndRiders(world::World& world, const SpatialIndex2D& spatial, time::SimStepView step) noexcept`
+- `static void KinematicSolver2D::StepMotorsAndMotionStacks(world::World& world, const SpatialIndex2D& spatial, time::SimStepView step, const KinematicStepConfig& cfg = {}) noexcept`
+- `static void StateAndCombatSolver::DispatchAnimationFrameDirectives(world::World& world, const assets::AssetBank& assetBank, time::SimStepView step, GameplayPipeline& pipeline) noexcept`
+- `static void StateAndCombatSolver::ResolveCombatHits(world::World& world, time::SimStepView step, std::span<const ResolvedHitEvent> hits, const GameplayPolicyTable& policies, GameplayPipeline& pipeline) noexcept`
 
 ### `GameplayPipeline` (`gameplay/GameplayPipeline.h` — Move-Only RAII 120 Hz Coordinator)
 - `[[nodiscard]] std::expected<void, GameplayErrc> Init(world::World& world, const GameplayPolicyTable& policies = {}, const GameplayPipelineConfig& cfg = {}) noexcept`
 - `void Shutdown() noexcept`, `void SetPolicyTable(const GameplayPolicyTable& policies) noexcept`
 - `[[nodiscard]] std::expected<void, GameplayErrc> SetActiveRoomCollision(const assets::AssetBank& bank, assets::BlobHandle collisionMapBlob) noexcept`
-- `void Tick(world::World& world, const assets::AssetBank& assetBank, core::time::SimStepView step, const platform::input::TickInput& tickInput, platform::input::ActionBuffer& actionBuffer) noexcept`
+- `void Tick(world::World& world, const assets::AssetBank& assetBank, time::SimStepView step, const input::TickInput& tickInput, input::ActionBuffer& actionBuffer) noexcept`
 - `void EmitCue(const SimCue& cue) noexcept`, `[[nodiscard]] constexpr std::span<const SimCue> DrainCues() noexcept`
 - `constexpr void SetWorldFlag(u16 flagId, bool value = true) noexcept`, `[[nodiscard]] constexpr bool TestWorldFlag(u16 flagId) const noexcept`
 - `[[nodiscard]] u64 ComputeAuditHash(const world::World& world) const noexcept`
@@ -62,14 +62,14 @@ m_assets.Pump(m_renderer);
 m_input.BeginFrame();
 SDL_Event ev;
 while (SDL_PollEvent(&ev)) {
-    en::platform::input::IngestSdlEvent(m_input, ev);
+    en::input::IngestSdlEvent(m_input, ev);
 }
 const auto& frameInput = m_input.EndFrame();
 
 m_time.BeginFrame();
 while (const auto step = m_time.PollTick()) {
     const auto tickInput = m_input.PollTick(step.TickIndex());
-    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::core::time::TimeChannel::Player));
+    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::time::TimeChannel::Player));
 
     m_world.BeginTick(step);
     m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);

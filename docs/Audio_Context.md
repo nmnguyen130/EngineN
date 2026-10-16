@@ -4,7 +4,7 @@
 - **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), strictly zero heap allocation after `Init()` (single `192 KB` 64-byte aligned arena slab), zero virtual dispatch, minimal 5-file footprint (`AudioTypes.h`, `AudioMixer.h/.cpp`, `AudioSystem.h/.cpp`), two-layer pure C++23 separation (`namespace en::audio`).
 - **Two-Layer Zero-Virtual Seam:**
   - **Layer 1 (`AudioTypes.h`, `AudioMixer.h/.cpp`):** Pure C++23 data-oriented Structure-of-Arrays (`VoicePoolSoA`) 64-voice polyphonic mixer (`kSampleRate = 48000`, `kMixBlockFrames = 256`), Q32.32 fixed-point phase accumulator with 4-point 3rd-order Hermite vari-speed resampling and pre-cached 4-sample loop guards, Cytomic Linear Trap-Integrated State Variable Filter (SVF), 16-slot steal crossfade pool (`StealSlotState`), planar SIMD bus accumulation (`kAudioBusCount = 8`), combat-to-music sidechain ducking, Padé `[3/2]` $\tanh$ master soft-clipper, and 4-stem sample-locked interactive music decks. Zero OS or `<SDL3/SDL_*.h>` dependencies; 100% deterministic in headless CI via `AudioMixer::ComputeAuditHash()`.
-  - **Layer 2 (`AudioSystem.h/.cpp`):** Move-only RAII coordinator owning the `SDL_AudioStream` hardware binding (`SDL_OpenAudioDeviceStream`), flat 1024-slot Fibonacci Robin Hood `SoundCueDef` index, 3-stage voice admission pipeline (cooldown/energy-summing coalescer, per-cue concurrency cap, priority/audibility stealing), 30 Hz staggered `gameplay::SpatialIndex2D::Raycast()` tile occlusion, `core::time::TimeChannel` hitstop/timescale synchronization, and `assets::ScopeId` bitmask retirement protection. `<SDL3/SDL_audio.h>` is strictly confined to `AudioSystem.cpp`.
+  - **Layer 2 (`AudioSystem.h/.cpp`):** Move-only RAII coordinator owning the `SDL_AudioStream` hardware binding (`SDL_OpenAudioDeviceStream`), flat 1024-slot Fibonacci Robin Hood `SoundCueDef` index, 3-stage voice admission pipeline (cooldown/energy-summing coalescer, per-cue concurrency cap, priority/audibility stealing), 30 Hz staggered `gameplay::SpatialIndex2D::Raycast()` tile occlusion, `time::TimeChannel` hitstop/timescale synchronization, and `assets::ScopeId` bitmask retirement protection. `<SDL3/SDL_audio.h>` is strictly confined to `AudioSystem.cpp`.
 - **Hybrid Lock-Free Thread Synchronization (Triple-Buffer + Discrete SPSC Ring):**
   - **Continuous State (`AudioFrameSnapshot`, `576 B` = 9 cache lines):** All per-frame continuous parameters (64 voice Q14 L/R gains, Q12 pitch ratios, pre-warped Q14 SVF cutoffs, 8 bus gains/cutoffs, 8 `TimeChannel` time scales, `frozenChannelMask`, and 4 music stem weights) are pre-computed on the main thread inside `AudioSystem::Update()` and published via a wait-free 3-slot atomic Triple Buffer (`tripleFlags`). Eliminates per-frame positional/filter command queue spam and hoists all transcendental math (`std::sqrt`, `std::cos`, `std::sin`, Padé $\tan$) out of the real-time audio callback.
   - **Discrete Lifecycle Edges (`AudioCommand`, `32 B` exact):** A 256-slot cache-isolated SPSC ring buffer (`cmdRing`) carries only discrete state transitions (`SpawnVoice`, `StopVoice`, `BindMusicStem`, `CommitMusicDeck`, `TriggerStinger`, `PanicReset`).
@@ -59,7 +59,7 @@
   - `void SetBusGain(AudioBusId bus, f32 linearGain) noexcept`, `void SetBusFilter(AudioBusId bus, FilterMode mode, f32 cutoffHz) noexcept`
   - `void TransitionMusic(u32 trackId, const assets::AssetBank& assetBank, u8 crossfadeBlocks = 94) noexcept`
   - `void SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weights) noexcept`
-  - `void Update(const world::World& world, const gameplay::SpatialIndex2D& spatial, const assets::AssetBank& assetBank, core::time::RenderTimeView timeView, u8 frozenChannelMask, std::span<const f32, 8> channelScales) noexcept`
+  - `void Update(const world::World& world, const gameplay::SpatialIndex2D& spatial, const assets::AssetBank& assetBank, time::RenderTimeView timeView, u8 frozenChannelMask, std::span<const f32, 8> channelScales) noexcept`
   - `void PumpHeadlessBlocks(u32 blockCount, std::span<f32> optionalCaptureOut = {}) noexcept`
   - `[[nodiscard]] AudioTelemetrySnapshot Telemetry() const noexcept`, `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
 
@@ -75,7 +75,7 @@ std::array<f32, 8> channelScales{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}
 m_time.BeginFrame();
 while (const auto step = m_time.PollTick()) {
     const auto tickInput = m_input.PollTick(step.TickIndex());
-    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::core::time::TimeChannel::Player));
+    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::time::TimeChannel::Player));
 
     m_world.BeginTick(step);
     m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);
