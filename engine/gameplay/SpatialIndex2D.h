@@ -37,9 +37,9 @@ struct ZoneSample2D {
 // Zero-allocation spatial accelerator combining an 8x8 hierarchical bitplane with a 3-pass Counting-Sort Prefix-Sum Grid.
 // Non-owning view over arena memory provided by GameplayPipeline; zero OS or dynamic memory dependencies.
 // Invariant: m_cellOffsets[c + 1] - m_cellOffsets[c] equals the exact number of dynamic boxes overlapping cell c.
-class SpatialIndex2D {
+class SpatialIndex2D final {
 public:
-    static constexpr u32 kGridCells = 512;
+    static constexpr u32 kGridCells   = 512;
     static constexpr u32 kMaxCellRefs = 2048;
 
     SpatialIndex2D() = default;

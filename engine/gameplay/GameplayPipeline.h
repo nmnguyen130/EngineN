@@ -18,18 +18,20 @@ enum class SimCueKind : u8 {
     CustomGameEvent
 };
 
-// Compact 24-byte outgoing presentation cue emitted during 120 Hz simulation ticks.
+// Outgoing presentation cue emitted during 120 Hz simulation ticks.
+// Carries generational EntityId emitter so downstream Audio/VFX/Debug consumers can track or attach safely.
 struct alignas(8) SimCue {
     assets::AssetId assetId{};
     f32 worldX{0.0f};
     f32 worldY{0.0f};
+    world::EntityId emitter{world::kNullEntity};
     u16 magnitude_q16{0};
     u16 durationTicks{0};
     SimCueKind kind{SimCueKind::AudioOneShot};
     u8 channel{0};
     u16 userTag{0};
 };
-static_assert(sizeof(SimCue) == 24);
+static_assert(sizeof(SimCue) == 32);
 
 struct GameplayPipelineConfig {
     usize arenaBytes{512u * 1024u};
@@ -40,17 +42,18 @@ struct GameplayPipelineConfig {
     u16 maxDamageReceivers{512};
     u16 maxBreadcrumbs{16};
     u16 maxCameras{4};
+    f32 pixelsPerMeter{64.0f};
     KinematicStepConfig kinematicConfig{};
 };
 
 // Top-level 120 Hz gameplay mechanism orchestrator, camera director, and persistent world-flag container.
 // Move-only RAII owner of a single 512 KB pre-allocated arena slab; zero dynamic allocation during Tick().
-// Invariant: Tick() mutates structural entity state strictly via World::Defer*() and never allocates memory.
-class GameplayPipeline {
+// Invariant: Never calls AudioSystem, Renderer, or DebugSystem directly; communicates strictly via DrainCues() and World ECS.
+class GameplayPipeline final {
 public:
-    static constexpr u32 kMaxWorldFlags = 4096;
+    static constexpr u32 kMaxWorldFlags   = 4096;
     static constexpr u32 kMaxCuesPerFrame = 256;
-    static constexpr u32 kMaxHitsPerTick = 256;
+    static constexpr u32 kMaxHitsPerTick  = 256;
 
     GameplayPipeline() = default;
     ~GameplayPipeline() noexcept;
@@ -120,7 +123,7 @@ public:
     [[nodiscard]] u64 ComputeAuditHash(const world::World& world) const noexcept;
 
 private:
-    static void StepCameraControllers(
+    void StepCameraControllers(
         world::World& world,
         time::SimStepView step) noexcept;
 
@@ -128,6 +131,7 @@ private:
     usize m_arenaBytes{0};
     GameplayPolicyTable m_policies{};
     KinematicStepConfig m_kinematicCfg{};
+    f32 m_invPixelsPerMeter{1.0f / 64.0f};
     SpatialIndex2D m_spatial{};
     ResolvedHitEvent* m_hitScratch{nullptr};
     SimCue* m_cueBuffer{nullptr};

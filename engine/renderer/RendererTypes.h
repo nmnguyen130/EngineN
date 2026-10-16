@@ -165,6 +165,7 @@ struct Camera2D {
     f32 worldCenterX{0.0f};
     f32 worldCenterY{0.0f};
     f32 zoom{1.0f};
+    f32 rotationRad{0.0f};
     FRect viewport{};
     FRect scissor{};
     bool screenSpace{false};

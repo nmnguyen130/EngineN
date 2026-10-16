@@ -11,34 +11,153 @@ void KinematicSolver2D::StepCarriersAndRiders(
     world::World& world,
     const SpatialIndex2D& spatial,
     time::SimStepView step) noexcept {
-    if (step.IsFrozen(time::TimeChannel::World)) {
-        return;
-    }
-
-    const KinematicStepConfig defaultCfg{};
-
     for (auto [riderId, motor] : world.View<KinematicMotor2D>()) {
-        if (motor.carrierId == world::kNullEntity || !world.IsAlive(motor.carrierId)) {
-            motor.carrierId = world::kNullEntity;
+        if (motor.carrierId == world::kNullEntity || step.IsFrozen(motor.timeChannel)) {
             continue;
         }
-
         const auto* carrier = world.TryGet<KinematicCarrier2D>(motor.carrierId);
         if (carrier == nullptr) {
             motor.carrierId = world::kNullEntity;
             continue;
         }
+        if (carrier->deltaX == 0.0f && carrier->deltaY == 0.0f) {
+            continue;
+        }
+        world::LocalTransform2D& loc = world.ModifyLocalTransformByIndex(riderId.index);
+        ResolveSingleMotorSweep(
+            riderId, loc, motor, spatial, carrier->deltaX, carrier->deltaY, KinematicStepConfig{});
+    }
+}
 
-        if (std::abs(carrier->deltaX) < 1e-6f && std::abs(carrier->deltaY) < 1e-6f) {
+void KinematicSolver2D::StepMotorsAndMotionStacks(
+    world::World& world,
+    const SpatialIndex2D& spatial,
+    time::SimStepView step,
+    const KinematicStepConfig& cfg) noexcept {
+
+    for (auto [id, motor] : world.View<KinematicMotor2D>()) {
+        if (step.IsFrozen(motor.timeChannel)) {
+            continue;
+        }
+        const f32 dt = step.Dt(motor.timeChannel);
+        if (dt <= 0.0f) {
             continue;
         }
 
-        world::LocalTransform2D local = world.GetLocalTransform(riderId);
-        const ContactFlags savedContacts = motor.contacts;
-        ResolveSingleMotorSweep(
-            riderId, local, motor, spatial, carrier->deltaX, carrier->deltaY, defaultCfg);
-        motor.contacts |= savedContacts;
-        world.SetLocalTransform(riderId, local);
+        if (motor.oneWayIgnoreTicks > 0) {
+            --motor.oneWayIgnoreTicks;
+        }
+
+        world::LocalTransform2D& loc = world.ModifyLocalTransformByIndex(id.index);
+        const f32 cx = loc.x + motor.bounds.OffsetX();
+        const f32 cy = loc.y + motor.bounds.OffsetY();
+        const f32 hw = motor.bounds.HalfW();
+        const f32 hh = motor.bounds.HalfH();
+
+        const ZoneSample2D zone = spatial.SampleEnvironmentalZones(cx, cy);
+        if (zone.submerged) {
+            motor.flags |= MotorFlags::Submerged;
+        } else {
+            motor.flags &= ~MotorFlags::Submerged;
+        }
+
+        f32 rootDx = 0.0f;
+        f32 rootDy = 0.0f;
+        const world::EntityId prevCarrierId = motor.carrierId;
+
+        if (auto* motion = world.TryGet<MotionStack2D>(id)) {
+            if (prevCarrierId != world::kNullEntity && motion->IsCarrierLaunchActive()) {
+                if (const auto* carrier = world.TryGet<KinematicCarrier2D>(prevCarrierId)) {
+                    motion->impulseVx += carrier->deltaX / dt;
+                    motion->impulseVy += std::max(0.0f, carrier->deltaY / dt);
+                }
+                motion->SetCarrierLaunchActive(false);
+            }
+
+            const f32 gravScale = static_cast<f32>(motion->gravityScale_q8) * (1.0f / 256.0f);
+            if (motion->overrideTicks > 0) {
+                motor.vx = motion->overrideVx;
+                motor.vy = motion->overrideVy + cfg.baseGravity * gravScale * dt;
+            } else {
+                motor.vx = motion->targetWalkVx;
+                motor.vy = std::max(cfg.terminalFallVy, motor.vy + cfg.baseGravity * gravScale * dt);
+            }
+
+            motor.vx += motion->impulseVx + zone.forceVx;
+            motor.vy += motion->impulseVy + zone.forceVy;
+            motor.vx *= zone.dragScale;
+            motor.vy *= zone.dragScale;
+
+            motion->impulseVx = 0.0f;
+            motion->impulseVy = 0.0f;
+
+            rootDx = static_cast<f32>(motion->rootMotionDx_q8) * (1.0f / 256.0f);
+            rootDy = static_cast<f32>(motion->rootMotionDy_q8) * (1.0f / 256.0f);
+            motion->rootMotionDx_q8 = 0;
+            motion->rootMotionDy_q8 = 0;
+        } else {
+            motor.vy = std::max(cfg.terminalFallVy, motor.vy + cfg.baseGravity * dt);
+        }
+
+        if (HasMotorFlag(motor.flags, MotorFlags::SoftPushbox)) {
+            spatial.ComputeSoftPushboxSeparation(id, motor.pushboxGroup, cx, cy, hw, hh, motor.vx);
+        }
+
+        f32 deltaX = motor.vx * dt + rootDx;
+        f32 deltaY = motor.vy * dt + rootDy;
+
+        // Project horizontal movement along slope tangent so walking uphill/downhill maintains constant speed
+        if (HasContact(motor.contacts, ContactFlags::OnSlope) &&
+            HasMotorFlag(motor.flags, MotorFlags::ProjectSlopes) &&
+            motor.vy <= 0.0f) {
+            const f32 snx = motor.SlopeNormalX();
+            const f32 sny = motor.SlopeNormalY();
+            if (sny > 0.2f) {
+                deltaY -= (snx / sny) * deltaX;
+            }
+        }
+
+        ResolveSingleMotorSweep(id, loc, motor, spatial, deltaX, deltaY, cfg);
+
+        if (auto* motion = world.TryGet<MotionStack2D>(id)) {
+            if (HasContact(motor.contacts, ContactFlags::Ground)) {
+                motion->groundCoyoteTicks = cfg.maxCoyoteTicks;
+                motion->SetWallSign(0);
+                motion->SetCarrierLaunchActive(motor.carrierId != world::kNullEntity);
+            } else if (HasContact(motor.contacts, ContactFlags::WallLeft)) {
+                motion->wallCoyoteTicks = cfg.maxWallCoyoteTicks;
+                motion->SetWallSign(-1);
+                if (motor.vy < cfg.wallSlideMaxVy) {
+                    motor.vy = cfg.wallSlideMaxVy;
+                }
+            } else if (HasContact(motor.contacts, ContactFlags::WallRight)) {
+                motion->wallCoyoteTicks = cfg.maxWallCoyoteTicks;
+                motion->SetWallSign(1);
+                if (motor.vy < cfg.wallSlideMaxVy) {
+                    motor.vy = cfg.wallSlideMaxVy;
+                }
+            }
+        }
+
+        // Update SafeGroundBreadcrumb2D when grounded on verified non-hazard static tiles
+        if (HasContact(motor.contacts, ContactFlags::Ground) &&
+            motor.carrierId == world::kNullEntity &&
+            HasMotorFlag(motor.flags, MotorFlags::TrackSafeAnchor)) {
+            if (auto* crumb = world.TryGet<SafeGroundBreadcrumb2D>(id)) {
+                const f32 footY = loc.y + motor.bounds.OffsetY() - hh - 0.05f;
+                const f32 footX = loc.x + motor.bounds.OffsetX();
+                if (spatial.CheckStaticPointSolid(footX - hw * 0.7f, footY, true) &&
+                    spatial.CheckStaticPointSolid(footX, footY, true) &&
+                    spatial.CheckStaticPointSolid(footX + hw * 0.7f, footY, true)) {
+                    if (std::abs(loc.x - crumb->safeX) > 1.5f || std::abs(loc.y - crumb->safeY) > 1.5f) {
+                        crumb->prevSafeX = crumb->safeX;
+                        crumb->prevSafeY = crumb->safeY;
+                        crumb->safeX     = loc.x;
+                        crumb->safeY     = loc.y;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -50,318 +169,123 @@ void KinematicSolver2D::ResolveSingleMotorSweep(
     f32 deltaX,
     f32 deltaY,
     const KinematicStepConfig& cfg) noexcept {
-    const bool startedGrounded = HasContact(inoutMotor.contacts, ContactFlags::Ground);
-    inoutMotor.contacts = ContactFlags::None;
 
-    const f32 offX  = inoutMotor.bounds.OffsetX();
-    const f32 offY  = inoutMotor.bounds.OffsetY();
-    const f32 halfW = inoutMotor.bounds.HalfW();
-    const f32 halfH = inoutMotor.bounds.HalfH();
-    const bool ignoreOneWay = (inoutMotor.oneWayIgnoreTicks > 0) ||
-                              HasMotorFlag(inoutMotor.flags, MotorFlags::Crushed);
+    const bool wasGrounded    = HasContact(inoutMotor.contacts, ContactFlags::Ground);
+    const bool notJumpingUp   = (inoutMotor.vy <= 0.0f);
+    inoutMotor.contacts       = ContactFlags::None;
+    inoutMotor.carrierId      = world::kNullEntity;
 
-    f32 cx = inoutTransform.x + offX;
-    f32 cy = inoutTransform.y + offY;
-    f32 remDx = deltaX;
-    f32 remDy = deltaY;
+    const f32 offX = inoutMotor.bounds.OffsetX();
+    const f32 offY = inoutMotor.bounds.OffsetY();
+    const f32 hw   = inoutMotor.bounds.HalfW();
+    const f32 hh   = inoutMotor.bounds.HalfH();
+    const bool ignoreOneWay = (inoutMotor.oneWayIgnoreTicks > 0);
 
-    f32 prevNormalX = 0.0f;
-    f32 prevNormalY = 0.0f;
-    bool hasPrevNormal = false;
+    bool steppedUp = false;
+    f32 stepHeightUsed = 0.0f;
 
-    for (u32 iter = 0; iter < 3u; ++iter) {
-        if (std::abs(remDx) < 1e-6f && std::abs(remDy) < 1e-6f) {
-            break;
+    // 1. Horizontal Sweep (with micro-lip / toe-stub step-up correction)
+    if (std::abs(deltaX) > 1e-6f) {
+        const f32 cx = inoutTransform.x + offX;
+        const f32 cy = inoutTransform.y + offY;
+        const SlabImpact2D hitX = spatial.SweepAabb(
+            id, cx, cy, hw, hh, deltaX, 0.0f, inoutMotor.solidMask, true);
+        if (hitX.hit) {
+            if (HasMotorFlag(inoutMotor.flags, MotorFlags::CornerCorrection) &&
+                (wasGrounded || notJumpingUp)) {
+                const f32 stepHeight = std::min(0.16f, cfg.cornerCorrectionMax);
+                const SlabImpact2D retryHigh = spatial.SweepAabb(
+                    id, cx, cy + stepHeight, hw, hh, deltaX, 0.0f, inoutMotor.solidMask, true);
+                if (!retryHigh.hit) {
+                    inoutTransform.x += deltaX;
+                    inoutTransform.y += stepHeight;
+                    steppedUp      = true;
+                    stepHeightUsed = stepHeight;
+                }
+            }
+
+            if (!steppedUp) {
+                inoutTransform.x += deltaX * hitX.toi + hitX.normalX * cfg.skinWidth;
+                inoutMotor.vx = 0.0f;
+                inoutMotor.contacts |= (hitX.normalX > 0.0f) ? ContactFlags::WallLeft : ContactFlags::WallRight;
+
+                if (HasMotorFlag(inoutMotor.flags, MotorFlags::DetectLedges) && notJumpingUp) {
+                    const f32 wallProbeX = (inoutTransform.x + offX) + (hitX.normalX > 0.0f ? -(hw + 0.08f) : (hw + 0.08f));
+                    const f32 headTopY   = (inoutTransform.y + offY) + hh;
+                    if (spatial.DetectLedgeCorner(wallProbeX, headTopY, inoutTransform.x + offX)) {
+                        inoutMotor.contacts |= (hitX.normalX > 0.0f)
+                            ? ContactFlags::LedgeGrabLeft
+                            : ContactFlags::LedgeGrabRight;
+                    }
+                }
+            }
+        } else {
+            inoutTransform.x += deltaX;
         }
+    }
 
-        const SlabImpact2D hit = spatial.SweepAabb(
-            id, cx, cy, halfW, halfH, remDx, remDy, inoutMotor.solidMask, ignoreOneWay);
+    // If horizontal step-up raised the actor, ensure vertical sweep settles back onto the step surface
+    // even when deltaY == 0 so ContactFlags::Ground is never dropped for 1 frame.
+    const f32 effectiveDeltaY = steppedUp ? std::min(deltaY, -(stepHeightUsed + cfg.skinWidth * 2.0f)) : deltaY;
 
-        if (!hit.hit) {
-            cx += remDx;
-            cy += remDy;
-            break;
-        }
+    // 2. Vertical Sweep & Uphill/Downhill Ground Snap
+    if (std::abs(effectiveDeltaY) > 1e-6f || (wasGrounded && notJumpingUp)) {
+        const f32 cx = inoutTransform.x + offX;
+        const f32 cy = inoutTransform.y + offY;
+        const SlabImpact2D hitY = (std::abs(effectiveDeltaY) > 1e-6f)
+            ? spatial.SweepAabb(id, cx, cy, hw, hh, 0.0f, effectiveDeltaY, inoutMotor.solidMask, ignoreOneWay)
+            : SlabImpact2D{};
 
-        if (hit.normalY < -0.7f && remDy > 0.0f &&
-            HasMotorFlag(inoutMotor.flags, MotorFlags::CornerCorrection)) {
-            const f32 advanceX = remDx * hit.toi;
-            const f32 advanceY = remDy * hit.toi;
-            const f32 testX = cx + advanceX;
-            const f32 testY = cy + advanceY;
-            const f32 remUpY = remDy * (1.0f - hit.toi);
-
-            bool corrected = false;
-            for (f32 sign : {-1.0f, 1.0f}) {
-                const f32 nudgeX = sign * cfg.cornerCorrectionMax;
-                const SlabImpact2D sideCheck = spatial.SweepAabb(
-                    id, testX, testY, halfW, halfH, nudgeX, 0.0f, inoutMotor.solidMask, true);
-                if (!sideCheck.hit) {
-                    const SlabImpact2D upCheck = spatial.SweepAabb(
-                        id, testX + nudgeX, testY, halfW, halfH, 0.0f, remUpY, inoutMotor.solidMask, true);
-                    if (!upCheck.hit) {
-                        cx = testX + nudgeX;
-                        cy = testY + remUpY;
-                        remDx = 0.0f;
-                        remDy = 0.0f;
-                        corrected = true;
+        if (hitY.hit) {
+            bool cornerCorrected = false;
+            if (effectiveDeltaY > 0.0f && hitY.normalY < 0.0f &&
+                HasMotorFlag(inoutMotor.flags, MotorFlags::CornerCorrection)) {
+                for (f32 nudge : {-cfg.cornerCorrectionMax, cfg.cornerCorrectionMax}) {
+                    const SlabImpact2D retry = spatial.SweepAabb(
+                        id, cx + nudge, cy, hw, hh, 0.0f, effectiveDeltaY, inoutMotor.solidMask, true);
+                    if (!retry.hit) {
+                        inoutTransform.x += nudge;
+                        inoutTransform.y += effectiveDeltaY;
+                        cornerCorrected = true;
                         break;
                     }
                 }
             }
-            if (corrected) {
-                break;
-            }
-        }
 
-        cx += remDx * hit.toi + hit.normalX * cfg.skinWidth;
-        cy += remDy * hit.toi + hit.normalY * cfg.skinWidth;
-
-        const f32 remFrac = 1.0f - hit.toi;
-        remDx *= remFrac;
-        remDy *= remFrac;
-
-        if (hit.normalY > 0.5f) {
-            inoutMotor.contacts |= ContactFlags::Ground;
-            inoutMotor.SetSlopeNormal(hit.normalX, hit.normalY);
-            inoutMotor.carrierId = hit.carrierId;
-            if (hit.tileShape == TileShape::OneWayTop) {
-                inoutMotor.contacts |= ContactFlags::OnOneWay;
-            }
-            if (std::abs(hit.normalX) > 0.1f) {
-                inoutMotor.contacts |= ContactFlags::OnSlope;
-            }
-            if (inoutMotor.vy < 0.0f) {
+            if (!cornerCorrected) {
+                inoutTransform.y += effectiveDeltaY * hitY.toi + hitY.normalY * cfg.skinWidth;
                 inoutMotor.vy = 0.0f;
-            }
-        } else if (hit.normalY < -0.5f) {
-            inoutMotor.contacts |= ContactFlags::Ceiling;
-            if (inoutMotor.vy > 0.0f) {
-                inoutMotor.vy = 0.0f;
-            }
-        } else if (hit.normalX > 0.5f) {
-            inoutMotor.contacts |= ContactFlags::WallLeft;
-            if (inoutMotor.vx < 0.0f) {
-                inoutMotor.vx = 0.0f;
-            }
-        } else if (hit.normalX < -0.5f) {
-            inoutMotor.contacts |= ContactFlags::WallRight;
-            if (inoutMotor.vx > 0.0f) {
-                inoutMotor.vx = 0.0f;
-            }
-        }
-
-        // Prevent infinite oscillation inside acute slope-to-wall creases.
-        if (hasPrevNormal && (prevNormalX * hit.normalX + prevNormalY * hit.normalY) < -0.1f) {
-            remDx = 0.0f;
-            remDy = 0.0f;
-            break;
-        }
-        prevNormalX = hit.normalX;
-        prevNormalY = hit.normalY;
-        hasPrevNormal = true;
-
-        if (HasContact(inoutMotor.contacts, ContactFlags::OnSlope) &&
-            HasMotorFlag(inoutMotor.flags, MotorFlags::ProjectSlopes)) {
-            const f32 tangentX = hit.normalY;
-            const f32 tangentY = -hit.normalX;
-            const f32 sign = (remDx >= 0.0f) ? 1.0f : -1.0f;
-            const f32 mag = std::abs(remDx);
-            remDx = std::abs(tangentX) * sign * mag;
-            remDy = (sign * tangentX >= 0.0f ? tangentY : -tangentY) * mag;
-        } else {
-            const f32 dot = remDx * hit.normalX + remDy * hit.normalY;
-            if (dot < 0.0f) {
-                remDx -= dot * hit.normalX;
-                remDy -= dot * hit.normalY;
-            }
-        }
-    }
-
-    if (startedGrounded &&
-        !HasContact(inoutMotor.contacts, ContactFlags::Ground) &&
-        inoutMotor.vy <= 0.0f &&
-        HasMotorFlag(inoutMotor.flags, MotorFlags::SnapToGround)) {
-        const f32 snapDist = std::min(cfg.groundSnapMaxDist, std::abs(deltaX) * 1.2f + 0.04f);
-        const SlabImpact2D snapHit = spatial.SweepAabb(
-            id, cx, cy, halfW, halfH, 0.0f, -snapDist, inoutMotor.solidMask, ignoreOneWay);
-        if (snapHit.hit && snapHit.normalY > 0.5f) {
-            cy -= snapDist * snapHit.toi - cfg.skinWidth;
-            inoutMotor.contacts |= ContactFlags::Ground;
-            inoutMotor.SetSlopeNormal(snapHit.normalX, snapHit.normalY);
-            inoutMotor.carrierId = snapHit.carrierId;
-            inoutMotor.vy = 0.0f;
-        } else {
-            inoutMotor.carrierId = world::kNullEntity;
-        }
-    } else if (!HasContact(inoutMotor.contacts, ContactFlags::Ground)) {
-        inoutMotor.carrierId = world::kNullEntity;
-        inoutMotor.SetSlopeNormal(0.0f, 1.0f);
-    }
-
-    if (!HasContact(inoutMotor.contacts, ContactFlags::Ground) &&
-        HasMotorFlag(inoutMotor.flags, MotorFlags::DetectLedges)) {
-        if (HasContact(inoutMotor.contacts, ContactFlags::WallRight)) {
-            if (spatial.DetectLedgeCorner(cx + halfW + 0.08f, cy + halfH, cx)) {
-                inoutMotor.contacts |= ContactFlags::LedgeGrabRight;
-            }
-        }
-        if (HasContact(inoutMotor.contacts, ContactFlags::WallLeft)) {
-            if (spatial.DetectLedgeCorner(cx - halfW - 0.08f, cy + halfH, cx)) {
-                inoutMotor.contacts |= ContactFlags::LedgeGrabLeft;
-            }
-        }
-    }
-
-    inoutTransform.x = cx - offX;
-    inoutTransform.y = cy - offY;
-}
-
-void KinematicSolver2D::StepMotorsAndMotionStacks(
-    world::World& world,
-    const SpatialIndex2D& spatial,
-    time::SimStepView step,
-    const KinematicStepConfig& cfg) noexcept {
-    for (auto [id, motor] : world.View<KinematicMotor2D>()) {
-        if (step.IsFrozen(motor.timeChannel)) {
-            continue;
-        }
-
-        const f32 dt = step.Dt(motor.timeChannel);
-        if (dt <= 0.0f) {
-            continue;
-        }
-
-        if (motor.oneWayIgnoreTicks > 0) {
-            --motor.oneWayIgnoreTicks;
-        }
-
-        world::LocalTransform2D local = world.GetLocalTransform(id);
-        const f32 cx = local.x + motor.bounds.OffsetX();
-        const f32 cy = local.y + motor.bounds.OffsetY();
-        const f32 hw = motor.bounds.HalfW();
-        const f32 hh = motor.bounds.HalfH();
-
-        const ZoneSample2D zone = spatial.SampleEnvironmentalZones(cx, cy);
-        if (zone.submerged) {
-            motor.flags |= MotorFlags::Submerged;
-        } else {
-            motor.flags &= ~MotorFlags::Submerged;
-        }
-
-        f32 sepVx = 0.0f;
-        if (HasMotorFlag(motor.flags, MotorFlags::SoftPushbox) && motor.pushboxGroup != 0) {
-            spatial.ComputeSoftPushboxSeparation(id, motor.pushboxGroup, cx, cy, hw, hh, sepVx);
-        }
-
-        f32 rootDx = 0.0f;
-        f32 rootDy = 0.0f;
-
-        if (auto* motion = world.TryGet<MotionStack2D>(id)) {
-            if (motion->overrideTicks > 0) {
-                --motion->overrideTicks;
-                motor.vx = motion->overrideVx;
-                motor.vy = motion->overrideVy;
-                if (motion->overrideTicks == 0) {
-                    motion->activePriority = 0;
-                    motion->gravityScale_q8 = 256;
-                }
-            } else {
-                motor.vx = motion->targetWalkVx;
-                const f32 gravScale = static_cast<f32>(motion->gravityScale_q8) * (1.0f / 256.0f);
-                // Suppress slope gravity drift while standing still on an angled floor.
-                const bool idleOnSlope = HasContact(motor.contacts, ContactFlags::Ground) &&
-                                         HasContact(motor.contacts, ContactFlags::OnSlope) &&
-                                         std::abs(motion->targetWalkVx) < 1e-4f;
-                if (!idleOnSlope) {
-                    motor.vy = std::max(cfg.terminalFallVy, motor.vy + cfg.baseGravity * gravScale * dt);
-                } else {
-                    motor.vy = 0.0f;
-                }
-            }
-
-            if ((HasContact(motor.contacts, ContactFlags::WallLeft) ||
-                 HasContact(motor.contacts, ContactFlags::WallRight)) &&
-                !HasContact(motor.contacts, ContactFlags::Ground) &&
-                motor.vy < cfg.wallSlideMaxVy) {
-                motor.vy = cfg.wallSlideMaxVy;
-            }
-
-            motor.vx = (motor.vx + motion->impulseVx + zone.forceVx + sepVx) * zone.dragScale;
-            motor.vy = (motor.vy + motion->impulseVy + zone.forceVy) * zone.dragScale;
-
-            const f32 decay = motion->IsCarrierLaunchActive() ? 0.992f : 0.88f;
-            motion->impulseVx *= decay;
-            motion->impulseVy *= 0.88f;
-            if (std::abs(motion->impulseVx) < 0.01f) motion->impulseVx = 0.0f;
-            if (std::abs(motion->impulseVy) < 0.01f) motion->impulseVy = 0.0f;
-
-            rootDx = static_cast<f32>(motion->rootMotionDx_q8) * (1.0f / 256.0f) *
-                     static_cast<f32>(motion->FacingSign());
-            rootDy = static_cast<f32>(motion->rootMotionDy_q8) * (1.0f / 256.0f);
-            motion->rootMotionDx_q8 = 0;
-            motion->rootMotionDy_q8 = 0;
-        } else {
-            motor.vy = std::max(cfg.terminalFallVy, motor.vy + cfg.baseGravity * dt);
-            motor.vx = (motor.vx + zone.forceVx + sepVx) * zone.dragScale;
-            motor.vy = (motor.vy + zone.forceVy) * zone.dragScale;
-        }
-
-        const world::EntityId prevCarrier = motor.carrierId;
-        const f32 stepDx = motor.vx * dt + rootDx;
-        const f32 stepDy = motor.vy * dt + rootDy;
-
-        ResolveSingleMotorSweep(id, local, motor, spatial, stepDx, stepDy, cfg);
-        world.SetLocalTransform(id, local);
-
-        if (auto* motion = world.TryGet<MotionStack2D>(id)) {
-            if (HasContact(motor.contacts, ContactFlags::Ground)) {
-                motion->groundCoyoteTicks = cfg.maxCoyoteTicks;
-                motion->SetCarrierLaunchActive(false);
-            } else if (motion->groundCoyoteTicks > 0) {
-                --motion->groundCoyoteTicks;
-            }
-
-            if (HasContact(motor.contacts, ContactFlags::WallLeft)) {
-                motion->wallCoyoteTicks = cfg.maxWallCoyoteTicks;
-                motion->SetWallSign(-1);
-            } else if (HasContact(motor.contacts, ContactFlags::WallRight)) {
-                motion->wallCoyoteTicks = cfg.maxWallCoyoteTicks;
-                motion->SetWallSign(1);
-            } else if (motion->wallCoyoteTicks > 0) {
-                --motion->wallCoyoteTicks;
-            } else {
-                motion->SetWallSign(0);
-            }
-
-            // Inherit carrier momentum when jumping or detaching off a moving platform.
-            if (prevCarrier != world::kNullEntity && motor.carrierId == world::kNullEntity) {
-                if (const auto* carrier = world.TryGet<KinematicCarrier2D>(prevCarrier)) {
-                    const f32 carrierVx = carrier->deltaX / dt;
-                    const f32 carrierVy = carrier->deltaY / dt;
-                    motion->impulseVx += carrierVx;
-                    if (motor.vy > 0.0f && carrierVy > 0.0f) {
-                        motor.vy += carrierVy * 0.85f;
+                if (hitY.normalY > 0.0f) {
+                    inoutMotor.contacts |= ContactFlags::Ground;
+                    inoutMotor.carrierId = hitY.carrierId;
+                    inoutMotor.SetSlopeNormal(hitY.normalX, hitY.normalY);
+                    if (std::abs(hitY.normalX) > 0.01f) {
+                        inoutMotor.contacts |= ContactFlags::OnSlope;
                     }
-                    motion->SetCarrierLaunchActive(true);
+                    if (hitY.tileShape == TileShape::OneWayTop) {
+                        inoutMotor.contacts |= ContactFlags::OnOneWay;
+                    }
+                } else {
+                    inoutMotor.contacts |= ContactFlags::Ceiling;
                 }
             }
-        }
+        } else {
+            inoutTransform.y += effectiveDeltaY;
 
-        if (HasContact(motor.contacts, ContactFlags::Ground) &&
-            !HasContact(motor.contacts, ContactFlags::OnOneWay) &&
-            motor.carrierId == world::kNullEntity &&
-            (step.TickIndex() & 15ULL) == 0ULL) {
-            if (auto* crumb = world.TryGet<SafeGroundBreadcrumb2D>(id)) {
-                const f32 footY = (local.y + motor.bounds.OffsetY()) - hh - 0.05f;
-                const f32 newCx = local.x + motor.bounds.OffsetX();
-                if (spatial.CheckStaticPointSolid(newCx - hw * 0.8f, footY, true) &&
-                    spatial.CheckStaticPointSolid(newCx, footY, true) &&
-                    spatial.CheckStaticPointSolid(newCx + hw * 0.8f, footY, true)) {
-                    crumb->prevSafeX = crumb->safeX;
-                    crumb->prevSafeY = crumb->safeY;
-                    crumb->safeX = local.x;
-                    crumb->safeY = local.y;
+            // Ground snap when walking uphill/downhill or stepping onto ledges (gated by notJumpingUp, NOT deltaY <= 0)
+            if ((wasGrounded || steppedUp) && notJumpingUp && HasMotorFlag(inoutMotor.flags, MotorFlags::SnapToGround)) {
+                const SlabImpact2D snapHit = spatial.SweepAabb(
+                    id, inoutTransform.x + offX, inoutTransform.y + offY,
+                    hw, hh, 0.0f, -cfg.groundSnapMaxDist, inoutMotor.solidMask, ignoreOneWay);
+                if (snapHit.hit && snapHit.normalY > 0.5f) {
+                    inoutTransform.y += (-cfg.groundSnapMaxDist) * snapHit.toi + cfg.skinWidth;
+                    inoutMotor.vy = 0.0f;
+                    inoutMotor.contacts |= ContactFlags::Ground;
+                    inoutMotor.carrierId = snapHit.carrierId;
+                    inoutMotor.SetSlopeNormal(snapHit.normalX, snapHit.normalY);
+                    if (std::abs(snapHit.normalX) > 0.01f) {
+                        inoutMotor.contacts |= ContactFlags::OnSlope;
+                    }
                 }
             }
         }

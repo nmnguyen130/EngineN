@@ -327,28 +327,20 @@ void World::BeginTick(time::SimStepView step) noexcept {
     m_transforms.SnapshotPreviousTransforms(m_maxAllocatedIndex, BuildActiveChannelMask(step), m_timeChannels);
 }
 
-void World::StepKinematicsAndAnimations(time::SimStepView step) noexcept {
+void World::StepAmbientVelocities(time::SimStepView step) noexcept {
     const u8 activeChannelMask = BuildActiveChannelMask(step);
     if (activeChannelMask == 0) {
         return;
     }
 
     alignas(32) std::array<f32, 8> chDt{};
-    alignas(16) std::array<u16, 8> chSubTicks{};
-
     for (u8 c = 0; c < 8; ++c) {
         if ((activeChannelMask & (1u << c)) != 0) {
-            const auto ch = static_cast<time::TimeChannel>(c);
-            chDt[c] = step.Dt(ch);
-            chSubTicks[c] = static_cast<u16>(
-                std::lround(step.EffectiveScale(ch) * static_cast<f32>(SpriteAnimator2D::kSubTicksPerTick))
-            );
+            chDt[c] = step.Dt(static_cast<time::TimeChannel>(c));
         }
     }
 
     const auto* __restrict channels = m_timeChannels.data();
-
-    // 1. Integrate non-colliding Velocity2D entities
     auto& velPool          = GetPool<Velocity2D>();
     const auto velEntities = velPool.Entities();
     auto velocities        = velPool.Components();
@@ -372,48 +364,6 @@ void World::StepKinematicsAndAnimations(time::SimStepView step) noexcept {
             v.vy *= damp;
         }
     }
-
-    // 2. Step lockstep [Sprite2D + SpriteAnimator2D] group with zero AssetBank calls
-    auto& spritePool         = GetPool<Sprite2D>();
-    auto& animPool           = GetPool<SpriteAnimator2D>();
-    const u16 groupCount     = spritePool.GroupSize();
-    const auto groupEntities = animPool.Entities();
-    auto sprites             = spritePool.Components();
-    auto anims               = animPool.Components();
-
-    for (u16 i = 0; i < groupCount; ++i) {
-        SpriteAnimator2D& anim = anims[i];
-        if (!anim.playing || anim.frameCount <= 1) {
-            continue;
-        }
-        const u16 deltaSub = chSubTicks[static_cast<u8>(channels[groupEntities[i].index])];
-        if (deltaSub == 0) {
-            continue;
-        }
-
-        const u32 targetSubTicks = static_cast<u32>(anim.ticksPerFrame) * SpriteAnimator2D::kSubTicksPerTick;
-        u32 accum = static_cast<u32>(anim.subTickAccum) + deltaSub;
-
-        if (accum >= targetSubTicks) {
-            const u32 framesAdvanced = accum / targetSubTicks;
-            accum %= targetSubTicks;
-            const u32 nextFrame = static_cast<u32>(anim.currentFrame) + framesAdvanced;
-            if (nextFrame >= anim.frameCount) {
-                anim.currentFrame = anim.loop
-                    ? static_cast<u16>(nextFrame % anim.frameCount)
-                    : static_cast<u16>(anim.frameCount - 1u);
-                if (!anim.loop) {
-                    anim.playing = 0;
-                    accum = 0;
-                }
-            } else {
-                anim.currentFrame = static_cast<u16>(nextFrame);
-            }
-            sprites[i].spriteIndex      = static_cast<u16>(anim.baseSpriteIndex + anim.firstFrame + anim.currentFrame);
-            sprites[i].spriteGeneration = anim.spriteGeneration;
-        }
-        anim.subTickAccum = static_cast<u16>(accum);
-    }
 }
 
 void World::EndTick(time::SimStepView /*step*/) noexcept {
@@ -435,12 +385,6 @@ void World::EndTick(time::SimStepView /*step*/) noexcept {
             m_flags[idx] = m_flags[idx] & ~EntityFlags::Teleported;
         }
     }
-}
-
-void World::Tick(time::SimStepView step) noexcept {
-    BeginTick(step);
-    StepKinematicsAndAnimations(step);
-    EndTick(step);
 }
 
 u64 World::ComputeAuditHash() const noexcept {

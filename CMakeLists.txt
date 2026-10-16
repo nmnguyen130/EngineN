@@ -35,6 +35,13 @@ add_library(engine STATIC
     engine/world/TransformSolver.cpp
     engine/world/World.cpp
     engine/world/WorldExtractor.cpp
+
+
+    # Gameplay
+    engine/gameplay/SpatialIndex2D.cpp
+    engine/gameplay/KinematicSolver2D.cpp
+    engine/gameplay/StateAndCombatSolver.cpp
+    engine/gameplay/GameplayPipeline.cpp
 )
 
 target_compile_features(engine PUBLIC cxx_std_23)

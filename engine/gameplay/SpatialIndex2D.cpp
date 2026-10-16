@@ -4,7 +4,6 @@
 #include "world/World.h"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -12,336 +11,344 @@ namespace en::gameplay {
 
 namespace {
 
-constexpr f32 kCellSize = 2.0f;
-constexpr f32 kInvCellSize = 0.5f;
-constexpr f32 kRayEps = 1e-6f;
+constexpr f32 kGridCellSize    = 4.0f;
+constexpr f32 kInvGridCellSize = 0.25f;
 
-[[nodiscard]] constexpr i32 FastFloorToInt(f32 v) noexcept {
-    const i32 i = static_cast<i32>(v);
-    return (v < static_cast<f32>(i)) ? (i - 1) : i;
-}
-
-[[nodiscard]] constexpr bool TestMinkowskiSlab(
-    f32 startX, f32 startY,
+[[nodiscard]] constexpr SlabImpact2D IntersectRayExpandedAabb(
+    f32 origX, f32 origY,
     f32 deltaX, f32 deltaY,
-    f32 boxMinX, f32 boxMinY,
-    f32 boxMaxX, f32 boxMaxY,
-    f32& outToi, f32& outNx, f32& outNy) noexcept {
-    f32 tEntryX = -1e30f;
-    f32 tExitX  =  1e30f;
-    f32 nx = 0.0f;
+    f32 minX, f32 minY,
+    f32 maxX, f32 maxY) noexcept {
 
-    if (std::abs(deltaX) < kRayEps) {
-        if (startX <= boxMinX || startX >= boxMaxX) {
-            return false;
+    SlabImpact2D res{};
+    f32 tNear = 0.0f;
+    f32 tFar  = 1.0f;
+    f32 normX = 0.0f;
+    f32 normY = 0.0f;
+
+    if (std::abs(deltaX) < 1e-6f) {
+        if (origX <= minX || origX >= maxX) {
+            return res;
         }
     } else {
         const f32 invDx = 1.0f / deltaX;
-        const f32 t1 = (boxMinX - startX) * invDx;
-        const f32 t2 = (boxMaxX - startX) * invDx;
-        if (t1 < t2) {
-            tEntryX = t1;
-            tExitX  = t2;
-            nx = -1.0f;
-        } else {
-            tEntryX = t2;
-            tExitX  = t1;
+        f32 t1 = (minX - origX) * invDx;
+        f32 t2 = (maxX - origX) * invDx;
+        f32 nx = -1.0f;
+        if (t1 > t2) {
+            std::swap(t1, t2);
             nx = 1.0f;
+        }
+        if (t1 > tNear) {
+            tNear = t1;
+            normX = nx;
+            normY = 0.0f;
+        }
+        tFar = std::min(tFar, t2);
+        if (tNear > tFar) {
+            return res;
         }
     }
 
-    f32 tEntryY = -1e30f;
-    f32 tExitY  =  1e30f;
-    f32 ny = 0.0f;
-
-    if (std::abs(deltaY) < kRayEps) {
-        if (startY <= boxMinY || startY >= boxMaxY) {
-            return false;
+    if (std::abs(deltaY) < 1e-6f) {
+        if (origY <= minY || origY >= maxY) {
+            return res;
         }
     } else {
         const f32 invDy = 1.0f / deltaY;
-        const f32 t1 = (boxMinY - startY) * invDy;
-        const f32 t2 = (boxMaxY - startY) * invDy;
-        if (t1 < t2) {
-            tEntryY = t1;
-            tExitY  = t2;
-            ny = -1.0f;
-        } else {
-            tEntryY = t2;
-            tExitY  = t1;
+        f32 t1 = (minY - origY) * invDy;
+        f32 t2 = (maxY - origY) * invDy;
+        f32 ny = -1.0f;
+        if (t1 > t2) {
+            std::swap(t1, t2);
             ny = 1.0f;
+        }
+        if (t1 > tNear) {
+            tNear = t1;
+            normX = 0.0f;
+            normY = ny;
+        }
+        tFar = std::min(tFar, t2);
+        if (tNear > tFar) {
+            return res;
         }
     }
 
-    const f32 tEntry = std::max(tEntryX, tEntryY);
-    const f32 tExit  = std::min(tExitX, tExitY);
-
-    if (tEntry > tExit || tExit <= 0.0f || tEntry > 1.0f) {
-        return false;
+    if (tNear >= 0.0f && tNear <= 1.0f && (normX != 0.0f || normY != 0.0f)) {
+        res.toi     = tNear;
+        res.normalX = normX;
+        res.normalY = normY;
+        res.hit     = true;
     }
-
-    if (tEntry < 0.0f) {
-        return false;
-    }
-
-    outToi = tEntry;
-    if (tEntryX > tEntryY) {
-        outNx = nx;
-        outNy = 0.0f;
-    } else {
-        outNx = 0.0f;
-        outNy = ny;
-    }
-    return true;
+    return res;
 }
+
+[[nodiscard]] constexpr bool IsSlopeTile(TileShape s) noexcept {
+    return s >= TileShape::Slope45Asc && s <= TileShape::Slope26HiDesc;
+}
+
+// Evaluates local normalized [0..1] slope height and unit surface normal for 45-deg and 26.5-deg tiles.
+constexpr void EvaluateSlopeSurface(
+    TileShape shape, f32 localU01, f32& outLocalHeight01, f32& outNormX, f32& outNormY) noexcept {
+    const f32 u = std::clamp(localU01, 0.0f, 1.0f);
+    constexpr f32 kInvSqrt2 = 0.70710678f;
+    constexpr f32 kNx26     = 0.44721360f;
+    constexpr f32 kNy26     = 0.89442719f;
+
+    switch (shape) {
+        case TileShape::Slope45Asc:
+            outLocalHeight01 = u;
+            outNormX = -kInvSqrt2;
+            outNormY =  kInvSqrt2;
+            break;
+        case TileShape::Slope45Desc:
+            outLocalHeight01 = 1.0f - u;
+            outNormX = kInvSqrt2;
+            outNormY = kInvSqrt2;
+            break;
+        case TileShape::Slope26LoAsc:
+            outLocalHeight01 = 0.5f * u;
+            outNormX = -kNx26;
+            outNormY =  kNy26;
+            break;
+        case TileShape::Slope26HiAsc:
+            outLocalHeight01 = 0.5f + 0.5f * u;
+            outNormX = -kNx26;
+            outNormY =  kNy26;
+            break;
+        case TileShape::Slope26LoDesc:
+            outLocalHeight01 = 0.5f * (1.0f - u);
+            outNormX = kNx26;
+            outNormY = kNy26;
+            break;
+        case TileShape::Slope26HiDesc:
+            outLocalHeight01 = 1.0f - 0.5f * u;
+            outNormX = kNx26;
+            outNormY = kNy26;
+            break;
+        default:
+            outLocalHeight01 = 1.0f;
+            outNormX = 0.0f;
+            outNormY = 1.0f;
+            break;
+    }
+}
+
+struct PendingGridBox {
+    world::EntityId id;
+    f32 minX;
+    f32 minY;
+    f32 maxX;
+    f32 maxY;
+    u16 mask;
+    u8 kind;
+    u8 aux;
+};
 
 } // namespace
 
 void SpatialIndex2D::BindArena(std::span<u8> arenaSlice) noexcept {
     u8* ptr = arenaSlice.data();
-    const auto alignPtr = [&ptr](usize align) noexcept {
+    auto alignPtr = [&ptr](usize bytes, usize align = 16u) noexcept -> u8* {
         const usize addr = reinterpret_cast<usize>(ptr);
-        const usize aligned = (addr + (align - 1u)) & ~(align - 1u);
-        ptr = reinterpret_cast<u8*>(aligned);
+        const usize aligned = (addr + align - 1u) & ~(align - 1u);
+        ptr = reinterpret_cast<u8*>(aligned + bytes);
+        return reinterpret_cast<u8*>(aligned);
     };
 
-    alignPtr(64);
-    m_cellCounts = reinterpret_cast<u16*>(ptr);
-    ptr += sizeof(u16) * (kGridCells + 1u);
-
-    alignPtr(64);
-    m_cellOffsets = reinterpret_cast<u16*>(ptr);
-    ptr += sizeof(u16) * (kGridCells + 1u);
-
-    alignPtr(64);
-    m_sortedEntities = reinterpret_cast<world::EntityId*>(ptr);
-    ptr += sizeof(world::EntityId) * kMaxCellRefs;
-
-    alignPtr(64);
-    m_boxMinX = reinterpret_cast<f32*>(ptr);
-    ptr += sizeof(f32) * kMaxCellRefs;
-
-    m_boxMinY = reinterpret_cast<f32*>(ptr);
-    ptr += sizeof(f32) * kMaxCellRefs;
-
-    m_boxMaxX = reinterpret_cast<f32*>(ptr);
-    ptr += sizeof(f32) * kMaxCellRefs;
-
-    m_boxMaxY = reinterpret_cast<f32*>(ptr);
-    ptr += sizeof(f32) * kMaxCellRefs;
-
-    alignPtr(32);
-    m_boxMask = reinterpret_cast<u16*>(ptr);
-    ptr += sizeof(u16) * kMaxCellRefs;
-
-    m_boxKind = ptr;
-    ptr += sizeof(u8) * kMaxCellRefs;
-
-    m_boxAux = ptr;
-    ptr += sizeof(u8) * kMaxCellRefs;
-
-    std::memset(m_cellCounts, 0, sizeof(u16) * (kGridCells + 1u));
-    std::memset(m_cellOffsets, 0, sizeof(u16) * (kGridCells + 1u));
-    m_totalRefs = 0;
+    m_cellCounts     = reinterpret_cast<u16*>(alignPtr(sizeof(u16) * (kGridCells + 1u)));
+    m_cellOffsets    = reinterpret_cast<u16*>(alignPtr(sizeof(u16) * (kGridCells + 1u)));
+    m_sortedEntities = reinterpret_cast<world::EntityId*>(alignPtr(sizeof(world::EntityId) * kMaxCellRefs));
+    m_boxMinX        = reinterpret_cast<f32*>(alignPtr(sizeof(f32) * kMaxCellRefs));
+    m_boxMinY        = reinterpret_cast<f32*>(alignPtr(sizeof(f32) * kMaxCellRefs));
+    m_boxMaxX        = reinterpret_cast<f32*>(alignPtr(sizeof(f32) * kMaxCellRefs));
+    m_boxMaxY        = reinterpret_cast<f32*>(alignPtr(sizeof(f32) * kMaxCellRefs));
+    m_boxMask        = reinterpret_cast<u16*>(alignPtr(sizeof(u16) * kMaxCellRefs));
+    m_boxKind        = reinterpret_cast<u8*>(alignPtr(sizeof(u8) * kMaxCellRefs));
+    m_boxAux         = reinterpret_cast<u8*>(alignPtr(sizeof(u8) * kMaxCellRefs));
+    m_totalRefs      = 0;
 }
 
-Result<void, GameplayErrc> SpatialIndex2D::BindCollisionMapBlob(
-    const assets::BlobRecord& blob) noexcept {
-    if (blob.data == nullptr || blob.size < sizeof(CookedCollisionMapHeader)) {
+Result<void, GameplayErrc> SpatialIndex2D::BindCollisionMapBlob(const assets::BlobRecord& blob) noexcept {
+    ClearCollisionMap();
+    if (blob.data == nullptr || blob.size < sizeof(CookedCollisionMapHeader)) [[unlikely]] {
         return Err(GameplayErrc::CorruptedBlobHeader);
     }
 
     const auto* hdr = reinterpret_cast<const CookedCollisionMapHeader*>(blob.data);
-    if (hdr->magic != CookedCollisionMapHeader::kMagic ||
-        hdr->version != CookedCollisionMapHeader::kVersion ||
-        hdr->tileSize_q8 == 0) {
+    if (hdr->magic != CookedCollisionMapHeader::kMagic || hdr->version != CookedCollisionMapHeader::kVersion) [[unlikely]] {
         return Err(GameplayErrc::CorruptedBlobHeader);
     }
 
     const usize chunkCount = static_cast<usize>(hdr->chunkCountX) * static_cast<usize>(hdr->chunkCountY);
-    const usize chunksEnd = sizeof(CookedCollisionMapHeader) + chunkCount * sizeof(CookedCollisionChunk8x8);
-    if (blob.size < chunksEnd || hdr->fineTileTableOffset < chunksEnd || hdr->fineTileTableOffset > blob.size) {
+    const usize chunksEnd  = sizeof(CookedCollisionMapHeader) + chunkCount * sizeof(CookedCollisionChunk8x8);
+    if (blob.size < chunksEnd || hdr->fineTileTableOffset > blob.size) [[unlikely]] {
         return Err(GameplayErrc::CorruptedBlobPayload);
     }
 
-    m_mapHeader = hdr;
-    m_chunks = reinterpret_cast<const CookedCollisionChunk8x8*>(blob.data + sizeof(CookedCollisionMapHeader));
-    m_fineTiles = reinterpret_cast<const CookedTileCell*>(blob.data + hdr->fineTileTableOffset);
-    if (hdr->zoneCount > 0 && hdr->zoneTableOffset + hdr->zoneCount * sizeof(EnvironmentalZone2D) <= blob.size) {
-        m_zones = reinterpret_cast<const EnvironmentalZone2D*>(blob.data + hdr->zoneTableOffset);
-    } else {
-        m_zones = nullptr;
-    }
-
-    m_tileSize = static_cast<f32>(hdr->tileSize_q8) * (1.0f / 256.0f);
+    m_mapHeader   = hdr;
+    m_chunks      = reinterpret_cast<const CookedCollisionChunk8x8*>(blob.data + sizeof(CookedCollisionMapHeader));
+    m_fineTiles   = reinterpret_cast<const CookedTileCell*>(blob.data + hdr->fineTileTableOffset);
+    m_zones       = (hdr->zoneCount > 0 && hdr->zoneTableOffset + hdr->zoneCount * sizeof(EnvironmentalZone2D) <= blob.size)
+        ? reinterpret_cast<const EnvironmentalZone2D*>(blob.data + hdr->zoneTableOffset)
+        : nullptr;
+    m_tileSize    = std::max(0.125f, static_cast<f32>(hdr->tileSize_q8) * (1.0f / 256.0f));
     m_invTileSize = 1.0f / m_tileSize;
     return {};
 }
 
 void SpatialIndex2D::ClearCollisionMap() noexcept {
-    m_mapHeader = nullptr;
-    m_chunks = nullptr;
-    m_fineTiles = nullptr;
-    m_zones = nullptr;
+    m_mapHeader   = nullptr;
+    m_chunks      = nullptr;
+    m_fineTiles   = nullptr;
+    m_zones       = nullptr;
+    m_tileSize    = 1.0f;
+    m_invTileSize = 1.0f;
 }
 
 CookedTileCell SpatialIndex2D::GetTileAt(i32 tx, i32 ty) const noexcept {
     if (m_mapHeader == nullptr || tx < 0 || ty < 0) {
-        return {};
+        return CookedTileCell{};
     }
-    const i32 chunkX = tx >> 3;
-    const i32 chunkY = ty >> 3;
-    if (chunkX >= static_cast<i32>(m_mapHeader->chunkCountX) ||
-        chunkY >= static_cast<i32>(m_mapHeader->chunkCountY)) {
-        return {};
+    const u32 cx = static_cast<u32>(tx) >> 3u;
+    const u32 cy = static_cast<u32>(ty) >> 3u;
+    if (cx >= m_mapHeader->chunkCountX || cy >= m_mapHeader->chunkCountY) {
+        return CookedTileCell{};
     }
 
-    const CookedCollisionChunk8x8& chunk =
-        m_chunks[chunkY * static_cast<i32>(m_mapHeader->chunkCountX) + chunkX];
-    const u32 localIdx = static_cast<u32>((ty & 7) * 8 + (tx & 7));
-    const u64 bit = 1ULL << localIdx;
-
+    const CookedCollisionChunk8x8& chunk = m_chunks[cy * m_mapHeader->chunkCountX + cx];
+    const u32 bitIdx = ((static_cast<u32>(ty) & 7u) << 3u) | (static_cast<u32>(tx) & 7u);
+    const u64 bit    = 1ULL << bitIdx;
     if ((chunk.solidBitmask & bit) == 0ULL) {
-        return {};
+        return CookedTileCell{};
     }
     if ((chunk.pureFullBlockBitmask & bit) != 0ULL) {
         return CookedTileCell{TileShape::FullSolid, TileMaterialFlags::SafeAnchor};
     }
-    return m_fineTiles[chunk.fineTileBaseIndex + localIdx];
+    return m_fineTiles[chunk.fineTileBaseIndex + bitIdx];
 }
 
 void SpatialIndex2D::RebuildDynamicGrid(const world::World& world) noexcept {
     if (m_cellCounts == nullptr) {
         return;
     }
-
     std::memset(m_cellCounts, 0, sizeof(u16) * (kGridCells + 1u));
+    m_totalRefs = 0;
 
-    const auto tallyBox = [this](f32 minX, f32 minY, f32 maxX, f32 maxY) noexcept {
-        const i32 x0 = FastFloorToInt(minX * kInvCellSize);
-        const i32 y0 = FastFloorToInt(minY * kInvCellSize);
-        const i32 x1 = FastFloorToInt(maxX * kInvCellSize);
-        const i32 y1 = FastFloorToInt(maxY * kInvCellSize);
-        for (i32 cy = y0; cy <= y1; ++cy) {
-            for (i32 cx = x0; cx <= x1; ++cx) {
-                const u32 bucket = HashCellCoords(cx, cy);
-                ++m_cellCounts[bucket];
-            }
+    // Collect world-space AABBs once into a stack buffer to avoid double ECS View iteration
+    std::array<PendingGridBox, 1024> pending{};
+    u32 pendingCount = 0;
+    const auto* __restrict worldTf = world.WorldTransforms().data();
+
+    auto pushBox = [&](world::EntityId id, f32 minX, f32 minY, f32 maxX, f32 maxY,
+                       u16 mask, RefKind kind, u8 aux) noexcept {
+        if (pendingCount >= pending.size()) [[unlikely]] {
+            return;
         }
-    };
+        pending[pendingCount++] = PendingGridBox{
+            .id   = id,
+            .minX = minX,
+            .minY = minY,
+            .maxX = maxX,
+            .maxY = maxY,
+            .mask = mask,
+            .kind = static_cast<u8>(kind),
+            .aux  = aux,
+        };
 
-    for (auto [id, carrier] : world.View<KinematicCarrier2D>()) {
-        const auto& wt = world.GetWorldTransform(id);
-        const f32 cx = wt.x + carrier.bounds.OffsetX();
-        const f32 cy = wt.y + carrier.bounds.OffsetY();
-        const f32 hw = carrier.bounds.HalfW();
-        const f32 hh = carrier.bounds.HalfH();
-        tallyBox(cx - hw, cy - hh, cx + hw, cy + hh);
-    }
+        const i32 cx0 = static_cast<i32>(std::floor(minX * kInvGridCellSize));
+        const i32 cy0 = static_cast<i32>(std::floor(minY * kInvGridCellSize));
+        const i32 cx1 = static_cast<i32>(std::floor(maxX * kInvGridCellSize));
+        const i32 cy1 = static_cast<i32>(std::floor(maxY * kInvGridCellSize));
 
-    for (auto [id, motor] : world.View<KinematicMotor2D>()) {
-        if (motor.pushboxGroup == 0 || !HasMotorFlag(motor.flags, MotorFlags::SoftPushbox)) {
-            continue;
-        }
-        const auto& wt = world.GetWorldTransform(id);
-        const f32 cx = wt.x + motor.bounds.OffsetX();
-        const f32 cy = wt.y + motor.bounds.OffsetY();
-        const f32 hw = motor.bounds.HalfW();
-        const f32 hh = motor.bounds.HalfH();
-        tallyBox(cx - hw, cy - hh, cx + hw, cy + hh);
-    }
-
-    for (auto [id, rig] : world.View<HitboxRig2D>()) {
-        const auto& wt = world.GetWorldTransform(id);
-        if ((rig.rigFlags & static_cast<u8>(HitboxRigFlags::HurtboxActive)) != 0) {
-            const f32 cx = wt.x + rig.hurtbox.OffsetX();
-            const f32 cy = wt.y + rig.hurtbox.OffsetY();
-            const f32 hw = rig.hurtbox.HalfW();
-            const f32 hh = rig.hurtbox.HalfH();
-            tallyBox(cx - hw, cy - hh, cx + hw, cy + hh);
-        }
-        if ((rig.rigFlags & static_cast<u8>(HitboxRigFlags::HitboxActive)) != 0) {
-            const f32 cx = wt.x + rig.primaryHitbox.OffsetX();
-            const f32 cy = wt.y + rig.primaryHitbox.OffsetY();
-            const f32 hw = rig.primaryHitbox.HalfW();
-            const f32 hh = rig.primaryHitbox.HalfH();
-            tallyBox(cx - hw, cy - hh, cx + hw, cy + hh);
-        }
-    }
-
-    u32 runningOffset = 0;
-    for (u32 c = 0; c < kGridCells; ++c) {
-        const u32 count = m_cellCounts[c];
-        m_cellOffsets[c] = static_cast<u16>(std::min<u32>(runningOffset, kMaxCellRefs));
-        runningOffset += count;
-        m_cellCounts[c] = m_cellOffsets[c];
-    }
-    m_totalRefs = std::min<u32>(runningOffset, kMaxCellRefs);
-    m_cellOffsets[kGridCells] = static_cast<u16>(m_totalRefs);
-
-    const auto scatterBox = [this](
-        world::EntityId id,
-        f32 minX, f32 minY, f32 maxX, f32 maxY,
-        u16 mask, RefKind kind, u8 aux) noexcept {
-        const i32 x0 = FastFloorToInt(minX * kInvCellSize);
-        const i32 y0 = FastFloorToInt(minY * kInvCellSize);
-        const i32 x1 = FastFloorToInt(maxX * kInvCellSize);
-        const i32 y1 = FastFloorToInt(maxY * kInvCellSize);
-        for (i32 cy = y0; cy <= y1; ++cy) {
-            for (i32 cx = x0; cx <= x1; ++cx) {
-                const u32 bucket = HashCellCoords(cx, cy);
-                const u16 dst = m_cellCounts[bucket];
-                if (dst < kMaxCellRefs) {
-                    m_sortedEntities[dst] = id;
-                    m_boxMinX[dst] = minX;
-                    m_boxMinY[dst] = minY;
-                    m_boxMaxX[dst] = maxX;
-                    m_boxMaxY[dst] = maxY;
-                    m_boxMask[dst] = mask;
-                    m_boxKind[dst] = static_cast<u8>(kind);
-                    m_boxAux[dst]  = aux;
-                    m_cellCounts[bucket] = static_cast<u16>(dst + 1u);
+        for (i32 cy = cy0; cy <= cy1; ++cy) {
+            for (i32 cx = cx0; cx <= cx1; ++cx) {
+                if (m_totalRefs >= kMaxCellRefs) [[unlikely]] {
+                    return;
                 }
+                ++m_cellCounts[HashCellCoords(cx, cy)];
+                ++m_totalRefs;
             }
         }
     };
 
     for (auto [id, carrier] : world.View<KinematicCarrier2D>()) {
-        const auto& wt = world.GetWorldTransform(id);
+        const auto& wt = worldTf[id.index];
         const f32 cx = wt.x + carrier.bounds.OffsetX();
         const f32 cy = wt.y + carrier.bounds.OffsetY();
         const f32 hw = carrier.bounds.HalfW();
         const f32 hh = carrier.bounds.HalfH();
-        scatterBox(id, cx - hw, cy - hh, cx + hw, cy + hh, 0x0008u, RefKind::Carrier, 0);
+        pushBox(id, cx - hw, cy - hh, cx + hw, cy + hh, 0xFFFFu, RefKind::Carrier, 0);
     }
 
     for (auto [id, motor] : world.View<KinematicMotor2D>()) {
-        if (motor.pushboxGroup == 0 || !HasMotorFlag(motor.flags, MotorFlags::SoftPushbox)) {
+        if (!HasMotorFlag(motor.flags, MotorFlags::SoftPushbox)) {
             continue;
         }
-        const auto& wt = world.GetWorldTransform(id);
+        const auto& wt = worldTf[id.index];
         const f32 cx = wt.x + motor.bounds.OffsetX();
         const f32 cy = wt.y + motor.bounds.OffsetY();
         const f32 hw = motor.bounds.HalfW();
         const f32 hh = motor.bounds.HalfH();
-        scatterBox(id, cx - hw, cy - hh, cx + hw, cy + hh, 0, RefKind::Pushbox, motor.pushboxGroup);
+        pushBox(id, cx - hw, cy - hh, cx + hw, cy + hh, motor.solidMask, RefKind::Pushbox, motor.pushboxGroup);
     }
 
     for (auto [id, rig] : world.View<HitboxRig2D>()) {
-        const auto& wt = world.GetWorldTransform(id);
+        const auto& wt = worldTf[id.index];
+        const auto* motion = world.TryGet<MotionStack2D>(id);
+        const f32 facing = motion != nullptr ? static_cast<f32>(motion->FacingSign()) : 1.0f;
+
         if ((rig.rigFlags & static_cast<u8>(HitboxRigFlags::HurtboxActive)) != 0) {
-            const f32 cx = wt.x + rig.hurtbox.OffsetX();
+            const f32 cx = wt.x + rig.hurtbox.OffsetX() * facing;
             const f32 cy = wt.y + rig.hurtbox.OffsetY();
             const f32 hw = rig.hurtbox.HalfW();
             const f32 hh = rig.hurtbox.HalfH();
-            scatterBox(id, cx - hw, cy - hh, cx + hw, cy + hh, rig.hurtLayerMask, RefKind::Hurtbox, rig.rigFlags);
+            pushBox(id, cx - hw, cy - hh, cx + hw, cy + hh, rig.hurtLayerMask, RefKind::Hurtbox, 0);
         }
         if ((rig.rigFlags & static_cast<u8>(HitboxRigFlags::HitboxActive)) != 0) {
-            const f32 cx = wt.x + rig.primaryHitbox.OffsetX();
+            const f32 cx = wt.x + rig.primaryHitbox.OffsetX() * facing;
             const f32 cy = wt.y + rig.primaryHitbox.OffsetY();
             const f32 hw = rig.primaryHitbox.HalfW();
             const f32 hh = rig.primaryHitbox.HalfH();
-            scatterBox(id, cx - hw, cy - hh, cx + hw, cy + hh, rig.hitLayerMask, RefKind::Hitbox, rig.rigFlags);
+            pushBox(id, cx - hw, cy - hh, cx + hw, cy + hh, rig.hitLayerMask, RefKind::Hitbox, rig.activeSliceIndex);
+        }
+    }
+
+    // Pass 2: Exclusive prefix sum
+    u16 running = 0;
+    for (u32 c = 0; c <= kGridCells; ++c) {
+        const u16 count  = m_cellCounts[c];
+        m_cellOffsets[c] = running;
+        m_cellCounts[c]  = running;
+        running = static_cast<u16>(running + count);
+    }
+
+    // Pass 3: Scatter cached PendingGridBox array into flat SoA arrays
+    u32 emitted = 0;
+    for (u32 i = 0; i < pendingCount; ++i) {
+        const PendingGridBox& b = pending[i];
+        const i32 cx0 = static_cast<i32>(std::floor(b.minX * kInvGridCellSize));
+        const i32 cy0 = static_cast<i32>(std::floor(b.minY * kInvGridCellSize));
+        const i32 cx1 = static_cast<i32>(std::floor(b.maxX * kInvGridCellSize));
+        const i32 cy1 = static_cast<i32>(std::floor(b.maxY * kInvGridCellSize));
+
+        for (i32 cy = cy0; cy <= cy1; ++cy) {
+            for (i32 cx = cx0; cx <= cx1; ++cx) {
+                if (emitted >= kMaxCellRefs) [[unlikely]] {
+                    return;
+                }
+                const u32 cell = HashCellCoords(cx, cy);
+                const u16 dst  = m_cellCounts[cell]++;
+                m_sortedEntities[dst] = b.id;
+                m_boxMinX[dst]        = b.minX;
+                m_boxMinY[dst]        = b.minY;
+                m_boxMaxX[dst]        = b.maxX;
+                m_boxMaxY[dst]        = b.maxY;
+                m_boxMask[dst]        = b.mask;
+                m_boxKind[dst]        = b.kind;
+                m_boxAux[dst]         = b.aux;
+                ++emitted;
+            }
         }
     }
 }
@@ -353,142 +360,108 @@ SlabImpact2D SpatialIndex2D::SweepAabb(
     f32 deltaX, f32 deltaY,
     u16 solidMask,
     bool ignoreOneWay) const noexcept {
+
     SlabImpact2D best{};
+    const f32 sweepMinX = std::min(centerX, centerX + deltaX) - halfW;
+    const f32 sweepMinY = std::min(centerY, centerY + deltaY) - halfH;
+    const f32 sweepMaxX = std::max(centerX, centerX + deltaX) + halfW;
+    const f32 sweepMaxY = std::max(centerY, centerY + deltaY) + halfH;
 
-    const f32 sweepMinX = std::min(centerX, centerX + deltaX) - halfW - 0.02f;
-    const f32 sweepMinY = std::min(centerY, centerY + deltaY) - halfH - 0.02f;
-    const f32 sweepMaxX = std::max(centerX, centerX + deltaX) + halfW + 0.02f;
-    const f32 sweepMaxY = std::max(centerY, centerY + deltaY) + halfH + 0.02f;
-
-    if (m_mapHeader != nullptr) {
-        const i32 tx0 = std::max(0, FastFloorToInt((sweepMinX - m_mapHeader->originX) * m_invTileSize));
-        const i32 ty0 = std::max(0, FastFloorToInt((sweepMinY - m_mapHeader->originY) * m_invTileSize));
-        const i32 maxTileX = static_cast<i32>(m_mapHeader->chunkCountX) * 8 - 1;
-        const i32 maxTileY = static_cast<i32>(m_mapHeader->chunkCountY) * 8 - 1;
-        const i32 tx1 = std::min(maxTileX, FastFloorToInt((sweepMaxX - m_mapHeader->originX) * m_invTileSize));
-        const i32 ty1 = std::min(maxTileY, FastFloorToInt((sweepMaxY - m_mapHeader->originY) * m_invTileSize));
+    // 1. Static tile map sweep (Full blocks, One-Way platforms, and Analytical Slopes)
+    if (m_mapHeader != nullptr && (solidMask & 0x0001u) != 0) {
+        const i32 tx0 = static_cast<i32>(std::floor((sweepMinX - m_mapHeader->originX) * m_invTileSize));
+        const i32 ty0 = static_cast<i32>(std::floor((sweepMinY - m_mapHeader->originY) * m_invTileSize));
+        const i32 tx1 = static_cast<i32>(std::floor((sweepMaxX - m_mapHeader->originX) * m_invTileSize));
+        const i32 ty1 = static_cast<i32>(std::floor((sweepMaxY - m_mapHeader->originY) * m_invTileSize));
 
         for (i32 ty = ty0; ty <= ty1; ++ty) {
-            const i32 chunkY = ty >> 3;
-            const u32 localY = static_cast<u32>(ty & 7);
-
-            for (i32 tx = tx0; tx <= tx1; ++tx) {
-                const i32 chunkX = tx >> 3;
-                const CookedCollisionChunk8x8& chunk =
-                    m_chunks[chunkY * static_cast<i32>(m_mapHeader->chunkCountX) + chunkX];
-
-                if (chunk.solidBitmask == 0ULL) {
-                    tx = ((chunkX + 1) << 3) - 1;
+            for (i32 cx = tx0; cx <= tx1; ++cx) {
+                const CookedTileCell cell = GetTileAt(cx, ty);
+                if (cell.shape == TileShape::Empty) {
+                    continue;
+                }
+                if (cell.shape == TileShape::OneWayTop && (ignoreOneWay || deltaY > 0.0f)) {
                     continue;
                 }
 
-                const u32 localIdx = (localY << 3u) | static_cast<u32>(tx & 7);
-                const u64 bit = 1ULL << localIdx;
-                if ((chunk.solidBitmask & bit) == 0ULL) {
-                    continue;
-                }
-
-                const CookedTileCell cell = ((chunk.pureFullBlockBitmask & bit) != 0ULL)
-                    ? CookedTileCell{TileShape::FullSolid, TileMaterialFlags::SafeAnchor}
-                    : m_fineTiles[chunk.fineTileBaseIndex + localIdx];
-
-                const f32 tileMinX = m_mapHeader->originX + static_cast<f32>(tx) * m_tileSize;
+                const f32 tileMinX = m_mapHeader->originX + static_cast<f32>(cx) * m_tileSize;
                 const f32 tileMinY = m_mapHeader->originY + static_cast<f32>(ty) * m_tileSize;
                 const f32 tileMaxX = tileMinX + m_tileSize;
                 const f32 tileMaxY = tileMinY + m_tileSize;
 
-                if (cell.shape == TileShape::OneWayTop) {
-                    if (ignoreOneWay || deltaY > 0.0f) {
+                if (IsSlopeTile(cell.shape)) {
+                    // Evaluate slope height at actor horizontal center
+                    const f32 endCenterX = centerX + deltaX;
+                    if (endCenterX + halfW < tileMinX || endCenterX - halfW > tileMaxX) {
                         continue;
                     }
-                    const f32 actorBottom = centerY - halfH;
-                    if (actorBottom < tileMaxY - 0.004f) {
-                        continue;
-                    }
-                }
+                    const f32 localU = (endCenterX - tileMinX) * m_invTileSize;
+                    f32 h01 = 1.0f, nx = 0.0f, ny = 1.0f;
+                    EvaluateSlopeSurface(cell.shape, localU, h01, nx, ny);
+                    const f32 slopeSurfaceY = tileMinY + h01 * m_tileSize;
+                    const f32 footStartY    = centerY - halfH;
+                    const f32 footEndY      = footStartY + deltaY;
 
-                if (cell.shape == TileShape::Slope45Asc || cell.shape == TileShape::Slope45Desc) {
-                    const f32 footX = std::clamp(centerX + deltaX, tileMinX, tileMaxX);
-                    const f32 localFracX = (footX - tileMinX) * m_invTileSize;
-                    const f32 slopeTopY = (cell.shape == TileShape::Slope45Asc)
-                        ? (tileMinY + localFracX * m_tileSize)
-                        : (tileMaxY - localFracX * m_tileSize);
-                    const f32 endBottomY = (centerY + deltaY) - halfH;
-                    if (endBottomY <= slopeTopY && (centerY - halfH) >= tileMinY - 0.1f) {
-                        const f32 reqCenterY = slopeTopY + halfH;
-                        const f32 denom = std::abs(deltaY) > kRayEps ? deltaY : -1.0f;
-                        const f32 t = std::clamp((reqCenterY - centerY) / denom, 0.0f, 1.0f);
-                        if (t < best.toi) {
-                            best.toi = t;
-                            best.normalX = (cell.shape == TileShape::Slope45Asc) ? -0.70710678f : 0.70710678f;
-                            best.normalY = 0.70710678f;
+                    if (deltaY <= 0.0f && footEndY <= slopeSurfaceY && footStartY >= tileMinY - 0.1f) {
+                        const f32 toi = (std::abs(deltaY) > 1e-6f)
+                            ? std::clamp((slopeSurfaceY - footStartY) / deltaY, 0.0f, 1.0f)
+                            : 0.0f;
+                        if (toi < best.toi) {
+                            best.toi       = toi;
+                            best.normalX   = nx;
+                            best.normalY   = ny;
                             best.tileShape = cell.shape;
-                            best.material = cell.material;
-                            best.carrierId = world::kNullEntity;
-                            best.hit = true;
+                            best.material  = cell.material;
+                            best.hit       = true;
                         }
                     }
                     continue;
                 }
 
-                f32 tHit = 1.0f;
-                f32 nx = 0.0f;
-                f32 ny = 0.0f;
-                if (TestMinkowskiSlab(
-                        centerX, centerY, deltaX, deltaY,
-                        tileMinX - halfW, tileMinY - halfH,
-                        tileMaxX + halfW, tileMaxY + halfH,
-                        tHit, nx, ny)) {
-                    if (cell.shape == TileShape::OneWayTop && ny <= 0.0f) {
-                        continue;
-                    }
-                    if (tHit < best.toi) {
-                        best.toi = tHit;
-                        best.normalX = nx;
-                        best.normalY = ny;
-                        best.tileShape = cell.shape;
-                        best.material = cell.material;
-                        best.carrierId = world::kNullEntity;
-                        best.hit = true;
-                    }
+                if (cell.shape == TileShape::OneWayTop && (centerY - halfH) < tileMaxY - 0.002f) {
+                    continue;
+                }
+
+                const SlabImpact2D hit = IntersectRayExpandedAabb(
+                    centerX, centerY, deltaX, deltaY,
+                    tileMinX - halfW, tileMinY - halfH,
+                    tileMaxX + halfW, tileMaxY + halfH
+                );
+                if (hit.hit && hit.toi < best.toi) {
+                    best           = hit;
+                    best.tileShape = cell.shape;
+                    best.material  = cell.material;
                 }
             }
         }
     }
 
-    if ((solidMask & 0x0008u) != 0 && m_cellOffsets != nullptr) {
-        const i32 cx0 = FastFloorToInt(sweepMinX * kInvCellSize);
-        const i32 cy0 = FastFloorToInt(sweepMinY * kInvCellSize);
-        const i32 cx1 = FastFloorToInt(sweepMaxX * kInvCellSize);
-        const i32 cy1 = FastFloorToInt(sweepMaxY * kInvCellSize);
+    // 2. Dynamic carrier sweep
+    if (m_cellOffsets != nullptr && m_totalRefs > 0) {
+        const i32 gx0 = static_cast<i32>(std::floor(sweepMinX * kInvGridCellSize));
+        const i32 gy0 = static_cast<i32>(std::floor(sweepMinY * kInvGridCellSize));
+        const i32 gx1 = static_cast<i32>(std::floor(sweepMaxX * kInvGridCellSize));
+        const i32 gy1 = static_cast<i32>(std::floor(sweepMaxY * kInvGridCellSize));
 
-        for (i32 cy = cy0; cy <= cy1; ++cy) {
-            for (i32 cx = cx0; cx <= cx1; ++cx) {
-                const u32 bucket = HashCellCoords(cx, cy);
-                const u16 begin = m_cellOffsets[bucket];
-                const u16 end   = m_cellOffsets[bucket + 1u];
-                for (u16 idx = begin; idx < end; ++idx) {
-                    if (m_boxKind[idx] != static_cast<u8>(RefKind::Carrier) ||
-                        m_sortedEntities[idx] == ignoreEntity) {
+        for (i32 gy = gy0; gy <= gy1; ++gy) {
+            for (i32 gx = gx0; gx <= gx1; ++gx) {
+                const u32 cell = HashCellCoords(gx, gy);
+                const u16 beg  = m_cellOffsets[cell];
+                const u16 end  = m_cellOffsets[cell + 1u];
+                for (u16 i = beg; i < end; ++i) {
+                    if (m_boxKind[i] != static_cast<u8>(RefKind::Carrier) ||
+                        m_sortedEntities[i] == ignoreEntity) {
                         continue;
                     }
-                    f32 tHit = 1.0f;
-                    f32 nx = 0.0f;
-                    f32 ny = 0.0f;
-                    if (TestMinkowskiSlab(
-                            centerX, centerY, deltaX, deltaY,
-                            m_boxMinX[idx] - halfW, m_boxMinY[idx] - halfH,
-                            m_boxMaxX[idx] + halfW, m_boxMaxY[idx] + halfH,
-                            tHit, nx, ny)) {
-                        if (tHit < best.toi) {
-                            best.toi = tHit;
-                            best.normalX = nx;
-                            best.normalY = ny;
-                            best.tileShape = TileShape::FullSolid;
-                            best.material = TileMaterialFlags::None;
-                            best.carrierId = m_sortedEntities[idx];
-                            best.hit = true;
-                        }
+                    const SlabImpact2D hit = IntersectRayExpandedAabb(
+                        centerX, centerY, deltaX, deltaY,
+                        m_boxMinX[i] - halfW, m_boxMinY[i] - halfH,
+                        m_boxMaxX[i] + halfW, m_boxMaxY[i] + halfH
+                    );
+                    if (hit.hit && hit.toi < best.toi) {
+                        best           = hit;
+                        best.carrierId = m_sortedEntities[i];
+                        best.tileShape = TileShape::FullSolid;
                     }
                 }
             }
@@ -503,37 +476,24 @@ bool SpatialIndex2D::CheckStaticPointSolid(
     if (m_mapHeader == nullptr) {
         return false;
     }
-    const i32 tx = FastFloorToInt((worldX - m_mapHeader->originX) * m_invTileSize);
-    const i32 ty = FastFloorToInt((worldY - m_mapHeader->originY) * m_invTileSize);
+    const i32 tx = static_cast<i32>(std::floor((worldX - m_mapHeader->originX) * m_invTileSize));
+    const i32 ty = static_cast<i32>(std::floor((worldY - m_mapHeader->originY) * m_invTileSize));
     const CookedTileCell cell = GetTileAt(tx, ty);
-    if (cell.shape != TileShape::FullSolid) {
+    if (cell.shape == TileShape::Empty || cell.shape == TileShape::OneWayTop || cell.shape == TileShape::HazardSolid) {
         return false;
     }
-    if (requireSafeAnchor) {
-        const u8 mat = static_cast<u8>(cell.material);
-        const bool isSafe = (mat & static_cast<u8>(TileMaterialFlags::SafeAnchor)) != 0 &&
-                            (mat & static_cast<u8>(TileMaterialFlags::Hazard)) == 0;
-        return isSafe;
+    if (requireSafeAnchor &&
+        (static_cast<u8>(cell.material) & static_cast<u8>(TileMaterialFlags::SafeAnchor)) == 0) {
+        return false;
     }
     return true;
 }
 
 bool SpatialIndex2D::DetectLedgeCorner(
     f32 chestWallX, f32 headTopY, f32 clearanceCenterX) const noexcept {
-    if (m_mapHeader == nullptr) {
-        return false;
-    }
-    const i32 wallTx = FastFloorToInt((chestWallX - m_mapHeader->originX) * m_invTileSize);
-    const i32 headTy = FastFloorToInt((headTopY - m_mapHeader->originY) * m_invTileSize);
-    const i32 clearTx = FastFloorToInt((clearanceCenterX - m_mapHeader->originX) * m_invTileSize);
-
-    const CookedTileCell chestCell = GetTileAt(wallTx, headTy - 1);
-    const CookedTileCell aboveWallCell = GetTileAt(wallTx, headTy);
-    const CookedTileCell headClearCell = GetTileAt(clearTx, headTy);
-
-    return (chestCell.shape == TileShape::FullSolid) &&
-           (aboveWallCell.shape == TileShape::Empty) &&
-           (headClearCell.shape == TileShape::Empty);
+    return CheckStaticPointSolid(chestWallX, headTopY - 0.15f, false) &&
+           !CheckStaticPointSolid(chestWallX, headTopY + 0.12f, false) &&
+           !CheckStaticPointSolid(clearanceCenterX, headTopY + 0.12f, false);
 }
 
 ZoneSample2D SpatialIndex2D::SampleEnvironmentalZones(f32 centerX, f32 centerY) const noexcept {
@@ -544,16 +504,13 @@ ZoneSample2D SpatialIndex2D::SampleEnvironmentalZones(f32 centerX, f32 centerY) 
     u8 highestPrio = 0;
     for (u32 i = 0; i < m_mapHeader->zoneCount; ++i) {
         const EnvironmentalZone2D& z = m_zones[i];
-        if (centerX >= z.minX && centerX <= z.maxX &&
-            centerY >= z.minY && centerY <= z.maxY) {
-            out.forceVx += static_cast<f32>(z.forceVx_q8) * (1.0f / 256.0f);
-            out.forceVy += static_cast<f32>(z.forceVy_q8) * (1.0f / 256.0f);
+        if (centerX >= z.minX && centerX <= z.maxX && centerY >= z.minY && centerY <= z.maxY) {
             if (z.priority >= highestPrio) {
-                highestPrio = z.priority;
+                highestPrio   = z.priority;
+                out.forceVx   = static_cast<f32>(z.forceVx_q8) * (1.0f / 256.0f);
+                out.forceVy   = static_cast<f32>(z.forceVy_q8) * (1.0f / 256.0f);
                 out.dragScale = static_cast<f32>(z.dragScale_q8) * (1.0f / 256.0f);
-            }
-            if ((z.zoneFlags & 0x01u) != 0) {
-                out.submerged = true;
+                out.submerged = (z.zoneFlags & 0x01u) != 0;
             }
         }
     }
@@ -566,40 +523,33 @@ void SpatialIndex2D::ComputeSoftPushboxSeparation(
     f32 centerX, f32 centerY,
     f32 halfW, f32 halfH,
     f32& inoutSepVx) const noexcept {
-    if (pushboxGroup == 0 || m_cellOffsets == nullptr) {
+    if (m_cellOffsets == nullptr || m_totalRefs == 0) {
         return;
     }
-    const u32 bucket = HashCellCoords(
-        FastFloorToInt(centerX * kInvCellSize),
-        FastFloorToInt(centerY * kInvCellSize));
-    const u16 begin = m_cellOffsets[bucket];
-    const u16 end   = m_cellOffsets[bucket + 1u];
+    const i32 cx = static_cast<i32>(std::floor(centerX * kInvGridCellSize));
+    const i32 cy = static_cast<i32>(std::floor(centerY * kInvGridCellSize));
+    const u32 cell = HashCellCoords(cx, cy);
+    const u16 beg  = m_cellOffsets[cell];
+    const u16 end  = m_cellOffsets[cell + 1u];
 
-    const f32 minX = centerX - halfW;
-    const f32 maxX = centerX + halfW;
-    const f32 minY = centerY - halfH;
-    const f32 maxY = centerY + halfH;
+    const f32 myMinX = centerX - halfW;
+    const f32 myMaxX = centerX + halfW;
+    const f32 myMinY = centerY - halfH;
+    const f32 myMaxY = centerY + halfH;
 
-    f32 accumPushVx = 0.0f;
-    for (u16 idx = begin; idx < end; ++idx) {
-        if (m_boxKind[idx] != static_cast<u8>(RefKind::Pushbox) ||
-            m_boxAux[idx] != pushboxGroup ||
-            m_sortedEntities[idx] == selfId) {
+    for (u16 i = beg; i < end; ++i) {
+        if (m_boxKind[i] != static_cast<u8>(RefKind::Pushbox) ||
+            m_boxAux[i] != pushboxGroup ||
+            m_sortedEntities[i] == selfId) {
             continue;
         }
-        if (maxX <= m_boxMinX[idx] || minX >= m_boxMaxX[idx] ||
-            maxY <= m_boxMinY[idx] || minY >= m_boxMaxY[idx]) {
-            continue;
+        if (myMaxX > m_boxMinX[i] && myMinX < m_boxMaxX[i] &&
+            myMaxY > m_boxMinY[i] && myMinY < m_boxMaxY[i]) {
+            const f32 otherCx = 0.5f * (m_boxMinX[i] + m_boxMaxX[i]);
+            const f32 dir = (centerX >= otherCx) ? 1.0f : -1.0f;
+            inoutSepVx += dir * 3.5f;
         }
-        const f32 otherCenterX = 0.5f * (m_boxMinX[idx] + m_boxMaxX[idx]);
-        const f32 diffX = centerX - otherCenterX;
-        const f32 combinedHalfW = halfW + 0.5f * (m_boxMaxX[idx] - m_boxMinX[idx]);
-        const f32 overlap = std::max(0.0f, combinedHalfW - std::abs(diffX));
-        const f32 dir = (diffX > 0.0001f) ? 1.0f : ((diffX < -0.0001f) ? -1.0f :
-                        (selfId.index < m_sortedEntities[idx].index ? -1.0f : 1.0f));
-        accumPushVx += dir * std::min(overlap * 8.0f, 3.5f);
     }
-    inoutSepVx += std::clamp(accumPushVx, -4.0f, 4.0f);
 }
 
 RayHit2D SpatialIndex2D::Raycast(
@@ -608,185 +558,166 @@ RayHit2D SpatialIndex2D::Raycast(
     f32 maxDist,
     u16 layerMask,
     world::EntityId ignoreId) const noexcept {
-    RayHit2D result{};
-    result.distance = maxDist;
-
+    RayHit2D out{};
     const f32 deltaX = dirX * maxDist;
     const f32 deltaY = dirY * maxDist;
-    const SlabImpact2D impact = SweepAabb(
-        ignoreId, originX, originY, 0.001f, 0.001f, deltaX, deltaY, layerMask, true);
-
-    if (impact.hit) {
-        result.hit = true;
-        result.distance = impact.toi * maxDist;
-        result.pointX = originX + deltaX * impact.toi;
-        result.pointY = originY + deltaY * impact.toi;
-        result.normalX = impact.normalX;
-        result.normalY = impact.normalY;
-        result.entity = impact.carrierId;
-        result.layer = 1u;
+    const SlabImpact2D hit = SweepAabb(ignoreId, originX, originY, 0.001f, 0.001f, deltaX, deltaY, layerMask, false);
+    if (hit.hit) {
+        out.hit      = true;
+        out.distance = hit.toi * maxDist;
+        out.pointX   = originX + deltaX * hit.toi;
+        out.pointY   = originY + deltaY * hit.toi;
+        out.normalX  = hit.normalX;
+        out.normalY  = hit.normalY;
+        out.entity   = hit.carrierId;
     }
-    return result;
+    return out;
 }
 
 u32 SpatialIndex2D::GatherCombatOverlaps(
     const world::World& world,
     const assets::AssetBank& assetBank,
     std::span<ResolvedHitEvent> outHits) const noexcept {
-    if (m_cellOffsets == nullptr || outHits.empty()) {
+    if (m_cellOffsets == nullptr || m_totalRefs == 0 || outHits.empty()) {
         return 0;
     }
 
     u32 hitCount = 0;
+    const auto* __restrict worldTf = world.WorldTransforms().data();
 
-    for (auto [attackerId, attackerRig] : world.View<HitboxRig2D>()) {
-        if ((attackerRig.rigFlags & static_cast<u8>(HitboxRigFlags::HitboxActive)) == 0) {
+    for (auto [attId, attRig] : world.View<HitboxRig2D>()) {
+        if ((attRig.rigFlags & static_cast<u8>(HitboxRigFlags::HitboxActive)) == 0) {
             continue;
         }
 
-        const auto& atkWt = world.GetWorldTransform(attackerId);
-        f32 signX = 1.0f;
-        if (const auto* motion = world.TryGet<MotionStack2D>(attackerId)) {
-            signX = static_cast<f32>(motion->FacingSign());
-        } else if (atkWt.scaleX < 0.0f) {
-            signX = -1.0f;
-        }
+        const auto& attWt     = worldTf[attId.index];
+        const auto* attMotion = world.TryGet<MotionStack2D>(attId);
+        const f32 attFacing   = attMotion != nullptr ? static_cast<f32>(attMotion->FacingSign()) : 1.0f;
 
-        const f32 unionCx = atkWt.x + attackerRig.primaryHitbox.OffsetX() * signX;
-        const f32 unionCy = atkWt.y + attackerRig.primaryHitbox.OffsetY();
-        const f32 unionHw = attackerRig.primaryHitbox.HalfW();
-        const f32 unionHh = attackerRig.primaryHitbox.HalfH();
-        const f32 atkMinX = unionCx - unionHw;
-        const f32 atkMinY = unionCy - unionHh;
-        const f32 atkMaxX = unionCx + unionHw;
-        const f32 atkMaxY = unionCy + unionHh;
+        const f32 unionCx = attWt.x + attRig.primaryHitbox.OffsetX() * attFacing;
+        const f32 unionCy = attWt.y + attRig.primaryHitbox.OffsetY();
+        const f32 minX    = unionCx - attRig.primaryHitbox.HalfW();
+        const f32 maxX    = unionCx + attRig.primaryHitbox.HalfW();
+        const f32 minY    = unionCy - attRig.primaryHitbox.HalfH();
+        const f32 maxY    = unionCy + attRig.primaryHitbox.HalfH();
 
-        const CookedAnimRigHeader* rigHdr = nullptr;
-        const CookedHitboxSlice* activeSlice = nullptr;
-        const CookedHitboxSocket* sockets = nullptr;
+        const CookedHitboxSocket* sliceSockets = nullptr;
+        u8 sliceSocketCount = 0;
 
-        if (attackerRig.activeSliceIndex != 0xFFu) {
-            if (const auto* fsm = world.TryGet<StateMachine2D>(attackerId)) {
-                const assets::BlobRecord& blob = assetBank.GetBlob(fsm->rigBlob);
-                if (blob.data != nullptr && blob.size >= sizeof(CookedAnimRigHeader)) {
-                    const auto* hdr = reinterpret_cast<const CookedAnimRigHeader*>(blob.data);
-                    if (hdr->magic == CookedAnimRigHeader::kMagic &&
-                        attackerRig.activeSliceIndex < hdr->hitboxSliceCount) {
-                        rigHdr = hdr;
-                        const auto* sliceTable = reinterpret_cast<const CookedHitboxSlice*>(
-                            blob.data + hdr->hitboxSliceOffset);
-                        activeSlice = &sliceTable[attackerRig.activeSliceIndex];
-                        sockets = reinterpret_cast<const CookedHitboxSocket*>(
-                            blob.data + hdr->hitboxSocketOffset);
+        if (const auto* fsm = world.TryGet<StateMachine2D>(attId)) {
+            const assets::BlobRecord& blob = assetBank.GetBlob(fsm->rigBlob);
+            if (blob.data != nullptr && blob.size >= sizeof(CookedAnimRigHeader)) {
+                const auto* hdr = reinterpret_cast<const CookedAnimRigHeader*>(blob.data);
+                if (hdr->magic == CookedAnimRigHeader::kMagic && attRig.activeSliceIndex < hdr->hitboxSliceCount) {
+                    const auto* slices  = reinterpret_cast<const CookedHitboxSlice*>(blob.data + hdr->hitboxSliceOffset);
+                    const auto* sockets = reinterpret_cast<const CookedHitboxSocket*>(blob.data + hdr->hitboxSocketOffset);
+                    const CookedHitboxSlice& sl = slices[attRig.activeSliceIndex];
+                    if (sl.socketCount > 0 && sl.firstSocketIndex + sl.socketCount <= hdr->hitboxSocketCount) {
+                        sliceSockets     = &sockets[sl.firstSocketIndex];
+                        sliceSocketCount = sl.socketCount;
                     }
                 }
             }
         }
 
-        const i32 cx0 = FastFloorToInt(atkMinX * kInvCellSize);
-        const i32 cy0 = FastFloorToInt(atkMinY * kInvCellSize);
-        const i32 cx1 = FastFloorToInt(atkMaxX * kInvCellSize);
-        const i32 cy1 = FastFloorToInt(atkMaxY * kInvCellSize);
+        const i32 cx0 = static_cast<i32>(std::floor(minX * kInvGridCellSize));
+        const i32 cy0 = static_cast<i32>(std::floor(minY * kInvGridCellSize));
+        const i32 cx1 = static_cast<i32>(std::floor(maxX * kInvGridCellSize));
+        const i32 cy1 = static_cast<i32>(std::floor(maxY * kInvGridCellSize));
 
         for (i32 cy = cy0; cy <= cy1; ++cy) {
             for (i32 cx = cx0; cx <= cx1; ++cx) {
-                const u32 bucket = HashCellCoords(cx, cy);
-                const u16 begin = m_cellOffsets[bucket];
-                const u16 end   = m_cellOffsets[bucket + 1u];
+                const u32 cell = HashCellCoords(cx, cy);
+                const u16 beg  = m_cellOffsets[cell];
+                const u16 end  = m_cellOffsets[cell + 1u];
 
-                for (u16 idx = begin; idx < end; ++idx) {
-                    const world::EntityId defenderId = m_sortedEntities[idx];
-                    if (defenderId == attackerId) {
+                for (u16 i = beg; i < end; ++i) {
+                    const u8 kind = m_boxKind[i];
+                    if (kind != static_cast<u8>(RefKind::Hurtbox) && kind != static_cast<u8>(RefKind::Hitbox)) {
+                        continue;
+                    }
+                    const world::EntityId defId = m_sortedEntities[i];
+                    if (defId == attId || (attRig.hitLayerMask & m_boxMask[i]) == 0) {
+                        continue;
+                    }
+                    if (attRig.HasAlreadyHit(defId)) {
+                        continue;
+                    }
+                    if (maxX <= m_boxMinX[i] || minX >= m_boxMaxX[i] ||
+                        maxY <= m_boxMinY[i] || minY >= m_boxMaxY[i]) {
                         continue;
                     }
 
-                    const u8 kind = m_boxKind[idx];
-                    if (kind != static_cast<u8>(RefKind::Hurtbox) &&
-                        kind != static_cast<u8>(RefKind::Hitbox)) {
+                    bool alreadyQueued = false;
+                    for (u32 h = 0; h < hitCount; ++h) {
+                        if (outHits[h].attacker == attId && outHits[h].defender == defId) {
+                            alreadyQueued = true;
+                            break;
+                        }
+                    }
+                    if (alreadyQueued) {
                         continue;
                     }
 
-                    if ((attackerRig.hitLayerMask & m_boxMask[idx]) == 0) {
-                        continue;
-                    }
+                    // Narrowphase multi-socket evaluation (picks highest-priority overlapping socket)
+                    u16 bestDmgMult = 256;
+                    i16 bestKbAngle = 35;
+                    u8  bestKbSpeed = 48;
+                    u8  bestHitstop = 6;
+                    u8  bestFlags   = 0;
+                    f32 contactX    = 0.5f * (std::max(minX, m_boxMinX[i]) + std::min(maxX, m_boxMaxX[i]));
+                    f32 contactY    = 0.5f * (std::max(minY, m_boxMinY[i]) + std::min(maxY, m_boxMaxY[i]));
 
-                    if (attackerRig.HasAlreadyHit(defenderId)) {
-                        continue;
-                    }
+                    if (sliceSockets != nullptr && sliceSocketCount > 0) {
+                        bool socketHit = false;
+                        u8 highestPrio = 0;
+                        for (u8 s = 0; s < sliceSocketCount; ++s) {
+                            const CookedHitboxSocket& sk = sliceSockets[s];
+                            const f32 scx  = attWt.x + sk.localBox.OffsetX() * attFacing;
+                            const f32 scy  = attWt.y + sk.localBox.OffsetY();
+                            const f32 sMinX = scx - sk.localBox.HalfW();
+                            const f32 sMaxX = scx + sk.localBox.HalfW();
+                            const f32 sMinY = scy - sk.localBox.HalfH();
+                            const f32 sMaxY = scy + sk.localBox.HalfH();
 
-                    if (atkMaxX < m_boxMinX[idx] || atkMinX > m_boxMaxX[idx] ||
-                        atkMaxY < m_boxMinY[idx] || atkMinY > m_boxMaxY[idx]) {
-                        continue;
-                    }
-
-                    const bool isClash = (kind == static_cast<u8>(RefKind::Hitbox));
-                    if (isClash && ((attackerRig.rigFlags & static_cast<u8>(HitboxRigFlags::ClashParryable)) == 0 ||
-                                    (m_boxAux[idx] & static_cast<u8>(HitboxRigFlags::ClashParryable)) == 0)) {
-                        continue;
-                    }
-
-                    ResolvedHitEvent ev{};
-                    ev.attacker = attackerId;
-                    ev.defender = defenderId;
-                    ev.contactX = 0.5f * (std::max(atkMinX, m_boxMinX[idx]) + std::min(atkMaxX, m_boxMaxX[idx]));
-                    ev.contactY = 0.5f * (std::max(atkMinY, m_boxMinY[idx]) + std::min(atkMaxY, m_boxMaxY[idx]));
-                    ev.damageMultiplier_q8 = 256;
-                    ev.knockbackAngleDeg = signX >= 0.0f ? i16{25} : i16{155};
-                    ev.knockbackSpeed_q2 = 44;
-                    ev.hitstopTicks = 6;
-                    ev.socketFlags = m_boxAux[idx];
-                    ev.isClashParry = isClash ? u8{1} : u8{0};
-
-                    if (rigHdr != nullptr && activeSlice != nullptr && sockets != nullptr && activeSlice->socketCount > 0) {
-                        bool matchedSubSocket = false;
-                        u8 bestPrio = 0;
-                        for (u8 s = 0; s < activeSlice->socketCount; ++s) {
-                            const CookedHitboxSocket& sock = sockets[activeSlice->firstSocketIndex + s];
-                            const f32 scx = atkWt.x + sock.localBox.OffsetX() * signX;
-                            const f32 scy = atkWt.y + sock.localBox.OffsetY();
-                            const f32 shw = sock.localBox.HalfW();
-                            const f32 shh = sock.localBox.HalfH();
-                            if (scx + shw >= m_boxMinX[idx] && scx - shw <= m_boxMaxX[idx] &&
-                                scy + shh >= m_boxMinY[idx] && scy - shh <= m_boxMaxY[idx]) {
-                                if (!matchedSubSocket || sock.priority >= bestPrio) {
-                                    matchedSubSocket = true;
-                                    bestPrio = sock.priority;
-                                    ev.damageMultiplier_q8 = sock.damageMultiplier_q8;
-                                    ev.knockbackAngleDeg = signX >= 0.0f
-                                        ? sock.knockbackAngleDeg
-                                        : static_cast<i16>(180 - sock.knockbackAngleDeg);
-                                    ev.knockbackSpeed_q2 = sock.knockbackSpeed_q2;
-                                    ev.hitstopTicks = sock.hitstopTicks;
-                                    ev.socketFlags |= sock.socketFlags;
+                            if (sMaxX > m_boxMinX[i] && sMinX < m_boxMaxX[i] &&
+                                sMaxY > m_boxMinY[i] && sMinY < m_boxMaxY[i]) {
+                                if (!socketHit || sk.priority >= highestPrio) {
+                                    socketHit   = true;
+                                    highestPrio = sk.priority;
+                                    bestDmgMult = sk.damageMultiplier_q8;
+                                    bestKbAngle = sk.knockbackAngleDeg;
+                                    bestKbSpeed = sk.knockbackSpeed_q2;
+                                    bestHitstop = sk.hitstopTicks;
+                                    bestFlags   = sk.socketFlags;
+                                    contactX    = 0.5f * (std::max(sMinX, m_boxMinX[i]) + std::min(sMaxX, m_boxMaxX[i]));
+                                    contactY    = 0.5f * (std::max(sMinY, m_boxMinY[i]) + std::min(sMaxY, m_boxMaxY[i]));
                                 }
                             }
                         }
-                        if (!matchedSubSocket) {
+                        if (!socketHit) {
                             continue;
                         }
                     }
 
+                    const u8 isClash = (kind == static_cast<u8>(RefKind::Hitbox)) ? 1u : 0u;
                     if (hitCount < outHits.size()) {
-                        outHits[hitCount++] = ev;
+                        outHits[hitCount++] = ResolvedHitEvent{
+                            .attacker            = attId,
+                            .defender            = defId,
+                            .contactX            = contactX,
+                            .contactY            = contactY,
+                            .damageMultiplier_q8 = bestDmgMult,
+                            .knockbackAngleDeg   = bestKbAngle,
+                            .knockbackSpeed_q2   = bestKbSpeed,
+                            .hitstopTicks        = bestHitstop,
+                            .socketFlags         = bestFlags,
+                            .isClashParry        = isClash,
+                        };
                     }
                 }
             }
         }
-    }
-
-    if (hitCount > 1) {
-        std::sort(outHits.begin(), outHits.begin() + hitCount,
-            [](const ResolvedHitEvent& a, const ResolvedHitEvent& b) noexcept {
-                if (a.defender.index != b.defender.index) return a.defender.index < b.defender.index;
-                if (a.attacker.index != b.attacker.index) return a.attacker.index < b.attacker.index;
-                return a.damageMultiplier_q8 > b.damageMultiplier_q8;
-            });
-
-        const auto it = std::unique(outHits.begin(), outHits.begin() + hitCount,
-            [](const ResolvedHitEvent& a, const ResolvedHitEvent& b) noexcept {
-                return a.defender == b.defender && a.attacker == b.attacker;
-            });
-        hitCount = static_cast<u32>(std::distance(outHits.begin(), it));
     }
 
     return hitCount;

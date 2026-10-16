@@ -13,7 +13,6 @@ void WorldExtractor::Extract(
     time::RenderTimeView timeView,
     renderer::RenderList& outRenderList) noexcept {
 
-    // Precompute interpolation alphas across all 8 TimeChannels once per frame
     alignas(32) std::array<f32, 8> chAlphas{};
     for (u8 c = 0; c < 8; ++c) {
         chAlphas[c] = timeView.Alpha(static_cast<time::TimeChannel>(c));
@@ -23,7 +22,7 @@ void WorldExtractor::Extract(
     const auto* __restrict prevSpan = world.PrevWorldTransforms().data();
     const auto* __restrict chSpan   = world.TimeChannels().data();
 
-    // 1. Extract active CameraRig2D views into RenderList
+    // 1. Extract active CameraRig2D views into RenderList (including interpolated worldRotRad)
     const auto& camPool    = world.GetPool<CameraRig2D>();
     const auto camEntities = camPool.Entities();
     const auto camRigs     = camPool.Components();
@@ -38,17 +37,22 @@ void WorldExtractor::Extract(
         const PrevWorldSnapshot2D& prev = prevSpan[idx];
         const WorldTransform2D& curr    = currSpan[idx];
 
+        const f32 camRotRad = (alpha < 0.9999f && prev.worldRotRad != curr.worldRotRad)
+            ? NormalizeAngleRad(prev.worldRotRad + alpha * ShortestAngleDelta(prev.worldRotRad, curr.worldRotRad))
+            : curr.worldRotRad;
+
         outRenderList.SetView(rig.viewSlot, renderer::Camera2D{
             .worldCenterX = prev.x + alpha * (curr.x - prev.x),
             .worldCenterY = prev.y + alpha * (curr.y - prev.y),
             .zoom         = rig.zoom,
+            .rotationRad  = camRotRad,
             .viewport     = rig.viewport,
             .scissor      = rig.scissor,
             .screenSpace  = rig.screenSpace,
         });
     }
 
-    // 2. Linearly sweep dense Sprite2D array with direct pointer indexing
+    // 2. Linearly sweep dense Sprite2D array with symmetric pivot-aware flip math
     const auto& spritePool    = world.GetPool<Sprite2D>();
     const auto spriteEntities = spritePool.Entities();
     const auto sprites        = spritePool.Components();
@@ -59,10 +63,10 @@ void WorldExtractor::Extract(
             continue;
         }
 
-        const u16 idx                  = spriteEntities[i].index;
-        const f32 alpha                = chAlphas[static_cast<u8>(chSpan[idx])];
-        const PrevWorldSnapshot2D& t0  = prevSpan[idx];
-        const WorldTransform2D& t1     = currSpan[idx];
+        const u16 idx                 = spriteEntities[i].index;
+        const f32 alpha               = chAlphas[static_cast<u8>(chSpan[idx])];
+        const PrevWorldSnapshot2D& t0 = prevSpan[idx];
+        const WorldTransform2D& t1    = currSpan[idx];
 
         const f32 wx = t0.x + alpha * (t1.x - t0.x);
         const f32 wy = t0.y + alpha * (t1.y - t0.y);
@@ -77,21 +81,20 @@ void WorldExtractor::Extract(
             FastSinCos(lerpedAngle, cosR, sinR);
         }
 
-        const assets::SpriteFrame& frame = assetBank.GetSprite(assets::SpriteHandle{
-            .spriteIndex = sp.spriteIndex,
-            .generation  = sp.spriteGeneration,
-        });
+        const assets::SpriteFrame& frame = assetBank.GetSprite(sp.sprite);
         const f32 quadW = static_cast<f32>(frame.width) * std::abs(sx);
         const f32 quadH = static_cast<f32>(frame.height) * std::abs(sy);
 
         const bool flipX = ((sp.blendAndFlags & static_cast<u8>(SpriteFlags::FlipX)) != 0) ^ (sx < 0.0f);
         const bool flipY = ((sp.blendAndFlags & static_cast<u8>(SpriteFlags::FlipY)) != 0) ^ (sy < 0.0f);
 
-        const f32 pivX = flipX ? (1.0f - frame.pivotX) : frame.pivotX;
-        const f32 pivY = flipY ? (1.0f - frame.pivotY) : frame.pivotY;
+        const f32 pivX      = flipX ? (1.0f - frame.pivotX) : frame.pivotX;
+        const f32 pivY      = flipY ? (1.0f - frame.pivotY) : frame.pivotY;
+        const f32 flipSignX = flipX ? -1.0f : 1.0f;
+        const f32 flipSignY = flipY ? -1.0f : 1.0f;
 
-        const f32 offsetX  = (0.5f - pivX) * quadW + static_cast<f32>(sp.localOffsetX);
-        const f32 offsetY  = (0.5f - pivY) * quadH + static_cast<f32>(sp.localOffsetY);
+        const f32 offsetX  = (0.5f - pivX) * quadW + static_cast<f32>(sp.localOffsetX) * flipSignX;
+        const f32 offsetY  = (0.5f - pivY) * quadH + static_cast<f32>(sp.localOffsetY) * flipSignY;
         const f32 rawDepth = static_cast<f32>(sp.baseDepth) + wd + wy * static_cast<f32>(sp.ySortScale);
 
         outRenderList.PushQuad(renderer::QuadCmd{
@@ -158,9 +161,14 @@ Result<EntityId, WorldErrc> WorldExtractor::InstantiatePrefab(
             outSpawnedEntities[i] = entityId;
         }
 
+        const u16 atlasSlot = assetBank.FindSlot(rec.atlasOrTextureId);
+        const assets::AtlasHandle resolvedAtlas = assetBank.ToAtlasHandle(atlasSlot);
+        const assets::SpriteHandle initialSprite = assetBank.GetSpriteHandle(resolvedAtlas, rec.firstFrame);
+
         if ((rec.flags & 0x01u) != 0) {
             (void)world.Emplace<Sprite2D>(entityId, Sprite2D{
                 .tint       = rec.tint,
+                .sprite     = initialSprite,
                 .baseDepth  = rec.baseDepth,
                 .ySortScale = rec.ySortScale,
                 .passId     = rec.passId,
@@ -169,9 +177,12 @@ Result<EntityId, WorldErrc> WorldExtractor::InstantiatePrefab(
         }
         if ((rec.flags & 0x02u) != 0) {
             (void)world.Emplace<SpriteAnimator2D>(entityId, SpriteAnimator2D{
+                .atlas         = resolvedAtlas,
                 .firstFrame    = rec.firstFrame,
                 .frameCount    = std::max<u16>(1u, rec.frameCount),
+                .currentFrame  = 0,
                 .ticksPerFrame = std::max<u16>(1u, rec.ticksPerFrame),
+                .subTickAccum  = 0,
                 .loop          = 1,
                 .playing       = 1,
             });

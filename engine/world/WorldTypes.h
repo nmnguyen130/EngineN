@@ -3,6 +3,7 @@
 #include "core/Result.h"
 #include "core/Types.h"
 #include "core/time/TimeTypes.h"
+#include "assets/AssetTypes.h"
 #include "renderer/RendererTypes.h"
 
 #include <cmath>
@@ -118,7 +119,7 @@ struct PrevWorldSnapshot2D {
 };
 static_assert(sizeof(PrevWorldSnapshot2D) == 24);
 
-// 16B linear & angular velocity integrated at 120 Hz.
+// 16B linear & angular velocity integrated at 120 Hz for non-colliding ambient entities.
 struct alignas(16) Velocity2D {
     static constexpr u8 kTypeId = 1;
 
@@ -137,13 +138,11 @@ enum class SpriteFlags : u8 {
 };
 
 // 32B cache-aligned visual quad descriptor (2 per 64B cache line).
-// Stores raw 1-hop sprite table index & generation to keep Layer 1 decoupled from AssetTypes.h.
 struct alignas(32) Sprite2D {
     static constexpr u8 kTypeId = 2;
 
     renderer::Color tint{1.0f, 1.0f, 1.0f, 1.0f};
-    u16 spriteIndex{0};
-    u16 spriteGeneration{0};
+    assets::SpriteHandle sprite{};
     u16 baseDepth{32768};
     i16 ySortScale{0};
     i16 localOffsetX{0};
@@ -155,14 +154,13 @@ struct alignas(32) Sprite2D {
 };
 static_assert(sizeof(Sprite2D) == 32);
 
-// 16B Q8.8 fixed-point 120 Hz frame animator (4 per 64B cache line).
-// Uses pre-resolved baseSpriteIndex so 120 Hz stepping requires zero AssetBank calls.
+// 16B Q8.8 fixed-point 120 Hz atlas frame animator (4 per 64B cache line).
+// Stepped exclusively by gameplay::AnimationSubsystem in lockstep with Sprite2D.
 struct alignas(16) SpriteAnimator2D {
     static constexpr u8 kTypeId = 3;
     static constexpr u16 kSubTicksPerTick = 256;
 
-    u16 baseSpriteIndex{0};
-    u16 spriteGeneration{0};
+    assets::AtlasHandle atlas{};
     u16 firstFrame{0};
     u16 frameCount{1};
     u16 currentFrame{0};

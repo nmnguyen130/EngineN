@@ -278,6 +278,9 @@ public:
     [[nodiscard]] constexpr const LocalTransform2D& GetLocalTransform(EntityId id) const noexcept {
         return m_transforms.GetLocal(id.index);
     }
+    [[nodiscard]] constexpr LocalTransform2D& ModifyLocalTransformByIndex(u16 idx) noexcept {
+        return m_transforms.ModifyLocal(idx);
+    }
     void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
         if (IsAlive(id)) {
             m_transforms.SetLocal(id.index, local);
@@ -287,6 +290,15 @@ public:
 
     [[nodiscard]] constexpr const WorldTransform2D& GetWorldTransform(EntityId id) const noexcept {
         return m_transforms.GetWorld(id.index);
+    }
+    [[nodiscard]] constexpr const WorldTransform2D& GetWorldByIndex(u16 idx) const noexcept {
+        return m_transforms.GetWorld(idx);
+    }
+    [[nodiscard]] constexpr const PrevWorldSnapshot2D& GetPrevWorldByIndex(u16 idx) const noexcept {
+        return m_transforms.GetPrevWorld(idx);
+    }
+    [[nodiscard]] constexpr time::TimeChannel GetTimeChannelByIndex(u16 idx) const noexcept {
+        return m_timeChannels[idx];
     }
     [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldTransforms() const noexcept {
         return m_transforms.WorldSpan();
@@ -328,11 +340,10 @@ public:
         );
     }
 
-    // 120 Hz Pure Layer-1 Simulation Pipeline (Zero AssetBank dependency)
+    // Pure Layer-1 Spatial & Ambient Velocity Lifecycle (Animation moved to AnimationSubsystem)
     void BeginTick(time::SimStepView step) noexcept;
-    void StepKinematicsAndAnimations(time::SimStepView step) noexcept;
+    void StepAmbientVelocities(time::SimStepView step) noexcept;
     void EndTick(time::SimStepView step) noexcept;
-    void Tick(time::SimStepView step) noexcept;
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 

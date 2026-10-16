@@ -18,8 +18,8 @@ struct KinematicStepConfig {
 
 // Stateless continuous swept-AABB kinematic solver, carrier transfer engine, and topology sensor.
 // Operates directly on World component pools and SpatialIndex2D with zero dynamic memory allocation.
-// Invariant: Never mutates structural ECS state; writes resolved coordinates via World::SetLocalTransform().
-class KinematicSolver2D {
+// Invariant: Never mutates structural ECS state; writes resolved coordinates via World::ModifyLocalTransformByIndex().
+class KinematicSolver2D final {
 public:
     static void StepCarriersAndRiders(
         world::World& world,

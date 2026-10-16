@@ -201,7 +201,11 @@ struct alignas(16) KinematicCarrier2D {
 static_assert(sizeof(KinematicCarrier2D) == 16);
 
 // Priority motion arbitration stack, animation root-motion accumulator, and forgiveness timers.
-// Pure POD mechanism mutated during Stage 2, Stage 3, and Stage 4.
+// packedSigns layout:
+//   Bit 0: FacingSign (1 = +1 Right, 0 = -1 Left)
+//   Bits 1..2: WallSign (1 = +1 Right, 2 = -1 Left, 0 = None)
+//   Bit 3: CarrierLaunchActive
+//   Bit 4: FacingLocked (Prevents auto-flip from velocity during backstep/strafe/attack states)
 // Invariant: overrideTicks == 0 implies activePriority == 0 (locomotion tier).
 struct alignas(32) MotionStack2D {
     static constexpr u8 kTypeId = 18;
@@ -249,6 +253,14 @@ struct alignas(32) MotionStack2D {
     constexpr void SetCarrierLaunchActive(bool active) noexcept {
         if (active) packedSigns |= 0x08;
         else packedSigns &= ~0x08;
+    }
+
+    [[nodiscard]] constexpr bool IsFacingLocked() const noexcept {
+        return (packedSigns & 0x10) != 0;
+    }
+    constexpr void SetFacingLocked(bool locked) noexcept {
+        if (locked) packedSigns |= 0x10;
+        else packedSigns &= ~0x10;
     }
 
     constexpr bool PushOverride(u8 priority, f32 vx, f32 vy, u16 durationTicks, u16 gravScaleQ8 = 256) noexcept {
@@ -303,13 +315,12 @@ struct alignas(16) StateMachine2D {
 static_assert(sizeof(StateMachine2D) == 16);
 
 enum class HitboxRigFlags : u8 {
-    None          = 0,
-    HurtboxActive = 1u << 0,
-    HitboxActive  = 1u << 1,
-    ClashParryable= 1u << 2,
-    PogoSurface   = 1u << 3,
-    SweptDashHull = 1u << 4,
-    LatchedAnimPlay = 1u << 7
+    None           = 0,
+    HurtboxActive  = 1u << 0,
+    HitboxActive   = 1u << 1,
+    ClashParryable = 1u << 2,
+    RecoilOnHit    = 1u << 3,
+    SweptDashHull  = 1u << 4,
 };
 
 // Multi-socket hitbox/hurtbox rig with 64-bit SplitMix Bloom Filter swing deduplication.
@@ -324,8 +335,7 @@ struct alignas(32) HitboxRig2D {
     u16 hurtLayerMask{0};
     u16 swingId{0};
     u8 activeSliceIndex{0xFFu};
-    u8 rigFlags{static_cast<u8>(HitboxRigFlags::HurtboxActive) |
-                static_cast<u8>(HitboxRigFlags::LatchedAnimPlay)};
+    u8 rigFlags{static_cast<u8>(HitboxRigFlags::HurtboxActive)};
 
     constexpr void ActivateSlice(u8 sliceIdx, CompactAabb2D unionBox, bool newSwing) noexcept {
         if (newSwing) {
@@ -392,11 +402,17 @@ enum class CameraCtrlFlags : u8 {
     LockVerticalAirborne = 1u << 0,
     ClampToRoom          = 1u << 1,
     LockAxisX            = 1u << 2,
-    LockAxisY            = 1u << 3
+    LockAxisY            = 1u << 3,
+    SoftBoundaryCushion  = 1u << 4,
+    VelocityLookahead    = 1u << 5
 };
 
-// Multi-target weighted camera director with directional hit-kick spring, trauma noise, and Hermite room blender.
-// Invariant: roomBlendTicks <= roomBlendDuration.
+// Ultimate 64B 2D Camera Director (Itay Keren / Hollow Knight / Unity Cinemachine model):
+// - Dual-Zone Focus Box (Soft Deadzone + Hard Panic Window)
+// - Sustained Turn-Confirmation Filter (prevents camera whip on quick micro-flips/kiting)
+// - Pre-Spring Soft-Cushion Room Boundary Clamping (zero velocity snapping or hard-stop jerks at map edges)
+// - Fall Look-Down & Platform Snapping with distinct Landing vs Airborne frequencies
+// Invariant: roomBlendTicks <= roomBlendDuration && sizeof(CameraController2D) == 64.
 struct alignas(64) CameraController2D {
     static constexpr u8 kTypeId = 23;
 
@@ -415,19 +431,22 @@ struct alignas(64) CameraController2D {
     i16 kickVelY_q8{0};
     u16 trauma_q16{0};
     u16 roomBlendTicks{0};
-    u16 roomBlendDuration{36};
+    u8 roomBlendDuration{36};
+    u8 sustainedMoveTicks{0};
     u8 secondaryWeight_q8{0};
-    u8 deadzoneHalfW_q4{20};
+    u8 deadzoneHalfW_q4{18};
     u8 deadzoneHalfH_q4{28};
-    u8 springFreqX_q4{96};
-    u8 springFreqY_q4{112};
+    u8 springFreqX_q4{88};
+    u8 springFreqY_q4{104};
     u8 cameraFlags{static_cast<u8>(CameraCtrlFlags::LockVerticalAirborne) |
-                   static_cast<u8>(CameraCtrlFlags::ClampToRoom)};
+                   static_cast<u8>(CameraCtrlFlags::ClampToRoom) |
+                   static_cast<u8>(CameraCtrlFlags::SoftBoundaryCushion) |
+                   static_cast<u8>(CameraCtrlFlags::VelocityLookahead)};
 
-    constexpr void TransitionToRoom(CompactAabb2D newBounds, u16 blendTicks = 36) noexcept {
+    constexpr void TransitionToRoom(CompactAabb2D newBounds, u8 blendTicks = 36) noexcept {
         prevRoomBounds = activeRoomBounds;
         activeRoomBounds = newBounds;
-        roomBlendDuration = blendTicks > 0 ? blendTicks : u16{1};
+        roomBlendDuration = blendTicks > 0 ? blendTicks : u8{1};
         roomBlendTicks = blendTicks;
     }
 
