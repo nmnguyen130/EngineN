@@ -2,19 +2,12 @@
 
 #include "audio/AudioMixer.h"
 #include "audio/AudioTypes.h"
-#include "core/time/TimeViews.h"
-#include "world/WorldTypes.h"
 
-#include <array>
-#include <atomic>
 #include <span>
 
 struct SDL_AudioStream;
 
-namespace en::assets { class AssetBank; class AssetSystem; }
-namespace en::world { class World; }
-namespace en::gameplay { class SpatialIndex2D; struct SimCue; }
-namespace en::platform { enum class WindowFlags : u8; struct WindowState; }
+namespace en::assets { class AssetBank; }
 
 namespace en::audio {
 
@@ -35,9 +28,9 @@ struct alignas(8) CueHashSlot {
 };
 static_assert(sizeof(CueHashSlot) == 8);
 
-// Coordinates Robin Hood cue lookup, 3-stage voice admission, raycast occlusion, and SDL3 output.
-// Move-only RAII owner of the contiguous arena slab and SDL_AudioStream handle.
-// Invariant: Continuous parameters sync via wait-free triple buffering; discrete edges use SPSC ring.
+// Coordinates Robin Hood cue lookup, 3-stage voice admission, main-thread occlusion, and SDL3 output.
+// Move-only RAII owner of the contiguous arena slab and SDL_AudioStream handle; zero world/gameplay headers.
+// Invariant: Continuous parameters sync via wait-free triple buffering; occlusion queries run strictly on main thread.
 class AudioSystem {
 public:
     AudioSystem() = default;
@@ -62,17 +55,14 @@ public:
         const assets::BlobRecord& cueBlob,
         assets::ScopeId owningScope) noexcept;
 
-    void RequestScopeRelease(assets::ScopeId scope, assets::AssetSystem& assetSystem) noexcept;
-    void OnWindowEvent(platform::WindowFlags flags, const platform::WindowState& winState) noexcept;
+    // Marks an asset scope for retirement and returns the bitmask of all scopes now safe to release.
+    void RequestScopeRelease(assets::ScopeId scope) noexcept;
+    [[nodiscard]] u32 PollReleasableScopeMask() noexcept;
 
-    void SetListenerPosition(f32 worldX, f32 worldY) noexcept {
-        m_listenerX = worldX;
-        m_listenerY = worldY;
-    }
+    void SetFocusMuted(bool muted) noexcept;
 
-    void ConsumeSimCues(
-        std::span<const gameplay::SimCue> cues,
-        const world::World& world,
+    void SubmitTriggers(
+        std::span<const AudioTriggerReq> triggers,
         const assets::AssetBank& assetBank) noexcept;
 
     VoiceHandle PlayCue(
@@ -80,7 +70,7 @@ public:
         const assets::AssetBank& assetBank,
         f32 worldX = 0.0f,
         f32 worldY = 0.0f,
-        world::EntityId emitter = world::kNullEntity) noexcept;
+        u32 emitterId = kNullEmitter) noexcept;
 
     void StopVoice(VoiceHandle handle, u16 fadeOutBlocks = 1) noexcept;
     void SetBusGain(AudioBusId bus, f32 linearGain) noexcept;
@@ -89,23 +79,19 @@ public:
     void TransitionMusic(u32 trackId, const assets::AssetBank& assetBank, u8 crossfadeBlocks = 94) noexcept;
     void SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weights) noexcept;
 
-    void Update(
-        const world::World& world,
-        const gameplay::SpatialIndex2D& spatial,
-        const assets::AssetBank& assetBank,
-        time::RenderTimeView timeView,
-        u8 frozenChannelMask,
-        std::span<const f32, 8> channelScales) noexcept;
+    // Evaluates staggered 30 Hz main-thread raycast occlusion and publishes the triple-buffered frame snapshot.
+    void Update(const AudioUpdateDesc& desc) noexcept;
 
     void PumpHeadlessBlocks(u32 blockCount, std::span<f32> optionalCaptureOut = {}) noexcept;
 
+    [[nodiscard]] u32 ExtractActiveEmitters(std::span<AudioEmitterView> outEmitters) const noexcept;
     [[nodiscard]] AudioTelemetrySnapshot Telemetry() const noexcept;
     [[nodiscard]] u64 ComputeAuditHash() const noexcept { return m_mixer.ComputeAuditHash(); }
 
 private:
     struct MainVoiceTracker {
         u32 cueId{0};
-        world::EntityId emitter{world::kNullEntity};
+        u32 emitterId{kNullEmitter};
         u64 spawnTick{0};
         f32 worldX{0.0f};
         f32 worldY{0.0f};
@@ -118,16 +104,16 @@ private:
         u8  priority{0};
         u8  curve{0};
         u8  flags{0};
-        bool active{false};
     };
 
     struct SharedBridgeState;
 
     [[nodiscard]] const SoundCueDef* FindCueDef(SoundCueId id, u16& outIndex) const noexcept;
     bool EnqueueCommand(const AudioCommand& cmd) noexcept;
+    void ReconcileFinishedVoices() noexcept;
     void ComputeVoiceSpatialTargets(u32 slot, AudioFrameSnapshot& snap) const noexcept;
     void PublishFrameSnapshot(const AudioFrameSnapshot& snap) noexcept;
-    void ExecuteAudioCallback(SDL_AudioStream* stream, int additionalBytes) noexcept;
+    void ConsumeAndMixBlocks(u32 blockCount, SDL_AudioStream* stream, std::span<f32> captureOut) noexcept;
 
     static void AudioStreamCallback(
         void* userdata,
@@ -138,17 +124,16 @@ private:
     AudioSystemConfig m_cfg{};
     SDL_AudioStream* m_stream{nullptr};
     u8* m_arenaSlab{nullptr};
-    usize m_arenaBytes{0};
     SharedBridgeState* m_bridge{nullptr};
     AudioMixer m_mixer{};
 
+    u64 m_trackedActiveMask{0};
     f32 m_listenerX{0.0f};
     f32 m_listenerY{0.0f};
     u64 m_currentTick{0};
     u32 m_rngState{0xA341316Cu};
     u32 m_pendingUnpinScopeMask{0};
     u8  m_nextStealPoolIdx{0};
-    bool m_mutedByFocus{false};
 };
 
 } // namespace en::audio

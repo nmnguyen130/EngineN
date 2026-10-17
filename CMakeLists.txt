@@ -42,6 +42,10 @@ add_library(engine STATIC
     engine/gameplay/KinematicSolver2D.cpp
     engine/gameplay/StateAndCombatSolver.cpp
     engine/gameplay/GameplayPipeline.cpp
+
+    # Audio
+    engine/audio/AudioMixer.cpp
+    engine/audio/AudioSystem.cpp
 )
 
 target_compile_features(engine PUBLIC cxx_std_23)

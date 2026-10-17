@@ -1,9 +1,9 @@
 #pragma once
 
+#include "assets/AssetTypes.h"
 #include "core/Result.h"
 #include "core/Types.h"
 #include "core/time/TimeTypes.h"
-#include "assets/AssetTypes.h"
 
 #include <array>
 #include <span>
@@ -21,6 +21,7 @@ inline constexpr u32 kMaxMusicTracks    = 32;
 inline constexpr u32 kMaxMusicStems     = 4;
 inline constexpr u32 kCommandRingSize   = 256;
 inline constexpr u32 kCookedAudioMagic  = 0x44554145u; // 'EAUD'
+inline constexpr u32 kNullEmitter       = 0xFFFFFFFFu;
 
 enum class AudioErrc : u8 {
     InvalidConfig = 0,
@@ -102,6 +103,56 @@ struct SoundCueId {
     constexpr bool operator==(const SoundCueId&) const noexcept = default;
 };
 
+// Branchless exact-center constant-power stereo panner on panNorm in [-1, 1] (<0.09 dB power error).
+// Preserves exact -3.0103 dB (0.70710678) at center (panNorm = 0) and unit power at hard L/R extremes.
+constexpr void EvalConstantPowerPan(f32 panNorm, f32& outL, f32& outR) noexcept {
+    constexpr f32 kCenterBoost = 0.8284271247461903f; // 2.0f * (sqrt(2.0f) - 1.0f)
+    const f32 x  = 0.5f * (panNorm + 1.0f);
+    const f32 x1 = 1.0f - x;
+    outL = x1 * (1.0f + kCenterBoost * x);
+    outR = x  * (1.0f + kCenterBoost * x1);
+}
+
+// Decoupled 16-byte trigger payload bridged from simulation cues without exposing gameplay headers.
+struct alignas(16) AudioTriggerReq {
+    SoundCueId cueId{};
+    f32 worldX{0.0f};
+    f32 worldY{0.0f};
+    u32 emitterId{kNullEmitter};
+};
+static_assert(sizeof(AudioTriggerReq) == 16);
+
+// Decoupled 16-byte active emitter snapshot exported for debug overlays and spatial telemetry.
+struct alignas(16) AudioEmitterView {
+    f32 worldX{0.0f};
+    f32 worldY{0.0f};
+    f32 maxDist{0.0f};
+    f32 occlusionFactor{1.0f};
+};
+static_assert(sizeof(AudioEmitterView) == 16);
+
+// Main-thread raycast callback for staggered 30 Hz acoustic occlusion.
+// Invariant: Invoked strictly inside AudioSystem::Update() on the main thread; never on the audio thread.
+using AudioOcclusionQueryFn = bool (*)(
+    const void* userCtx,
+    f32 startX,
+    f32 startY,
+    f32 dirX,
+    f32 dirY,
+    f32 maxDist,
+    u32 ignoreEmitterId) noexcept;
+
+// Consolidated per-frame synchronization payload passed once to AudioSystem::Update().
+struct AudioUpdateDesc {
+    u64 tickIndex{0};
+    f32 listenerX{0.0f};
+    f32 listenerY{0.0f};
+    std::span<const f32> channelScales{};
+    u8 frozenChannelMask{0};
+    AudioOcclusionQueryFn occlusionQuery{nullptr};
+    const void* occlusionUserCtx{nullptr};
+};
+
 // Cooked 32-byte acoustic definition (2 records per 64B cache line, zero padding).
 // Quantized fixed-point fields halve L1 cache pressure during high-concurrency combat ticks.
 struct alignas(32) SoundCueDef {
@@ -142,13 +193,13 @@ static_assert(sizeof(SoundCueDef) == 32);
 
 // Cooked 32-byte interactive music track definition with beat-grid metadata and zero padding.
 struct alignas(32) MusicTrackDef {
-    u32 trackId{0};                                  // 4B  [0..4)
+    u32 trackId{0};                                          // 4B  [0..4)
     std::array<assets::AudioHandle, kMaxMusicStems> stems{}; // 16B [4..20)
-    u32 loopStartFrame{0};                           // 4B  [20..24)
-    u32 loopEndFrame{0};                             // 4B  [24..28)
-    u16 tempoBpmQ8{120 << 8};                        // 2B  [28..30) Q8.8 BPM
-    u8  packedStemsAndBeats{0x21};                   // 1B  [30..31) [2:0]=stemCount, [7:3]=beatsPerBar
-    u8  defaultCrossfadeBlocks{94};                  // 1B  [31..32) in 256-sample blocks (~501 ms)
+    u32 loopStartFrame{0};                                   // 4B  [20..24)
+    u32 loopEndFrame{0};                                     // 4B  [24..28)
+    u16 tempoBpmQ8{120 << 8};                                // 2B  [28..30) Q8.8 BPM
+    u8  packedStemsAndBeats{0x21};                           // 1B  [30..31) [2:0]=stemCount, [7:3]=beatsPerBar
+    u8  defaultCrossfadeBlocks{94};                          // 1B  [31..32) in 256-sample blocks (~501 ms)
 
     [[nodiscard]] constexpr u8 StemCount() const noexcept { return static_cast<u8>(packedStemsAndBeats & 0x07u); }
     [[nodiscard]] constexpr u8 BeatsPerBar() const noexcept { return static_cast<u8>((packedStemsAndBeats >> 3u) & 0x1Fu); }

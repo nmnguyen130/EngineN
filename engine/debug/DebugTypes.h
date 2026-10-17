@@ -86,6 +86,17 @@ enum class OverlayFlags : u32 {
     return (static_cast<u32>(mask) & static_cast<u32>(bit)) != 0;
 }
 
+// Decoupled command packet returned by DebugSystem::BeginFrame() so the outer loop mutates TimePipeline
+// without DebugSystem holding raw subsystem pointers or including heavy template headers.
+struct alignas(8) DebugLoopDirectives {
+    u16 stepTicks{0};
+    f32 channelTimeScale{1.0f};
+    u8  targetTimeChannel{0xFFu};
+    bool togglePause{false};
+    bool forcePause{false};
+};
+static_assert(sizeof(DebugLoopDirectives) == 12);
+
 enum class DebugShapeKind : u8 {
     Line = 0,
     BoxOutline,
@@ -230,11 +241,11 @@ constexpr void UnpackDebugAtlasRGBA8(std::span<u8, kDebugAtlasWidth * kDebugAtla
     }
 
     for (u32 glyphIdx = 0; glyphIdx < 96; ++glyphIdx) {
-        const u32 col = glyphIdx & 15u;
-        const u32 row = glyphIdx >> 4u;
+        const u32 col   = glyphIdx & 15u;
+        const u32 row   = glyphIdx >> 4u;
         const u32 baseX = col * 8u;
         const u32 baseY = row * 8u;
-        const u64 bits = kEmbeddedFont8x8[glyphIdx];
+        const u64 bits  = kEmbeddedFont8x8[glyphIdx];
 
         for (u32 py = 0; py < 8; ++py) {
             const u8 rowBits = static_cast<u8>((bits >> ((7u - py) * 8u)) & 0xFFu);
@@ -250,7 +261,6 @@ constexpr void UnpackDebugAtlasRGBA8(std::span<u8, kDebugAtlasWidth * kDebugAtla
         }
     }
 
-    // Fill [120..127, 56..63] with opaque white (0xFFFFFFFF) for kSolidWhiteUv geometry rendering.
     for (u32 py = 56; py < 64; ++py) {
         for (u32 px = 120; px < 128; ++px) {
             const usize idx = (py * kDebugAtlasWidth + px) * 4u;

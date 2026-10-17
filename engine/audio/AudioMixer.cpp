@@ -15,6 +15,7 @@ inline constexpr f32 kQ14ToFloat     = 1.0f / 16384.0f;
 inline constexpr f32 kInvBlockFrames = 1.0f / static_cast<f32>(kMixBlockFrames);
 inline constexpr f32 kFracQ32ToFloat = 1.0f / 4294967296.0f;
 inline constexpr f32 kAntiDenormalDc = 1.0e-20f;
+inline constexpr f32 kSvfResonanceK  = 1.41421356f; // Butterworth Q = 0.7071
 
 [[nodiscard]] constexpr u8 AlignOffset64(const u8* ptr) noexcept {
     const usize addr = std::bit_cast<usize>(ptr);
@@ -52,6 +53,37 @@ inline constexpr f32 kAntiDenormalDc = 1.0e-20f;
     return x ^ (x >> 31u);
 }
 
+constexpr void StepSvfSample(
+    f32 input,
+    f32 a1,
+    f32 a2,
+    f32 a3,
+    f32& ic1eq,
+    f32& ic2eq,
+    f32& outV1,
+    f32& outV2) noexcept {
+    const f32 v0 = input + kAntiDenormalDc;
+    const f32 v3 = v0 - ic2eq;
+    outV1        = a1 * ic1eq + a2 * v3;
+    outV2        = ic2eq + a2 * ic1eq + a3 * v3;
+    ic1eq        = 2.0f * outV1 - ic1eq;
+    ic2eq        = 2.0f * outV2 - ic2eq;
+}
+
+constexpr void UpdateBit(u64& mask, u64 bit, bool set) noexcept {
+    mask = (mask & ~bit) | (set ? bit : 0ULL);
+}
+
+template <typename T>
+[[nodiscard]] T* CarveArena(u8*& cursor, usize count = 1u) noexcept {
+    auto* ptr = reinterpret_cast<T*>(cursor);
+    for (usize i = 0; i < count; ++i) {
+        std::construct_at(&ptr[i]);
+    }
+    cursor += sizeof(T) * count;
+    return ptr;
+}
+
 } // namespace
 
 Result<void, AudioErrc> AudioMixer::Init(std::span<u8> arenaSlice) noexcept {
@@ -60,27 +92,14 @@ Result<void, AudioErrc> AudioMixer::Init(std::span<u8> arenaSlice) noexcept {
     }
 
     std::memset(arenaSlice.data(), 0, arenaSlice.size());
-    u8* cursor = arenaSlice.data();
-    cursor += AlignOffset64(cursor);
+    u8* cursor = arenaSlice.data() + AlignOffset64(arenaSlice.data());
 
-    m_voices = std::construct_at(reinterpret_cast<VoicePoolSoA*>(cursor));
-    cursor += sizeof(VoicePoolSoA);
-
-    m_stealState = std::construct_at(reinterpret_cast<StealSlotState*>(cursor));
-    cursor += sizeof(StealSlotState);
-
-    m_decks = reinterpret_cast<MusicDeckRuntime*>(cursor);
-    std::construct_at(&m_decks[0]);
-    std::construct_at(&m_decks[1]);
-    cursor += sizeof(MusicDeckRuntime) * 2u;
-
-    m_busDsp = std::construct_at(reinterpret_cast<BusDspState*>(cursor));
-    cursor += sizeof(BusDspState);
-
-    const usize scratchBytesPerChannel = sizeof(f32) * kAudioBusCount * kMixBlockFrames;
-    m_busScratchL = reinterpret_cast<f32*>(cursor);
-    cursor += scratchBytesPerChannel;
-    m_busScratchR = reinterpret_cast<f32*>(cursor);
+    m_voices      = CarveArena<VoicePoolSoA>(cursor);
+    m_stealState  = CarveArena<StealSlotState>(cursor);
+    m_decks       = CarveArena<MusicDeckRuntime>(cursor, 2u);
+    m_busDsp      = CarveArena<BusDspState>(cursor);
+    m_busScratchL = CarveArena<f32>(cursor, kAudioBusCount * kMixBlockFrames);
+    m_busScratchR = CarveArena<f32>(cursor, kAudioBusCount * kMixBlockFrames);
 
     Reset();
     return {};
@@ -95,14 +114,11 @@ void AudioMixer::Reset() noexcept {
     m_decks[0]    = MusicDeckRuntime{};
     m_decks[1]    = MusicDeckRuntime{};
     *m_busDsp     = BusDspState{};
-    for (usize b = 0; b < kAudioBusCount; ++b) {
-        m_busDsp->curGain[b] = 1.0f;
-    }
-    m_busDsp->masterFadeGain = 1.0f;
-    m_deckCrossfadeAlpha     = 0.0f;
-    m_deckCrossfadeStep      = 0.0f;
-    m_telemetry              = AudioTelemetrySnapshot{};
-    m_sampleCounter          = 0;
+    m_busDsp->curGain.fill(1.0f);
+    m_deckCrossfadeAlpha = 0.0f;
+    m_deckCrossfadeStep  = 0.0f;
+    m_telemetry          = AudioTelemetrySnapshot{};
+    m_sampleCounter      = 0;
 }
 
 void AudioMixer::RefreshLoopGuard(u32 slot) noexcept {
@@ -116,7 +132,6 @@ void AudioMixer::RefreshLoopGuard(u32 slot) noexcept {
         guard[0] = guard[1] = guard[2] = guard[3] = 0;
         return;
     }
-    // Pre-cache samples across the loop/end boundary so inner sample loops avoid branchy modulo wraps.
     guard[0] = pcm[frames > 1u ? frames - 2u : 0u];
     guard[1] = pcm[frames - 1u];
     if (looping && loopBeg < frames) {
@@ -147,11 +162,11 @@ void AudioMixer::CaptureStealTail(u32 slot, u8 stealIdx) noexcept {
     u64  phase   = m_voices->phaseQ32[slot];
     const u64 st = m_voices->baseStepQ32[slot];
     for (u32 i = 0; i < kMixBlockFrames; ++i) {
-        const u32 idx  = static_cast<u32>(phase >> 32u);
-        const f32 s    = (idx < frames) ? (static_cast<f32>(pcm[idx]) * kPcm16ToFloat) : 0.0f;
-        const f32 env  = 1.0f - (static_cast<f32>(i) * kInvBlockFrames);
-        dst[i]         = s * env;
-        phase         += st;
+        const u32 idx = static_cast<u32>(phase >> 32u);
+        const f32 s   = (idx < frames) ? (static_cast<f32>(pcm[idx]) * kPcm16ToFloat) : 0.0f;
+        const f32 env = 1.0f - (static_cast<f32>(i) * kInvBlockFrames);
+        dst[i]        = s * env;
+        phase        += st;
     }
     ++m_telemetry.stolenVoicesTotal;
 }
@@ -167,40 +182,28 @@ void AudioMixer::ApplyCommand(const AudioCommand& cmd) noexcept {
         if (slot >= kMaxVoices || !cmd.payload.spawn.pcm || cmd.payload.spawn.frameCount == 0u) {
             return;
         }
-        const u64 bit = 1ULL << slot;
+        const u64 bit       = 1ULL << slot;
         const VoiceFlags vf = static_cast<VoiceFlags>(cmd.flags);
 
         m_voices->activeMask |= bit;
         m_voices->stoppingMask &= ~bit;
-        if (HasVoiceFlag(vf, VoiceFlags::Looping)) {
-            m_voices->loopMask |= bit;
-        } else {
-            m_voices->loopMask &= ~bit;
-        }
-        if (HasVoiceFlag(vf, VoiceFlags::PauseOnHitstop)) {
-            m_voices->pauseOnHitstopMask |= bit;
-        } else {
-            m_voices->pauseOnHitstopMask &= ~bit;
-        }
-        if (HasVoiceFlag(vf, VoiceFlags::FollowTimeScale)) {
-            m_voices->followTimeScaleMask |= bit;
-        } else {
-            m_voices->followTimeScaleMask &= ~bit;
-        }
+        UpdateBit(m_voices->loopMask, bit, HasVoiceFlag(vf, VoiceFlags::Looping));
+        UpdateBit(m_voices->pauseOnHitstopMask, bit, HasVoiceFlag(vf, VoiceFlags::PauseOnHitstop));
+        UpdateBit(m_voices->followTimeScaleMask, bit, HasVoiceFlag(vf, VoiceFlags::FollowTimeScale));
 
-        m_voices->pcmPtr[slot]      = cmd.payload.spawn.pcm;
-        m_voices->phaseQ32[slot]    = 0ULL;
-        const u64 rateNum           = static_cast<u64>(cmd.payload.spawn.sampleRate) << 32u;
-        m_voices->baseStepQ32[slot] = rateNum / kSampleRate;
-        m_voices->frameCount[slot]  = cmd.payload.spawn.frameCount;
-        m_voices->loopStart[slot]   = std::min(cmd.payload.spawn.loopStartFrame, cmd.payload.spawn.frameCount - 1u);
-        m_voices->curGainL[slot]    = static_cast<f32>(cmd.payload.spawn.gainL_Q14) * kQ14ToFloat;
-        m_voices->curGainR[slot]    = static_cast<f32>(cmd.payload.spawn.gainR_Q14) * kQ14ToFloat;
-        m_voices->svfIc1eq[slot]    = 0.0f;
-        m_voices->svfIc2eq[slot]    = 0.0f;
-        m_voices->generation[slot]  = cmd.generation;
+        m_voices->pcmPtr[slot]        = cmd.payload.spawn.pcm;
+        m_voices->phaseQ32[slot]      = 0ULL;
+        const u64 rateNum             = static_cast<u64>(cmd.payload.spawn.sampleRate) << 32u;
+        m_voices->baseStepQ32[slot]   = rateNum / kSampleRate;
+        m_voices->frameCount[slot]    = cmd.payload.spawn.frameCount;
+        m_voices->loopStart[slot]     = std::min(cmd.payload.spawn.loopStartFrame, cmd.payload.spawn.frameCount - 1u);
+        m_voices->curGainL[slot]      = static_cast<f32>(cmd.payload.spawn.gainL_Q14) * kQ14ToFloat;
+        m_voices->curGainR[slot]      = static_cast<f32>(cmd.payload.spawn.gainR_Q14) * kQ14ToFloat;
+        m_voices->svfIc1eq[slot]      = 0.0f;
+        m_voices->svfIc2eq[slot]      = 0.0f;
+        m_voices->generation[slot]    = cmd.generation;
         m_voices->busAndChannel[slot] = cmd.packedBusAndChannel;
-        m_voices->scopeId[slot]     = cmd.assetScopeId & 0x1Fu;
+        m_voices->scopeId[slot]       = cmd.assetScopeId & 0x1Fu;
         RefreshLoopGuard(slot);
         break;
     }
@@ -221,8 +224,8 @@ void AudioMixer::ApplyCommand(const AudioCommand& cmd) noexcept {
         break;
     }
     case AudioCmdType::BindMusicStem: {
-        const u8 deckIdx = (cmd.payload.music.deckAndStemIdx >> 7u) & 0x01u;
-        const u8 stemIdx = cmd.payload.music.deckAndStemIdx & 0x03u;
+        const u8 deckIdx       = (cmd.payload.music.deckAndStemIdx >> 7u) & 0x01u;
+        const u8 stemIdx       = cmd.payload.music.deckAndStemIdx & 0x03u;
         MusicDeckRuntime& deck = m_decks[deckIdx];
         deck.stemPcm[stemIdx]  = cmd.payload.music.pcm;
         deck.frameCount        = cmd.payload.music.frameCount;
@@ -257,26 +260,23 @@ void AudioMixer::ApplyCommand(const AudioCommand& cmd) noexcept {
     }
 }
 
-void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexcept {
-    u64 mask = m_voices->activeMask;
-    while (mask != 0ULL) {
+u8 AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexcept {
+    u8 dirtyBusMask = 0u;
+    for (u64 mask = m_voices->activeMask; mask != 0ULL; mask &= (mask - 1ULL)) {
         const u32 slot = static_cast<u32>(std::countr_zero(mask));
-        mask &= (mask - 1ULL);
-        const u64 bit = 1ULL << slot;
+        const u64 bit  = 1ULL << slot;
 
-        const u8  busAndCh  = m_voices->busAndChannel[slot];
-        const u8  busIdx    = static_cast<u8>(busAndCh & 0x07u);
-        const u8  channelId = static_cast<u8>((busAndCh >> 3u) & 0x07u);
-        const bool isFrozen = (snapshot.frozenChannelMask & (1u << channelId)) != 0u;
-        const bool pauseHit = (m_voices->pauseOnHitstopMask & bit) != 0ULL;
+        const u8   busAndCh  = m_voices->busAndChannel[slot];
+        const u8   busIdx    = static_cast<u8>(busAndCh & 0x07u);
+        const u8   channelId = static_cast<u8>((busAndCh >> 3u) & 0x07u);
+        const bool isFrozen  = (snapshot.frozenChannelMask & (1u << channelId)) != 0u;
+        const bool pauseHit  = (m_voices->pauseOnHitstopMask & bit) != 0ULL;
+        const bool holdPhase = isFrozen && pauseHit;
 
         f32 targetL = static_cast<f32>(snapshot.targetGainL_Q14[slot]) * kQ14ToFloat;
         f32 targetR = static_cast<f32>(snapshot.targetGainR_Q14[slot]) * kQ14ToFloat;
 
-        if (isFrozen && pauseHit) {
-            targetL = 0.0f;
-            targetR = 0.0f;
-        } else if ((m_voices->stoppingMask & bit) != 0ULL) {
+        if (holdPhase || (m_voices->stoppingMask & bit) != 0ULL) {
             targetL = 0.0f;
             targetR = 0.0f;
         }
@@ -286,8 +286,7 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
         const f32 stepL = (targetL - gainL) * kInvBlockFrames;
         const f32 stepR = (targetR - gainR) * kInvBlockFrames;
 
-        // If frozen by hitstop and already ramped to silence, hold phaseQ32 constant.
-        if (isFrozen && pauseHit && gainL <= 1.0e-5f && gainR <= 1.0e-5f) {
+        if (holdPhase && gainL <= 1.0e-5f && gainR <= 1.0e-5f) {
             m_voices->curGainL[slot] = 0.0f;
             m_voices->curGainR[slot] = 0.0f;
             continue;
@@ -299,16 +298,15 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
             pitchScaleQ12     = (pitchScaleQ12 * (chScale != 0u ? chScale : 4096u)) >> 12u;
         }
         pitchScaleQ12     = std::clamp<u64>(pitchScaleQ12, 1024u, 8192u);
-        const u64 stepQ32 = (m_voices->baseStepQ32[slot] * pitchScaleQ12) >> 12u;
+        const u64 stepQ32 = holdPhase ? 0ULL : ((m_voices->baseStepQ32[slot] * pitchScaleQ12) >> 12u);
 
-        const f32 g     = static_cast<f32>(snapshot.targetSvfG_Q14[slot]) * kQ14ToFloat;
+        const f32 g          = static_cast<f32>(snapshot.targetSvfG_Q14[slot]) * kQ14ToFloat;
         const bool useFilter = (g > 0.001f && g < 0.96f);
-        const f32 k     = 1.41421356f; // Butterworth Q = 0.7071
-        const f32 a1    = useFilter ? (1.0f / (1.0f + g * (g + k))) : 0.0f;
-        const f32 a2    = g * a1;
-        const f32 a3    = g * a2;
-        f32 ic1eq       = m_voices->svfIc1eq[slot];
-        f32 ic2eq       = m_voices->svfIc2eq[slot];
+        const f32 a1         = useFilter ? (1.0f / (1.0f + g * (g + kSvfResonanceK))) : 0.0f;
+        const f32 a2         = g * a1;
+        const f32 a3         = g * a2;
+        f32 ic1eq            = m_voices->svfIc1eq[slot];
+        f32 ic2eq            = m_voices->svfIc2eq[slot];
 
         const i16* pcm    = m_voices->pcmPtr[slot];
         const u32  frames = m_voices->frameCount[slot];
@@ -318,6 +316,7 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
 
         f32* busL = &m_busScratchL[static_cast<usize>(busIdx) * kMixBlockFrames];
         f32* busR = &m_busScratchR[static_cast<usize>(busIdx) * kMixBlockFrames];
+        dirtyBusMask |= static_cast<u8>(1u << busIdx);
 
         u64 phase  = m_voices->phaseQ32[slot];
         bool ended = false;
@@ -338,7 +337,6 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
             const f32 frac = static_cast<f32>(phase & 0xFFFFFFFFULL) * kFracQ32ToFloat;
             f32 sample     = 0.0f;
 
-            // Fast branchless interior span when 4-tap window lies inside valid PCM frames.
             if (idx >= 1u && idx + 2u < frames) {
                 sample = SampleHermite4(
                     static_cast<f32>(pcm[idx - 1u]),
@@ -360,24 +358,15 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
             }
 
             if (useFilter) {
-                // Cytomic Linear Trap-Integrated SVF low-pass stage with anti-denormal offset.
-                const f32 v0 = sample + kAntiDenormalDc;
-                const f32 v3 = v0 - ic2eq;
-                const f32 v1 = a1 * ic1eq + a2 * v3;
-                const f32 v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                ic1eq        = 2.0f * v1 - ic1eq;
-                ic2eq        = 2.0f * v2 - ic2eq;
-                sample       = v2;
+                f32 v1 = 0.0f;
+                StepSvfSample(sample, a1, a2, a3, ic1eq, ic2eq, v1, sample);
             }
 
             busL[i] += sample * gainL;
             busR[i] += sample * gainR;
             gainL   += stepL;
             gainR   += stepR;
-
-            if (!(isFrozen && pauseHit)) {
-                phase += stepQ32;
-            }
+            phase   += stepQ32;
         }
 
         m_voices->phaseQ32[slot] = phase;
@@ -397,43 +386,53 @@ void AudioMixer::MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexc
             }
         }
     }
+    return dirtyBusMask;
 }
 
-void AudioMixer::MixStealPoolPlanar() noexcept {
-    u16 mask = m_stealState->activeMask;
-    while (mask != 0u) {
+u8 AudioMixer::MixStealPoolPlanar() noexcept {
+    u8 dirtyBusMask = 0u;
+    for (u16 mask = m_stealState->activeMask; mask != 0u; mask &= static_cast<u16>(mask - 1u)) {
         const u32 stealIdx = static_cast<u32>(std::countr_zero(mask));
-        mask &= static_cast<u16>(mask - 1u);
+        const u8   busIdx  = m_stealState->busIdx[stealIdx];
+        const f32  gL      = m_stealState->gainL[stealIdx];
+        const f32  gR      = m_stealState->gainR[stealIdx];
+        const f32* src     = &m_stealState->samples[stealIdx * kMixBlockFrames];
+        f32*       busL    = &m_busScratchL[static_cast<usize>(busIdx) * kMixBlockFrames];
+        f32*       busR    = &m_busScratchR[static_cast<usize>(busIdx) * kMixBlockFrames];
 
-        const u8   busIdx = m_stealState->busIdx[stealIdx];
-        const f32  gL     = m_stealState->gainL[stealIdx];
-        const f32  gR     = m_stealState->gainR[stealIdx];
-        const f32* src    = &m_stealState->samples[stealIdx * kMixBlockFrames];
-        f32*       busL   = &m_busScratchL[static_cast<usize>(busIdx) * kMixBlockFrames];
-        f32*       busR   = &m_busScratchR[static_cast<usize>(busIdx) * kMixBlockFrames];
-
+        dirtyBusMask |= static_cast<u8>(1u << busIdx);
         for (u32 i = 0; i < kMixBlockFrames; ++i) {
             busL[i] += src[i] * gL;
             busR[i] += src[i] * gR;
         }
     }
     m_stealState->activeMask = 0u;
+    return dirtyBusMask;
 }
 
-void AudioMixer::MixMusicDecksPlanar(const AudioFrameSnapshot& snapshot) noexcept {
+u8 AudioMixer::MixMusicDecksPlanar(const AudioFrameSnapshot& snapshot) noexcept {
+    if (!m_decks[0].active && !m_decks[1].active) {
+        return 0u;
+    }
+
     f32* musicL = &m_busScratchL[static_cast<usize>(AudioBusId::Music) * kMixBlockFrames];
     f32* musicR = &m_busScratchR[static_cast<usize>(AudioBusId::Music) * kMixBlockFrames];
 
+    // Branchless constant-power crossfade gains between Deck A (0) and Deck B (1).
+    f32 gainDeckA = 1.0f;
+    f32 gainDeckB = 0.0f;
+    EvalConstantPowerPan((m_deckCrossfadeAlpha * 2.0f) - 1.0f, gainDeckA, gainDeckB);
+    const std::array<f32, 2> deckGains{gainDeckA, gainDeckB};
+
+    u8 dirtyBusMask = 0u;
     for (u32 d = 0; d < 2u; ++d) {
         MusicDeckRuntime& deck = m_decks[d];
         if (!deck.active || deck.frameCount == 0u) {
             continue;
         }
+        dirtyBusMask |= static_cast<u8>(1u << static_cast<u8>(AudioBusId::Music));
 
-        const f32 deckGain = (d == 0u)
-                                 ? std::cos(m_deckCrossfadeAlpha * 1.57079632f)
-                                 : std::sin(m_deckCrossfadeAlpha * 1.57079632f);
-
+        const f32 deckGain = deckGains[d];
         for (u8 s = 0; s < deck.stemCount; ++s) {
             const i16* pcm = deck.stemPcm[s];
             if (!pcm) {
@@ -473,17 +472,22 @@ void AudioMixer::MixMusicDecksPlanar(const AudioFrameSnapshot& snapshot) noexcep
             m_deckCrossfadeStep  = 0.0f;
         }
     }
+    return dirtyBusMask;
 }
 
 void AudioMixer::ProcessBusesAndMaster(
     const AudioFrameSnapshot& snapshot,
+    u8 dirtyBusMask,
     std::span<f32, kMixBlockFrames * 2> outStereo) noexcept {
     f32* masterL = &m_busScratchL[0];
     f32* masterR = &m_busScratchR[0];
 
-    // 1. Measure combat peak energy on SfxPlayer (2) and SfxCombat (3) for sidechain ducking.
+    // 1. Measure combat peak energy only when SfxPlayer (2) or SfxCombat (3) received audio this block.
     f32 combatPeak = 0.0f;
-    for (u32 b : {2u, 3u}) {
+    for (u32 b : {static_cast<u32>(AudioBusId::SfxPlayer), static_cast<u32>(AudioBusId::SfxCombat)}) {
+        if ((dirtyBusMask & (1u << b)) == 0u) {
+            continue;
+        }
         const f32* bL = &m_busScratchL[b * kMixBlockFrames];
         const f32* bR = &m_busScratchR[b * kMixBlockFrames];
         for (u32 i = 0; i < kMixBlockFrames; ++i) {
@@ -495,23 +499,30 @@ void AudioMixer::ProcessBusesAndMaster(
     m_busDsp->sidechainEnvelope += (envTarget - m_busDsp->sidechainEnvelope) * envRate;
     const f32 duckGain = std::clamp(1.0f - (m_busDsp->sidechainEnvelope * 0.65f), 0.55f, 1.0f);
 
-    // 2. Process Sub-Buses 1..7 and sum into Master Bus 0.
+    // 2. Process Sub-Buses 1..7 and sum into Master Bus 0 (skipping completely idle buses in O(1)).
     for (usize b = 1; b < kAudioBusCount; ++b) {
-        f32* bL = &m_busScratchL[b * kMixBlockFrames];
-        f32* bR = &m_busScratchR[b * kMixBlockFrames];
-
         f32 targetGain = static_cast<f32>(snapshot.busTargetGainQ14[b]) * kQ14ToFloat;
         if (b == static_cast<usize>(AudioBusId::Music) || b == static_cast<usize>(AudioBusId::Ambience)) {
             targetGain *= duckGain;
         }
+
+        const bool busDirty = (dirtyBusMask & (1u << b)) != 0u;
+        const bool hasTail  = (std::abs(m_busDsp->svfIc1eqL[b]) + std::abs(m_busDsp->svfIc2eqL[b]) +
+                               std::abs(m_busDsp->svfIc1eqR[b]) + std::abs(m_busDsp->svfIc2eqR[b])) > 1.0e-6f;
+        if (!busDirty && !hasTail) {
+            m_busDsp->curGain[b] = targetGain;
+            continue;
+        }
+
+        f32* bL           = &m_busScratchL[b * kMixBlockFrames];
+        f32* bR           = &m_busScratchR[b * kMixBlockFrames];
         f32 curGain       = m_busDsp->curGain[b];
         const f32 gainStp = (targetGain - curGain) * kInvBlockFrames;
 
         const FilterMode mode = static_cast<FilterMode>((snapshot.busFilterModesBits >> (b * 2u)) & 0x03u);
         const f32 g           = static_cast<f32>(snapshot.busSvfG_Q14[b]) * kQ14ToFloat;
         const bool applySvf   = (mode != FilterMode::Bypass && g > 0.001f && g < 0.98f);
-        const f32 k           = 1.41421356f;
-        const f32 a1          = applySvf ? (1.0f / (1.0f + g * (g + k))) : 0.0f;
+        const f32 a1          = applySvf ? (1.0f / (1.0f + g * (g + kSvfResonanceK))) : 0.0f;
         const f32 a2          = g * a1;
         const f32 a3          = g * a2;
 
@@ -524,17 +535,9 @@ void AudioMixer::ProcessBusesAndMaster(
             f32 sL = bL[i];
             f32 sR = bR[i];
             if (applySvf) {
-                const f32 v3L = (sL + kAntiDenormalDc) - ic2L;
-                const f32 v1L = a1 * ic1L + a2 * v3L;
-                const f32 v2L = ic2L + a2 * ic1L + a3 * v3L;
-                ic1L          = 2.0f * v1L - ic1L;
-                ic2L          = 2.0f * v2L - ic2L;
-
-                const f32 v3R = (sR + kAntiDenormalDc) - ic2R;
-                const f32 v1R = a1 * ic1R + a2 * v3R;
-                const f32 v2R = ic2R + a2 * ic1R + a3 * v3R;
-                ic1R          = 2.0f * v1R - ic1R;
-                ic2R          = 2.0f * v2R - ic2R;
+                f32 v1L = 0.0f, v2L = 0.0f, v1R = 0.0f, v2R = 0.0f;
+                StepSvfSample(sL, a1, a2, a3, ic1L, ic2L, v1L, v2L);
+                StepSvfSample(sR, a1, a2, a3, ic1R, ic2R, v1R, v2R);
 
                 if (mode == FilterMode::LowPass) {
                     sL = v2L;
@@ -543,8 +546,8 @@ void AudioMixer::ProcessBusesAndMaster(
                     sL = v1L;
                     sR = v1R;
                 } else {
-                    sL = sL - k * v1L - v2L;
-                    sR = sR - k * v1R - v2R;
+                    sL = sL - kSvfResonanceK * v1L - v2L;
+                    sR = sR - kSvfResonanceK * v1R - v2R;
                 }
             }
             masterL[i] += sL * curGain;
@@ -579,7 +582,7 @@ void AudioMixer::ProcessBusesAndMaster(
         masterGain            += masterStep;
     }
 
-    m_busDsp->curGain[0]   = masterGain;
+    m_busDsp->curGain[0]    = masterGain;
     m_telemetry.masterPeakL = peakL;
     m_telemetry.masterPeakR = peakR;
 }
@@ -596,17 +599,15 @@ void AudioMixer::MixBlock(
     std::memset(m_busScratchL, 0, totalScratchBytes);
     std::memset(m_busScratchR, 0, totalScratchBytes);
 
-    MixActiveVoicesPlanar(snapshot);
-    MixStealPoolPlanar();
-    MixMusicDecksPlanar(snapshot);
-    ProcessBusesAndMaster(snapshot, outInterleavedStereo);
+    u8 dirtyBusMask = 0u;
+    dirtyBusMask |= MixActiveVoicesPlanar(snapshot);
+    dirtyBusMask |= MixStealPoolPlanar();
+    dirtyBusMask |= MixMusicDecksPlanar(snapshot);
+    ProcessBusesAndMaster(snapshot, dirtyBusMask, outInterleavedStereo);
 
-    // Publish active voice mask and OR-reduced AssetBank ScopeId pin mask for wait-free retirement.
     u32 scopeMask = 0u;
-    u64 vMask     = m_voices->activeMask;
-    while (vMask != 0ULL) {
+    for (u64 vMask = m_voices->activeMask; vMask != 0ULL; vMask &= (vMask - 1ULL)) {
         const u32 slot = static_cast<u32>(std::countr_zero(vMask));
-        vMask &= (vMask - 1ULL);
         scopeMask |= (1u << (m_voices->scopeId[slot] & 0x1Fu));
     }
 
@@ -620,10 +621,8 @@ u64 AudioMixer::ComputeAuditHash() const noexcept {
         return 0ULL;
     }
     u64 h = MixSplitMix64(m_voices->activeMask ^ m_sampleCounter);
-    u64 m = m_voices->activeMask;
-    while (m != 0ULL) {
+    for (u64 m = m_voices->activeMask; m != 0ULL; m &= (m - 1ULL)) {
         const u32 slot = static_cast<u32>(std::countr_zero(m));
-        m &= (m - 1ULL);
         h ^= MixSplitMix64(m_voices->phaseQ32[slot] ^ (static_cast<u64>(m_voices->generation[slot]) << 16u));
     }
     h ^= MixSplitMix64(static_cast<u64>(m_decks[0].cursorFrame) | (static_cast<u64>(m_decks[1].cursorFrame) << 32u));

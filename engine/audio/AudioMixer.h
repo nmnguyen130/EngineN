@@ -58,12 +58,11 @@ struct alignas(64) BusDspState {
     std::array<f32, kAudioBusCount> svfIc1eqR{};
     std::array<f32, kAudioBusCount> svfIc2eqR{};
     f32 sidechainEnvelope{0.0f};
-    f32 masterFadeGain{1.0f};
 };
 
 // Pure C++23 data-oriented audio mixer, vari-speed Hermite resampler, and Cytomic SVF processor.
 // Non-owning view over a caller-supplied arena slice; zero OS or SDL3 dependencies.
-// Invariant: MixBlock() executes in bounded O(popcount(activeMask)) time with zero allocations or locks.
+// Invariant: MixBlock() executes in bounded O(popcount(activeMask) + popcount(dirtyBusMask)) time with zero allocations.
 class AudioMixer {
 public:
     [[nodiscard]] static constexpr usize RequiredArenaBytes() noexcept {
@@ -85,19 +84,20 @@ public:
 private:
     void CaptureStealTail(u32 voiceSlot, u8 stealPoolIdx) noexcept;
     void RefreshLoopGuard(u32 voiceSlot) noexcept;
-    void MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexcept;
-    void MixStealPoolPlanar() noexcept;
-    void MixMusicDecksPlanar(const AudioFrameSnapshot& snapshot) noexcept;
+    [[nodiscard]] u8 MixActiveVoicesPlanar(const AudioFrameSnapshot& snapshot) noexcept;
+    [[nodiscard]] u8 MixStealPoolPlanar() noexcept;
+    [[nodiscard]] u8 MixMusicDecksPlanar(const AudioFrameSnapshot& snapshot) noexcept;
     void ProcessBusesAndMaster(
         const AudioFrameSnapshot& snapshot,
+        u8 dirtyBusMask,
         std::span<f32, kMixBlockFrames * 2> outStereo) noexcept;
 
     VoicePoolSoA* m_voices{nullptr};
     StealSlotState* m_stealState{nullptr};
-    MusicDeckRuntime* m_decks{nullptr}; // [2]: Deck A (0) and Deck B (1)
+    MusicDeckRuntime* m_decks{nullptr};
     BusDspState* m_busDsp{nullptr};
-    f32* m_busScratchL{nullptr};        // [kAudioBusCount * kMixBlockFrames]
-    f32* m_busScratchR{nullptr};        // [kAudioBusCount * kMixBlockFrames]
+    f32* m_busScratchL{nullptr};
+    f32* m_busScratchR{nullptr};
 
     f32 m_deckCrossfadeAlpha{0.0f};
     f32 m_deckCrossfadeStep{0.0f};
