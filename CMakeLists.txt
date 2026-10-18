@@ -18,6 +18,7 @@ FetchContent_MakeAvailable(SDL3)
 add_library(engine STATIC
     # Core
     engine/core/Log.cpp
+    engine/core/time/SdlClock.cpp
 
     # Platform
     engine/platform/Platform.cpp
@@ -30,22 +31,6 @@ add_library(engine STATIC
     # Assets
     engine/assets/AssetBank.cpp
     engine/assets/AssetSystem.cpp
-
-    # World
-    engine/world/TransformSolver.cpp
-    engine/world/World.cpp
-    engine/world/WorldExtractor.cpp
-
-
-    # Gameplay
-    engine/gameplay/SpatialIndex2D.cpp
-    engine/gameplay/KinematicSolver2D.cpp
-    engine/gameplay/StateAndCombatSolver.cpp
-    engine/gameplay/GameplayPipeline.cpp
-
-    # Audio
-    engine/audio/AudioMixer.cpp
-    engine/audio/AudioSystem.cpp
 )
 
 target_compile_features(engine PUBLIC cxx_std_23)
@@ -73,4 +58,8 @@ function(add_engine_test TEST_NAME)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endfunction()
 
-add_engine_test(TestTimeLoop)
+add_engine_test(TimeTests)
+add_engine_test(PlatformTests)
+add_engine_test(InputTests)
+add_engine_test(RendererTests)
+add_engine_test(AssetsTests)

@@ -1,9 +1,38 @@
 #include "debug/DebugProfilerAndConsole.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <cstring>
 
 namespace en::debug {
+
+namespace {
+
+inline constexpr u16 kKeyReturn    = 40;
+inline constexpr u16 kKeyEscape    = 41;
+inline constexpr u16 kKeyBackspace = 42;
+inline constexpr u16 kKeyTab       = 43;
+inline constexpr u16 kKeyHome      = 74;
+inline constexpr u16 kKeyPageUp    = 75;
+inline constexpr u16 kKeyDelete    = 76;
+inline constexpr u16 kKeyEnd       = 77;
+inline constexpr u16 kKeyPageDown  = 78;
+inline constexpr u16 kKeyRight     = 79;
+inline constexpr u16 kKeyLeft      = 80;
+inline constexpr u16 kKeyDown      = 81;
+inline constexpr u16 kKeyUp        = 82;
+
+inline constexpr std::array<std::string_view, 8> kChannelNames{{
+    "World", "Player", "Enemy", "Proj", "Vfx", "Camera", "Ui", "Custom"
+}};
+
+[[nodiscard]] constexpr u32 QuantizeFrameBucket(u16 frameTotalUs) noexcept {
+    // 256 us per bucket (>> 8), covering 0..16.38 ms across 64 buckets.
+    return std::min<u32>(static_cast<u32>(frameTotalUs) >> 8u, 63u);
+}
+
+} // namespace
 
 void DebugProfiler::BindArena(std::span<FrameProfileSample, kHistoryFrames> samples) noexcept {
     m_samples = samples;
@@ -11,199 +40,192 @@ void DebugProfiler::BindArena(std::span<FrameProfileSample, kHistoryFrames> samp
 }
 
 void DebugProfiler::Clear() noexcept {
-    for (auto& s : m_samples) {
+    for (FrameProfileSample& s : m_samples) {
         s = FrameProfileSample{};
     }
     m_buckets.fill(0);
-    m_writeIdx    = 0;
-    m_latestIdx   = 0;
-    m_validFrames = 0;
+    m_activeBucketMask = 0;
+    m_currentIdx       = 0;
+    m_validFrames      = 0;
 }
 
 void DebugProfiler::BeginFrame(u64 frameIndex, u64 simTickIndex) noexcept {
-    if (m_samples.empty()) return;
-
-    FrameProfileSample& slot = m_samples[m_writeIdx];
+    if (m_samples.empty()) {
+        return;
+    }
+    if (m_validFrames > 0) {
+        m_currentIdx = (m_currentIdx + 1u) & static_cast<u32>(kHistoryFrames - 1);
+    }
     if (m_validFrames == kHistoryFrames) {
-        const u32 oldBucket = std::min<u32>(kBucketCount - 1u, slot.scopeUs[0] >> 8u);
-        if (m_buckets[oldBucket] > 0) {
-            --m_buckets[oldBucket];
+        const u16 oldUs     = m_samples[m_currentIdx].scopeUs[static_cast<usize>(ProfileScopeId::FrameTotal)];
+        const u32 oldBucket = QuantizeFrameBucket(oldUs);
+        if (m_buckets[oldBucket] > 0 && --m_buckets[oldBucket] == 0) {
+            m_activeBucketMask &= ~(1ull << oldBucket);
         }
     }
 
-    slot = FrameProfileSample{};
-    slot.frameIndex   = frameIndex;
-    slot.simTickIndex = simTickIndex;
+    FrameProfileSample& cur = m_samples[m_currentIdx];
+    cur              = FrameProfileSample{};
+    cur.frameIndex   = frameIndex;
+    cur.simTickIndex = simTickIndex;
+    cur.channelScaleQ8.fill(256);
 }
 
 void DebugProfiler::RecordScopeUs(ProfileScopeId scope, u32 durationUs) noexcept {
-    if (m_samples.empty()) return;
+    if (m_samples.empty()) {
+        return;
+    }
     const usize idx = static_cast<usize>(scope);
     if (idx < kProfileScopeCount) {
-        m_samples[m_writeIdx].scopeUs[idx] = static_cast<u16>(std::min<u32>(65535u, durationUs));
+        m_samples[m_currentIdx].scopeUs[idx] = static_cast<u16>(std::min<u32>(durationUs, 65535u));
     }
 }
 
-void DebugProfiler::RecordSubsystemTelemetry(u8 catchupTicks, u16 aliveEntities,
-                                             u16 submittedQuads, u16 culledQuads, u16 drawBatches,
-                                             u8 radixPasses,
-                                             const audio::AudioTelemetrySnapshot& audioSnap,
-                                             std::span<const f32, 8> channelScales,
-                                             u8 frozenChannelMask) noexcept {
-    if (m_samples.empty()) return;
-    FrameProfileSample& s = m_samples[m_writeIdx];
-    s.catchupTicks        = catchupTicks;
-    s.aliveEntities       = aliveEntities;
-    s.submittedQuads      = submittedQuads;
-    s.culledQuads         = culledQuads;
-    s.drawBatches         = drawBatches;
-    s.radixPassesExecuted = radixPasses;
-    s.activePhysVoices    = static_cast<u8>(std::popcount(audioSnap.activeVoiceMask));
-    s.activeVirtVoices    = static_cast<u8>(std::min<u32>(255u, audioSnap.activeVirtualVoices));
-    s.audioCpuPermille    = static_cast<u16>(std::clamp(audioSnap.callbackCpuLoadRatio * 1000.0f, 0.0f, 1000.0f));
-    s.audioPeakL_Q10      = static_cast<u16>(std::clamp(audioSnap.masterPeakL * 1024.0f, 0.0f, 65535.0f));
-    s.audioPeakR_Q10      = static_cast<u16>(std::clamp(audioSnap.masterPeakR * 1024.0f, 0.0f, 65535.0f));
-    s.audioUnderruns      = static_cast<u8>(std::min<u32>(255u, audioSnap.underrunCount));
-    s.frozenChannelMask   = frozenChannelMask;
+void DebugProfiler::RecordSubsystemTelemetry(const SubsystemTelemetryDesc& desc) noexcept {
+    if (m_samples.empty()) {
+        return;
+    }
+    FrameProfileSample& s = m_samples[m_currentIdx];
+    s.aliveEntities       = desc.aliveEntities;
+    s.submittedQuads      = desc.submittedQuads;
+    s.culledQuads         = desc.culledQuads;
+    s.drawBatches         = desc.drawBatches;
+    s.catchupTicks        = desc.catchupTicks;
+    s.radixPassesExecuted = desc.radixPasses;
+    s.frozenChannelMask   = desc.frozenChannelMask;
+    s.activePhysVoices    = desc.activePhysVoices;
+    s.activeVirtVoices    = desc.activeVirtVoices;
+    s.audioUnderruns      = desc.audioUnderruns;
+    s.audioCpuPermille    = static_cast<u16>(std::clamp(desc.audioCpuLoadRatio * 1000.0f, 0.0f, 65535.0f));
+    s.audioPeakL_Q10      = static_cast<u16>(std::clamp(desc.audioPeakL * 1024.0f, 0.0f, 65535.0f));
+    s.audioPeakR_Q10      = static_cast<u16>(std::clamp(desc.audioPeakR * 1024.0f, 0.0f, 65535.0f));
 
-    for (usize ch = 0; ch < 8; ++ch) {
-        s.channelScaleQ8[ch] = static_cast<u16>(std::clamp(channelScales[ch] * 256.0f, 0.0f, 65535.0f));
+    const usize count = std::min<usize>(desc.channelScales.size(), 8u);
+    for (usize i = 0; i < count; ++i) {
+        s.channelScaleQ8[i] = static_cast<u16>(std::clamp(desc.channelScales[i] * 256.0f, 0.0f, 65535.0f));
     }
 }
 
 void DebugProfiler::EndFrame() noexcept {
-    if (m_samples.empty()) return;
-    FrameProfileSample& s = m_samples[m_writeIdx];
-    if (s.scopeUs[0] == 0) {
-        u32 total = 0;
-        for (usize i = 1; i < kProfileScopeCount; ++i) {
-            total += s.scopeUs[i];
-        }
-        s.scopeUs[0] = static_cast<u16>(std::min<u32>(65535u, total));
+    if (m_samples.empty()) {
+        return;
     }
-
-    const u32 newBucket = std::min<u32>(kBucketCount - 1u, s.scopeUs[0] >> 8u);
-    ++m_buckets[newBucket];
-
-    m_latestIdx = m_writeIdx;
-    m_writeIdx  = (m_writeIdx + 1u) & (kHistoryFrames - 1u);
+    const u16 totalUs = m_samples[m_currentIdx].scopeUs[static_cast<usize>(ProfileScopeId::FrameTotal)];
+    const u32 bucket  = QuantizeFrameBucket(totalUs);
+    ++m_buckets[bucket];
+    m_activeBucketMask |= (1ull << bucket);
     if (m_validFrames < kHistoryFrames) {
         ++m_validFrames;
     }
 }
 
 u32 DebugProfiler::ComputePercentileUs(u32 targetRankOutOf256) const noexcept {
-    if (m_validFrames == 0) return 0;
-    const u32 scaledTarget = (targetRankOutOf256 * m_validFrames + 255u) >> 8u;
-    u32 accum = 0;
-    for (u32 b = 0; b < kBucketCount; ++b) {
-        accum += m_buckets[b];
-        if (accum >= scaledTarget) {
-            return (b << 8u) + 128u;
+    if (m_validFrames == 0 || m_activeBucketMask == 0ull) {
+        return 0;
+    }
+    const u32 rankTarget = std::max(1u, (std::min(targetRankOutOf256, 256u) * m_validFrames) >> 8u);
+    u32 cumulative       = 0;
+    u64 mask             = m_activeBucketMask;
+
+    while (mask != 0ull) {
+        const u32 bucket = static_cast<u32>(std::countr_zero(mask));
+        mask &= (mask - 1ull);
+        cumulative += m_buckets[bucket];
+        if (cumulative >= rankTarget) {
+            return (bucket << 8u) + 128u;
         }
     }
-    return (kBucketCount << 8u);
+    return 16384u;
 }
 
 void DebugProfiler::EmitProfilerAndTimeHud(OverlayFlags flags,
-                                           platform::Extent2i viewportSize,
+                                           platform::Extent2i,
                                            DebugBatcher& hudBatcher) const noexcept {
-    if (m_samples.empty() || m_validFrames == 0) return;
-    const FrameProfileSample& latest = m_samples[m_latestIdx];
-    std::array<char, 80> buf{};
-    char* end = buf.data() + buf.size();
+    if (m_samples.empty()) {
+        return;
+    }
+    const FrameProfileSample& cur = m_samples[m_currentIdx];
+    f32 panelY = 12.0f;
 
     if (HasOverlay(flags, OverlayFlags::ProfilerHud)) {
-        const f32 panelW = 296.0f;
-        const f32 panelH = 164.0f;
-        const f32 panelX = static_cast<f32>(viewportSize.w) - panelW - 12.0f;
-        const f32 panelY = 12.0f;
+        const f32 x = 12.0f;
+        const f32 y = panelY;
+        const f32 w = 276.0f;
+        const f32 h = 132.0f;
 
-        hudBatcher.PushSolidRect({panelX, panelY, panelW, panelH}, renderer::Color::FromRGBA8(0x0D1117DD));
-        hudBatcher.PushBoxOutline({panelX, panelY, panelW, panelH}, 1.0f, renderer::Color::FromRGBA8(0x33AAFFFF));
+        hudBatcher.PushSolidRect({x, y, w, h}, renderer::Color::FromRGBA8(0x10141EE0u));
+        hudBatcher.PushBoxOutline({x, y, w, h}, 1.0f, renderer::Color::FromRGBA8(0x4488CCFFu));
 
-        const f32 p50Ms = static_cast<f32>(ComputePercentileUs(128)) * 0.001f;
-        const f32 p95Ms = static_cast<f32>(ComputePercentileUs(243)) * 0.001f;
-        const f32 p99Ms = static_cast<f32>(ComputePercentileUs(253)) * 0.001f;
+        const f32 frameMs = static_cast<f32>(cur.scopeUs[0]) * 0.001f;
+        const f32 p50Ms   = static_cast<f32>(ComputePercentileUs(128)) * 0.001f;
+        const f32 p99Ms   = static_cast<f32>(ComputePercentileUs(253)) * 0.001f;
 
-        {
-            char* p = buf.data();
-            for (char c : std::string_view("MS P50:")) *p++ = c;
-            p = DebugBatcher::FormatF32Fixed2(p, end, p50Ms);
-            for (char c : std::string_view(" P95:")) *p++ = c;
-            p = DebugBatcher::FormatF32Fixed2(p, end, p95Ms);
-            for (char c : std::string_view(" P99:")) *p++ = c;
-            p = DebugBatcher::FormatF32Fixed2(p, end, p99Ms);
-            hudBatcher.PushText(panelX + 8.0f, panelY + 8.0f,
-                                std::string_view(buf.data(), static_cast<usize>(p - buf.data())),
-                                renderer::Color::FromRGBA8(0x00FF88FF));
-        }
+        DebugTextLine line{};
+        line.Str("FRAME ").F32(frameMs).Str("ms  P50:").F32(p50Ms).Str("  P99:").F32(p99Ms);
+        hudBatcher.PushText(x + 8.0f, y + 6.0f, line.View(), renderer::Color::FromRGBA8(0x88FFAAFFu));
 
-        // 256-frame stacked bar graph (1px per frame).
-        const f32 graphX = panelX + 20.0f;
-        const f32 graphY = panelY + 24.0f;
+        line.Clear();
+        line.Str("Sim:").F32(static_cast<f32>(cur.scopeUs[3]) * 0.001f)
+            .Str("ms Rdr:").F32(static_cast<f32>(cur.scopeUs[11]) * 0.001f)
+            .Str("ms Ticks:").I64(cur.catchupTicks);
+        hudBatcher.PushText(x + 8.0f, y + 18.0f, line.View(), renderer::Color::FromRGBA8(0xDDE8FFFFu));
+
+        line.Clear();
+        line.Str("Ent:").I64(cur.aliveEntities)
+            .Str(" Quads:").I64(cur.submittedQuads)
+            .Str(" Bch:").I64(cur.drawBatches)
+            .Str(" Rdx:").I64(cur.radixPassesExecuted);
+        hudBatcher.PushText(x + 8.0f, y + 30.0f, line.View(), renderer::Color::FromRGBA8(0xAACCFFFFu));
+
+        line.Clear();
+        line.Str("AudVoices:").I64(cur.activePhysVoices).Char('/').I64(cur.activeVirtVoices)
+            .Str(" Cpu:").F32(static_cast<f32>(cur.audioCpuPermille) * 0.1f).Char('%');
+        hudBatcher.PushText(x + 8.0f, y + 42.0f, line.View(), renderer::Color::FromRGBA8(0xFFCC88FFu));
+
+        const f32 graphX = x + 10.0f;
+        const f32 graphY = y + 58.0f;
         const f32 graphH = 64.0f;
-        hudBatcher.PushSolidRect({graphX, graphY, 256.0f, graphH}, renderer::Color::FromRGBA8(0x161B22FF));
+        hudBatcher.PushSolidRect({graphX, graphY, 256.0f, graphH}, renderer::Color::FromRGBA8(0x080A10FFu));
 
-        for (u32 i = 0; i < kHistoryFrames; ++i) {
-            const u32 idx = (m_writeIdx + i) & (kHistoryFrames - 1u);
-            const FrameProfileSample& s = m_samples[idx];
-            const f32 x = graphX + static_cast<f32>(i);
-
-            const f32 simH = std::min(graphH, static_cast<f32>(s.scopeUs[static_cast<usize>(ProfileScopeId::SimTickTotal)]) * (graphH / 16667.0f));
-            const f32 renH = std::min(graphH - simH, static_cast<f32>(s.scopeUs[static_cast<usize>(ProfileScopeId::RenderSubmit)]) * (graphH / 16667.0f));
-
-            if (simH > 0.5f) {
-                hudBatcher.PushSolidRect({x, graphY + graphH - simH, 1.0f, simH}, renderer::Color::FromRGBA8(0x2288FFFF));
-            }
-            if (renH > 0.5f) {
-                hudBatcher.PushSolidRect({x, graphY + graphH - simH - renH, 1.0f, renH}, renderer::Color::FromRGBA8(0x00FF66FF));
-            }
+        const u32 count = std::min<u32>(m_validFrames, 256u);
+        for (u32 i = 0; i < count; ++i) {
+            const u32 idx   = (m_currentIdx + kHistoryFrames - i) & static_cast<u32>(kHistoryFrames - 1);
+            const f32 ms    = static_cast<f32>(m_samples[idx].scopeUs[0]) * 0.001f;
+            const f32 barH  = std::clamp(ms * 3.5f, 1.0f, graphH);
+            const renderer::Color col = (ms > 16.67f)
+                ? renderer::Color::FromRGBA8(0xFF4444FFu)
+                : (ms > 8.33f ? renderer::Color::FromRGBA8(0xFFCC33FFu)
+                              : renderer::Color::FromRGBA8(0x33DD77FFu));
+            hudBatcher.PushSolidRect({graphX + 255.0f - static_cast<f32>(i), graphY + graphH - barH, 1.0f, barH}, col);
         }
 
-        // 8.33ms (120Hz) and 16.67ms (60Hz) reference lines.
-        hudBatcher.PushLine(graphX, graphY + graphH * 0.5f, graphX + 256.0f, graphY + graphH * 0.5f,
-                            1.0f, renderer::Color::FromRGBA8(0xFFFF0066));
-
-        auto emitStat = [&](f32 yOff, std::string_view label, i64 v0, i64 v1, i64 v2) {
-            char* p = buf.data();
-            for (char c : label) *p++ = c;
-            p = DebugBatcher::FormatI64(p, end, v0);
-            if (p < end) *p++ = '/';
-            p = DebugBatcher::FormatI64(p, end, v1);
-            if (p < end) *p++ = '/';
-            p = DebugBatcher::FormatI64(p, end, v2);
-            hudBatcher.PushText(panelX + 8.0f, panelY + yOff,
-                                std::string_view(buf.data(), static_cast<usize>(p - buf.data())),
-                                renderer::Color::FromRGBA8(0xE0E6F0FF));
-        };
-
-        emitStat(96.0f,  "ENT/TICK/RADIX: ", latest.aliveEntities, latest.catchupTicks, latest.radixPassesExecuted);
-        emitStat(112.0f, "QUAD/CULL/BTCH: ", latest.submittedQuads, latest.culledQuads, latest.drawBatches);
-        emitStat(128.0f, "AUD V/VIRT/CPU: ", latest.activePhysVoices, latest.activeVirtVoices, latest.audioCpuPermille);
-        emitStat(144.0f, "PEAK L/R / UDR: ", latest.audioPeakL_Q10, latest.audioPeakR_Q10, latest.audioUnderruns);
+        panelY += h + 8.0f;
     }
 
     if (HasOverlay(flags, OverlayFlags::TimeChannelHud)) {
-        const f32 panelX = 12.0f;
-        const f32 panelY = 12.0f;
-        const f32 panelW = 240.0f;
-        const f32 panelH = 92.0f;
+        const f32 x = 12.0f;
+        const f32 y = panelY;
+        const f32 w = 220.0f;
+        const f32 h = 104.0f;
 
-        hudBatcher.PushSolidRect({panelX, panelY, panelW, panelH}, renderer::Color::FromRGBA8(0x0D1117DD));
-        hudBatcher.PushBoxOutline({panelX, panelY, panelW, panelH}, 1.0f, renderer::Color::FromRGBA8(0x00E5FFFF));
-        hudBatcher.PushText(panelX + 8.0f, panelY + 6.0f, "TIME CHANNELS [0..7]",
-                            renderer::Color::FromRGBA8(0x00E5FFFF));
+        hudBatcher.PushSolidRect({x, y, w, h}, renderer::Color::FromRGBA8(0x10141EE0u));
+        hudBatcher.PushBoxOutline({x, y, w, h}, 1.0f, renderer::Color::FromRGBA8(0x4488CCFFu));
+        hudBatcher.PushText(x + 8.0f, y + 6.0f, "TIME CHANNELS (120Hz)", renderer::Color::FromRGBA8(0xFFFF88FFu));
 
         for (u8 ch = 0; ch < 8; ++ch) {
-            const f32 rowY = panelY + 20.0f + static_cast<f32>(ch) * 8.5f;
-            const bool frozen = (latest.frozenChannelMask & (1u << ch)) != 0;
-            const f32 scale = static_cast<f32>(latest.channelScaleQ8[ch]) * (1.0f / 256.0f);
-            const f32 barW  = std::clamp(scale * 80.0f, 0.0f, 160.0f);
+            const f32 rowY    = y + 18.0f + static_cast<f32>(ch) * 10.0f;
+            const bool frozen = (cur.frozenChannelMask & (1u << ch)) != 0;
+            const f32 scale   = static_cast<f32>(cur.channelScaleQ8[ch]) * (1.0f / 256.0f);
 
-            hudBatcher.PushSolidRect({panelX + 12.0f, rowY, barW, 6.0f},
-                                     frozen ? renderer::Color::FromRGBA8(0x00FFFFFF)
-                                            : renderer::Color::FromRGBA8(0x00CC66FF));
+            hudBatcher.PushText(x + 8.0f, rowY, kChannelNames[ch], renderer::Color::FromRGBA8(0xCCD8E8FFu));
+            const f32 barW = std::clamp(scale * 60.0f, 0.0f, 120.0f);
+            const renderer::Color barCol = frozen
+                ? renderer::Color::FromRGBA8(0xFF4466FFu)
+                : renderer::Color::FromRGBA8(0x44CCFFFFu);
+            hudBatcher.PushSolidRect({x + 68.0f, rowY + 1.0f, barW, 6.0f}, barCol);
+            if (frozen) {
+                hudBatcher.PushText(x + 156.0f, rowY, "FROZEN", renderer::Color::FromRGBA8(0xFF6688FFu));
+            }
         }
     }
 }
@@ -212,22 +234,24 @@ ConsoleArgs::ConsoleArgs(std::string_view rawLine) noexcept {
     usize i = 0;
     const usize n = rawLine.size();
     while (i < n && m_count < kMaxTokens) {
-        while (i < n && (rawLine[i] == ' ' || rawLine[i] == '\t')) {
+        while (i < n && static_cast<u8>(rawLine[i]) <= 0x20u) {
             ++i;
         }
-        if (i >= n) break;
-
+        if (i >= n) {
+            break;
+        }
         if (rawLine[i] == '"') {
-            ++i;
-            const usize start = i;
+            const usize start = ++i;
             while (i < n && rawLine[i] != '"') {
                 ++i;
             }
             m_tokens[m_count++] = rawLine.substr(start, i - start);
-            if (i < n) ++i;
+            if (i < n) {
+                ++i;
+            }
         } else {
             const usize start = i;
-            while (i < n && rawLine[i] != ' ' && rawLine[i] != '\t') {
+            while (i < n && static_cast<u8>(rawLine[i]) > 0x20u) {
                 ++i;
             }
             m_tokens[m_count++] = rawLine.substr(start, i - start);
@@ -239,89 +263,74 @@ Result<i64, DebugErrc> ConsoleArgs::GetInt(usize idx) const noexcept {
     if (idx >= m_count || m_tokens[idx].empty()) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const std::string_view s = m_tokens[idx];
-    usize pos = 0;
-    bool neg = false;
-    if (s[0] == '-') {
-        neg = true;
-        pos = 1;
-    } else if (s[0] == '+') {
-        pos = 1;
-    }
-    if (pos >= s.size()) return Err(DebugErrc::InvalidArguments);
-
+    const std::string_view tok = m_tokens[idx];
     i64 val = 0;
-    for (; pos < s.size(); ++pos) {
-        const char c = s[pos];
-        if (c < '0' || c > '9') return Err(DebugErrc::InvalidArguments);
-        val = val * 10 + (c - '0');
+    const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), val);
+    if (ec != std::errc{} || ptr != tok.data() + tok.size()) {
+        return Err(DebugErrc::InvalidArguments);
     }
-    return neg ? -val : val;
+    return val;
 }
 
 Result<f32, DebugErrc> ConsoleArgs::GetFloat(usize idx) const noexcept {
     if (idx >= m_count || m_tokens[idx].empty()) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const std::string_view s = m_tokens[idx];
-    usize pos = 0;
-    f32 sign = 1.0f;
-    if (s[0] == '-') {
-        sign = -1.0f;
-        pos = 1;
-    } else if (s[0] == '+') {
-        pos = 1;
+    const std::string_view tok = m_tokens[idx];
+    f32 val = 0.0f;
+    const auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), val);
+    if (ec != std::errc{} || ptr != tok.data() + tok.size() || !std::isfinite(val)) {
+        return Err(DebugErrc::InvalidArguments);
     }
-    if (pos >= s.size()) return Err(DebugErrc::InvalidArguments);
-
-    f32 result = 0.0f;
-    bool seenDot = false;
-    f32 fracScale = 0.1f;
-
-    for (; pos < s.size(); ++pos) {
-        const char c = s[pos];
-        if (c == '.') {
-            if (seenDot) return Err(DebugErrc::InvalidArguments);
-            seenDot = true;
-            continue;
-        }
-        if (c < '0' || c > '9') return Err(DebugErrc::InvalidArguments);
-        const f32 digit = static_cast<f32>(c - '0');
-        if (!seenDot) {
-            result = result * 10.0f + digit;
-        } else {
-            result += digit * fracScale;
-            fracScale *= 0.1f;
-        }
-    }
-    return result * sign;
+    return val;
 }
 
 Result<bool, DebugErrc> ConsoleArgs::GetBool(usize idx) const noexcept {
     if (idx >= m_count || m_tokens[idx].empty()) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const std::string_view s = m_tokens[idx];
-    if (s == "1" || s == "true" || s == "on") return true;
-    if (s == "0" || s == "false" || s == "off") return false;
+    const std::string_view t = m_tokens[idx];
+    if (t == "1" || t == "true" || t == "on" || t == "yes") {
+        return true;
+    }
+    if (t == "0" || t == "false" || t == "off" || t == "no") {
+        return false;
+    }
     return Err(DebugErrc::InvalidArguments);
 }
 
 void DebugConsole::BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
                              std::span<LogEntryMeta, kMaxLogEntries> logMeta,
                              std::span<char, kLogTextBytes> logText,
-                             std::span<std::array<char, 128>, kMaxHistory> historyBuf) noexcept {
+                             std::span<std::array<char, kMaxLineChars>, kMaxHistory> historyBuf) noexcept {
     m_symbols = symbolTable;
     m_logMeta = logMeta;
     m_logText = logText;
     m_history = historyBuf;
 
-    for (auto& sym : m_symbols) sym = ConsoleSymbol{};
+    for (ConsoleSymbol& sym : m_symbols) {
+        sym = ConsoleSymbol{};
+    }
+    for (auto& h : m_history) {
+        h.fill('\0');
+    }
+    m_pendingCount     = 0;
+    m_inputLen         = 0;
+    m_cursorPos        = 0;
+    m_historyWriteIdx  = 0;
+    m_historyCount     = 0;
+    m_historyBrowseIdx = -1;
+    m_isOpen           = false;
     ClearLog();
 }
 
 void DebugConsole::ClearLog() noexcept {
-    for (auto& m : m_logMeta) m = LogEntryMeta{};
+    for (LogEntryMeta& meta : m_logMeta) {
+        meta = LogEntryMeta{};
+    }
+    if (!m_logText.empty()) {
+        std::memset(m_logText.data(), 0, m_logText.size());
+    }
     m_textWriteCursor = 0;
     m_logWriteIdx     = 0;
     m_logCount        = 0;
@@ -329,228 +338,262 @@ void DebugConsole::ClearLog() noexcept {
 }
 
 Result<ConsoleSymbol*, DebugErrc> DebugConsole::InsertSymbolSlot(std::string_view staticName) noexcept {
-    if (m_symbols.empty() || staticName.empty() || staticName.size() > 255u) {
+    if (staticName.empty() || staticName.size() > 255 || m_symbols.empty()) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const u32 h = HashSymbolName(staticName);
-    // Fibonacci hashing multiplier for 256-slot table (shift 32 - 8 = 24).
-    u32 slot = (h * 2654435769u) >> 24u;
-
-    for (usize probe = 0; probe < kMaxSymbols; ++probe) {
-        ConsoleSymbol& entry = m_symbols[slot];
-        if (entry.kind == SymbolKind::Empty) {
-            entry.nameHash = h;
-            entry.namePtr  = staticName.data();
-            entry.nameLen  = static_cast<u8>(staticName.size());
-            return &entry;
+    const u32 hash  = HashSymbolName(staticName);
+    u32 slot        = (hash * 2654435769u) >> 24u;
+    for (usize i = 0; i < kMaxSymbols; ++i) {
+        ConsoleSymbol& sym = m_symbols[slot];
+        if (sym.kind == SymbolKind::Empty) {
+            sym.nameHash = hash;
+            sym.nameLen  = static_cast<u8>(staticName.size());
+            sym.namePtr  = staticName.data();
+            return &sym;
         }
-        if (entry.nameHash == h &&
-            std::string_view(entry.namePtr, entry.nameLen) == staticName) {
+        if (sym.nameHash == hash && sym.nameLen == staticName.size() &&
+            std::string_view(sym.namePtr, sym.nameLen) == staticName) {
             return Err(DebugErrc::DuplicateSymbol);
         }
-        slot = (slot + 1u) & (kMaxSymbols - 1u);
+        slot = (slot + 1u) & static_cast<u32>(kMaxSymbols - 1);
     }
     return Err(DebugErrc::SymbolTableFull);
 }
 
 ConsoleSymbol* DebugConsole::FindSymbol(std::string_view name) noexcept {
-    if (m_symbols.empty() || name.empty()) return nullptr;
-    const u32 h = HashSymbolName(name);
-    u32 slot = (h * 2654435769u) >> 24u;
-
-    for (usize probe = 0; probe < kMaxSymbols; ++probe) {
-        ConsoleSymbol& entry = m_symbols[slot];
-        if (entry.kind == SymbolKind::Empty) {
+    if (name.empty() || m_symbols.empty()) {
+        return nullptr;
+    }
+    const u32 hash = HashSymbolName(name);
+    u32 slot       = (hash * 2654435769u) >> 24u;
+    for (usize i = 0; i < kMaxSymbols; ++i) {
+        ConsoleSymbol& sym = m_symbols[slot];
+        if (sym.kind == SymbolKind::Empty) {
             return nullptr;
         }
-        if (entry.nameHash == h &&
-            std::string_view(entry.namePtr, entry.nameLen) == name) {
-            return &entry;
+        if (sym.nameHash == hash && sym.nameLen == name.size() &&
+            std::string_view(sym.namePtr, sym.nameLen) == name) {
+            return &sym;
         }
-        slot = (slot + 1u) & (kMaxSymbols - 1u);
+        slot = (slot + 1u) & static_cast<u32>(kMaxSymbols - 1);
     }
     return nullptr;
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCommand(
-    std::string_view staticName,
-    ConsoleCmdCallback fn,
-    void* userCtx) noexcept {
-    if (fn == nullptr) return Err(DebugErrc::InvalidArguments);
+    std::string_view staticName, ConsoleCmdCallback fn, void* userCtx) noexcept {
+    if (fn == nullptr) {
+        return Err(DebugErrc::InvalidArguments);
+    }
     auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) return Err(slotRes.error());
+    if (!slotRes) {
+        return Err(slotRes.error());
+    }
     ConsoleSymbol* sym = *slotRes;
     sym->kind      = SymbolKind::Command;
     sym->targetPtr = userCtx;
     sym->cmdFn     = fn;
-    return {};
+    return Ok;
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarF32(
-    std::string_view staticName,
-    f32* target, f32 minVal, f32 maxVal) noexcept {
-    if (target == nullptr) return Err(DebugErrc::InvalidArguments);
+    std::string_view staticName, f32* target, f32 minVal, f32 maxVal) noexcept {
+    if (target == nullptr || minVal > maxVal) {
+        return Err(DebugErrc::InvalidArguments);
+    }
     auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) return Err(slotRes.error());
+    if (!slotRes) {
+        return Err(slotRes.error());
+    }
     ConsoleSymbol* sym = *slotRes;
     sym->kind      = SymbolKind::CVarF32;
     sym->targetPtr = target;
     sym->f32Bounds = {minVal, maxVal};
-    return {};
+    return Ok;
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarI32(
-    std::string_view staticName,
-    i32* target, i32 minVal, i32 maxVal) noexcept {
-    if (target == nullptr) return Err(DebugErrc::InvalidArguments);
+    std::string_view staticName, i32* target, i32 minVal, i32 maxVal) noexcept {
+    if (target == nullptr || minVal > maxVal) {
+        return Err(DebugErrc::InvalidArguments);
+    }
     auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) return Err(slotRes.error());
+    if (!slotRes) {
+        return Err(slotRes.error());
+    }
     ConsoleSymbol* sym = *slotRes;
     sym->kind      = SymbolKind::CVarI32;
     sym->targetPtr = target;
     sym->i32Bounds = {minVal, maxVal};
-    return {};
+    return Ok;
+}
+
+Result<void, DebugErrc> DebugConsole::RegisterCVarU32(
+    std::string_view staticName, u32* target, u32 minVal, u32 maxVal) noexcept {
+    if (target == nullptr || minVal > maxVal) {
+        return Err(DebugErrc::InvalidArguments);
+    }
+    auto slotRes = InsertSymbolSlot(staticName);
+    if (!slotRes) {
+        return Err(slotRes.error());
+    }
+    ConsoleSymbol* sym = *slotRes;
+    sym->kind      = SymbolKind::CVarU32;
+    sym->targetPtr = target;
+    sym->u32Bounds = {minVal, maxVal};
+    return Ok;
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarBool(
-    std::string_view staticName,
-    bool* target) noexcept {
-    if (target == nullptr) return Err(DebugErrc::InvalidArguments);
+    std::string_view staticName, bool* target) noexcept {
+    if (target == nullptr) {
+        return Err(DebugErrc::InvalidArguments);
+    }
     auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) return Err(slotRes.error());
+    if (!slotRes) {
+        return Err(slotRes.error());
+    }
     ConsoleSymbol* sym = *slotRes;
     sym->kind      = SymbolKind::CVarBool;
     sym->targetPtr = target;
-    return {};
+    return Ok;
 }
 
 void DebugConsole::Print(LogSeverity severity, std::string_view msg, u64 tickIndex) noexcept {
-    if (m_logMeta.empty() || m_logText.empty() || msg.empty()) return;
-
-    const u8 len = static_cast<u8>(std::min<usize>(msg.size(), 240u));
+    if (m_logMeta.empty() || m_logText.empty() || msg.empty()) {
+        return;
+    }
+    const u8 len = static_cast<u8>(std::min<usize>(msg.size(), 255u));
     if (static_cast<usize>(m_textWriteCursor) + len > kLogTextBytes) {
         m_textWriteCursor = 0;
     }
+    std::memcpy(m_logText.data() + m_textWriteCursor, msg.data(), len);
 
-    for (u8 i = 0; i < len; ++i) {
-        m_logText[m_textWriteCursor + i] = msg[i];
-    }
-
-    LogEntryMeta& meta = m_logMeta[m_logWriteIdx];
-    meta.textOffset = m_textWriteCursor;
-    meta.textLength = len;
-    meta.severity   = severity;
-    meta.tickLow16  = static_cast<u16>(tickIndex);
-
-    m_textWriteCursor = static_cast<u16>(m_textWriteCursor + len);
-    m_logWriteIdx     = (m_logWriteIdx + 1u) & (kMaxLogEntries - 1u);
+    const u32 slot       = m_logWriteIdx & static_cast<u32>(kMaxLogEntries - 1);
+    m_logMeta[slot]      = {m_textWriteCursor, static_cast<u16>(tickIndex), len, severity, 0};
+    m_textWriteCursor    = static_cast<u16>(m_textWriteCursor + len);
+    ++m_logWriteIdx;
     if (m_logCount < kMaxLogEntries) {
         ++m_logCount;
     }
 }
 
 void DebugConsole::EnqueueCommandLine(std::string_view line) noexcept {
-    if (line.empty() || m_pendingCount >= kMaxPendingCmds) return;
-    const u8 len = static_cast<u8>(std::min<usize>(line.size(), 120u));
-    for (u8 i = 0; i < len; ++i) {
-        m_pendingCmds[m_pendingCount][i] = line[i];
+    if (line.empty() || m_pendingCount >= kMaxPendingCmds) {
+        return;
     }
+    const u8 len = static_cast<u8>(std::min<usize>(line.size(), kMaxLineChars));
+    std::memcpy(m_pendingCmds[m_pendingCount].data(), line.data(), len);
     m_pendingLens[m_pendingCount] = len;
     ++m_pendingCount;
 }
 
 void DebugConsole::FlushPendingCommands(u64 currentTickIndex) noexcept {
     for (u8 i = 0; i < m_pendingCount; ++i) {
-        const std::string_view cmdLine(m_pendingCmds[i].data(), m_pendingLens[i]);
-        ExecuteImmediate(cmdLine, currentTickIndex);
+        ExecuteImmediate({m_pendingCmds[i].data(), m_pendingLens[i]}, currentTickIndex);
     }
     m_pendingCount = 0;
 }
 
 void DebugConsole::ExecuteImmediate(std::string_view line, u64 currentTickIndex) noexcept {
     const ConsoleArgs args(line);
-    if (args.Count() == 0) return;
-
+    if (args.Count() == 0) {
+        return;
+    }
     Print(LogSeverity::Echo, line, currentTickIndex);
 
     ConsoleSymbol* sym = FindSymbol(args[0]);
     if (sym == nullptr) {
-        Print(LogSeverity::Error, "Unknown command or CVar. Type 'help' for list.", currentTickIndex);
+        DebugTextLine err{};
+        err.Str("Unknown symbol: ").Str(args[0]);
+        Print(LogSeverity::Error, err.View(), currentTickIndex);
         return;
     }
 
-    std::array<char, 96> reply{};
-    char* end = reply.data() + reply.size();
+    if (sym->kind == SymbolKind::Command) {
+        sym->cmdFn(sym->targetPtr, args, *this);
+        return;
+    }
+
+    DebugTextLine out{};
+    out.Str({sym->namePtr, sym->nameLen}).Str(" = ");
+
+    if (args.Count() == 1) {
+        switch (sym->kind) {
+            case SymbolKind::CVarF32:  out.F32(*static_cast<const f32*>(sym->targetPtr)); break;
+            case SymbolKind::CVarI32:  out.I64(*static_cast<const i32*>(sym->targetPtr)); break;
+            case SymbolKind::CVarU32:  out.I64(*static_cast<const u32*>(sym->targetPtr)); break;
+            case SymbolKind::CVarBool: out.Str(*static_cast<const bool*>(sym->targetPtr) ? "true" : "false"); break;
+            default: break;
+        }
+        Print(LogSeverity::Info, out.View(), currentTickIndex);
+        return;
+    }
 
     switch (sym->kind) {
-        case SymbolKind::Command:
-            if (sym->cmdFn != nullptr) {
-                sym->cmdFn(sym->targetPtr, args, *this);
-            }
-            break;
         case SymbolKind::CVarF32: {
-            f32* ptr = static_cast<f32*>(sym->targetPtr);
-            if (args.Count() >= 2) {
-                if (auto val = args.GetFloat(1)) {
-                    *ptr = std::clamp(*val, sym->f32Bounds.minVal, sym->f32Bounds.maxVal);
-                } else {
-                    Print(LogSeverity::Error, "Invalid float value.", currentTickIndex);
-                    return;
-                }
-            }
-            char* p = reply.data();
-            for (char c : std::string_view(sym->namePtr, sym->nameLen)) *p++ = c;
-            for (char c : std::string_view(" = ")) *p++ = c;
-            p = DebugBatcher::FormatF32Fixed2(p, end, *ptr);
-            Print(LogSeverity::Success, std::string_view(reply.data(), static_cast<usize>(p - reply.data())), currentTickIndex);
+            const auto res = args.GetFloat(1);
+            if (!res) { Print(LogSeverity::Error, "Invalid float argument", currentTickIndex); return; }
+            const f32 v = std::clamp(*res, sym->f32Bounds.minVal, sym->f32Bounds.maxVal);
+            *static_cast<f32*>(sym->targetPtr) = v;
+            out.F32(v);
             break;
         }
         case SymbolKind::CVarI32: {
-            i32* ptr = static_cast<i32*>(sym->targetPtr);
-            if (args.Count() >= 2) {
-                if (auto val = args.GetInt(1)) {
-                    const i64 clamped = std::clamp<i64>(*val, sym->i32Bounds.minVal, sym->i32Bounds.maxVal);
-                    *ptr = static_cast<i32>(clamped);
-                } else {
-                    Print(LogSeverity::Error, "Invalid integer value.", currentTickIndex);
-                    return;
-                }
-            }
-            char* p = reply.data();
-            for (char c : std::string_view(sym->namePtr, sym->nameLen)) *p++ = c;
-            for (char c : std::string_view(" = ")) *p++ = c;
-            p = DebugBatcher::FormatI64(p, end, *ptr);
-            Print(LogSeverity::Success, std::string_view(reply.data(), static_cast<usize>(p - reply.data())), currentTickIndex);
+            const auto res = args.GetInt(1);
+            if (!res) { Print(LogSeverity::Error, "Invalid integer argument", currentTickIndex); return; }
+            const i32 v = static_cast<i32>(std::clamp<i64>(*res, sym->i32Bounds.minVal, sym->i32Bounds.maxVal));
+            *static_cast<i32*>(sym->targetPtr) = v;
+            out.I64(v);
+            break;
+        }
+        case SymbolKind::CVarU32: {
+            const auto res = args.GetInt(1);
+            if (!res || *res < 0) { Print(LogSeverity::Error, "Invalid unsigned argument", currentTickIndex); return; }
+            const u32 v = static_cast<u32>(std::clamp<i64>(*res, sym->u32Bounds.minVal, sym->u32Bounds.maxVal));
+            *static_cast<u32*>(sym->targetPtr) = v;
+            out.I64(v);
             break;
         }
         case SymbolKind::CVarBool: {
-            bool* ptr = static_cast<bool*>(sym->targetPtr);
-            if (args.Count() >= 2) {
-                if (auto val = args.GetBool(1)) {
-                    *ptr = *val;
-                } else {
-                    Print(LogSeverity::Error, "Invalid bool value (use 0/1/true/false).", currentTickIndex);
-                    return;
-                }
-            }
-            char* p = reply.data();
-            for (char c : std::string_view(sym->namePtr, sym->nameLen)) *p++ = c;
-            for (char c : (*ptr ? std::string_view(" = true") : std::string_view(" = false"))) *p++ = c;
-            Print(LogSeverity::Success, std::string_view(reply.data(), static_cast<usize>(p - reply.data())), currentTickIndex);
+            const auto res = args.GetBool(1);
+            if (!res) { Print(LogSeverity::Error, "Invalid bool argument", currentTickIndex); return; }
+            *static_cast<bool*>(sym->targetPtr) = *res;
+            out.Str(*res ? "true" : "false");
             break;
         }
-        default:
-            break;
+        default: break;
     }
+    Print(LogSeverity::Success, out.View(), currentTickIndex);
+}
+
+void DebugConsole::PushHistoryLine(std::string_view line) noexcept {
+    if (m_history.empty() || line.empty()) {
+        return;
+    }
+    const usize len = std::min<usize>(line.size(), kMaxLineChars - 1);
+    auto& slot      = m_history[m_historyWriteIdx];
+    slot.fill('\0');
+    std::memcpy(slot.data(), line.data(), len);
+    m_historyWriteIdx = static_cast<u8>((m_historyWriteIdx + 1u) & (kMaxHistory - 1u));
+    if (m_historyCount < kMaxHistory) {
+        ++m_historyCount;
+    }
+    m_historyBrowseIdx = -1;
 }
 
 void DebugConsole::OnTextInput(std::string_view utf8) noexcept {
-    if (!m_isOpen) return;
+    if (!m_isOpen) {
+        return;
+    }
     for (const char c : utf8) {
-        if (c == '`' || c == '~') continue;
-        if (c >= 0x20 && c < 0x7F && m_inputLen < m_inputBuf.size() - 1u) {
+        const u8 code = static_cast<u8>(c);
+        if (code < 0x20u || code > 0x7Eu || c == '`' || c == '~') {
+            continue;
+        }
+        if (static_cast<usize>(m_inputLen) + 1u < kMaxLineChars) {
             for (u8 i = m_inputLen; i > m_cursorPos; --i) {
-                m_inputBuf[i] = m_inputBuf[i - 1u];
+                m_inputBuf[i] = m_inputBuf[i - 1];
             }
             m_inputBuf[m_cursorPos++] = c;
             ++m_inputLen;
@@ -558,128 +601,177 @@ void DebugConsole::OnTextInput(std::string_view utf8) noexcept {
     }
 }
 
-void DebugConsole::AutoCompleteInput() noexcept {
-    const std::string_view prefix(m_inputBuf.data(), m_inputLen);
-    if (prefix.empty()) return;
-
-    for (const ConsoleSymbol& sym : m_symbols) {
-        if (sym.kind == SymbolKind::Empty) continue;
-        const std::string_view name(sym.namePtr, sym.nameLen);
-        if (name.starts_with(prefix)) {
-            const u8 copyLen = static_cast<u8>(std::min<usize>(name.size(), m_inputBuf.size() - 2u));
-            for (u8 i = 0; i < copyLen; ++i) {
-                m_inputBuf[i] = name[i];
-            }
-            m_inputBuf[copyLen] = ' ';
-            m_inputLen  = copyLen + 1u;
-            m_cursorPos = m_inputLen;
-            return;
-        }
+void DebugConsole::OnKeyPress(u16 scancode, bool, bool) noexcept {
+    if (!m_isOpen) {
+        return;
     }
-}
-
-void DebugConsole::OnKeyPress(u16 scancode, bool /*shift*/, bool /*ctrl*/) noexcept {
-    if (!m_isOpen) return;
-
-    // Standard SDL/USB HID scancodes: Return=40, Escape=41, Backspace=42, Tab=43, Right=79, Left=80, Down=81, Up=82.
     switch (scancode) {
-        case 40: { // Return / Enter
+        case kKeyReturn: {
             if (m_inputLen > 0) {
-                const std::string_view line(m_inputBuf.data(), m_inputLen);
-                if (!m_history.empty()) {
-                    auto& hSlot = m_history[m_historyWriteIdx];
-                    hSlot.fill(0);
-                    for (u8 i = 0; i < m_inputLen; ++i) hSlot[i] = m_inputBuf[i];
-                    m_historyWriteIdx = (m_historyWriteIdx + 1u) & (kMaxHistory - 1u);
-                    if (m_historyCount < kMaxHistory) ++m_historyCount;
-                }
-                EnqueueCommandLine(line);
-                m_inputLen         = 0;
-                m_cursorPos        = 0;
-                m_historyBrowseIdx = -1;
+                const std::string_view cmd(m_inputBuf.data(), m_inputLen);
+                PushHistoryLine(cmd);
+                EnqueueCommandLine(cmd);
+                m_inputLen     = 0;
+                m_cursorPos    = 0;
+                m_scrollOffset = 0;
             }
             break;
         }
-        case 42: { // Backspace
+        case kKeyEscape:
+            m_isOpen = false;
+            break;
+        case kKeyBackspace:
             if (m_cursorPos > 0) {
-                for (u8 i = m_cursorPos - 1u; i + 1u < m_inputLen; ++i) {
-                    m_inputBuf[i] = m_inputBuf[i + 1u];
+                for (u8 i = m_cursorPos - 1; i + 1 < m_inputLen; ++i) {
+                    m_inputBuf[i] = m_inputBuf[i + 1];
                 }
                 --m_cursorPos;
                 --m_inputLen;
             }
             break;
-        }
-        case 43: // Tab
-            AutoCompleteInput();
-            break;
-        case 80: // Left Arrow
-            if (m_cursorPos > 0) --m_cursorPos;
-            break;
-        case 79: // Right Arrow
-            if (m_cursorPos < m_inputLen) ++m_cursorPos;
-            break;
-        case 82: { // Up Arrow (History recall)
-            if (m_historyCount > 0 && !m_history.empty()) {
-                m_historyBrowseIdx = static_cast<i8>(std::min<i32>(m_historyCount - 1, m_historyBrowseIdx + 1));
-                const u32 idx = (m_historyWriteIdx + kMaxHistory - 1u - static_cast<u32>(m_historyBrowseIdx)) & (kMaxHistory - 1u);
-                const auto& hSlot = m_history[idx];
-                u8 len = 0;
-                while (len < 120u && hSlot[len] != 0) {
-                    m_inputBuf[len] = hSlot[len];
-                    ++len;
+        case kKeyDelete:
+            if (m_cursorPos < m_inputLen) {
+                for (u8 i = m_cursorPos; i + 1 < m_inputLen; ++i) {
+                    m_inputBuf[i] = m_inputBuf[i + 1];
                 }
-                m_inputLen  = len;
-                m_cursorPos = len;
+                --m_inputLen;
             }
             break;
-        }
+        case kKeyLeft:
+            if (m_cursorPos > 0) --m_cursorPos;
+            break;
+        case kKeyRight:
+            if (m_cursorPos < m_inputLen) ++m_cursorPos;
+            break;
+        case kKeyHome:
+            m_cursorPos = 0;
+            break;
+        case kKeyEnd:
+            m_cursorPos = m_inputLen;
+            break;
+        case kKeyTab:
+            AutoCompleteInput();
+            break;
+        case kKeyUp:
+            if (m_historyCount > 0 && !m_history.empty()) {
+                if (m_historyBrowseIdx + 1 < static_cast<i8>(m_historyCount)) {
+                    ++m_historyBrowseIdx;
+                }
+                const u8 idx = static_cast<u8>((m_historyWriteIdx + kMaxHistory - 1u - m_historyBrowseIdx) & (kMaxHistory - 1u));
+                const std::string_view h(m_history[idx].data());
+                m_inputLen  = static_cast<u8>(std::min<usize>(h.size(), kMaxLineChars - 1));
+                std::memcpy(m_inputBuf.data(), h.data(), m_inputLen);
+                m_cursorPos = m_inputLen;
+            }
+            break;
+        case kKeyDown:
+            if (m_historyBrowseIdx > 0 && !m_history.empty()) {
+                --m_historyBrowseIdx;
+                const u8 idx = static_cast<u8>((m_historyWriteIdx + kMaxHistory - 1u - m_historyBrowseIdx) & (kMaxHistory - 1u));
+                const std::string_view h(m_history[idx].data());
+                m_inputLen  = static_cast<u8>(std::min<usize>(h.size(), kMaxLineChars - 1));
+                std::memcpy(m_inputBuf.data(), h.data(), m_inputLen);
+                m_cursorPos = m_inputLen;
+            } else {
+                m_historyBrowseIdx = -1;
+                m_inputLen         = 0;
+                m_cursorPos        = 0;
+            }
+            break;
+        case kKeyPageUp:
+            if (m_logCount > 1) {
+                m_scrollOffset = std::min<u32>(m_scrollOffset + 5u, m_logCount - 1u);
+            }
+            break;
+        case kKeyPageDown:
+            m_scrollOffset = (m_scrollOffset > 5u) ? (m_scrollOffset - 5u) : 0u;
+            break;
         default:
             break;
     }
 }
 
-void DebugConsole::EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatcher& hudBatcher) const noexcept {
-    if (!m_isOpen) return;
-
-    const f32 consoleW = static_cast<f32>(viewportSize.w);
-    const f32 consoleH = static_cast<f32>(viewportSize.h) * 0.45f;
-
-    hudBatcher.PushSolidRect({0.0f, 0.0f, consoleW, consoleH}, renderer::Color::FromRGBA8(0x0A0E14EE));
-    hudBatcher.PushLine(0.0f, consoleH, consoleW, consoleH, 2.0f, renderer::Color::FromRGBA8(0x00E5FFFF));
-
-    const u32 maxVisibleLines = static_cast<u32>((consoleH - 32.0f) / 11.0f);
-    const u32 visibleCount = std::min(m_logCount, maxVisibleLines);
-
-    for (u32 i = 0; i < visibleCount; ++i) {
-        const u32 logOffset = visibleCount - 1u - i + m_scrollOffset;
-        if (logOffset >= m_logCount) continue;
-
-        const u32 ringIdx = (m_logWriteIdx + kMaxLogEntries - 1u - logOffset) & (kMaxLogEntries - 1u);
-        const LogEntryMeta& meta = m_logMeta[ringIdx];
-        const std::string_view text(&m_logText[meta.textOffset], meta.textLength);
-
-        renderer::Color col = renderer::Color::FromRGBA8(0xD0D8E8FF);
-        switch (meta.severity) {
-            case LogSeverity::Success: col = renderer::Color::FromRGBA8(0x00FF88FF); break;
-            case LogSeverity::Warning: col = renderer::Color::FromRGBA8(0xFFCC00FF); break;
-            case LogSeverity::Error:   col = renderer::Color::FromRGBA8(0xFF4444FF); break;
-            case LogSeverity::Echo:    col = renderer::Color::FromRGBA8(0x66CCFFFF); break;
-            default: break;
-        }
-
-        const f32 lineY = 8.0f + static_cast<f32>(i) * 11.0f;
-        hudBatcher.PushText(10.0f, lineY, text, col);
+void DebugConsole::AutoCompleteInput() noexcept {
+    if (m_inputLen == 0 || m_symbols.empty()) {
+        return;
+    }
+    const std::string_view prefix(m_inputBuf.data(), m_inputLen);
+    for (const char c : prefix) {
+        if (c == ' ') return;
     }
 
-    const f32 inputY = consoleH - 20.0f;
-    hudBatcher.PushSolidRect({6.0f, inputY - 3.0f, consoleW - 12.0f, 16.0f}, renderer::Color::FromRGBA8(0x161F2CFF));
-    hudBatcher.PushText(10.0f, inputY, "> ", renderer::Color::FromRGBA8(0x00E5FFFF));
-    hudBatcher.PushText(26.0f, inputY, std::string_view(m_inputBuf.data(), m_inputLen),
-                        renderer::Color::FromRGBA8(0xFFFFFFFF));
+    const ConsoleSymbol* best = nullptr;
+    for (const ConsoleSymbol& sym : m_symbols) {
+        if (sym.kind == SymbolKind::Empty || sym.nameLen < prefix.size()) {
+            continue;
+        }
+        const std::string_view candidate(sym.namePtr, sym.nameLen);
+        if (candidate.starts_with(prefix)) {
+            if (best == nullptr || candidate < std::string_view(best->namePtr, best->nameLen)) {
+                best = &sym;
+            }
+        }
+    }
 
-    const f32 cursorX = 26.0f + static_cast<f32>(m_cursorPos) * 8.0f;
-    hudBatcher.PushSolidRect({cursorX, inputY, 6.0f, 9.0f}, renderer::Color::FromRGBA8(0x00FF88CC));
+    if (best != nullptr) {
+        const u8 copyLen = static_cast<u8>(std::min<usize>(best->nameLen, kMaxLineChars - 2));
+        std::memcpy(m_inputBuf.data(), best->namePtr, copyLen);
+        m_inputBuf[copyLen] = ' ';
+        m_inputLen          = static_cast<u8>(copyLen + 1u);
+        m_cursorPos         = m_inputLen;
+    }
+}
+
+void DebugConsole::EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatcher& hudBatcher) const noexcept {
+    if (!m_isOpen) {
+        return;
+    }
+    const f32 w = static_cast<f32>(viewportSize.w);
+    const f32 h = std::min(static_cast<f32>(viewportSize.h) * 0.45f, 280.0f);
+
+    hudBatcher.PushSolidRect({0.0f, 0.0f, w, h}, renderer::Color::FromRGBA8(0x0B0E17EB));
+    hudBatcher.PushSolidRect({0.0f, h - 22.0f, w, 22.0f}, renderer::Color::FromRGBA8(0x161C2EFF));
+    hudBatcher.PushLine(0.0f, h, w, h, 1.5f, renderer::Color::FromRGBA8(0x4488CCFF));
+
+    const u32 maxRows  = static_cast<u32>((h - 28.0f) / 11.0f);
+    const u32 avail    = (m_logCount > m_scrollOffset) ? (m_logCount - m_scrollOffset) : 0u;
+    const u32 showRows = std::min(maxRows, avail);
+
+    for (u32 i = 0; i < showRows; ++i) {
+        const u32 backIdx = m_scrollOffset + (showRows - 1u - i);
+        const u32 slot    = (m_logWriteIdx + kMaxLogEntries - 1u - backIdx) & static_cast<u32>(kMaxLogEntries - 1);
+        const LogEntryMeta& meta = m_logMeta[slot];
+
+        renderer::Color col = renderer::Color::FromRGBA8(0xD0DAE8FFu);
+        switch (meta.severity) {
+            case LogSeverity::Success: col = renderer::Color::FromRGBA8(0x66FF99FFu); break;
+            case LogSeverity::Warning: col = renderer::Color::FromRGBA8(0xFFCC44FFu); break;
+            case LogSeverity::Error:   col = renderer::Color::FromRGBA8(0xFF5566FFu); break;
+            case LogSeverity::Echo:    col = renderer::Color::FromRGBA8(0x88BBFFFFu); break;
+            case LogSeverity::Info:    break;
+        }
+
+        const std::string_view txt(m_logText.data() + meta.textOffset, meta.textLength);
+        hudBatcher.PushText(8.0f, 6.0f + static_cast<f32>(i) * 11.0f, txt, col);
+    }
+
+    DebugTextLine prompt{};
+    prompt.Str("> ").Str({m_inputBuf.data(), m_inputLen});
+    hudBatcher.PushText(8.0f, h - 16.0f, prompt.View(), renderer::Color::FromRGBA8(0xFFFFFFFFu));
+
+    const f32 cursorX = 8.0f + static_cast<f32>(m_cursorPos + 2u) * DebugBatcher::kGlyphWidth;
+    hudBatcher.PushSolidRect({cursorX, h - 16.0f, 6.0f, 9.0f}, renderer::Color::FromRGBA8(0x66CCFFFFu));
+}
+
+u64 DebugConsole::ComputeAuditHash() const noexcept {
+    u64 h = MixAuditHash(0xC04501E99001ull, m_logCount);
+    h = MixAuditHash(h, m_logWriteIdx);
+    for (const ConsoleSymbol& sym : m_symbols) {
+        if (sym.kind != SymbolKind::Empty) {
+            h = MixAuditHash(h, (static_cast<u64>(sym.nameHash) << 8) | static_cast<u8>(sym.kind));
+        }
+    }
+    return h;
 }
 
 } // namespace en::debug

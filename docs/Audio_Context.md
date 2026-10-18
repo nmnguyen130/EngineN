@@ -1,93 +1,73 @@
-# EngineN — Audio Subsystem Context (`audio/`)
+# EngineN — Audio Subsystem Context (`engine/audio/`)
 
 ## 1. Architecture & Invariants
-- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), strictly zero heap allocation after `Init()` (single `192 KB` 64-byte aligned arena slab), zero virtual dispatch, minimal 5-file footprint (`AudioTypes.h`, `AudioMixer.h/.cpp`, `AudioSystem.h/.cpp`), two-layer pure C++23 separation (`namespace en::audio`).
+- **Core:** C++23 (`-fno-exceptions`, `-fno-rtti`), zero heap allocation after `Init()` (single 192 KB 64B-aligned arena slab), zero virtual dispatch, 5-file footprint (`AudioTypes.h`, `AudioMixer.h/.cpp`, `AudioSystem.h/.cpp`), decoupled pure C++ design (zero OS, SDL3, World, or Gameplay dependencies in headers).
 - **Two-Layer Zero-Virtual Seam:**
-  - **Layer 1 (`AudioTypes.h`, `AudioMixer.h/.cpp`):** Pure C++23 data-oriented Structure-of-Arrays (`VoicePoolSoA`) 64-voice polyphonic mixer (`kSampleRate = 48000`, `kMixBlockFrames = 256`), Q32.32 fixed-point phase accumulator with 4-point 3rd-order Hermite vari-speed resampling and pre-cached 4-sample loop guards, Cytomic Linear Trap-Integrated State Variable Filter (SVF), 16-slot steal crossfade pool (`StealSlotState`), planar SIMD bus accumulation (`kAudioBusCount = 8`), combat-to-music sidechain ducking, Padé `[3/2]` $\tanh$ master soft-clipper, and 4-stem sample-locked interactive music decks. Zero OS or `<SDL3/SDL_*.h>` dependencies; 100% deterministic in headless CI via `AudioMixer::ComputeAuditHash()`.
-  - **Layer 2 (`AudioSystem.h/.cpp`):** Move-only RAII coordinator owning the `SDL_AudioStream` hardware binding (`SDL_OpenAudioDeviceStream`), flat 1024-slot Fibonacci Robin Hood `SoundCueDef` index, 3-stage voice admission pipeline (cooldown/energy-summing coalescer, per-cue concurrency cap, priority/audibility stealing), 30 Hz staggered `gameplay::SpatialIndex2D::Raycast()` tile occlusion, `time::TimeChannel` hitstop/timescale synchronization, and `assets::ScopeId` bitmask retirement protection. `<SDL3/SDL_audio.h>` is strictly confined to `AudioSystem.cpp`.
-- **Hybrid Lock-Free Thread Synchronization (Triple-Buffer + Discrete SPSC Ring):**
-  - **Continuous State (`AudioFrameSnapshot`, `576 B` = 9 cache lines):** All per-frame continuous parameters (64 voice Q14 L/R gains, Q12 pitch ratios, pre-warped Q14 SVF cutoffs, 8 bus gains/cutoffs, 8 `TimeChannel` time scales, `frozenChannelMask`, and 4 music stem weights) are pre-computed on the main thread inside `AudioSystem::Update()` and published via a wait-free 3-slot atomic Triple Buffer (`tripleFlags`). Eliminates per-frame positional/filter command queue spam and hoists all transcendental math (`std::sqrt`, `std::cos`, `std::sin`, Padé $\tan$) out of the real-time audio callback.
-  - **Discrete Lifecycle Edges (`AudioCommand`, `32 B` exact):** A 256-slot cache-isolated SPSC ring buffer (`cmdRing`) carries only discrete state transitions (`SpawnVoice`, `StopVoice`, `BindMusicStem`, `CommitMusicDeck`, `TriggerStinger`, `PanicReset`).
-- **Zero-Queue Bitmask Scope Retirement (`activeScopePinMask`):**
-  - Each active physical voice records its `assets::ScopeId` (`0..31`). At the end of `AudioMixer::MixBlock()`, active scope bits are OR-reduced into `AudioTelemetrySnapshot::activeScopePinMask` (`u32`). When unloading a room bank via `AudioSystem::RequestScopeRelease()`, `AssetSystem::EndScope()` is invoked immediately if the scope bit is `0`, or deferred cleanly until active fade-outs complete.
+  - **Layer 1 (`AudioMixer`):** Structure-of-Arrays (`VoicePoolSoA`) 64-voice mixer (`kSampleRate = 48000`, `kMixBlockFrames = 256`), Q32.32 phase accumulator with 4-point 3rd-order Hermite resampling, Cytomic SVF filters, 16-slot steal crossfade pool, planar SIMD bus accumulation (8 buses), combat sidechain ducking, Padé [3/2] $\tanh$ soft-clipper, and 4-stem interactive music decks. 100% testable headless via `ComputeAuditHash()`.
+  - **Layer 2 (`AudioSystem`):** Move-only RAII coordinator owning `SDL_AudioStream`, flat 1024-slot Robin Hood `SoundCueDef` index, 3-stage voice admission (cooldown/energy coalescing, concurrency cap, priority stealing), 30 Hz staggered raycast occlusion callback, timescale synchronization, and bitmask scope retirement. `<SDL3/SDL_audio.h>` is strictly confined to `AudioSystem.cpp`.
+- **Hybrid Lock-Free Thread Synchronization:**
+  - **Continuous State (`AudioFrameSnapshot`, 576B):** Precomputed on main thread in `Update()` (Q14 L/R gains, Q12 pitches, Q14 SVF cutoffs, bus gains, stem weights) and published via wait-free 3-slot atomic Triple Buffer (`tripleFlags`), hoisting all transcendental math out of the audio thread.
+  - **Discrete Edges (`AudioCommand`, 32B):** 256-slot cache-isolated SPSC ring buffer (`cmdRing`) transfers lifecycle commands (`SpawnVoice`, `StopVoice`, `BindMusicStem`, etc.).
+- **Zero-Queue Bitmask Scope Retirement:** Voices record `assets::ScopeId` (0..31). Active scope bits are OR-reduced in `AudioTelemetrySnapshot`. Releasable scopes are polled via `PollReleasableScopeMask()`.
 
-## 2. Core Types (`audio/AudioTypes.h`)
-- **Primitives, Enums & Bitmasks:**
-  - `enum class AudioErrc : u8`: `InvalidConfig`, `ArenaExhausted`, `DeviceOpenFailed`, `CorruptedBankBlob`, `CueTableFull`, `VoicePoolExhausted`.
-  - `enum class AudioBusId : u8`: `Master = 0`, `Music`, `SfxPlayer`, `SfxCombat`, `SfxWorld`, `Ambience`, `Ui`, `Voice`, `Count` (`kAudioBusCount = 8`).
-  - `enum class FilterMode : u8`: `Bypass = 0`, `LowPass`, `HighPass`, `BandPass`.
-  - `enum class AttenuationCurve : u8`: `None = 0`, `Linear`, `InverseClamped`, `Smoothstep`.
-  - `enum class StealPolicy : u8`: `Reject = 0`, `StealOldest`, `StealQuietest`, `Virtualize`.
-  - `enum class VoiceFlags : u8`: `None`, `Looping`, `Spatialized2D`, `FollowTimeScale`, `PauseOnHitstop`, `BypassOcclusion`, `OneVoicePerEntity`. Queried via `constexpr bool HasVoiceFlag(VoiceFlags val, VoiceFlags mask) noexcept`.
-- **Identifiers & Generational Handles:**
-  - `struct VoiceHandle { u16 index{0}; u16 generation{0}; };` (`sizeof == 4`).
-  - `struct SoundCueId { u32 value{0}; };` — Supports lossless 32-bit construction and 64-bit `assets::AssetId` XOR-folding via `SoundCueId::FromAssetId(assets::AssetId)`.
-- **Cooked Binary Formats (`'EAUD'` Blobs) & Synchronization Records (Zero Padding):**
-  - `struct alignas(16) CookedAudioBankHeader` (`sizeof == 16`, magic `'EAUD'`).
-  - `struct alignas(32) SoundCueDef` (`sizeof == 32`, 2 cues per 64B cache line): `cueId`, `variations[4]` (`assets::AudioHandle`), `baseGainQ14`, `basePitchCents`, `gainVarQ8`, `pitchVarSemitonesQ4`, `minDistQ2`, `maxDistQ1`, `packedRouting`, `packedChannelAndCurve`, `priority`, `packedFlagsAndCooldown`.
-  - `struct alignas(32) MusicTrackDef` (`sizeof == 32`): `trackId`, `stems[4]` (`assets::AudioHandle`), `loopStartFrame`, `loopEndFrame`, `tempoBpmQ8`, `packedStemsAndBeats`, `defaultCrossfadeBlocks`.
-  - `struct alignas(32) AudioCommand` (`sizeof == 32`): `type` (`AudioCmdType`), `packedBusAndChannel`, `voiceSlot`, `generation`, `flags`, `assetScopeId`, `payload` (`24 B` union: `Spawn`, `Stop`, `MusicStem`).
-  - `struct alignas(64) AudioFrameSnapshot` (`sizeof == 576`, 9 cache lines): `targetGainL_Q14[64]`, `targetGainR_Q14[64]`, `targetPitchQ12[64]`, `targetSvfG_Q14[64]`, `busTargetGainQ14[8]`, `busSvfG_Q14[8]`, `channelTimeScaleQ12[8]`, `stemWeightsQ14[4]`, `busFilterModesBits`, `frozenChannelMask`, `masterMuteFlag`, `snapshotSeq`.
-  - `struct alignas(32) AudioTelemetrySnapshot` (`sizeof == 32`): `activeVoiceMask` (`u64`), `activeScopePinMask` (`u32`), `stolenVoicesTotal`, `masterPeakL`, `masterPeakR`, `callbackCpuLoadRatio`, `activeVirtualVoices`, `underrunCount`.
+## 2. Core Layouts & Types (`AudioTypes.h`)
+- `AudioErrc`: `InvalidConfig`, `ArenaExhausted`, `DeviceOpenFailed`, `CorruptedBankBlob`, `CueTableFull`, `VoicePoolExhausted`.
+- `AudioBusId`: `Master = 0`, `Music`, `SfxPlayer`, `SfxCombat`, `SfxWorld`, `Ambience`, `Ui`, `Voice` (`kAudioBusCount = 8`).
+- `VoiceHandle`: `{u16 index, u16 generation}` (4B).
+- `SoundCueId`: 32-bit ID constructed directly or via `SoundCueId::FromAssetId(AssetId)`.
+- `SoundCueDef` (`alignas(32)`, 32B): `cueId`, `variations[4]`, `baseGainQ14`, `basePitchCents`, `gainVarQ8`, `pitchVarSemitonesQ4`, `minDistQ2`, `maxDistQ1`, `packedRouting`, `packedChannelAndCurve`, `priority`, `packedFlagsAndCooldown`.
+- `MusicTrackDef` (`alignas(32)`, 32B): `trackId`, `stems[4]`, `loopStartFrame`, `loopEndFrame`, `tempoBpmQ8`, `packedStemsAndBeats`, `defaultCrossfadeBlocks`.
+- `AudioTriggerReq` (24B): Input trigger struct `{cueId, worldX, worldY, emitterId}`.
+- `AudioUpdateDesc`: `{tickIndex, listenerX, listenerY, channelScales, frozenChannelMask, occlusionQuery, occlusionUserCtx}`.
+- `AudioFrameSnapshot` (`alignas(64)`, 576B): Triple-buffered continuous mix frame.
+- `AudioTelemetrySnapshot` (`alignas(32)`, 32B): `activeVoiceMask`, `activeScopePinMask`, `masterPeakL/R`, `callbackCpuLoadRatio`.
 
-## 3. Public Interfaces & Signatures
-### `AudioMixer` (`audio/AudioMixer.h` — Pure C++23 SoA Mixer & DSP Engine)
-- Lifecycle & Sizing:
-  - `[[nodiscard]] static constexpr usize RequiredArenaBytes() noexcept`
-  - `[[nodiscard]] std::expected<void, AudioErrc> Init(std::span<u8> arenaSlice) noexcept`
-  - `void Reset() noexcept`
-- Block Mixing & Determinism Audit:
-  - `void ApplyCommand(const AudioCommand& cmd) noexcept`
-  - `void MixBlock(const AudioFrameSnapshot& snapshot, std::span<f32, kMixBlockFrames * 2> outInterleavedStereo) noexcept`
-  - `[[nodiscard]] constexpr const AudioTelemetrySnapshot& Telemetry() const noexcept`
-  - `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
+## 3. Subsystem APIs
+### `AudioMixer` (`engine/audio/AudioMixer.h` — SoA Mixer & DSP Engine)
+- `Init(span<u8> arenaSlice)` $\to$ `Result<void, AudioErrc>`, `Reset()`
+- `ApplyCommand(AudioCommand)`, `MixBlock(AudioFrameSnapshot, span<f32, 512> outStereo)`
+- `Telemetry()` $\to$ `const AudioTelemetrySnapshot&`, `ComputeAuditHash()` $\to$ `u64`.
 
-### `AudioSystem` (`audio/AudioSystem.h` — Move-Only RAII Coordinator & SDL3 Stream Adapter)
-- Lifecycle & Bank Registration:
-  - `[[nodiscard]] std::expected<void, AudioErrc> Init(const AudioSystemConfig& cfg = {}) noexcept`
-  - `void Shutdown() noexcept`
-  - `[[nodiscard]] std::expected<void, AudioErrc> RegisterCueDef(const SoundCueDef& def, assets::ScopeId owningScope = 0) noexcept`
-  - `[[nodiscard]] std::expected<void, AudioErrc> RegisterMusicTrackDef(const MusicTrackDef& def) noexcept`
-  - `[[nodiscard]] std::expected<void, AudioErrc> RegisterCueBank(const assets::BlobRecord& cueBlob, assets::ScopeId owningScope) noexcept`
-  - `void RequestScopeRelease(assets::ScopeId scope, assets::AssetSystem& assetSystem) noexcept`
-  - `void OnWindowEvent(platform::WindowFlags flags, const platform::WindowState& winState) noexcept`
-- Playback, Routing & Frame Synchronization:
-  - `void SetListenerPosition(f32 worldX, f32 worldY) noexcept`
-  - `void ConsumeSimCues(std::span<const gameplay::SimCue> cues, const world::World& world, const assets::AssetBank& assetBank) noexcept` (filters `SimCueKind::AudioOneShot` and resolves `SoundCueId::FromAssetId(cue.assetId)` at `(cue.worldX, cue.worldY)`)
-  - `VoiceHandle PlayCue(SoundCueId cueId, const assets::AssetBank& assetBank, f32 worldX = 0.0f, f32 worldY = 0.0f, world::EntityId emitter = world::kNullEntity) noexcept`
-  - `void StopVoice(VoiceHandle handle, u16 fadeOutBlocks = 1) noexcept`
-  - `void SetBusGain(AudioBusId bus, f32 linearGain) noexcept`, `void SetBusFilter(AudioBusId bus, FilterMode mode, f32 cutoffHz) noexcept`
-  - `void TransitionMusic(u32 trackId, const assets::AssetBank& assetBank, u8 crossfadeBlocks = 94) noexcept`
-  - `void SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weights) noexcept`
-  - `void Update(const world::World& world, const gameplay::SpatialIndex2D& spatial, const assets::AssetBank& assetBank, time::RenderTimeView timeView, u8 frozenChannelMask, std::span<const f32, 8> channelScales) noexcept`
-  - `void PumpHeadlessBlocks(u32 blockCount, std::span<f32> optionalCaptureOut = {}) noexcept`
-  - `[[nodiscard]] AudioTelemetrySnapshot Telemetry() const noexcept`, `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
+### `AudioSystem` (`engine/audio/AudioSystem.h` — Hardware Coordinator & Mixer Host)
+- **Lifecycle & Registrations:**
+  - `Init(AudioSystemConfig)` $\to$ `Result<void, AudioErrc>`, `Shutdown()`
+  - `RegisterCueDef(SoundCueDef, ScopeId)` $\to$ `Result<void, AudioErrc>`
+  - `RegisterMusicTrackDef(MusicTrackDef)` $\to$ `Result<void, AudioErrc>`
+  - `RegisterCueBank(BlobRecord, ScopeId)` $\to$ `Result<void, AudioErrc>`
+  - `RequestScopeRelease(ScopeId)`, `PollReleasableScopeMask()` $\to$ `u32`
+  - `SetFocusMuted(bool muted)`
+- **Playback & Control:**
+  - `PlayCue(cueId, assetBank, worldX, worldY, emitterId)` $\to$ `VoiceHandle`
+  - `SubmitTriggers(span<const AudioTriggerReq>, assetBank)`: Bulk ingestion of cues.
+  - `StopVoice(handle, fadeOutBlocks)`, `SetBusGain(bus, linearGain)`, `SetBusFilter(bus, mode, cutoffHz)`
+  - `TransitionMusic(trackId, assetBank, crossfadeBlocks)`, `SetMusicStemWeights(span<const f32, 4>)`
+  - `Update(AudioUpdateDesc)`: Staggered raycast occlusion & triple-buffer publish.
+  - `ExtractActiveEmitters(span<AudioEmitterView>)` $\to$ `u32` (for debug visualization).
+  - `Telemetry()` $\to$ `AudioTelemetrySnapshot`, `ComputeAuditHash()` $\to$ `u64`.
 
-## 4. Canonical Main Loop Usage
+## 4. Main Loop Integration
 ```cpp
-const auto winChanges = m_platform.Pump(m_window, m_input, m_devToolsTap);
-m_audio.OnWindowEvent(winChanges, m_window.State());
-m_assets.Pump(m_renderer);
-
-u8 frozenMask = 0;
-std::array<f32, 8> channelScales{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-
-m_time.BeginFrame();
-while (const auto step = m_time.PollTick()) {
-    const auto tickInput = m_input.PollTick(step.TickIndex());
-    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::time::TimeChannel::Player));
-
-    m_world.BeginTick(step);
-    m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);
-    m_world.EndTick(step);
-
-    for (u8 ch = 0; ch < 8; ++ch) {
-        if (step.IsFrozen(ch)) {
-            frozenMask |= static_cast<u8>(1u << ch);
-        }
-        channelScales[ch] = step.EffectiveScale(ch);
+// 1. Drain gameplay cues and submit to audio
+std::array<audio::AudioTriggerReq, 64> triggers{};
+usize triggerCount = 0;
+for (const auto& cue : m_gameplay.DrainCues()) {
+    if (cue.kind == gameplay::SimCueKind::AudioOneShot && triggerCount < triggers.size()) {
+        triggers[triggerCount++] = {
+            .cueId = audio::SoundCueId::FromAssetId(cue.assetId),
+            .worldX = cue.worldX,
+            .worldY = cue.worldY,
+            .emitterId = cue.emitter.index
+        };
     }
 }
+m_audio.SubmitTriggers({triggers.data(), triggerCount}, m_assets.Bank());
 
-m_audio.ConsumeSimCues(m_gameplay.DrainCues(), m_world, m_assets.Bank());
-m_audio.Update(m_world, m_gameplay.Spatial(), m_assets.Bank(), m_time.GetRenderView(), frozenMask, channelScales);
+// 2. Update audio listener & spatial occlusion
+m_audio.Update({
+    .tickIndex = step.TickIndex(),
+    .listenerX = m_camera.worldCenterX,
+    .listenerY = m_camera.worldCenterY,
+    .channelScales = m_time.ChannelScales(),
+    .frozenChannelMask = m_time.FrozenMask()
+});
+```

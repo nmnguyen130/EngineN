@@ -8,6 +8,7 @@
 #include <SDL3/SDL_render.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <utility>
 
@@ -45,6 +46,15 @@ namespace {
     return (filter == TextureFilter::Linear) ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST;
 }
 
+[[nodiscard]] SDL_Rect ToSdlRect(const FRect& r) noexcept {
+    return SDL_Rect{
+        static_cast<int>(std::lround(r.x)),
+        static_cast<int>(std::lround(r.y)),
+        static_cast<int>(std::lround(r.w)),
+        static_cast<int>(std::lround(r.h))
+    };
+}
+
 } // namespace
 
 Renderer::~Renderer() noexcept {
@@ -53,19 +63,24 @@ Renderer::~Renderer() noexcept {
 
 Renderer::Renderer(Renderer&& other) noexcept
     : m_renderer(std::exchange(other.m_renderer, nullptr))
-    , m_viewportSize(other.m_viewportSize)
+    , m_viewportSize(std::exchange(other.m_viewportSize, {}))
+    , m_freeHead(std::exchange(other.m_freeHead, 0))
+    , m_highWaterSlot(std::exchange(other.m_highWaterSlot, 1))
     , m_textures(std::exchange(other.m_textures, {}))
-    , m_freeHead(other.m_freeHead)
-    , m_list(std::move(other.m_list)) {}
+    , m_list(std::move(other.m_list)) {
+    other.m_list.Reset({});
+}
 
 Renderer& Renderer::operator=(Renderer&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_renderer     = std::exchange(other.m_renderer, nullptr);
-        m_viewportSize = other.m_viewportSize;
-        m_textures     = std::exchange(other.m_textures, {});
-        m_freeHead     = other.m_freeHead;
-        m_list         = std::move(other.m_list);
+        m_renderer      = std::exchange(other.m_renderer, nullptr);
+        m_viewportSize  = std::exchange(other.m_viewportSize, {});
+        m_freeHead      = std::exchange(other.m_freeHead, 0);
+        m_highWaterSlot = std::exchange(other.m_highWaterSlot, 1);
+        m_textures      = std::exchange(other.m_textures, {});
+        m_list          = std::move(other.m_list);
+        other.m_list.Reset({});
     }
     return *this;
 }
@@ -87,13 +102,9 @@ Result<void, RendererErrc> Renderer::Init(
     m_viewportSize = window.State().pixelSize;
     (void)SetPresentMode(cfg.presentMode);
 
-    for (u16 i = 1; i < kMaxTextures - 1; ++i) {
-        m_textures[i].nextFree   = static_cast<u16>(i + 1);
-        m_textures[i].generation = 0;
-    }
-    m_textures[kMaxTextures - 1].nextFree   = 0;
-    m_textures[kMaxTextures - 1].generation = 0;
-    m_freeHead = 1;
+    // Lazy high-water slot allocation avoids a 4096-slot initialization loop across 64 KB.
+    m_freeHead      = 0;
+    m_highWaterSlot = 1;
 
     SDL_Texture* whiteTex = SDL_CreateTexture(
         m_renderer,
@@ -116,7 +127,6 @@ Result<void, RendererErrc> Renderer::Init(
         .width       = 1,
         .height      = 1,
         .generation  = 1,
-        .nextFree    = 0,
         .cachedBlend = BlendMode::AlphaPMA
     };
 
@@ -128,20 +138,22 @@ void Renderer::Shutdown() noexcept {
         return;
     }
 
-    for (TextureSlot& slot : m_textures) {
+    for (u16 i = 0; i < m_highWaterSlot; ++i) {
+        TextureSlot& slot = m_textures[i];
         if (slot.texture) {
             SDL_DestroyTexture(slot.texture);
             slot.texture = nullptr;
         }
+        slot.width      = 0;
+        slot.height     = 0;
         slot.generation = 0;
     }
 
+    m_freeHead      = 0;
+    m_highWaterSlot = 1;
+
     SDL_DestroyRenderer(m_renderer);
     m_renderer = nullptr;
-}
-
-void Renderer::ResizeViewport(platform::Extent2i pixelSize) noexcept {
-    m_viewportSize = pixelSize;
 }
 
 Result<void, RendererErrc> Renderer::SetPresentMode(PresentMode mode) noexcept {
@@ -172,8 +184,20 @@ Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& d
     if (desc.width == 0 || desc.height == 0) {
         return Err(RendererErrc::InvalidDimension);
     }
-    if (m_freeHead == 0) {
+    if (m_freeHead == 0 && m_highWaterSlot >= kMaxTextures) {
         return Err(RendererErrc::PoolExhausted);
+    }
+
+    const usize minRowBytes    = static_cast<usize>(desc.width) * 4u;
+    const usize effectivePitch = (desc.pitch > 0) ? static_cast<usize>(desc.pitch) : minRowBytes;
+    if (!desc.pixels.empty()) {
+        if (effectivePitch < minRowBytes) {
+            return Err(RendererErrc::TextureUpdateFailed);
+        }
+        const usize requiredBytes = static_cast<usize>(desc.height - 1u) * effectivePitch + minRowBytes;
+        if (desc.pixels.size() < requiredBytes) {
+            return Err(RendererErrc::TextureUpdateFailed);
+        }
     }
 
     SDL_Texture* tex = SDL_CreateTexture(
@@ -187,8 +211,7 @@ Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& d
     }
 
     if (!desc.pixels.empty()) {
-        const int pitch = (desc.pitch > 0) ? static_cast<int>(desc.pitch) : static_cast<int>(desc.width * 4);
-        if (!SDL_UpdateTexture(tex, nullptr, desc.pixels.data(), pitch)) {
+        if (!SDL_UpdateTexture(tex, nullptr, desc.pixels.data(), static_cast<int>(effectivePitch))) {
             SDL_DestroyTexture(tex);
             return Err(RendererErrc::TextureUpdateFailed);
         }
@@ -197,16 +220,20 @@ Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& d
     SDL_SetTextureScaleMode(tex, ToSdlScaleMode(desc.filter));
     SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
 
-    const u16 slotIdx = m_freeHead;
-    TextureSlot& slot = m_textures[slotIdx];
-    m_freeHead        = slot.nextFree;
+    u16 slotIdx = 0;
+    if (m_freeHead != 0) {
+        slotIdx    = m_freeHead;
+        m_freeHead = m_textures[slotIdx].width;
+    } else {
+        slotIdx = m_highWaterSlot++;
+    }
 
-    const u16 nextGen = static_cast<u16>(slot.generation + 1);
+    TextureSlot& slot = m_textures[slotIdx];
+    const u16 nextGen = static_cast<u16>(slot.generation + 1u);
     slot.texture     = tex;
     slot.width       = desc.width;
     slot.height      = desc.height;
     slot.generation  = (nextGen == 0) ? 1u : nextGen;
-    slot.nextFree    = 0;
     slot.cachedBlend = BlendMode::AlphaPMA;
 
     return TextureHandle{slotIdx, slot.generation};
@@ -224,6 +251,8 @@ Result<void, RendererErrc> Renderer::UpdateTexture(
     TextureSlot& slot = m_textures[handle.index];
     SDL_Rect sdlRect{};
     const SDL_Rect* rectPtr = nullptr;
+    usize updateW = slot.width;
+    usize updateH = slot.height;
 
     if (!region.IsEmpty()) {
         sdlRect = SDL_Rect{
@@ -232,14 +261,27 @@ Result<void, RendererErrc> Renderer::UpdateTexture(
             static_cast<int>(region.w),
             static_cast<int>(region.h)
         };
+        if (sdlRect.x < 0 || sdlRect.y < 0 || sdlRect.w <= 0 || sdlRect.h <= 0 ||
+            sdlRect.x + sdlRect.w > static_cast<int>(slot.width) ||
+            sdlRect.y + sdlRect.h > static_cast<int>(slot.height)) {
+            return Err(RendererErrc::InvalidDimension);
+        }
         rectPtr = &sdlRect;
+        updateW = static_cast<usize>(sdlRect.w);
+        updateH = static_cast<usize>(sdlRect.h);
     }
 
-    const int rowPitch = (pitch > 0)
-        ? static_cast<int>(pitch)
-        : static_cast<int>((rectPtr ? sdlRect.w : slot.width) * 4);
+    const usize minRowBytes    = updateW * 4u;
+    const usize effectivePitch = (pitch > 0) ? static_cast<usize>(pitch) : minRowBytes;
+    if (effectivePitch < minRowBytes) {
+        return Err(RendererErrc::TextureUpdateFailed);
+    }
+    const usize requiredBytes = (updateH - 1u) * effectivePitch + minRowBytes;
+    if (pixels.size() < requiredBytes) {
+        return Err(RendererErrc::TextureUpdateFailed);
+    }
 
-    if (!SDL_UpdateTexture(slot.texture, rectPtr, pixels.data(), rowPitch)) {
+    if (!SDL_UpdateTexture(slot.texture, rectPtr, pixels.data(), static_cast<int>(effectivePitch))) {
         return Err(RendererErrc::TextureUpdateFailed);
     }
     return {};
@@ -254,60 +296,96 @@ void Renderer::DestroyTexture(TextureHandle handle) noexcept {
     SDL_DestroyTexture(slot.texture);
     slot.texture = nullptr;
 
-    const u16 invalidatedGen = static_cast<u16>(slot.generation + 1);
+    const u16 invalidatedGen = static_cast<u16>(slot.generation + 1u);
     slot.generation = (invalidatedGen == 0) ? 1u : invalidatedGen;
-    slot.nextFree   = m_freeHead;
+    slot.width      = m_freeHead;
+    slot.height     = 0;
     m_freeHead      = handle.index;
 }
 
-RenderList& Renderer::BeginFrame() noexcept {
+RenderList& Renderer::BeginFrame(ViewportExtent pixelSize) noexcept {
+    if (pixelSize.IsValid()) {
+        m_viewportSize = pixelSize;
+    }
     m_list.Reset(m_viewportSize);
     return m_list;
 }
 
-void Renderer::Submit() noexcept {
-    Submit(m_list);
-}
-
 void Renderer::Submit(RenderList& list) noexcept {
-    if (!m_renderer || m_viewportSize.w <= 0 || m_viewportSize.h <= 0) {
+    if (!m_renderer || !m_viewportSize.IsValid()) {
         return;
     }
 
     list.Compile();
 
-    const auto batches = list.Batches();
+    const auto batches       = list.Batches();
     const auto sharedIndices = RenderList::SharedQuadIndices(RenderList::kChunkQuads);
 
-    u8 nextPassToClear = 0;
-    u8 activeView = 0xFFu;
+    const FRect fullViewport{
+        0.0f,
+        0.0f,
+        static_cast<f32>(m_viewportSize.w),
+        static_cast<f32>(m_viewportSize.h)
+    };
+    FRect activeViewport = fullViewport;
+    FRect activeScissor{};
+    u8 activeViewSlot    = 0xFFu;
+    u16 pendingClearMask = list.ClearPassMask();
 
-    auto clearPassesUpTo = [&](u8 targetPass) noexcept {
-        while (nextPassToClear <= targetPass && nextPassToClear < RenderList::kMaxPasses) {
-            const RenderPassDesc& pass = list.Pass(nextPassToClear++);
-            if (pass.enabled && pass.clear) {
-                SDL_SetRenderViewport(m_renderer, nullptr);
-                SDL_SetRenderClipRect(m_renderer, nullptr);
-                activeView = 0xFFu;
-                SDL_SetRenderDrawColorFloat(
-                    m_renderer,
-                    pass.clearColor.r,
-                    pass.clearColor.g,
-                    pass.clearColor.b,
-                    pass.clearColor.a);
-                SDL_RenderClear(m_renderer);
-            }
+    SDL_SetRenderViewport(m_renderer, nullptr);
+    SDL_SetRenderClipRect(m_renderer, nullptr);
+
+    auto executeDueClears = [&](u16 dueMask) noexcept {
+        if (dueMask == 0) {
+            return;
         }
+        if (activeViewport != fullViewport) {
+            SDL_SetRenderViewport(m_renderer, nullptr);
+            activeViewport = fullViewport;
+            activeViewSlot = 0xFFu;
+        }
+        if (!activeScissor.IsEmpty()) {
+            SDL_SetRenderClipRect(m_renderer, nullptr);
+            activeScissor  = {};
+            activeViewSlot = 0xFFu;
+        }
+        for (u32 m = dueMask; m != 0; m &= (m - 1u)) {
+            const u8 passIdx = static_cast<u8>(std::countr_zero(m));
+            const Color& c   = list.Pass(passIdx).clearColor;
+            SDL_SetRenderDrawColorFloat(m_renderer, c.r, c.g, c.b, c.a);
+            SDL_RenderClear(m_renderer);
+        }
+        pendingClearMask &= static_cast<u16>(~dueMask);
     };
 
     for (const DrawBatch& batch : batches) {
-        if (batch.passId >= nextPassToClear) {
-            clearPassesUpTo(batch.passId);
-        }
+        const u16 passReachMask = static_cast<u16>((1u << (batch.passId + 1u)) - 1u);
+        executeDueClears(pendingClearMask & passReachMask);
 
-        if (batch.viewSlot != activeView) {
-            activeView = batch.viewSlot;
-            ApplyCameraView(list.View(activeView));
+        if (batch.viewSlot != activeViewSlot) {
+            activeViewSlot = batch.viewSlot;
+            const Camera2D& view = list.View(activeViewSlot);
+            const FRect targetVp = view.viewport.IsEmpty() ? fullViewport : view.viewport;
+
+            if (targetVp != activeViewport) {
+                activeViewport = targetVp;
+                if (targetVp == fullViewport) {
+                    SDL_SetRenderViewport(m_renderer, nullptr);
+                } else {
+                    const SDL_Rect vp = ToSdlRect(targetVp);
+                    SDL_SetRenderViewport(m_renderer, &vp);
+                }
+            }
+
+            if (view.scissor != activeScissor) {
+                activeScissor = view.scissor;
+                if (activeScissor.IsEmpty()) {
+                    SDL_SetRenderClipRect(m_renderer, nullptr);
+                } else {
+                    const SDL_Rect clip = ToSdlRect(activeScissor);
+                    SDL_SetRenderClipRect(m_renderer, &clip);
+                }
+            }
         }
 
         SDL_Texture* sdlTex = ResolveAndBindTexture(batch.texture, batch.blend);
@@ -339,34 +417,8 @@ void Renderer::Submit(RenderList& list) noexcept {
         }
     }
 
-    clearPassesUpTo(static_cast<u8>(RenderList::kMaxPasses - 1));
+    executeDueClears(pendingClearMask);
     SDL_RenderPresent(m_renderer);
-}
-
-void Renderer::ApplyCameraView(const Camera2D& view) noexcept {
-    if (view.viewport.IsEmpty()) {
-        SDL_SetRenderViewport(m_renderer, nullptr);
-    } else {
-        const SDL_Rect vp{
-            static_cast<int>(std::lround(view.viewport.x)),
-            static_cast<int>(std::lround(view.viewport.y)),
-            static_cast<int>(std::lround(view.viewport.w)),
-            static_cast<int>(std::lround(view.viewport.h))
-        };
-        SDL_SetRenderViewport(m_renderer, &vp);
-    }
-
-    if (view.scissor.IsEmpty()) {
-        SDL_SetRenderClipRect(m_renderer, nullptr);
-    } else {
-        const SDL_Rect clip{
-            static_cast<int>(std::lround(view.scissor.x)),
-            static_cast<int>(std::lround(view.scissor.y)),
-            static_cast<int>(std::lround(view.scissor.w)),
-            static_cast<int>(std::lround(view.scissor.h))
-        };
-        SDL_SetRenderClipRect(m_renderer, &clip);
-    }
 }
 
 SDL_Texture* Renderer::ResolveAndBindTexture(TextureHandle handle, BlendMode blend) noexcept {

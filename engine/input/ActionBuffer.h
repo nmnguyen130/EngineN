@@ -8,8 +8,8 @@
 namespace en::input {
 
 // Deterministic tick-counted intent buffer for jump/dash forgiveness and hitstop freeze retention.
-// Self-contained 40-byte value type; pairs with SimStepView::IsFrozen(ch).
-// Invariant: Ages never exceed kMaxBufferTicks; expired bits are automatically cleared.
+// Self-contained 36-byte value type; pairs with SimStepView::IsFrozen(ch).
+// Invariant: Ages are defined for set bits in pending and never exceed kMaxBufferTicks.
 class ActionBuffer {
 public:
     static constexpr u8 kMaxBufferTicks = 60;
@@ -23,6 +23,9 @@ public:
         m_press   = {};
         m_release = {};
     }
+
+    [[nodiscard]] constexpr u16 PendingPressMask() const noexcept { return m_press.pending; }
+    [[nodiscard]] constexpr u16 PendingReleaseMask() const noexcept { return m_release.pending; }
 
     [[nodiscard]] constexpr bool Peek(InputId auto a, u8 windowTicks) const noexcept {
         return Check(m_press, ToInputIndex(a), windowTicks);
@@ -46,10 +49,13 @@ public:
             h ^= v;
             h *= 1099511628211ull;
         };
-        mix(m_press.pending);
-        for (const u8 a : m_press.age) mix(a);
-        mix(m_release.pending);
-        for (const u8 a : m_release.age) mix(a);
+        mix(static_cast<u64>(m_press.pending) | (static_cast<u64>(m_release.pending) << 16));
+        for (u32 m = m_press.pending; m != 0; m &= m - 1) {
+            mix(m_press.age[std::countr_zero(m)]);
+        }
+        for (u32 m = m_release.pending; m != 0; m &= m - 1) {
+            mix(m_release.age[std::countr_zero(m)]);
+        }
         return h;
     }
 
@@ -60,8 +66,12 @@ private:
     };
 
     static constexpr void StepChannel(Channel& ch, u16 edges, bool frozen) noexcept {
+        if ((ch.pending | edges) == 0) {
+            return;
+        }
+
         for (u32 m = edges; m != 0; m &= m - 1) {
-            ch.age[static_cast<usize>(std::countr_zero(m))] = 0;
+            ch.age[std::countr_zero(m)] = 0;
         }
         ch.pending |= edges;
 
@@ -70,10 +80,9 @@ private:
         }
 
         for (u32 m = static_cast<u32>(ch.pending & ~edges); m != 0; m &= m - 1) {
-            const usize i = static_cast<usize>(std::countr_zero(m));
+            const int i = std::countr_zero(m);
             if (++ch.age[i] > kMaxBufferTicks) {
                 ch.pending &= static_cast<u16>(~(1u << i));
-                ch.age[i]   = 0;
             }
         }
     }
@@ -87,12 +96,13 @@ private:
             return false;
         }
         ch.pending &= static_cast<u16>(~(1u << i));
-        ch.age[i]   = 0;
         return true;
     }
 
     Channel m_press{};
     Channel m_release{};
 };
+
+static_assert(sizeof(ActionBuffer) == 36);
 
 } // namespace en::input

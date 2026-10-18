@@ -1,63 +1,66 @@
 #include "debug/DebugInspector.h"
 
-#include "assets/AssetBank.h"
-#include "audio/AudioSystem.h"
-#include "gameplay/GameplayPipeline.h"
 #include "gameplay/GameplayTypes.h"
 #include "input/ActionBuffer.h"
-#include "renderer/RendererList.h"
+#include "renderer/RenderList.h"
 #include "world/World.h"
 
-#include <algorithm>
 #include <cmath>
-#include <type_traits>
-#include <utility>
 
 namespace en::debug {
 
 namespace {
 
-constexpr f32 UnpackQ8(i16 q8) noexcept {
-    return static_cast<f32>(q8) * (1.0f / 256.0f);
+inline constexpr f32 kInvQ8 = 1.0f / 256.0f;
+
+[[nodiscard]] constexpr renderer::FRect UnpackWorldBox(f32 wx, f32 wy, const gameplay::CompactAabb2D& box) noexcept {
+    const f32 cx = wx + static_cast<f32>(box.offsetX_q8) * kInvQ8;
+    const f32 cy = wy + static_cast<f32>(box.offsetY_q8) * kInvQ8;
+    const f32 hw = static_cast<f32>(box.halfW_q8) * kInvQ8;
+    const f32 hh = static_cast<f32>(box.halfH_q8) * kInvQ8;
+    return {cx - hw, cy - hh, hw * 2.0f, hh * 2.0f};
 }
 
-constexpr f32 UnpackQ14(i16 q14) noexcept {
-    return static_cast<f32>(q14) * (1.0f / 16384.0f);
+[[nodiscard]] constexpr renderer::FRect UnpackQ8ArrayBox(f32 wx, f32 wy, const std::array<i16, 4>& q8) noexcept {
+    const f32 cx = wx + static_cast<f32>(q8[0]) * kInvQ8;
+    const f32 cy = wy + static_cast<f32>(q8[1]) * kInvQ8;
+    const f32 hw = static_cast<f32>(q8[2]) * kInvQ8;
+    const f32 hh = static_cast<f32>(q8[3]) * kInvQ8;
+    return {cx - hw, cy - hh, hw * 2.0f, hh * 2.0f};
 }
 
 struct ActiveCameraView {
     f32 centerX{0.0f};
     f32 centerY{0.0f};
     f32 zoom{1.0f};
-    f32 minX{-640.0f};
-    f32 minY{-360.0f};
-    f32 maxX{640.0f};
-    f32 maxY{360.0f};
+    renderer::FRect viewport{};
+    renderer::FRect worldBounds{};
 };
 
-// Queries the active CameraRig2D in viewSlot 0 directly from World to compute frustum bounds.
 [[nodiscard]] ActiveCameraView ResolveActiveCamera(const world::World& world,
                                                    platform::Extent2i viewportSize) noexcept {
     ActiveCameraView out{};
-    const f32 halfW = static_cast<f32>(viewportSize.w) * 0.5f;
-    const f32 halfH = static_cast<f32>(viewportSize.h) * 0.5f;
+    out.viewport = {0.0f, 0.0f, static_cast<f32>(viewportSize.w), static_cast<f32>(viewportSize.h)};
+    out.zoom     = 1.0f;
 
-    for (auto [id, rigRef] : world.View<world::CameraRig2D>()) {
-        const auto* rig = &rigRef;
-        if (rig != nullptr && rig->active && rig->viewSlot == 0 && !rig->screenSpace) {
-            const auto& wt = world.GetWorldTransform(id);
+    for (const world::EntityId id : world.View<world::CameraRig2D>()) {
+        const auto* rig = world.TryGet<world::CameraRig2D>(id);
+        if (rig != nullptr && rig->active && !rig->screenSpace && rig->viewSlot == 0) {
+            const world::WorldTransform2D& wt = world.GetWorldTransform(id);
             out.centerX = wt.x;
             out.centerY = wt.y;
-            out.zoom    = std::max(rig->zoom, 0.05f);
+            out.zoom    = rig->zoom > 0.01f ? rig->zoom : 1.0f;
+            if (rig->viewport.w > 0.0f && rig->viewport.h > 0.0f) {
+                out.viewport = rig->viewport;
+            }
             break;
         }
     }
 
     const f32 invZoom = 1.0f / out.zoom;
-    out.minX = out.centerX - halfW * invZoom;
-    out.maxX = out.centerX + halfW * invZoom;
-    out.minY = out.centerY - halfH * invZoom;
-    out.maxY = out.centerY + halfH * invZoom;
+    const f32 halfW   = (out.viewport.w * 0.5f) * invZoom;
+    const f32 halfH   = (out.viewport.h * 0.5f) * invZoom;
+    out.worldBounds   = {out.centerX - halfW, out.centerY - halfH, halfW * 2.0f, halfH * 2.0f};
     return out;
 }
 
@@ -69,13 +72,13 @@ void DebugInspector::BindArena(std::span<ActorTickRecord, kHistoryTicks> tickRin
 }
 
 void DebugInspector::Clear() noexcept {
-    for (auto& rec : m_tickRing) {
+    for (ActorTickRecord& rec : m_tickRing) {
         rec = ActorTickRecord{};
     }
-    m_pinnedEntity     = world::kNullEntity;
-    m_lastRecordedTick = 0;
-    m_scrubOffset      = 0;
-    m_recordedCount    = 0;
+    m_pinnedEntity  = world::kNullEntity;
+    m_writeCursor   = 0;
+    m_scrubOffset   = 0;
+    m_recordedCount = 0;
 }
 
 void DebugInspector::RecordActorTick(const world::World& world,
@@ -86,93 +89,107 @@ void DebugInspector::RecordActorTick(const world::World& world,
         return;
     }
 
-    world::EntityId targetId = m_pinnedEntity;
-    if (!world.IsAlive(targetId)) {
-        for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
-            targetId = id;
+    world::EntityId target = m_pinnedEntity;
+    if (!world.IsAlive(target)) {
+        target = world::kNullEntity;
+        for (const world::EntityId id : world.View<gameplay::StateMachine2D, gameplay::KinematicMotor2D>()) {
+            target = id;
             break;
+        }
+        if (target.index == 0) {
+            for (const world::EntityId id : world.View<gameplay::KinematicMotor2D>()) {
+                target = id;
+                break;
+            }
         }
     }
 
-    ActorTickRecord& rec = m_tickRing[tickIndex & (kHistoryTicks - 1u)];
-    rec = ActorTickRecord{};
-    rec.tickIndex     = tickIndex;
-    rec.entityId      = targetId;
+    ActorTickRecord rec{};
+    rec.tickIndex     = static_cast<u32>(tickIndex);
+    rec.entityId      = target;
     rec.inputHeld     = tickInput.held;
     rec.inputPressed  = tickInput.pressed;
     rec.inputReleased = tickInput.released;
     rec.axisX         = tickInput.axis[0];
     rec.axisY         = tickInput.axis[1];
 
-    u16 bufMask = 0;
-    for (u8 a = 0; a < 16; ++a) {
+    u16 bufferedMask = 0;
+    for (u8 a = 0; a < input::kMaxActions; ++a) {
         if (actionBuffer.Peek(a, 12)) {
-            bufMask |= static_cast<u16>(1u << a);
+            bufferedMask |= static_cast<u16>(1u << a);
         }
     }
-    rec.actionBufferMask = bufMask;
+    rec.actionBufferMask = bufferedMask;
 
-    if (world.IsAlive(targetId)) {
-        const auto& wt = world.GetWorldTransform(targetId);
+    if (world.IsAlive(target)) {
+        const world::WorldTransform2D& wt = world.GetWorldTransform(target);
         rec.worldX = wt.x;
         rec.worldY = wt.y;
 
-        if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(targetId)) {
+        if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(target)) {
             rec.velX         = motor->vx;
             rec.velY         = motor->vy;
             rec.contactFlags = static_cast<u8>(motor->contacts);
+        } else if (const auto* vel = world.TryGet<world::Velocity2D>(target)) {
+            rec.velX = vel->vx;
+            rec.velY = vel->vy;
         }
-        if (const auto* fsm = world.TryGet<gameplay::StateMachine2D>(targetId)) {
+
+        if (const auto* fsm = world.TryGet<gameplay::StateMachine2D>(target)) {
+            rec.cancelMask = fsm->cancelMask;
+            rec.stateTicks = fsm->stateTicks;
             rec.stateId    = fsm->stateId;
             rec.animClipId = fsm->animClipId;
-            rec.animFrame  = static_cast<u8>(fsm->lastAnimFrame);
-            rec.stateTicks = fsm->stateTicks;
-            rec.cancelMask = static_cast<u16>(fsm->cancelMask);
+            rec.animFrame  = fsm->lastAnimFrame;
         }
-        if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(targetId)) {
+
+        if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(target)) {
+            rec.hurtboxQ8 = {rig->hurtbox.offsetX_q8, rig->hurtbox.offsetY_q8,
+                             rig->hurtbox.halfW_q8, rig->hurtbox.halfH_q8};
+            rec.hitboxQ8  = {rig->primaryHitbox.offsetX_q8, rig->primaryHitbox.offsetY_q8,
+                             rig->primaryHitbox.halfW_q8, rig->primaryHitbox.halfH_q8};
             rec.activeSliceIdx = rig->activeSliceIndex;
-            auto packBox = [](const auto& box) noexcept -> std::array<i16, 4> {
-                return {box.offsetX_q8, box.offsetY_q8, static_cast<i16>(box.halfW_q8), static_cast<i16>(box.halfH_q8)};
-            };
-            rec.hurtboxQ8 = packBox(rig->hurtbox);
-            rec.hitboxQ8  = packBox(rig->primaryHitbox);
         }
-        if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(targetId)) {
-            rec.hp          = static_cast<i16>(dmg->hp);
-            rec.iframeTicks = static_cast<u8>(std::min<u16>(255u, dmg->iframeTicks));
+
+        if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(target)) {
+            rec.hp          = dmg->hp;
+            rec.iframeTicks = dmg->iframeTicks;
         }
     }
 
-    m_lastRecordedTick = tickIndex;
+    m_tickRing[m_writeCursor] = rec;
+    m_writeCursor = static_cast<u8>((m_writeCursor + 1u) & (kHistoryTicks - 1u));
     if (m_recordedCount < kHistoryTicks) {
         ++m_recordedCount;
     }
 }
 
 world::EntityId DebugInspector::PickEntityAtScreenPos(const world::World& world,
-                                                      time::RenderTimeView /*timeView*/,
+                                                      time::RenderTimeView,
                                                       input::Vec2 mousePos,
                                                       platform::Extent2i viewportSize) noexcept {
     const ActiveCameraView cam = ResolveActiveCamera(world, viewportSize);
-    const f32 halfW  = static_cast<f32>(viewportSize.w) * 0.5f;
-    const f32 halfH  = static_cast<f32>(viewportSize.h) * 0.5f;
-    const f32 worldX = cam.centerX + (mousePos.x - halfW) / cam.zoom;
-    const f32 worldY = cam.centerY + (mousePos.y - halfH) / cam.zoom;
+    const f32 relX   = mousePos.x - (cam.viewport.x + cam.viewport.w * 0.5f);
+    const f32 relY   = mousePos.y - (cam.viewport.y + cam.viewport.h * 0.5f);
+    const f32 worldX = cam.centerX + relX / cam.zoom;
+    const f32 worldY = cam.centerY + relY / cam.zoom;
 
     world::EntityId bestEntity = world::kNullEntity;
     f32 bestArea = 1e30f;
 
-    for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
-        const auto* motor = &motorRef;
-        if (motor == nullptr) continue;
-        const auto& wt = world.GetWorldTransform(id);
-        const f32 cx = wt.x + UnpackQ8(motor->bounds.offsetX_q8);
-        const f32 cy = wt.y + UnpackQ8(motor->bounds.offsetY_q8);
-        const f32 hw = std::max(4.0f, UnpackQ8(motor->bounds.halfW_q8));
-        const f32 hh = std::max(4.0f, UnpackQ8(motor->bounds.halfH_q8));
+    for (const world::EntityId id : world.View<world::LocalTransform2D>()) {
+        const world::WorldTransform2D& wt = world.GetWorldTransform(id);
+        renderer::FRect bounds{wt.x - 8.0f, wt.y - 8.0f, 16.0f, 16.0f};
 
-        if (std::abs(worldX - cx) <= hw && std::abs(worldY - cy) <= hh) {
-            const f32 area = hw * hh;
+        if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(id); rig && rig->hurtbox.halfW_q8 > 0) {
+            bounds = UnpackWorldBox(wt.x, wt.y, rig->hurtbox);
+        } else if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(id); motor && motor->bounds.halfW_q8 > 0) {
+            bounds = UnpackWorldBox(wt.x, wt.y, motor->bounds);
+        }
+
+        if (worldX >= bounds.x && worldX <= bounds.x + bounds.w &&
+            worldY >= bounds.y && worldY <= bounds.y + bounds.h) {
+            const f32 area = bounds.w * bounds.h;
             if (area < bestArea) {
                 bestArea   = area;
                 bestEntity = id;
@@ -184,233 +201,220 @@ world::EntityId DebugInspector::PickEntityAtScreenPos(const world::World& world,
     return bestEntity;
 }
 
-void DebugInspector::EmitWorldAndInspectorOverlays(
-    OverlayFlags flags,
-    const world::World& world,
-    const gameplay::GameplayPipeline& /*gameplay*/,
-    const audio::AudioSystem& /*audio*/,
-    const assets::AssetBank& /*assetBank*/,
-    time::RenderTimeView /*timeView*/,
-    const input::FrameInput& frameInput,
-    platform::Extent2i viewportSize,
-    renderer::TextureHandle debugAtlas,
-    renderer::RenderList& outList) const noexcept {
+void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
+                                                   const DebugEmitOverlayContext& ctx,
+                                                   DebugBatcher& worldBatcher,
+                                                   DebugBatcher& hudBatcher) const noexcept {
+    if (flags == OverlayFlags::None) {
+        return;
+    }
 
-    DebugBatcher worldBatcher(outList, debugAtlas, kDebugWorldPassId, 0);
-    DebugBatcher hudBatcher(outList, debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
+    const ActiveCameraView cam = ResolveActiveCamera(ctx.world, ctx.viewportSize);
+    const f32 cullMinX = cam.worldBounds.x - 64.0f;
+    const f32 cullMinY = cam.worldBounds.y - 64.0f;
+    const f32 cullMaxX = cam.worldBounds.x + cam.worldBounds.w + 64.0f;
+    const f32 cullMaxY = cam.worldBounds.y + cam.worldBounds.h + 64.0f;
 
-    const ActiveCameraView cam = ResolveActiveCamera(world, viewportSize);
-    const f32 linePx = 1.0f / cam.zoom;
+    if (HasOverlay(flags, OverlayFlags::DynamicSpatialGrid)) {
+        constexpr f32 kCellSize = 64.0f;
+        const f32 startX = std::floor(cam.worldBounds.x / kCellSize) * kCellSize;
+        const f32 startY = std::floor(cam.worldBounds.y / kCellSize) * kCellSize;
+        const f32 endX   = cam.worldBounds.x + cam.worldBounds.w;
+        const f32 endY   = cam.worldBounds.y + cam.worldBounds.h;
 
-    if (HasOverlay(flags, OverlayFlags::KinematicBounds) ||
-        HasOverlay(flags, OverlayFlags::VelocityVectors)) {
-        for (auto [id, motorRef] : world.View<gameplay::KinematicMotor2D>()) {
-            const auto* motor = &motorRef;
-            if (motor == nullptr) continue;
-            const auto& wt = world.GetWorldTransform(id);
+        for (f32 gx = startX; gx <= endX; gx += kCellSize) {
+            worldBatcher.PushLine(gx, cam.worldBounds.y, gx, endY, 1.0f,
+                                  renderer::Color::FromRGBA8(0x6644AA38u));
+        }
+        for (f32 gy = startY; gy <= endY; gy += kCellSize) {
+            worldBatcher.PushLine(cam.worldBounds.x, gy, endX, gy, 1.0f,
+                                  renderer::Color::FromRGBA8(0x6644AA38u));
+        }
+    }
 
-            const f32 cx = wt.x + UnpackQ8(motor->bounds.offsetX_q8);
-            const f32 cy = wt.y + UnpackQ8(motor->bounds.offsetY_q8);
-            const f32 hw = UnpackQ8(motor->bounds.halfW_q8);
-            const f32 hh = UnpackQ8(motor->bounds.halfH_q8);
+    // Single fused pass across alive spatial entities for all world-space overlays.
+    if (HasOverlay(flags, OverlayFlags::AllWorld | OverlayFlags::EntityInspector)) {
+        const bool drawTransforms  = HasOverlay(flags, OverlayFlags::SpatialTransforms);
+        const bool drawKinematics  = HasOverlay(flags, OverlayFlags::KinematicBounds);
+        const bool drawVelocities  = HasOverlay(flags, OverlayFlags::VelocityVectors);
+        const bool drawCombat      = HasOverlay(flags, OverlayFlags::CombatHitboxes);
+        const bool drawBreadcrumbs = HasOverlay(flags, OverlayFlags::SafeBreadcrumbs);
+        const bool drawCameraRigs  = HasOverlay(flags, OverlayFlags::CameraRigOverlay);
 
-            if (cx + hw < cam.minX || cx - hw > cam.maxX ||
-                cy + hh < cam.minY || cy - hh > cam.maxY) {
+        for (const world::EntityId id : ctx.world.View<world::LocalTransform2D>()) {
+            const world::WorldTransform2D& wt = ctx.world.GetWorldTransform(id);
+            const f32 wx = wt.x;
+            const f32 wy = wt.y;
+
+            const bool inFrustum = (wx >= cullMinX && wx <= cullMaxX && wy >= cullMinY && wy <= cullMaxY);
+            if (!inFrustum && !drawCameraRigs && id.index != m_pinnedEntity.index) {
                 continue;
             }
 
-            if (HasOverlay(flags, OverlayFlags::KinematicBounds)) {
-                const renderer::FRect box{cx - hw, cy - hh, hw * 2.0f, hh * 2.0f};
-                const renderer::Color col = (id.index == m_pinnedEntity.index && id.generation == m_pinnedEntity.generation)
-                    ? renderer::Color::FromRGBA8(0x00FF88FFu)
-                    : renderer::Color::FromRGBA8(0x00E5FFFFu);
-                worldBatcher.PushBoxOutline(box, linePx, col);
+            if (drawTransforms && inFrustum) {
+                worldBatcher.PushLine(wx, wy, wx + wt.cosRot * 8.0f, wy + wt.sinRot * 8.0f,
+                                      1.0f, renderer::Color::FromRGBA8(0xFF4444FFu));
+                worldBatcher.PushLine(wx, wy, wx - wt.sinRot * 8.0f, wy + wt.cosRot * 8.0f,
+                                      1.0f, renderer::Color::FromRGBA8(0x44FF44FFu));
+            }
 
-                const u8 contacts = static_cast<u8>(motor->contacts);
-                const renderer::Color contactCol = renderer::Color::FromRGBA8(0x00FF44FFu);
-                if (contacts & static_cast<u8>(gameplay::ContactFlags::Ground)) {
-                    worldBatcher.PushLine(cx - hw, cy + hh, cx + hw, cy + hh, linePx * 2.5f, contactCol);
+            if (drawKinematics || drawVelocities) {
+                if (const auto* motor = ctx.world.TryGet<gameplay::KinematicMotor2D>(id)) {
+                    if (drawKinematics && inFrustum && motor->bounds.halfW_q8 > 0) {
+                        const renderer::FRect box = UnpackWorldBox(wx, wy, motor->bounds);
+                        const u8 contacts         = static_cast<u8>(motor->contacts);
+                        const renderer::Color col = (contacts & 1u) != 0
+                            ? renderer::Color::FromRGBA8(0x44FF88FFu)
+                            : renderer::Color::FromRGBA8(0x44CCFFFFu);
+                        worldBatcher.PushBoxOutline(box, 1.0f, col);
+                    }
+                    if (drawVelocities && inFrustum && (std::abs(motor->vx) > 0.5f || std::abs(motor->vy) > 0.5f)) {
+                        worldBatcher.PushArrow(wx, wy, wx + motor->vx * 0.1f, wy + motor->vy * 0.1f,
+                                               4.0f, 1.0f, renderer::Color::FromRGBA8(0xFFFF44FFu));
+                    }
+                } else if (drawVelocities && inFrustum) {
+                    if (const auto* vel = ctx.world.TryGet<world::Velocity2D>(id)) {
+                        if (std::abs(vel->vx) > 0.5f || std::abs(vel->vy) > 0.5f) {
+                            worldBatcher.PushArrow(wx, wy, wx + vel->vx * 0.1f, wy + vel->vy * 0.1f,
+                                                   4.0f, 1.0f, renderer::Color::FromRGBA8(0xFFCC44FFu));
+                        }
+                    }
                 }
-                if (contacts & static_cast<u8>(gameplay::ContactFlags::Ceiling)) {
-                    worldBatcher.PushLine(cx - hw, cy - hh, cx + hw, cy - hh, linePx * 2.5f, contactCol);
-                }
-                if (contacts & static_cast<u8>(gameplay::ContactFlags::WallLeft)) {
-                    worldBatcher.PushLine(cx - hw, cy - hh, cx - hw, cy + hh, linePx * 2.5f, contactCol);
-                }
-                if (contacts & static_cast<u8>(gameplay::ContactFlags::WallRight)) {
-                    worldBatcher.PushLine(cx + hw, cy - hh, cx + hw, cy + hh, linePx * 2.5f, contactCol);
-                }
-                if (contacts & static_cast<u8>(gameplay::ContactFlags::OnSlope)) {
-                    const f32 nx = UnpackQ14(motor->slopeNormalX_q14);
-                    const f32 ny = UnpackQ14(motor->slopeNormalY_q14);
-                    worldBatcher.PushArrow(cx, cy + hh, cx + nx * 12.0f, cy + hh + ny * 12.0f,
-                                           3.0f * linePx, linePx, renderer::Color::FromRGBA8(0xFFAA00FFu));
+
+                if (drawKinematics && inFrustum) {
+                    if (const auto* carrier = ctx.world.TryGet<gameplay::KinematicCarrier2D>(id)) {
+                        const renderer::FRect box = UnpackWorldBox(wx, wy, carrier->bounds);
+                        worldBatcher.PushBoxOutline(box, 1.5f, renderer::Color::FromRGBA8(0xFF9922FFu));
+                    }
                 }
             }
 
-            if (HasOverlay(flags, OverlayFlags::VelocityVectors)) {
-                worldBatcher.PushArrow(cx, cy, cx + motor->vx * 0.1f, cy + motor->vy * 0.1f,
-                                       4.0f * linePx, linePx, renderer::Color::FromRGBA8(0xFFFF00FFu));
-            }
-        }
-    }
-
-    if (HasOverlay(flags, OverlayFlags::CombatHitboxes)) {
-        for (auto [id, rigRef] : world.View<gameplay::HitboxRig2D>()) {
-            const auto* rig = &rigRef;
-            if (rig == nullptr) continue;
-            const auto& wt = world.GetWorldTransform(id);
-
-            const f32 hcx = wt.x + UnpackQ8(rig->hurtbox.offsetX_q8);
-            const f32 hcy = wt.y + UnpackQ8(rig->hurtbox.offsetY_q8);
-            const f32 hhw = UnpackQ8(rig->hurtbox.halfW_q8);
-            const f32 hhh = UnpackQ8(rig->hurtbox.halfH_q8);
-
-            if (hhw > 0.0f && hhh > 0.0f) {
-                bool invuln = false;
-                if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(id)) {
-                    invuln = (dmg->iframeTicks > 0);
+            if (drawCombat && inFrustum) {
+                if (const auto* rig = ctx.world.TryGet<gameplay::HitboxRig2D>(id)) {
+                    const auto* dmg      = ctx.world.TryGet<gameplay::DamageReceiver2D>(id);
+                    const bool hasIframe = (dmg != nullptr && dmg->iframeTicks > 0);
+                    if (rig->hurtbox.halfW_q8 > 0) {
+                        const renderer::FRect hb  = UnpackWorldBox(wx, wy, rig->hurtbox);
+                        const renderer::Color col = hasIframe
+                            ? renderer::Color::FromRGBA8(0xFFFFFFFFu)
+                            : renderer::Color::FromRGBA8(0x22FF66CCu);
+                        worldBatcher.PushBoxOutline(hb, 1.0f, col);
+                    }
+                    if (rig->activeSliceIndex != 0xFFu && rig->primaryHitbox.halfW_q8 > 0) {
+                        const renderer::FRect atk = UnpackWorldBox(wx, wy, rig->primaryHitbox);
+                        worldBatcher.PushSolidRect(atk, renderer::Color::FromRGBA8(0xFF224444u));
+                        worldBatcher.PushBoxOutline(atk, 1.5f, renderer::Color::FromRGBA8(0xFF2244FFu));
+                    }
                 }
-                const renderer::FRect hurtRect{hcx - hhw, hcy - hhh, hhw * 2.0f, hhh * 2.0f};
-                worldBatcher.PushSolidRect(hurtRect, invuln
-                    ? renderer::Color::FromRGBA8(0xFFD70044u)
-                    : renderer::Color::FromRGBA8(0x2288FF44u));
-                worldBatcher.PushBoxOutline(hurtRect, linePx, invuln
-                    ? renderer::Color::FromRGBA8(0xFFD700FFu)
-                    : renderer::Color::FromRGBA8(0x44AAFFFFu));
             }
 
-            const f32 acx = wt.x + UnpackQ8(rig->primaryHitbox.offsetX_q8);
-            const f32 acy = wt.y + UnpackQ8(rig->primaryHitbox.offsetY_q8);
-            const f32 ahw = UnpackQ8(rig->primaryHitbox.halfW_q8);
-            const f32 ahh = UnpackQ8(rig->primaryHitbox.halfH_q8);
-
-            if (ahw > 0.0f && ahh > 0.0f) {
-                const renderer::FRect hitRect{acx - ahw, acy - ahh, ahw * 2.0f, ahh * 2.0f};
-                worldBatcher.PushSolidRect(hitRect, renderer::Color::FromRGBA8(0xFF222266u));
-                worldBatcher.PushBoxOutline(hitRect, linePx * 1.5f, renderer::Color::FromRGBA8(0xFF4444FFu));
+            if (drawBreadcrumbs && inFrustum) {
+                if (const auto* bc = ctx.world.TryGet<gameplay::SafeGroundBreadcrumb2D>(id)) {
+                    worldBatcher.PushLine(wx, wy, bc->safeX, bc->safeY, 1.0f,
+                                          renderer::Color::FromRGBA8(0x44FFAA88u));
+                    worldBatcher.PushBoxOutline({bc->safeX - 3.0f, bc->safeY - 3.0f, 6.0f, 6.0f},
+                                                1.0f, renderer::Color::FromRGBA8(0x00FF88FFu));
+                }
             }
-        }
-    }
 
-    if (HasOverlay(flags, OverlayFlags::SafeBreadcrumbs)) {
-        for (auto [id, bcRef] : world.View<gameplay::SafeGroundBreadcrumb2D>()) {
-            const auto* bc = &bcRef;
-            if (bc == nullptr) continue;
-            worldBatcher.PushLine(bc->prevSafeX, bc->prevSafeY, bc->safeX, bc->safeY,
-                                  linePx, renderer::Color::FromRGBA8(0x44FF88AAu));
-            worldBatcher.PushCircleOutline(bc->safeX, bc->safeY, 4.0f * linePx, 8,
-                                           linePx, renderer::Color::FromRGBA8(0x00FF66FFu));
-        }
-    }
+            if (drawCameraRigs) {
+                if (const auto* ctrl = ctx.world.TryGet<gameplay::CameraController2D>(id)) {
+                    const f32 dzW = static_cast<f32>(ctrl->deadzoneHalfW_q4) * (1.0f / 16.0f);
+                    const f32 dzH = static_cast<f32>(ctrl->deadzoneHalfH_q4) * (1.0f / 16.0f);
+                    worldBatcher.PushBoxOutline({wx - dzW, wy - dzH, dzW * 2.0f, dzH * 2.0f},
+                                                1.0f, renderer::Color::FromRGBA8(0xFF66FFAAu));
+                }
+            }
 
-    if (HasOverlay(flags, OverlayFlags::CameraRigOverlay)) {
-        for (auto [id, ctrlRef] : world.View<gameplay::CameraController2D>()) {
-            const auto* ctrl = &ctrlRef;
-            if (ctrl == nullptr) continue;
-            const auto& wt = world.GetWorldTransform(id);
-            const f32 dzW = static_cast<f32>(ctrl->deadzoneHalfW_q4) * (1.0f / 16.0f);
-            const f32 dzH = static_cast<f32>(ctrl->deadzoneHalfH_q4) * (1.0f / 16.0f);
-            worldBatcher.PushBoxOutline({wt.x - dzW, wt.y - dzH, dzW * 2.0f, dzH * 2.0f},
-                                        linePx, renderer::Color::FromRGBA8(0xFFCC00CCu));
+            if (id.index == m_pinnedEntity.index && id.generation == m_pinnedEntity.generation) {
+                worldBatcher.PushBoxOutline({wx - 12.0f, wy - 12.0f, 24.0f, 24.0f},
+                                            1.5f, renderer::Color::FromRGBA8(0xFFFF00FFu));
+            }
         }
     }
 
     if (HasOverlay(flags, OverlayFlags::EntityInspector)) {
-        EmitEntityInspectorCard(world, viewportSize, hudBatcher);
+        EmitEntityInspectorCard(ctx.world, ctx.viewportSize, hudBatcher);
     }
-
     if (HasOverlay(flags, OverlayFlags::FlightScrubber)) {
-        EmitFlightScrubberOverlay(m_lastRecordedTick, viewportSize, worldBatcher, hudBatcher);
+        EmitFlightScrubberOverlay(ctx.timeView.tickIndex, ctx.viewportSize, worldBatcher, hudBatcher);
     }
-
     if (HasOverlay(flags, OverlayFlags::InputViewerHud)) {
-        EmitInputViewerOverlay(frameInput, viewportSize, hudBatcher);
+        EmitInputViewerOverlay(ctx.frameInput, ctx.viewportSize, hudBatcher);
     }
+}
+
+void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
+                                                   const DebugEmitOverlayContext& ctx,
+                                                   renderer::TextureHandle debugAtlas,
+                                                   renderer::RenderList& outList) const noexcept {
+    DebugBatcher worldBatcher(outList, debugAtlas, kDebugWorldPassId, 0);
+    DebugBatcher hudBatcher(outList, debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
+    EmitWorldAndInspectorOverlays(flags, ctx, worldBatcher, hudBatcher);
 }
 
 void DebugInspector::EmitEntityInspectorCard(const world::World& world,
-                                             platform::Extent2i /*viewportSize*/,
+                                             platform::Extent2i viewportSize,
                                              DebugBatcher& hudBatcher) const noexcept {
+    const f32 cardW = 248.0f;
+    const f32 cardH = 128.0f;
+    const f32 cardX = static_cast<f32>(viewportSize.w) - cardW - 12.0f;
+    const f32 cardY = 12.0f;
+
+    hudBatcher.PushSolidRect({cardX, cardY, cardW, cardH}, renderer::Color::FromRGBA8(0x10141EE0u));
+    hudBatcher.PushBoxOutline({cardX, cardY, cardW, cardH}, 1.0f, renderer::Color::FromRGBA8(0x4488CCFFu));
+
+    const f32 tx = cardX + 8.0f;
+    f32 ty       = cardY + 8.0f;
+
     if (!world.IsAlive(m_pinnedEntity)) {
+        hudBatcher.PushText(tx, ty, "INSPECTOR: <Click Entity>", renderer::Color::FromRGBA8(0xAACCFFFFu));
         return;
     }
 
-    const f32 panelX = 12.0f;
-    const f32 panelY = 112.0f;
-    const f32 panelW = 264.0f;
-    const f32 panelH = 148.0f;
+    DebugTextLine line{};
+    line.Str("ENTITY #").I64(m_pinnedEntity.index).Str(" (Gen ").I64(m_pinnedEntity.generation).Char(')');
+    hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xFFFF66FFu));
+    ty += 12.0f;
 
-    hudBatcher.PushSolidRect({panelX, panelY, panelW, panelH}, renderer::Color::FromRGBA8(0x10141CDD));
-    hudBatcher.PushBoxOutline({panelX, panelY, panelW, panelH}, 1.0f, renderer::Color::FromRGBA8(0x00E5FFFF));
-
-    std::array<char, 64> buf{};
-    char* end = buf.data() + buf.size();
-
-    auto emitLine = [&](f32 yOff, std::string_view prefix, auto v0, auto v1, renderer::Color col) {
-        auto toI64 = [](auto val) noexcept -> i64 {
-            if constexpr (std::is_enum_v<decltype(val)>) {
-                return static_cast<i64>(std::to_underlying(val));
-            } else {
-                return static_cast<i64>(val);
-            }
-        };
-        char* p = buf.data();
-        for (char c : prefix) {
-            if (p < end) *p++ = c;
-        }
-        p = DebugBatcher::FormatI64(p, end, toI64(v0));
-        if (p < end) *p++ = ':';
-        p = DebugBatcher::FormatI64(p, end, toI64(v1));
-        hudBatcher.PushText(panelX + 8.0f, panelY + yOff,
-                            std::string_view(buf.data(), static_cast<usize>(p - buf.data())), col);
-    };
-
-    emitLine(8.0f, "ENTITY ID:GEN  ", m_pinnedEntity.index, m_pinnedEntity.generation,
-             renderer::Color::FromRGBA8(0x00FF88FF));
-
-    const auto& wt = world.GetWorldTransform(m_pinnedEntity);
-    {
-        char* p = buf.data();
-        for (char c : std::string_view("POS X/Y: ")) *p++ = c;
-        p = DebugBatcher::FormatF32Fixed2(p, end, wt.x);
-        if (p < end) *p++ = ' ';
-        p = DebugBatcher::FormatF32Fixed2(p, end, wt.y);
-        hudBatcher.PushText(panelX + 8.0f, panelY + 24.0f,
-                            std::string_view(buf.data(), static_cast<usize>(p - buf.data())),
-                            renderer::Color::FromRGBA8(0xE0E6F0FF));
-    }
+    const world::WorldTransform2D& wt = world.GetWorldTransform(m_pinnedEntity);
+    line.Clear();
+    line.Str("Pos: (").F32(wt.x).Str(", ").F32(wt.y).Char(')');
+    hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xE0E8F0FFu));
+    ty += 11.0f;
 
     if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(m_pinnedEntity)) {
-        char* p = buf.data();
-        for (char c : std::string_view("VEL X/Y: ")) *p++ = c;
-        p = DebugBatcher::FormatF32Fixed2(p, end, motor->vx);
-        if (p < end) *p++ = ' ';
-        p = DebugBatcher::FormatF32Fixed2(p, end, motor->vy);
-        hudBatcher.PushText(panelX + 8.0f, panelY + 40.0f,
-                            std::string_view(buf.data(), static_cast<usize>(p - buf.data())),
-                            renderer::Color::FromRGBA8(0xFFFF66FF));
-
-        emitLine(56.0f, "CONTACTS:CH    ", motor->contacts, motor->timeChannel,
-                 renderer::Color::FromRGBA8(0x88DDFFFF));
+        line.Clear();
+        line.Str("Vel: (").F32(motor->vx).Str(", ").F32(motor->vy).Str(") C:0x")
+            .U64Hex(static_cast<u8>(motor->contacts), 2);
+        hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0x88EEFFFFu));
+        ty += 11.0f;
     }
 
     if (const auto* fsm = world.TryGet<gameplay::StateMachine2D>(m_pinnedEntity)) {
-        emitLine(76.0f, "FSM STATE:TICK ", fsm->stateId, fsm->stateTicks,
-                 renderer::Color::FromRGBA8(0xFFAA44FF));
-        emitLine(92.0f, "CLIP:FRAME     ", fsm->animClipId, fsm->lastAnimFrame,
-                 renderer::Color::FromRGBA8(0xFFCC88FF));
+        line.Clear();
+        line.Str("FSM: St=").I64(fsm->stateId)
+            .Str(" Clip=").I64(fsm->animClipId)
+            .Str(" Frm=").I64(fsm->lastAnimFrame)
+            .Str(" T=").I64(fsm->stateTicks);
+        hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0x88FFAAFFu));
+        ty += 11.0f;
+
+        line.Clear();
+        line.Str("CancelMask: 0x").U64Hex(fsm->cancelMask, 4);
+        hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xCCCCCCFFu));
+        ty += 11.0f;
     }
 
     if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(m_pinnedEntity)) {
-        emitLine(112.0f, "HP:MAX_HP      ", dmg->hp, dmg->maxHp,
-                 renderer::Color::FromRGBA8(0xFF5555FF));
-        emitLine(128.0f, "IFRAME:STUN    ", dmg->iframeTicks, dmg->stunTicks,
-                 renderer::Color::FromRGBA8(0xFFD700FF));
+        line.Clear();
+        line.Str("HP: ").I64(dmg->hp).Char('/').I64(dmg->maxHp)
+            .Str("  IFrames: ").I64(dmg->iframeTicks);
+        hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xFF99AAFFu));
     }
 }
 
-void DebugInspector::EmitFlightScrubberOverlay(u64 currentTickIndex,
+void DebugInspector::EmitFlightScrubberOverlay(u64,
                                                platform::Extent2i viewportSize,
                                                DebugBatcher& worldBatcher,
                                                DebugBatcher& hudBatcher) const noexcept {
@@ -418,128 +422,85 @@ void DebugInspector::EmitFlightScrubberOverlay(u64 currentTickIndex,
         return;
     }
 
-    const u64 targetTick = currentTickIndex - m_scrubOffset;
-    const ActorTickRecord& rec = m_tickRing[targetTick & (kHistoryTicks - 1u)];
+    const u8 off  = std::min<u8>(m_scrubOffset, static_cast<u8>(m_recordedCount - 1));
+    const u8 slot = static_cast<u8>((m_writeCursor + kHistoryTicks - 1u - off) & (kHistoryTicks - 1u));
+    const ActorTickRecord& rec = m_tickRing[slot];
 
-    // Render historical ghost silhouette in world space when scrubbing backward.
-    if (m_scrubOffset > 0 && rec.entityId.index != 0) {
-        const f32 hcx = rec.worldX + UnpackQ8(rec.hurtboxQ8[0]);
-        const f32 hcy = rec.worldY + UnpackQ8(rec.hurtboxQ8[1]);
-        const f32 hhw = UnpackQ8(rec.hurtboxQ8[2]);
-        const f32 hhh = UnpackQ8(rec.hurtboxQ8[3]);
-        if (hhw > 0.0f && hhh > 0.0f) {
-            const renderer::FRect ghostHurt{hcx - hhw, hcy - hhh, hhw * 2.0f, hhh * 2.0f};
-            worldBatcher.PushSolidRect(ghostHurt, renderer::Color::FromRGBA8(0x00FFFF33u));
-            worldBatcher.PushBoxOutline(ghostHurt, 1.0f, renderer::Color::FromRGBA8(0x00FFFFFFu));
+    if (rec.entityId.index != 0) {
+        if (rec.hurtboxQ8[2] > 0) {
+            const renderer::FRect hb = UnpackQ8ArrayBox(rec.worldX, rec.worldY, rec.hurtboxQ8);
+            worldBatcher.PushBoxOutline(hb, 1.5f, renderer::Color::FromRGBA8(0x00FFFFCCu));
         }
-
-        const f32 acx = rec.worldX + UnpackQ8(rec.hitboxQ8[0]);
-        const f32 acy = rec.worldY + UnpackQ8(rec.hitboxQ8[1]);
-        const f32 ahw = UnpackQ8(rec.hitboxQ8[2]);
-        const f32 ahh = UnpackQ8(rec.hitboxQ8[3]);
-        if (ahw > 0.0f && ahh > 0.0f) {
-            const renderer::FRect ghostHit{acx - ahw, acy - ahh, ahw * 2.0f, ahh * 2.0f};
-            worldBatcher.PushSolidRect(ghostHit, renderer::Color::FromRGBA8(0xFF005555u));
-            worldBatcher.PushBoxOutline(ghostHit, 1.5f, renderer::Color::FromRGBA8(0xFF2266FFu));
+        if (rec.activeSliceIdx != 0xFFu && rec.hitboxQ8[2] > 0) {
+            const renderer::FRect atk = UnpackQ8ArrayBox(rec.worldX, rec.worldY, rec.hitboxQ8);
+            worldBatcher.PushBoxOutline(atk, 1.5f, renderer::Color::FromRGBA8(0xFF00FFCCu));
         }
     }
 
-    // Emit 64-tick bottom scrubber bar in screen space.
-    const f32 barW = 384.0f;
-    const f32 barH = 54.0f;
+    const f32 barW = 360.0f;
+    const f32 barH = 44.0f;
     const f32 barX = (static_cast<f32>(viewportSize.w) - barW) * 0.5f;
     const f32 barY = static_cast<f32>(viewportSize.h) - barH - 12.0f;
 
-    hudBatcher.PushSolidRect({barX, barY, barW, barH}, renderer::Color::FromRGBA8(0x0D1117DD));
-    hudBatcher.PushBoxOutline({barX, barY, barW, barH}, 1.0f, renderer::Color::FromRGBA8(0x4488FFFF));
+    hudBatcher.PushSolidRect({barX, barY, barW, barH}, renderer::Color::FromRGBA8(0x10141EE0u));
+    hudBatcher.PushBoxOutline({barX, barY, barW, barH}, 1.0f, renderer::Color::FromRGBA8(0x66AAFFFFu));
 
-    std::array<char, 64> hdr{};
-    char* p = hdr.data();
-    char* end = hdr.data() + hdr.size();
-    for (char c : std::string_view("FLIGHT SCRUB [-")) *p++ = c;
-    p = DebugBatcher::FormatI64(p, end, m_scrubOffset);
-    for (char c : std::string_view("t] STATE:")) *p++ = c;
-    p = DebugBatcher::FormatI64(p, end, rec.stateId);
-    for (char c : std::string_view(" FRM:")) *p++ = c;
-    p = DebugBatcher::FormatI64(p, end, rec.animFrame);
-    hudBatcher.PushText(barX + 8.0f, barY + 6.0f,
-                        std::string_view(hdr.data(), static_cast<usize>(p - hdr.data())),
-                        renderer::Color::FromRGBA8(0xFFFFFFFF));
+    DebugTextLine line{};
+    line.Str("SCRUB [-").I64(off).Str("t] Tick:").I64(rec.tickIndex)
+        .Str(" St:").I64(rec.stateId)
+        .Str(" Frm:").I64(rec.animFrame)
+        .Str(" In:0x").U64Hex(rec.inputHeld, 4);
+    hudBatcher.PushText(barX + 8.0f, barY + 6.0f, line.View(), renderer::Color::FromRGBA8(0xFFFFFFFFu));
 
-    const f32 cellW = 5.5f;
-    const f32 stripX = barX + 14.0f;
-    const f32 stripY = barY + 22.0f;
-
+    const f32 cellW = (barW - 16.0f) / static_cast<f32>(kHistoryTicks);
     for (u8 i = 0; i < m_recordedCount; ++i) {
-        const u64 t = currentTickIndex - i;
-        const ActorTickRecord& slot = m_tickRing[t & (kHistoryTicks - 1u)];
-        const f32 x = stripX + static_cast<f32>(kHistoryTicks - 1u - i) * cellW;
-
-        const bool hasHitbox = (slot.hitboxQ8[2] > 0 && slot.hitboxQ8[3] > 0);
-        const bool hasCancel = (slot.cancelMask != 0);
-        const bool hasPress  = (slot.inputPressed != 0);
-
-        const renderer::Color stateCol = hasHitbox
-            ? renderer::Color::FromRGBA8(0xFF3333FF)
-            : (hasCancel ? renderer::Color::FromRGBA8(0xFFCC00FF)
-                         : renderer::Color::FromRGBA8(0x336699FF));
-        hudBatcher.PushSolidRect({x, stripY, cellW - 1.0f, 12.0f}, stateCol);
-
-        if (hasPress) {
-            hudBatcher.PushSolidRect({x, stripY + 14.0f, cellW - 1.0f, 8.0f},
-                                     renderer::Color::FromRGBA8(0x00FF66FF));
-        } else if (slot.actionBufferMask != 0) {
-            hudBatcher.PushSolidRect({x, stripY + 16.0f, cellW - 1.0f, 4.0f},
-                                     renderer::Color::FromRGBA8(0x00AA44AA));
-        }
-
-        if (i == m_scrubOffset) {
-            hudBatcher.PushBoxOutline({x - 1.0f, stripY - 2.0f, cellW + 1.0f, 26.0f},
-                                      1.0f, renderer::Color::FromRGBA8(0xFFFFFFFF));
-        }
+        const u8 histSlot = static_cast<u8>((m_writeCursor + kHistoryTicks - 1u - i) & (kHistoryTicks - 1u));
+        const ActorTickRecord& item = m_tickRing[histSlot];
+        const f32 cx = barX + barW - 8.0f - static_cast<f32>(i + 1u) * cellW;
+        const renderer::Color col = (i == off)
+            ? renderer::Color::FromRGBA8(0xFFFF00FFu)
+            : (item.activeSliceIdx != 0xFFu
+                ? renderer::Color::FromRGBA8(0xFF4466FFu)
+                : renderer::Color::FromRGBA8(0x336699FFu));
+        hudBatcher.PushSolidRect({cx, barY + 22.0f, cellW - 1.0f, 14.0f}, col);
     }
 }
 
 void DebugInspector::EmitInputViewerOverlay(const input::FrameInput& frameInput,
                                             platform::Extent2i viewportSize,
                                             DebugBatcher& hudBatcher) const noexcept {
-    const f32 panelW = 240.0f;
-    const f32 panelH = 68.0f;
-    const f32 panelX = 12.0f;
-    const f32 panelY = static_cast<f32>(viewportSize.h) - panelH - 12.0f;
+    const f32 x = 12.0f;
+    const f32 y = static_cast<f32>(viewportSize.h) - 52.0f;
+    const f32 w = 224.0f;
+    const f32 h = 40.0f;
 
-    hudBatcher.PushSolidRect({panelX, panelY, panelW, panelH}, renderer::Color::FromRGBA8(0x10141CDD));
-    hudBatcher.PushBoxOutline({panelX, panelY, panelW, panelH}, 1.0f, renderer::Color::FromRGBA8(0x557799FF));
-    hudBatcher.PushText(panelX + 8.0f, panelY + 6.0f, "INPUT ACTIONS [0..15]",
-                        renderer::Color::FromRGBA8(0xAACCFFFF));
+    hudBatcher.PushSolidRect({x, y, w, h}, renderer::Color::FromRGBA8(0x10141EE0u));
+    hudBatcher.PushBoxOutline({x, y, w, h}, 1.0f, renderer::Color::FromRGBA8(0x557799FFu));
 
-    for (u8 a = 0; a < 16; ++a) {
-        const f32 bx = panelX + 8.0f + static_cast<f32>(a) * 14.0f;
-        const f32 by = panelY + 24.0f;
-        const bool pressed  = (frameInput.pressed & (1u << a)) != 0;
-        const bool held     = (frameInput.held & (1u << a)) != 0;
-        const bool released = (frameInput.released & (1u << a)) != 0;
+    DebugTextLine line{};
+    line.Str("INPUT Held:0x").U64Hex(frameInput.held, 4)
+        .Str(" Edge:0x").U64Hex(frameInput.pressed, 4);
+    hudBatcher.PushText(x + 6.0f, y + 5.0f, line.View(), renderer::Color::FromRGBA8(0xDDE8FFFFu));
 
-        renderer::Color col = renderer::Color::FromRGBA8(0x283040FF);
-        if (pressed) {
-            col = renderer::Color::FromRGBA8(0x00FF66FF);
-        } else if (held) {
-            col = renderer::Color::FromRGBA8(0x00B8FFFF);
-        } else if (released) {
-            col = renderer::Color::FromRGBA8(0xFFAA00FF);
-        }
-        hudBatcher.PushSolidRect({bx, by, 11.0f, 16.0f}, col);
+    for (u32 bit = 0; bit < 16; ++bit) {
+        const bool isHeld = (frameInput.held & (1u << bit)) != 0;
+        const bool isEdge = (frameInput.pressed & (1u << bit)) != 0;
+        const renderer::Color col = isEdge
+            ? renderer::Color::FromRGBA8(0xFFFF44FFu)
+            : (isHeld ? renderer::Color::FromRGBA8(0x44FF88FFu) : renderer::Color::FromRGBA8(0x283040FFu));
+        hudBatcher.PushSolidRect({x + 6.0f + static_cast<f32>(bit) * 13.0f, y + 20.0f, 10.0f, 12.0f}, col);
     }
+}
 
-    if (m_recordedCount > 0 && !m_tickRing.empty()) {
-        const ActorTickRecord& latest = m_tickRing[m_lastRecordedTick & (kHistoryTicks - 1u)];
-        const f32 stickCx = panelX + 208.0f;
-        const f32 stickCy = panelY + 48.0f;
-        hudBatcher.PushCircleOutline(stickCx, stickCy, 14.0f, 16, 1.0f, renderer::Color::FromRGBA8(0x6688AAFF));
-        const f32 sx = stickCx + (static_cast<f32>(latest.axisX) / 32767.0f) * 12.0f;
-        const f32 sy = stickCy + (static_cast<f32>(latest.axisY) / 32767.0f) * 12.0f;
-        hudBatcher.PushSolidRect({sx - 2.0f, sy - 2.0f, 4.0f, 4.0f}, renderer::Color::FromRGBA8(0x00FF88FF));
+u64 DebugInspector::ComputeAuditHash() const noexcept {
+    u64 h = MixAuditHash(0xA7C0159EC701ull, m_recordedCount);
+    h = MixAuditHash(h, (static_cast<u64>(m_pinnedEntity.generation) << 16) | m_pinnedEntity.index);
+    for (u8 i = 0; i < m_recordedCount; ++i) {
+        const ActorTickRecord& r = m_tickRing[i];
+        h = MixAuditHash(h, (static_cast<u64>(r.tickIndex) << 32) |
+                            (static_cast<u64>(r.stateId) << 16) | r.inputHeld);
     }
+    return h;
 }
 
 } // namespace en::debug

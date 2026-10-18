@@ -36,9 +36,61 @@ private:
     renderer::QuadCmd m_templateQuad{};
 };
 
+// Zero-allocation stack string builder for HUD text formatting without repetitive pointer arithmetic.
+class DebugTextLine {
+public:
+    constexpr void Clear() noexcept { m_len = 0; }
+
+    DebugTextLine& Str(std::string_view sv) noexcept {
+        const usize rem = m_buf.size() - m_len;
+        const usize n   = sv.size() < rem ? sv.size() : rem;
+        for (usize i = 0; i < n; ++i) {
+            m_buf[m_len + i] = sv[i];
+        }
+        m_len += n;
+        return *this;
+    }
+
+    DebugTextLine& Char(char c) noexcept {
+        if (m_len < m_buf.size()) {
+            m_buf[m_len++] = c;
+        }
+        return *this;
+    }
+
+    DebugTextLine& I64(i64 val) noexcept {
+        char* end = m_buf.data() + m_buf.size();
+        char* cur = DebugBatcher::FormatI64(m_buf.data() + m_len, end, val);
+        m_len     = static_cast<usize>(cur - m_buf.data());
+        return *this;
+    }
+
+    DebugTextLine& U64Hex(u64 val, u8 digits = 8) noexcept {
+        char* end = m_buf.data() + m_buf.size();
+        char* cur = DebugBatcher::FormatU64Hex(m_buf.data() + m_len, end, val, digits);
+        m_len     = static_cast<usize>(cur - m_buf.data());
+        return *this;
+    }
+
+    DebugTextLine& F32(f32 val) noexcept {
+        char* end = m_buf.data() + m_buf.size();
+        char* cur = DebugBatcher::FormatF32Fixed2(m_buf.data() + m_len, end, val);
+        m_len     = static_cast<usize>(cur - m_buf.data());
+        return *this;
+    }
+
+    [[nodiscard]] constexpr std::string_view View() const noexcept {
+        return {m_buf.data(), m_len};
+    }
+
+private:
+    std::array<char, 128> m_buf{};
+    usize m_len{0};
+};
+
 // Fixed 2048-slot transient shape pool managed by 64-bit occupancy bitwords.
 // Non-owning view over the 64 KB shape slice in DebugSystem's arena.
-// Invariant: Zero memory moves on expiration; active slots are scanned in 64-slot blocks via countr_zero.
+// Invariant: m_activeCount == sum(popcount(m_activeWords)); active slots are scanned via countr_zero.
 class DebugShapePool {
 public:
     static constexpr usize kMaxShapes = 2048;
@@ -62,24 +114,25 @@ public:
                        u32 rgba8 = 0xFFFFFFFFu, u32 durationTicks = 1) noexcept;
 
     void EmitAndExpire(u64 currentTickIndex,
+                       DebugBatcher& worldBatcher,
+                       DebugBatcher& hudBatcher) noexcept;
+
+    void EmitAndExpire(u64 currentTickIndex,
                        renderer::TextureHandle debugAtlas,
                        renderer::RenderList& outList) noexcept;
 
-    [[nodiscard]] constexpr u32 ActiveCount() const noexcept {
-        u32 total = 0;
-        for (const u64 w : m_activeWords) {
-            total += static_cast<u32>(std::popcount(w));
-        }
-        return total;
-    }
+    [[nodiscard]] constexpr u32 ActiveCount() const noexcept { return m_activeCount; }
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
-    [[nodiscard]] DebugShapeCmd& AllocateSlot(u32 durationTicks) noexcept;
+    [[nodiscard]] DebugShapeCmd* AllocateSlot(DebugShapeKind kind, f32 x0, f32 y0,
+                                              u32 rgba8, f32 thickness, u32 durationTicks) noexcept;
 
     std::span<DebugShapeCmd> m_pool{};
     std::array<u64, kWordCount> m_activeWords{};
     u32 m_allocCursor{0};
     u32 m_currentTickLow{0};
+    u32 m_activeCount{0};
 };
 
 } // namespace en::debug

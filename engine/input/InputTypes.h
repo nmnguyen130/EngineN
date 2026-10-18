@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <concepts>
+#include <initializer_list>
 #include <type_traits>
 
 namespace en::input {
@@ -17,6 +18,7 @@ inline constexpr usize kMaxGamepads        = 4;
 inline constexpr usize kMaxActions         = 16;
 inline constexpr usize kMaxAxes            = 4;
 inline constexpr usize kMaxBindingsPerSlot = 4;
+inline constexpr f32   kInvAxisMax         = 1.0f / 32767.0f;
 
 template <typename T>
 concept InputId = (std::unsigned_integral<T> || std::is_enum_v<T>) && sizeof(T) <= sizeof(u32);
@@ -52,9 +54,9 @@ enum class SocdPolicy : u8 {
 };
 
 // Packed 4-byte physical control token (Keyboard scancode, Mouse button, or Gamepad button).
-// Value type; gamepadIndex == kAnyGamepad matches any connected controller slot [0..3].
+// Value type; gamepadIndex == kAnyGamepad matches any controller slot [0..3].
 // Invariant: sizeof(Source) == 4.
-struct Source {
+struct alignas(4) Source {
     static constexpr u8  kAnyGamepad        = 0xFF;
     static constexpr u16 kMaxScancodes      = 512;
     static constexpr u16 kMaxMouseButtons   = 8;
@@ -80,9 +82,18 @@ struct Source {
         switch (device) {
             case Device::Keyboard: return code > 0 && code < kMaxScancodes;
             case Device::Mouse:    return code > 0 && code < kMaxMouseButtons;
-            case Device::Gamepad:  return code < kMaxGamepadButtons;
+            case Device::Gamepad:  return code < kMaxGamepadButtons &&
+                                          (gamepadIndex < kMaxGamepads || gamepadIndex == kAnyGamepad);
             default:               return false;
         }
+    }
+
+    [[nodiscard]] constexpr bool Matches(Source physical) const noexcept {
+        return device == physical.device &&
+               code == physical.code &&
+               (device != Device::Gamepad ||
+                gamepadIndex == kAnyGamepad ||
+                gamepadIndex == physical.gamepadIndex);
     }
 
     [[nodiscard]] constexpr bool operator==(const Source&) const noexcept = default;
@@ -101,9 +112,11 @@ struct AxisBinding {
     f32         scale        = 1.0f;
 };
 
+static_assert(sizeof(AxisBinding) == 20);
+
 // Direct-indexed binding table eliminating dynamic search and runtime capacity errors.
-// Pure data aggregate; can be swapped, serialized, or mutated at zero cost.
-// Invariant: Every action owns exactly kMaxBindingsPerSlot physical source slots.
+// Pure 336-byte data aggregate; can be swapped, serialized, or mutated at zero cost.
+// Invariant: Every stored Source is either Default (Device::None) or validated via Source::IsValid().
 struct InputMap {
     std::array<std::array<Source, kMaxBindingsPerSlot>, kMaxActions> actions{};
     std::array<AxisBinding, kMaxAxes>                                axes{};
@@ -133,12 +146,16 @@ struct InputMap {
     constexpr InputMap& BindAxis(InputId auto axis, const AxisBinding& cfg) noexcept {
         const u8 idx = ToInputIndex(axis);
         if (idx < kMaxAxes) {
-            axes[idx] = cfg;
+            axes[idx]          = cfg;
+            axes[idx].negative = cfg.negative.IsValid() ? cfg.negative : Source{};
+            axes[idx].positive = cfg.positive.IsValid() ? cfg.positive : Source{};
             axes[idx].deadzone = std::clamp(cfg.deadzone, 0.0f, 0.99f);
         }
         return *this;
     }
 };
+
+static_assert(sizeof(InputMap) == 336);
 
 [[nodiscard]] constexpr f32 ApplyAxialDeadzone(f32 value, f32 deadzone) noexcept {
     deadzone = std::clamp(deadzone, 0.0f, 0.99f);
@@ -154,12 +171,12 @@ struct InputMap {
 [[nodiscard]] inline Vec2 ApplyRadialDeadzone(Vec2 stick, f32 deadzone) noexcept {
     deadzone = std::clamp(deadzone, 0.0f, 0.99f);
     const f32 lenSq = stick.x * stick.x + stick.y * stick.y;
-    if (!std::isfinite(lenSq) || lenSq <= deadzone * deadzone) {
+    if (!(lenSq > deadzone * deadzone)) {
         return Vec2{0.0f, 0.0f};
     }
-    const f32 len    = std::sqrt(lenSq);
-    const f32 scaled = (std::min(len, 1.0f) - deadzone) / (1.0f - deadzone);
-    return Vec2{(stick.x / len) * scaled, (stick.y / len) * scaled};
+    const f32 len   = std::sqrt(lenSq);
+    const f32 scale = (std::min(len, 1.0f) - deadzone) / ((1.0f - deadzone) * len);
+    return Vec2{stick.x * scale, stick.y * scale};
 }
 
 // L1 cache-aligned immutable 120Hz simulation input snapshot.
@@ -170,10 +187,8 @@ struct alignas(64) TickInput {
     u16 held     = 0;
     u16 pressed  = 0;
     u16 released = 0;
-    u16 pad0     = 0;
     std::array<i16, kMaxAxes>    axis{};
     std::array<u16, kMaxActions> heldTicks{};
-    u64 reserved = 0;
 
     [[nodiscard]] constexpr bool Held(InputId auto a) const noexcept {
         return ((held >> ToInputIndex(a)) & 1u) != 0;
@@ -195,7 +210,7 @@ struct alignas(64) TickInput {
     [[nodiscard]] constexpr f32 Axis(InputId auto ax) const noexcept {
         const u8 idx = ToInputIndex(ax);
         return (idx < kMaxAxes)
-            ? std::clamp(static_cast<f32>(axis[idx]) / 32767.0f, -1.0f, 1.0f)
+            ? std::clamp(static_cast<f32>(axis[idx]) * kInvAxisMax, -1.0f, 1.0f)
             : 0.0f;
     }
 
@@ -203,25 +218,38 @@ struct alignas(64) TickInput {
         const Vec2 raw{Axis(axX), Axis(axY)};
         return (radialDeadzone > 0.0f) ? ApplyRadialDeadzone(raw, radialDeadzone) : raw;
     }
+
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
+        u64 h = 14695981039346656037ull;
+        auto mix = [&](u64 v) constexpr noexcept {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(tick);
+        mix(static_cast<u64>(held) |
+            (static_cast<u64>(pressed) << 16) |
+            (static_cast<u64>(released) << 32));
+        for (const i16 ax : axis) mix(static_cast<u16>(ax));
+        for (const u16 ht : heldTicks) mix(ht);
+        return h;
+    }
 };
 
 static_assert(sizeof(TickInput) == 64);
 
 // L1 cache-aligned render-frame input view for UI, cursor, and key-rebinding menus.
-// Computed once per frame in EndInputFrame().
+// Computed once per frame in EndFrame() or IngestPlatformFrame().
 // Invariant: sizeof(FrameInput) == 64.
 struct alignas(64) FrameInput {
-    u64    frameIndex    = 0;
-    u16    held          = 0;
-    u16    pressed       = 0;
-    u16    released      = 0;
-    Device activeDevice  = Device::None;
-    u8     pad0          = 0;
-    Source lastPressed{}; // Captures physical button press for "Press any key to rebind"
+    u64    frameIndex   = 0;
+    u16    held         = 0;
+    u16    pressed      = 0;
+    u16    released     = 0;
+    Device activeDevice = Device::None;
+    Source lastPressed{};
     Vec2   mousePos{0.0f, 0.0f};
     Vec2   mouseDelta{0.0f, 0.0f};
     Vec2   mouseWheel{0.0f, 0.0f};
-    u8     pad1[20]{};
 
     [[nodiscard]] constexpr bool Held(InputId auto a) const noexcept {
         return ((held >> ToInputIndex(a)) & 1u) != 0;

@@ -5,13 +5,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
+#include <utility>
 
 namespace en::input {
 
 // Stateless-routing, pull-evaluated input pipeline for 120Hz simulation and variable render frames.
-// Zero heap allocation, 100% constexpr, and immune to stuck-key bugs on binding or mask changes.
-// Invariant: Sub-frame taps (press+release within one frame) are preserved across consecutive ticks.
-class InputPipeline {
+// Zero heap allocation, 100% constexpr, L1 cache-line partitioned, and immune to stuck-key bugs.
+// Invariant: Sub-frame taps are preserved independently for render frames and simulation ticks.
+class alignas(64) InputPipeline {
 public:
     static constexpr i16 kGamepadWakeThreshold = 8000;
     static constexpr u16 kAllActionsMask       = 0xFFFFu;
@@ -27,16 +29,54 @@ public:
     }
 
     [[nodiscard]] constexpr const FrameInput& EndFrame() noexcept {
-        const u16 liveHeld      = EvaluateLiveHeld() & m_actionMask;
-        const u16 maskedTap     = m_latchedTap & m_actionMask;
-        const u16 effectiveHeld = liveHeld | maskedTap;
+        const u16 liveHeld = EvaluateLiveHeld();
+        const u16 tapMask  = std::exchange(m_frameTap, 0) & m_actionMask;
 
         ++m_frame.frameIndex;
-        m_frame.pressed  = static_cast<u16>((effectiveHeld & ~m_prevFrameHeld) | maskedTap);
-        m_frame.released = static_cast<u16>(~liveHeld & (m_prevFrameHeld | m_frame.pressed));
+        m_frame.pressed  = static_cast<u16>(((liveHeld | tapMask) & ~m_prevFrameHeld) | tapMask);
+        m_frame.released = static_cast<u16>(~liveHeld & (m_prevFrameHeld | tapMask));
         m_frame.held     = liveHeld;
         m_prevFrameHeld  = liveHeld;
         return m_frame;
+    }
+
+    // Single-pass ingestion of coalesced PlatformFrameEvents from en::platform::Platform::Pump().
+    template <typename FrameBatchT>
+    constexpr const FrameInput& IngestPlatformFrame(const FrameBatchT& batch) noexcept {
+        BeginFrame();
+
+        if (batch.focusCleared) {
+            ClearPhysicalState();
+        }
+
+        for (u32 m = batch.disconnectedPadMask; m != 0; m &= m - 1) {
+            DisconnectGamepad(static_cast<u8>(std::countr_zero(m)));
+        }
+
+        if (batch.hasMouseMotion) {
+            FeedMouseMotion(Vec2{batch.mouseX, batch.mouseY}, Vec2{batch.mouseDx, batch.mouseDy});
+        }
+
+        if (batch.wheelX != 0.0f || batch.wheelY != 0.0f) {
+            FeedMouseWheel(Vec2{batch.wheelX, batch.wheelY});
+        }
+
+        for (usize i = 0; i < batch.eventCount; ++i) {
+            const auto& ev   = batch.events[i];
+            const u16   hdr  = ev.packedHeader;
+            const u16   code = static_cast<u16>(hdr & 0x0FFFu);
+            const u8    slot = static_cast<u8>((hdr >> 12) & 0x03u);
+
+            switch (hdr >> 14) {
+                case 0: FeedButton(Source::Key(code), ev.value != 0); break;
+                case 1: FeedButton(Source::Mouse(code), ev.value != 0); break;
+                case 2: FeedGamepadButton(slot, code, ev.value != 0); break;
+                case 3: FeedGamepadAxis(slot, static_cast<u8>(code), ev.value); break;
+                default: break;
+            }
+        }
+
+        return EndFrame();
     }
 
     [[nodiscard]] constexpr const FrameInput& GetFrameView() const noexcept {
@@ -44,21 +84,18 @@ public:
     }
 
     [[nodiscard]] constexpr TickInput PollTick(u64 tickIndex) noexcept {
-        const u16 liveHeld = EvaluateLiveHeld() & m_actionMask;
-        const u16 tapMask  = m_latchedTap & m_actionMask;
-        m_latchedTap       = 0;
-
-        // Force sub-frame tap held for 1 tick so simulation sees Press on Tick N and Release on Tick N+1.
+        const u16 liveHeld = EvaluateLiveHeld();
+        const u16 tapMask  = std::exchange(m_tickTap, 0) & m_actionMask;
         const u16 tickHeld = liveHeld | tapMask;
         const u16 pressed  = static_cast<u16>((tickHeld & ~m_prevTickHeld) | tapMask);
         const u16 released = static_cast<u16>(~tickHeld & m_prevTickHeld);
         m_prevTickHeld     = tickHeld;
 
-        for (u32 m = static_cast<u32>(~tickHeld & 0xFFFFu); m != 0; m &= m - 1) {
-            m_heldTicks[static_cast<usize>(std::countr_zero(m))] = 0;
+        for (u32 m = released; m != 0; m &= m - 1) {
+            m_heldTicks[std::countr_zero(m)] = 0;
         }
         for (u32 m = tickHeld; m != 0; m &= m - 1) {
-            const usize a = static_cast<usize>(std::countr_zero(m));
+            const int a = std::countr_zero(m);
             if (((pressed >> a) & 1u) != 0) {
                 m_heldTicks[a] = 1;
             } else if (m_heldTicks[a] < 0xFFFFu) {
@@ -76,9 +113,15 @@ public:
         };
     }
 
-    [[nodiscard]] constexpr auto&& Map(this auto&& self) noexcept { return self.m_map; }
+    [[nodiscard]] constexpr InputMap& Map() noexcept { return m_map; }
+    [[nodiscard]] constexpr const InputMap& Map() const noexcept { return m_map; }
 
-    constexpr void SetActionMask(u16 enabledActionsMask) noexcept { m_actionMask = enabledActionsMask; }
+    constexpr void SetActionMask(u16 enabledActionsMask) noexcept {
+        m_actionMask = enabledActionsMask;
+        m_tickTap   &= enabledActionsMask;
+        m_frameTap  &= enabledActionsMask;
+    }
+
     [[nodiscard]] constexpr u16 GetActionMask() const noexcept { return m_actionMask; }
 
     constexpr void FeedButton(Source src, bool down) noexcept {
@@ -96,7 +139,7 @@ public:
     }
 
     constexpr void FeedMouseMotion(Vec2 pos, Vec2 delta) noexcept {
-        m_frame.mousePos   = pos;
+        m_frame.mousePos    = pos;
         m_frame.mouseDelta += delta;
     }
 
@@ -104,62 +147,57 @@ public:
         m_frame.mouseWheel += wheel;
     }
 
-    constexpr void FeedGamepadAxis(u32 instanceId, u8 axisIdx, i16 value) noexcept {
-        if (axisIdx >= GamepadState::kMaxAxes) {
-            return;
-        }
-        const u8 slot = AcquireGamepadSlot(instanceId);
-        if (slot < kMaxGamepads) {
-            m_pads[slot].axes[axisIdx] = value;
+    constexpr void FeedGamepadAxis(u8 padSlot, u8 axisIdx, i16 value) noexcept {
+        if (padSlot < kMaxGamepads && axisIdx < GamepadState::kMaxAxes) {
+            m_pads[padSlot].axes[axisIdx] = value;
             if (value > kGamepadWakeThreshold || value < -kGamepadWakeThreshold) {
                 m_frame.activeDevice = Device::Gamepad;
             }
         }
     }
 
-    constexpr void FeedGamepadButton(u32 instanceId, u16 button, bool down) noexcept {
-        const u8 slot = AcquireGamepadSlot(instanceId);
-        if (slot < kMaxGamepads) {
-            FeedButton(Source::Pad(button, slot), down);
+    constexpr void FeedGamepadButton(u8 padSlot, u16 button, bool down) noexcept {
+        if (padSlot < kMaxGamepads) {
+            FeedButton(Source::Pad(button, padSlot), down);
         }
     }
 
-    constexpr void DisconnectGamepad(u32 instanceId) noexcept {
-        for (auto& pad : m_pads) {
-            if (pad.connected && pad.instanceId == instanceId) {
-                pad = {};
-                break;
-            }
+    constexpr void DisconnectGamepad(u8 padSlot) noexcept {
+        if (padSlot < kMaxGamepads) {
+            m_pads[padSlot] = {};
+            m_anyPadButtons = m_pads[0].buttons | m_pads[1].buttons |
+                              m_pads[2].buttons | m_pads[3].buttons;
         }
     }
 
     constexpr void ClearPhysicalState() noexcept {
-        m_keyBits.fill(0);
-        m_mouseBits  = 0;
-        m_latchedTap = 0;
-        m_lastAxisDir.fill(0);
-        for (auto& pad : m_pads) {
-            pad.buttons = 0;
-            pad.axes.fill(0);
-        }
+        m_keyBits       = {};
+        m_pads          = {};
+        m_anyPadButtons = 0;
+        m_keyWordMask   = 0;
+        m_mouseBits     = 0;
+        m_tickTap       = 0;
+        m_frameTap      = 0;
+        m_lastAxisDir   = {};
     }
 
     [[nodiscard]] constexpr bool IsPhysicallyDown(Source src) const noexcept {
         switch (src.device) {
             case Device::Keyboard:
-                return (m_keyBits[src.code >> 6] & (1ull << (src.code & 63))) != 0;
+                return src.code < Source::kMaxScancodes &&
+                       (m_keyBits[src.code >> 6] & (1ull << (src.code & 63))) != 0;
             case Device::Mouse:
-                return (m_mouseBits & (1u << src.code)) != 0;
+                return src.code < Source::kMaxMouseButtons &&
+                       (m_mouseBits & (1u << src.code)) != 0;
             case Device::Gamepad: {
-                const u32 bit = 1u << src.code;
-                if (src.gamepadIndex == Source::kAnyGamepad) {
-                    for (const auto& pad : m_pads) {
-                        if (pad.connected && (pad.buttons & bit) != 0) return true;
-                    }
+                if (src.code >= Source::kMaxGamepadButtons) {
                     return false;
                 }
+                const u32 bit = 1u << src.code;
+                if (src.gamepadIndex == Source::kAnyGamepad) {
+                    return (m_anyPadButtons & bit) != 0;
+                }
                 return src.gamepadIndex < kMaxGamepads &&
-                       m_pads[src.gamepadIndex].connected &&
                        (m_pads[src.gamepadIndex].buttons & bit) != 0;
             }
             default:
@@ -173,57 +211,55 @@ public:
             h ^= v;
             h *= 1099511628211ull;
         };
-        mix(m_actionMask);
-        mix(m_latchedTap);
-        mix(m_prevTickHeld);
-        for (const u16 ht : m_heldTicks) mix(ht);
+        mix(static_cast<u64>(m_actionMask) |
+            (static_cast<u64>(m_tickTap) << 16) |
+            (static_cast<u64>(m_prevTickHeld) << 32));
+        for (u32 m = m_prevTickHeld; m != 0; m &= m - 1) {
+            mix(m_heldTicks[std::countr_zero(m)]);
+        }
         for (const i8 dir : m_lastAxisDir) mix(static_cast<u8>(dir));
         return h;
     }
 
 private:
-    struct GamepadState {
+    struct alignas(16) GamepadState {
         static constexpr usize kMaxAxes = 6;
-        u32  instanceId = 0;
-        u32  buttons    = 0;
-        bool connected  = false;
+        u32 buttons = 0;
         std::array<i16, kMaxAxes> axes{};
     };
 
-    [[nodiscard]] constexpr u8 AcquireGamepadSlot(u32 instanceId) noexcept {
-        u8 freeSlot = static_cast<u8>(kMaxGamepads);
-        for (u8 i = 0; i < kMaxGamepads; ++i) {
-            if (m_pads[i].connected) {
-                if (m_pads[i].instanceId == instanceId) return i;
-            } else if (freeSlot == kMaxGamepads) {
-                freeSlot = i;
-            }
-        }
-        if (freeSlot < kMaxGamepads) {
-            m_pads[freeSlot] = {.instanceId = instanceId, .connected = true};
-        }
-        return freeSlot;
-    }
+    static_assert(sizeof(GamepadState) == 16);
 
     constexpr void SetPhysicalBit(Source src, bool down) noexcept {
         switch (src.device) {
             case Device::Keyboard: {
-                const u64 mask = 1ull << (src.code & 63);
-                if (down) m_keyBits[src.code >> 6] |= mask;
-                else      m_keyBits[src.code >> 6] &= ~mask;
+                const usize w    = src.code >> 6;
+                const u64   mask = 1ull << (src.code & 63);
+                if (down) {
+                    m_keyBits[w]  |= mask;
+                    m_keyWordMask |= static_cast<u8>(1u << w);
+                } else if ((m_keyBits[w] &= ~mask) == 0) {
+                    m_keyWordMask &= static_cast<u8>(~(1u << w));
+                }
                 break;
             }
             case Device::Mouse: {
                 const u8 mask = static_cast<u8>(1u << src.code);
                 if (down) m_mouseBits |= mask;
-                else      m_mouseBits &= ~mask;
+                else      m_mouseBits &= static_cast<u8>(~mask);
                 break;
             }
             case Device::Gamepad: {
                 if (src.gamepadIndex >= kMaxGamepads) return;
                 const u32 mask = 1u << src.code;
-                if (down) m_pads[src.gamepadIndex].buttons |= mask;
-                else      m_pads[src.gamepadIndex].buttons &= ~mask;
+                if (down) {
+                    m_pads[src.gamepadIndex].buttons |= mask;
+                    m_anyPadButtons                  |= mask;
+                } else {
+                    m_pads[src.gamepadIndex].buttons &= ~mask;
+                    m_anyPadButtons = m_pads[0].buttons | m_pads[1].buttons |
+                                      m_pads[2].buttons | m_pads[3].buttons;
+                }
                 break;
             }
             default:
@@ -232,34 +268,35 @@ private:
     }
 
     constexpr void RecordTapAndSocd(Source pressedSrc) noexcept {
-        const auto matches = [pressedSrc](Source binding) constexpr noexcept {
-            return binding.device == pressedSrc.device &&
-                   binding.code == pressedSrc.code &&
-                   (binding.device != Device::Gamepad ||
-                    binding.gamepadIndex == Source::kAnyGamepad ||
-                    binding.gamepadIndex == pressedSrc.gamepadIndex);
-        };
-
-        for (usize a = 0; a < kMaxActions; ++a) {
+        u16 tapped = 0;
+        for (u32 m = m_actionMask; m != 0; m &= m - 1) {
+            const int a = std::countr_zero(m);
             for (const Source s : m_map.actions[a]) {
-                if (s.IsValid() && matches(s)) {
-                    m_latchedTap |= static_cast<u16>(1u << a);
+                if (s.Matches(pressedSrc)) {
+                    tapped |= static_cast<u16>(1u << a);
                     break;
                 }
             }
         }
+        m_tickTap  |= tapped;
+        m_frameTap |= tapped;
 
         for (usize ax = 0; ax < kMaxAxes; ++ax) {
-            if (matches(m_map.axes[ax].negative)) m_lastAxisDir[ax] = -1;
-            if (matches(m_map.axes[ax].positive)) m_lastAxisDir[ax] = 1;
+            if (m_map.axes[ax].negative.Matches(pressedSrc)) m_lastAxisDir[ax] = -1;
+            if (m_map.axes[ax].positive.Matches(pressedSrc)) m_lastAxisDir[ax] = 1;
         }
     }
 
     [[nodiscard]] constexpr u16 EvaluateLiveHeld() const noexcept {
+        if ((m_keyWordMask | m_mouseBits | m_anyPadButtons) == 0) {
+            return 0;
+        }
+
         u16 mask = 0;
-        for (usize a = 0; a < kMaxActions; ++a) {
+        for (u32 m = m_actionMask; m != 0; m &= m - 1) {
+            const int a = std::countr_zero(m);
             for (const Source s : m_map.actions[a]) {
-                if (s.IsValid() && IsPhysicallyDown(s)) {
+                if (IsPhysicallyDown(s)) {
                     mask |= static_cast<u16>(1u << a);
                     break;
                 }
@@ -274,32 +311,38 @@ private:
             return out;
         }
 
+        const bool anyButtons = (m_keyWordMask | m_mouseBits | m_anyPadButtons) != 0;
+
         for (usize i = 0; i < kMaxAxes; ++i) {
-            const auto& cfg = m_map.axes[i];
-            const bool  neg = IsPhysicallyDown(cfg.negative);
-            const bool  pos = IsPhysicallyDown(cfg.positive);
+            const AxisBinding& cfg = m_map.axes[i];
 
             f32 digital = 0.0f;
-            if (neg && pos) {
-                digital = (cfg.socd == SocdPolicy::LastInputWins) ? static_cast<f32>(m_lastAxisDir[i]) : 0.0f;
-            } else if (pos) {
-                digital = 1.0f;
-            } else if (neg) {
-                digital = -1.0f;
+            if (anyButtons) {
+                const bool neg = IsPhysicallyDown(cfg.negative);
+                const bool pos = IsPhysicallyDown(cfg.positive);
+                if (neg && pos) {
+                    digital = (cfg.socd == SocdPolicy::LastInputWins) ? static_cast<f32>(m_lastAxisDir[i]) : 0.0f;
+                } else if (pos) {
+                    digital = 1.0f;
+                } else if (neg) {
+                    digital = -1.0f;
+                }
             }
 
             f32 analog = 0.0f;
             if (cfg.gamepadAxis != GamepadAxis::None) {
                 const usize axIdx = static_cast<usize>(cfg.gamepadAxis) - 1;
                 for (usize p = 0; p < kMaxGamepads; ++p) {
-                    if (!m_pads[p].connected ||
-                        (cfg.gamepadIndex != Source::kAnyGamepad && cfg.gamepadIndex != p)) {
+                    if (cfg.gamepadIndex != Source::kAnyGamepad && cfg.gamepadIndex != p) {
                         continue;
                     }
-                    const i16 raw  = m_pads[p].axes[axIdx];
+                    const i16 raw = m_pads[p].axes[axIdx];
+                    if (raw == 0) {
+                        continue;
+                    }
                     const f32 norm = (raw < 0)
                         ? (static_cast<f32>(raw) * (1.0f / 32768.0f))
-                        : (static_cast<f32>(raw) * (1.0f / 32767.0f));
+                        : (static_cast<f32>(raw) * kInvAxisMax);
                     f32 v = ApplyAxialDeadzone(norm, cfg.deadzone);
                     if (cfg.inverted) v = -v;
                     v = std::clamp(v * cfg.scale, -1.0f, 1.0f);
@@ -310,24 +353,39 @@ private:
             }
 
             const f32 val = (std::abs(analog) > std::abs(digital)) ? analog : digital;
-            out[i] = static_cast<i16>(val >= 0.0f ? (val * 32767.0f + 0.5f) : (val * 32767.0f - 0.5f));
+            if (val != 0.0f) {
+                out[i] = static_cast<i16>(val >= 0.0f ? (val * 32767.0f + 0.5f) : (val * 32767.0f - 0.5f));
+            }
         }
         return out;
     }
 
-    alignas(64) std::array<u64, Source::kMaxScancodes / 64> m_keyBits{};
-    u8 m_mouseBits = 0;
-    std::array<i8, kMaxAxes> m_lastAxisDir{};
-    std::array<GamepadState, kMaxGamepads> m_pads{};
-
-    InputMap m_map{};
-    u16      m_actionMask    = kAllActionsMask;
-    u16      m_latchedTap    = 0;
-    u16      m_prevTickHeld  = 0;
-    u16      m_prevFrameHeld = 0;
+    // Cache Line 0 (0..63B): Hot tick/frame bitmasks and hold counters.
     std::array<u16, kMaxActions> m_heldTicks{};
+    u32                          m_anyPadButtons = 0;
+    u16                          m_actionMask    = kAllActionsMask;
+    u16                          m_tickTap       = 0;
+    u16                          m_frameTap      = 0;
+    u16                          m_prevTickHeld  = 0;
+    u16                          m_prevFrameHeld = 0;
+    u8                           m_keyWordMask   = 0;
+    u8                           m_mouseBits     = 0;
+    std::array<i8, kMaxAxes>     m_lastAxisDir{};
 
+    // Cache Line 1 (64..127B): Render-frame snapshot.
     FrameInput m_frame{};
+
+    // Cache Line 2 (128..191B): 512-bit physical keyboard state bitboard.
+    alignas(64) std::array<u64, Source::kMaxScancodes / 64> m_keyBits{};
+
+    // Cache Line 3 (192..255B): 4 x 16B physical gamepad slots.
+    alignas(64) std::array<GamepadState, kMaxGamepads> m_pads{};
+
+    // Cache Lines 4..9 (256..591B): Direct-indexed action and axis binding map.
+    alignas(64) InputMap m_map{};
 };
+
+static_assert(alignof(InputPipeline) == 64);
+static_assert(sizeof(InputPipeline) == 640);
 
 } // namespace en::input

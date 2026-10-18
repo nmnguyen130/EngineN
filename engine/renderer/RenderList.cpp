@@ -25,25 +25,30 @@ consteval std::array<u16, RenderList::kChunkQuads * 6> BuildStaticQuadIndices() 
 
 alignas(64) constexpr auto kStaticQuadIndices = BuildStaticQuadIndices();
 
-constexpr void HashBytesFNV1a(u64& hash, const void* data, std::size_t len) noexcept {
-    const auto* bytes = static_cast<const u8*>(data);
-    for (std::size_t i = 0; i < len; ++i) {
-        hash ^= static_cast<u64>(bytes[i]);
+constexpr void HashWords64(u64& hash, const void* data, std::size_t wordCount) noexcept {
+    const auto* words = static_cast<const u64*>(data);
+    for (std::size_t i = 0; i < wordCount; ++i) {
+        u64 k = words[i];
+        k ^= k >> 30;
+        k *= 0xBF58476D1CE4E5B9ULL;
+        k ^= k >> 27;
+        k *= 0x94D049BB133111EBULL;
+        k ^= k >> 31;
+        hash ^= k;
         hash *= 1099511628211ULL;
     }
 }
 
 } // namespace
 
-void RenderList::Reset(platform::Extent2i size) noexcept {
-    m_quadCount   = 0;
-    m_batchCount  = 0;
-    m_prevKey     = 0;
-    m_isMonotonic = true;
-    m_compiled    = false;
-    m_stats       = {};
-
-    std::memset(m_histograms.data(), 0, sizeof(m_histograms));
+void RenderList::Reset(ViewportExtent size) noexcept {
+    m_prevKey         = 0;
+    m_varyingBits     = 0;
+    m_stats           = {};
+    m_enabledPassMask = 0x0001u;
+    m_clearPassMask   = 0x0001u;
+    m_isMonotonic     = true;
+    m_compiled        = false;
 
     const FRect fullVp{
         0.0f,
@@ -51,43 +56,35 @@ void RenderList::Reset(platform::Extent2i size) noexcept {
         static_cast<f32>(size.w),
         static_cast<f32>(size.h)
     };
+    m_views.fill(Camera2D{
+        .worldCenterX = fullVp.w * 0.5f,
+        .worldCenterY = fullVp.h * 0.5f,
+        .zoom         = 1.0f,
+        .viewport     = fullVp,
+        .scissor      = {},
+        .screenSpace  = true
+    });
 
-    for (u32 i = 0; i < kMaxViews; ++i) {
-        m_views[i] = Camera2D{
-            .worldCenterX = fullVp.w * 0.5f,
-            .worldCenterY = fullVp.h * 0.5f,
-            .zoom         = 1.0f,
-            .viewport     = fullVp,
-            .scissor      = {},
-            .screenSpace  = true
-        };
-    }
-
-    for (u32 i = 0; i < kMaxPasses; ++i) {
-        m_passes[i] = RenderPassDesc{
-            .clearColor = Colors::Black,
-            .clear      = (i == 0),
-            .enabled    = (i == 0)
-        };
-    }
-}
-
-void RenderList::SetPass(u8 passId, const RenderPassDesc& desc) noexcept {
-    m_passes[passId & 0x0Fu] = desc;
-}
-
-void RenderList::SetView(u8 viewSlot, const Camera2D& cam) noexcept {
-    m_views[viewSlot & 0x0Fu] = cam;
+    m_passes.fill(RenderPassDesc{
+        .clearColor = Colors::Black,
+        .clear      = false,
+        .enabled    = false
+    });
+    m_passes[0].clear   = true;
+    m_passes[0].enabled = true;
 }
 
 void RenderList::PushQuad(const QuadCmd& cmd) noexcept {
     const u8 passIdx = cmd.passId & 0x0Fu;
-    if (!m_passes[passIdx].enabled || cmd.w <= 0.0f || cmd.h <= 0.0f) {
+    if (((m_enabledPassMask & (1u << passIdx)) == 0u) || cmd.w <= 0.0f || cmd.h <= 0.0f) {
         return;
     }
 
     const Camera2D& cam = m_views[cmd.viewSlot & 0x0Fu];
     const f32 zoom = cam.screenSpace ? 1.0f : cam.zoom;
+    if (zoom <= 0.0f) {
+        return;
+    }
 
     const f32 cx = cam.screenSpace
         ? cmd.x
@@ -96,15 +93,16 @@ void RenderList::PushQuad(const QuadCmd& cmd) noexcept {
         ? cmd.y
         : (cmd.y - cam.worldCenterY) * zoom + (cam.viewport.h * 0.5f);
 
-    const f32 halfW = (cmd.w * 0.5f) * zoom;
-    const f32 halfH = (cmd.h * 0.5f) * zoom;
+    const f32 halfScale = 0.5f * zoom;
+    const f32 halfW     = cmd.w * halfScale;
+    const f32 halfH     = cmd.h * halfScale;
 
     const f32 hxX = halfW * cmd.cosRot;
     const f32 hxY = halfW * cmd.sinRot;
     const f32 hyX = -halfH * cmd.sinRot;
     const f32 hyY = halfH * cmd.cosRot;
 
-    // Conservative L1 bounding radius in view-space for fast branchless AABB frustum culling.
+    // Conservative L1 bounding radius in view-space for branchless AABB frustum culling.
     const f32 boundRx = std::abs(hxX) + std::abs(hyX);
     const f32 boundRy = std::abs(hxY) + std::abs(hyY);
 
@@ -116,65 +114,45 @@ void RenderList::PushQuad(const QuadCmd& cmd) noexcept {
         }
     }
 
-    if (m_quadCount >= kMaxQuads) {
+    const u32 quadCount = m_stats.submittedQuads;
+    if (quadCount >= kMaxQuads) {
         ++m_stats.droppedQuads;
         return;
     }
 
-    const u16 quadIdx = static_cast<u16>(m_quadCount);
-    const u64 key = SortKey::Pack(cmd, quadIdx);
+    const u16 quadIdx = static_cast<u16>(quadCount);
+    const u64 key     = SortKey::Pack(cmd, quadIdx);
 
-    if (m_quadCount > 0 && key < m_prevKey) {
-        m_isMonotonic = false;
+    if (quadCount > 0) {
+        m_varyingBits |= (key ^ m_prevKey);
+        if (key < m_prevKey) {
+            m_isMonotonic = false;
+        }
     }
     m_prevKey = key;
 
-    // Accumulate histograms for bytes 2..7 during insertion to avoid pre-sort memory scans.
-    for (u32 b = 0; b < 6; ++b) {
-        const u8 byteVal = static_cast<u8>((key >> ((b + 2) * 8)) & 0xFFu);
-        ++m_histograms[b][byteVal];
-    }
-
-    f32 u0 = cmd.uv.x;
-    f32 v0 = cmd.uv.y;
-    f32 u1 = cmd.uv.x + cmd.uv.w;
-    f32 v1 = cmd.uv.y + cmd.uv.h;
-    if (cmd.flipX) { std::swap(u0, u1); }
-    if (cmd.flipY) { std::swap(v0, v1); }
+    const f32 uBase = cmd.uv.x;
+    const f32 vBase = cmd.uv.y;
+    const f32 uFar  = uBase + cmd.uv.w;
+    const f32 vFar  = vBase + cmd.uv.h;
 
     m_quads[quadIdx] = PreparedQuad{
         .cx         = cx,
         .cy         = cy,
-        .hxX        = hxX,
-        .hxY        = hxY,
-        .hyX        = hyX,
-        .hyY        = hyY,
-        .u0         = u0,
-        .v0         = v0,
-        .u1         = u1,
-        .v1         = v1,
+        .d0X        = hxX + hyX,
+        .d0Y        = hxY + hyY,
+        .d1X        = hxX - hyX,
+        .d1Y        = hxY - hyY,
+        .u0         = cmd.flipX ? uFar  : uBase,
+        .v0         = cmd.flipY ? vFar  : vBase,
+        .u1         = cmd.flipX ? uBase : uFar,
+        .v1         = cmd.flipY ? vBase : vFar,
         .color      = cmd.color,
-        .textureGen = cmd.texture.generation
+        .textureGen = static_cast<u16>(cmd.texture.IsValid() ? cmd.texture.generation : 1u)
     };
 
     m_keys[quadIdx] = key;
-    ++m_quadCount;
-    ++m_stats.submittedQuads;
-}
-
-void RenderList::PushRect(FRect rect, Color color, u8 passId, u8 layer, u16 depth, u8 viewSlot) noexcept {
-    PushQuad(QuadCmd{
-        .x        = rect.x + rect.w * 0.5f,
-        .y        = rect.y + rect.h * 0.5f,
-        .w        = rect.w,
-        .h        = rect.h,
-        .color    = color,
-        .texture  = kWhiteTexture,
-        .depth    = depth,
-        .passId   = passId,
-        .layer    = layer,
-        .viewSlot = viewSlot
-    });
+    m_stats.submittedQuads = quadCount + 1;
 }
 
 void RenderList::PushLine(
@@ -187,7 +165,7 @@ void RenderList::PushLine(
         return;
     }
 
-    const f32 len = std::sqrt(lenSq);
+    const f32 len    = std::sqrt(lenSq);
     const f32 invLen = 1.0f / len;
 
     PushQuad(QuadCmd{
@@ -211,9 +189,9 @@ void RenderList::Compile() noexcept {
         return;
     }
     m_compiled = true;
-    m_batchCount = 0;
 
-    if (m_quadCount == 0) {
+    const u32 quadCount = m_stats.submittedQuads;
+    if (quadCount == 0) {
         m_stats.monotonicFastPath = true;
         return;
     }
@@ -221,40 +199,53 @@ void RenderList::Compile() noexcept {
     m_stats.monotonicFastPath = m_isMonotonic;
 
     // Stage 1: 6-Byte LSD Radix Sort on bytes [2..7] (bits 16..63).
-    // Bytes [0..1] store the monotonically increasing quadIndex and never need sorting.
-    if (!m_isMonotonic && m_quadCount > 1) {
-        u64* src = m_keys.data();
-        u64* dst = m_scratchKeys.data();
-
+    // Active varying bytes are identified via m_varyingBits and histogrammed in one linear scan.
+    if (!m_isMonotonic && quadCount > 1) {
+        u8 activeShifts[6]{};
+        u32 numPasses = 0;
         for (u32 b = 0; b < 6; ++b) {
-            const u32 shift = (b + 2) * 8;
-            const auto& hist = m_histograms[b];
-            const u8 firstByte = static_cast<u8>((src[0] >> shift) & 0xFFu);
-
-            // Skip radix pass if all active keys share the exact same byte value.
-            if (hist[firstByte] == m_quadCount) {
-                continue;
+            const u8 shift = static_cast<u8>((b + 2) * 8);
+            if (((m_varyingBits >> shift) & 0xFFULL) != 0) {
+                activeShifts[numPasses++] = shift;
             }
-
-            std::array<u32, 256> offsets{};
-            u32 runningOffset = 0;
-            for (u32 i = 0; i < 256; ++i) {
-                offsets[i] = runningOffset;
-                runningOffset += hist[i];
-            }
-
-            for (u32 i = 0; i < m_quadCount; ++i) {
-                const u64 k = src[i];
-                const u8 bucket = static_cast<u8>((k >> shift) & 0xFFu);
-                dst[offsets[bucket]++] = k;
-            }
-
-            std::swap(src, dst);
-            ++m_stats.radixPassesRun;
         }
 
-        if (src != m_keys.data()) {
-            std::memcpy(m_keys.data(), src, m_quadCount * sizeof(u64));
+        if (numPasses > 0) {
+            alignas(64) std::array<std::array<u32, 256>, 6> histograms{};
+            for (u32 i = 0; i < quadCount; ++i) {
+                const u64 k = m_keys[i];
+                for (u32 p = 0; p < numPasses; ++p) {
+                    ++histograms[p][static_cast<u8>((k >> activeShifts[p]) & 0xFFu)];
+                }
+            }
+
+            u64* src = m_keys.data();
+            u64* dst = m_scratchKeys.data();
+
+            for (u32 p = 0; p < numPasses; ++p) {
+                const u8 shift = activeShifts[p];
+                auto& offsets  = histograms[p];
+
+                u32 runningOffset = 0;
+                for (u32 i = 0; i < 256; ++i) {
+                    const u32 count = offsets[i];
+                    offsets[i] = runningOffset;
+                    runningOffset += count;
+                }
+
+                for (u32 i = 0; i < quadCount; ++i) {
+                    const u64 k = src[i];
+                    const u8 bucket = static_cast<u8>((k >> shift) & 0xFFu);
+                    dst[offsets[bucket]++] = k;
+                }
+
+                std::swap(src, dst);
+            }
+
+            if (src != m_keys.data()) {
+                std::memcpy(m_keys.data(), src, quadCount * sizeof(u64));
+            }
+            m_stats.radixPassesRun = numPasses;
         }
     }
 
@@ -262,7 +253,8 @@ void RenderList::Compile() noexcept {
     u64 prevKey = m_keys[0];
     u16 prevGen = m_quads[SortKey::QuadIndex(prevKey)].textureGen;
 
-    m_batches[0] = DrawBatch{
+    DrawBatch* curBatch = &m_batches[0];
+    *curBatch = DrawBatch{
         .firstQuad = 0,
         .quadCount = 1,
         .texture   = TextureHandle{SortKey::TextureIndex(prevKey), prevGen},
@@ -270,20 +262,19 @@ void RenderList::Compile() noexcept {
         .viewSlot  = SortKey::ViewSlot(prevKey),
         .blend     = SortKey::Blend(prevKey)
     };
-    m_batchCount = 1;
+    u32 batchCount = 1;
 
-    for (u32 i = 1; i < m_quadCount; ++i) {
+    for (u32 i = 1; i < quadCount; ++i) {
         const u64 key = m_keys[i];
         const u16 gen = m_quads[SortKey::QuadIndex(key)].textureGen;
-        const bool sameState = (((key ^ prevKey) & SortKey::kBatchStateMask) == 0) && (gen == prevGen);
-
-        if (sameState) {
-            ++m_batches[m_batchCount - 1].quadCount;
+        if (((key ^ prevKey) & SortKey::kBatchStateMask) == 0 && gen == prevGen) {
+            ++curBatch->quadCount;
         } else {
-            if (m_batchCount >= kMaxBatches) {
+            if (batchCount >= kMaxBatches) {
                 break;
             }
-            m_batches[m_batchCount++] = DrawBatch{
+            curBatch = &m_batches[batchCount++];
+            *curBatch = DrawBatch{
                 .firstQuad = i,
                 .quadCount = 1,
                 .texture   = TextureHandle{SortKey::TextureIndex(key), gen},
@@ -296,7 +287,7 @@ void RenderList::Compile() noexcept {
         }
     }
 
-    m_stats.drawBatches = m_batchCount;
+    m_stats.drawBatches = batchCount;
 }
 
 void RenderList::ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D> outVertices) const noexcept {
@@ -305,21 +296,21 @@ void RenderList::ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D
         const PreparedQuad& q = m_quads[qIdx];
         Vertex2D* v = &outVertices[i * 4];
 
-        v[0] = Vertex2D{q.cx - q.hxX - q.hyX, q.cy - q.hxY - q.hyY, q.color, q.u0, q.v0};
-        v[1] = Vertex2D{q.cx + q.hxX - q.hyX, q.cy + q.hxY - q.hyY, q.color, q.u1, q.v0};
-        v[2] = Vertex2D{q.cx + q.hxX + q.hyX, q.cy + q.hxY + q.hyY, q.color, q.u1, q.v1};
-        v[3] = Vertex2D{q.cx - q.hxX + q.hyX, q.cy - q.hxY + q.hyY, q.color, q.u0, q.v1};
+        v[0] = Vertex2D{q.cx - q.d0X, q.cy - q.d0Y, q.color, q.u0, q.v0};
+        v[1] = Vertex2D{q.cx + q.d1X, q.cy + q.d1Y, q.color, q.u1, q.v0};
+        v[2] = Vertex2D{q.cx + q.d0X, q.cy + q.d0Y, q.color, q.u1, q.v1};
+        v[3] = Vertex2D{q.cx - q.d1X, q.cy - q.d1Y, q.color, q.u0, q.v1};
     }
 }
 
 u64 RenderList::ComputeAuditHash() const noexcept {
     u64 hash = 14695981039346656037ULL;
-    HashBytesFNV1a(hash, m_batches.data(), m_batchCount * sizeof(DrawBatch));
-    for (u32 i = 0; i < m_quadCount; ++i) {
+    HashWords64(hash, m_batches.data(), m_stats.drawBatches * (sizeof(DrawBatch) / sizeof(u64)));
+    for (u32 i = 0; i < m_stats.submittedQuads; ++i) {
         const u16 qIdx = SortKey::QuadIndex(m_keys[i]);
         const u64 stateBits = m_keys[i] & ~0xFFFFULL;
-        HashBytesFNV1a(hash, &stateBits, sizeof(u64));
-        HashBytesFNV1a(hash, &m_quads[qIdx], sizeof(PreparedQuad));
+        HashWords64(hash, &stateBits, 1);
+        HashWords64(hash, &m_quads[qIdx], sizeof(PreparedQuad) / sizeof(u64));
     }
     return hash;
 }

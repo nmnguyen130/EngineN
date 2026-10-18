@@ -1,71 +1,54 @@
-# EngineN — Gameplay & Kinematic Simulation Subsystem Context (`gameplay/`)
+# EngineN — Gameplay Subsystem Context (`engine/gameplay/`)
 
 ## 1. Architecture & Invariants
-- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), zero heap allocation in hot paths (single 512 KB pre-allocated contiguous arena slab at `Init()`), zero virtual dispatch (`GameplayPolicyTable` function-pointer table), minimal 5-file footprint (`GameplayTypes.h`, `SpatialIndex2D.h/.cpp`, `KinematicSolver2D.h/.cpp`, `StateAndCombatSolver.h/.cpp`, `GameplayPipeline.h/.cpp`), two-layer pure C++ separation (zero OS or SDL3 dependencies; `namespace en::gameplay`).
-- **Two-Layer Zero-Virtual Seam & Policy Separation:**
-  - **Layer 1 (`GameplayTypes.h`, `SpatialIndex2D.h/.cpp`, `KinematicSolver2D.h/.cpp`, `StateAndCombatSolver.h/.cpp`):** Policy-free authoritative simulation mechanisms: two-level hierarchical `u64` tile bitplane, 3-pass Counting-Sort Prefix-Sum dynamic spatial grid, continuous Minkowski Swept-AABB move-and-slide solver, priority motion stack, bitmask cancel-window & on-hit promotion FSM, and 64-bit SplitMix Bloom-filter combat overlap engine.
-  - **Layer 2 (`GameplayPipeline.h/.cpp`):** Stateless asset, policy, camera, and presentation bridge. Binds `assets::BlobRecord` (`Residency::Sim`) collision/rig tables, invokes user-registered `GameplayPolicyTable` callbacks, steps the analytic 2nd-order `CameraController2D`, manages the 4096-bit persistent world-flag bitset (`m_worldFlags`), and outputs lockless `SimCue` records for audio/VFX/haptics.
-- **Zero-Tick Hitbox Latency & Channel Freeze Synchronization:**
-  - Animation stepping (`World::StepKinematicsAndAnimations()`) and `CookedAnimRigHeader` frame-edge directive dispatching execute in **Stage 2** (prior to Stage 4 kinematics and Stage 5 combat overlaps), guaranteeing 0-tick latency between a frame entering its active window and its hitbox striking a target.
-  - Entities on frozen `TimeChannel`s (`step.IsFrozen(ch)`) have `SpriteAnimator2D::playing` gated off before `StepKinematicsAndAnimations()` and restored immediately afterward (`HitboxRigFlags::LatchedAnimPlay`), preventing hitbox/frame desynchronization during hitstop.
-- **Double-Integration Prevention & Transform Propagation:**
-  - Colliding actors use `KinematicMotor2D` (`kTypeId = 16`) and never attach `world::Velocity2D` (`kTypeId = 1`).
-  - `world.PropagateTransforms()` is invoked explicitly at the end of Stage 4 so hierarchical child hitboxes hold current-tick `WorldTransform2D` coordinates before Stage 5 combat queries run.
+- **Core:** C++23, zero heap allocation in hot paths (single 512 KB pre-allocated arena slab at `Init()`), zero virtual dispatch (`GameplayPolicyTable` function pointers), minimal footprint (`GameplayTypes.h`, `SpatialIndex2D.h/.cpp`, `KinematicSolver2D.h/.cpp`, `StateAndCombatSolver.h/.cpp`, `GameplayPipeline.h/.cpp`).
+- **Two-Layer Policy Separation:**
+  - **Layer 1 (Authoritative Solvers):** Two-level `u64` tile collision bitplane, 3-pass counting-sort dynamic spatial grid (`SpatialIndex2D`), continuous swept-AABB move-and-slide solver (`KinematicSolver2D`), Q8.8 fixed-point priority motion stack, cancel-window FSM, 64-bit SplitMix Bloom filter hit arbitration, and lockstep `AnimationSubsystem`.
+  - **Layer 2 (`GameplayPipeline`):** Binds `assets::BlobRecord` (`Residency::Sim`) collision/rig maps, invokes user policy callbacks, steps analytic 2nd-order `CameraController2D`, manages 4096-bit persistent `m_worldFlags`, and outputs lockless `SimCue` presentation records (audio/VFX).
+- **6-Stage 120Hz Pipeline Execution (`GameplayPipeline::Tick`):**
+  - **Stage 1 (Carriers):** Advance moving platforms & transfer delta displacements onto grounded riders (`KinematicCarrier2D`).
+  - **Stage 2 (Animations):** Step `AnimationSubsystem` & dispatch `.erig` frame directives (0-tick hitbox latency, TimeChannel freeze gating).
+  - **Stage 3 (State & Policies):** Advance state machine timers and evaluate policy callbacks against `cancelMask`.
+  - **Stage 4 (Kinematics):** Integrate ambient velocities, rebuild spatial grid, solve swept motors (`KinematicMotor2D`), propagate transforms.
+  - **Stage 5 (Combat):** Rebuild combat grid at updated world transforms, gather overlaps via `hitBloomMask`, arbitrate damage/hits.
+  - **Stage 6 (Camera):** Step critically-damped spring camera director on `TimeChannel::Camera` (unfrozen during combat hitstop).
+- **Double-Integration Prevention:** Colliding entities use `KinematicMotor2D` (`kTypeId = 16`) and never attach `world::Velocity2D` (`kTypeId = 1`).
 
-## 2. Core Types & Components (`gameplay/GameplayTypes.h`)
-- **Primitives, Bitmasks & Compact Bounds:**
-  - `enum class GameplayErrc : u8`: `InvalidConfig`, `OutOfMemory`, `CorruptedBlobHeader`, `CorruptedBlobPayload`, `ArenaExhausted`, `WorldRegistrationFailed`.
-  - `enum class ContactFlags : u8`: `None`, `Ground`, `Ceiling`, `WallLeft`, `WallRight`, `OnSlope`, `OnOneWay`, `LedgeGrabLeft`, `LedgeGrabRight`.
-  - `enum class MotorFlags : u8`: `None`, `SnapToGround`, `CornerCorrection`, `ProjectSlopes`, `DetectLedges`, `SoftPushbox`, `TrackSafeAnchor`, `Crushed`, `Submerged`.
-  - `enum class CancelCategory : u16`: `None`, `MovementTurn`, `Jump`, `WallJump`, `EvadeDash`, `PrimaryAttack`, `SecondarySkill`, `DefensiveParry`, `UtilityInteract`, `CrouchSlide`, `LedgeMantle`, `CustomCategory0`, `CustomCategory1`, `AnyAction`.
-  - `struct CompactAabb2D` (`sizeof == 8`): Quantized Q8.8 signed meter local bounds (`offsetX_q8`, `offsetY_q8`, `halfW_q8`, `halfH_q8`).
-- **Gameplay ECS Components (Zero-Padding Layouts, `128B`/Actor Total):**
-  - `struct alignas(32) KinematicMotor2D` (`kTypeId = 16`, `sizeof == 32`): `vx`, `vy`, `bounds` (`CompactAabb2D`), `carrierId`, `slopeNormalX_q14`, `slopeNormalY_q14`, `solidMask`, `bodyLayer`, `pushboxGroup`, `contacts`, `flags`, `timeChannel`, `oneWayIgnoreTicks`.
-  - `struct alignas(16) KinematicCarrier2D` (`kTypeId = 17`, `sizeof == 16`): `deltaX`, `deltaY`, `bounds` (`CompactAabb2D`).
-  - `struct alignas(32) MotionStack2D` (`kTypeId = 18`, `sizeof == 32`): `targetWalkVx`, `overrideVx`, `overrideVy`, `impulseVx`, `impulseVy`, `rootMotionDx_q8`, `rootMotionDy_q8`, `gravityScale_q8`, `overrideTicks`, `activePriority`, `groundCoyoteTicks`, `wallCoyoteTicks`, `packedSigns` (facing, wall sign, carrier launch momentum flag).
-  - `struct alignas(16) StateMachine2D` (`kTypeId = 19`, `sizeof == 16`): `rigBlob` (`assets::BlobHandle`), `stateTicks`, `cancelMask`, `onHitCancelMask`, `lastAnimFrame`, `stateId`, `prevStateId`, `animClipId`, `hurtboxProfileId`.
-  - `struct alignas(32) HitboxRig2D` (`kTypeId = 20`, `sizeof == 32`): `hitBloomMask` (`u64` 2-bit SplitMix filter), `hurtbox`, `primaryHitbox`, `hitLayerMask`, `hurtLayerMask`, `swingId`, `activeSliceIndex`, `rigFlags`.
-  - `struct alignas(16) DamageReceiver2D` (`kTypeId = 21`, `sizeof == 16`): `hp`, `maxHp`, `iframeTicks`, `stunTicks`, `poise`, `teamId`, `receiverFlags`.
-  - `struct alignas(16) SafeGroundBreadcrumb2D` (`kTypeId = 22`, `sizeof == 16`): `safeX`, `safeY`, `prevSafeX`, `prevSafeY` (3-ray verified static non-hazard anchors).
-  - `struct alignas(64) CameraController2D` (`kTypeId = 23`, `sizeof == 64`): `primaryTarget`, `secondaryTarget`, `velX`, `velY`, `latchedGroundY`, `kickOffsetX`, `kickOffsetY`, `activeRoomBounds`, `prevRoomBounds`, `lookaheadX_q8`, `peekOffsetY_q8`, `kickVelX_q8`, `kickVelY_q8`, `trauma_q16`, `roomBlendTicks`, `roomBlendDuration`, `secondaryWeight_q8`, `deadzoneHalfW_q4`, `deadzoneHalfH_q4`, `springFreqX_q4`, `springFreqY_q4`, `cameraFlags`.
-- **Cooked Binary Formats (`Residency::Sim` Blobs):**
-  - `struct alignas(16) CookedCollisionMapHeader` (`32B`, magic `'ECOL'`), `CookedCollisionChunk8x8` (`24B`), `CookedTileCell` (`2B`), `EnvironmentalZone2D` (`24B`).
-  - `struct alignas(16) CookedAnimRigHeader` (`32B`, magic `'ERIG'`), `CookedFrameDirective` (`8B`), `CookedHitboxSlice` (`16B`), `CookedHitboxSocket` (`16B`).
+## 2. Core Components & Layouts (`GameplayTypes.h`)
+- `GameplayErrc`: `InvalidConfig`, `OutOfMemory`, `CorruptedBlobHeader`, `CorruptedBlobPayload`, `ArenaExhausted`, `WorldRegistrationFailed`.
+- `CompactAabb2D` (8B): Q8.8 signed meter bounds (`offsetX_q8`, `offsetY_q8`, `halfW_q8`, `halfH_q8`).
+- `KinematicMotor2D` (`alignas(32)`, 32B, `kTypeId = 16`): `vx`, `vy`, `bounds`, `carrierId`, `slopeNormalX/Y_q14`, `solidMask`, `contacts`, `flags`.
+- `KinematicCarrier2D` (`alignas(16)`, 16B, `kTypeId = 17`): `deltaX`, `deltaY`, `bounds`.
+- `MotionStack2D` (`alignas(32)`, 32B, `kTypeId = 18`): `targetWalkVx`, `overrideVx/Vy`, `impulseVx/Vy`, `rootMotionDx/Dy_q8`, `gravityScale_q8`, `overrideTicks`, `coyoteTicks`, `packedSigns`.
+- `StateMachine2D` (`alignas(16)`, 16B, `kTypeId = 19`): `rigBlob` (`BlobHandle`), `stateTicks`, `cancelMask`, `onHitCancelMask`, `stateId`, `animClipId`, `hurtboxProfileId`.
+- `HitboxRig2D` (`alignas(32)`, 32B, `kTypeId = 20`): `hitBloomMask` (64-bit SplitMix filter), `hurtbox`, `primaryHitbox`, `hitLayerMask`, `hurtLayerMask`, `swingId`.
+- `DamageReceiver2D` (`alignas(16)`, 16B, `kTypeId = 21`): `hp`, `maxHp`, `iframeTicks`, `stunTicks`, `poise`, `teamId`, `receiverFlags`.
+- `SafeGroundBreadcrumb2D` (`alignas(16)`, 16B, `kTypeId = 22`): `safeX/Y`, `prevSafeX/Y` (verified non-hazard anchors).
+- `CameraController2D` (`alignas(64)`, 64B, `kTypeId = 23`): `primaryTarget`, `secondaryTarget`, `velX/Y`, `activeRoomBounds`, `lookaheadX_q8`, `trauma_q16`, `springFreqX/Y_q4`.
 
-## 3. Public Interfaces & Signatures
-### `SpatialIndex2D` (`gameplay/SpatialIndex2D.h`)
-- `void BindArena(std::span<u8> arenaSlice) noexcept`
-- `[[nodiscard]] std::expected<void, GameplayErrc> BindCollisionMapBlob(const assets::BlobRecord& blob) noexcept`
-- `void RebuildDynamicGrid(const world::World& world) noexcept`
-- `[[nodiscard]] SlabImpact2D SweepAabb(world::EntityId ignoreEntity, f32 centerX, f32 centerY, f32 halfW, f32 halfH, f32 deltaX, f32 deltaY, u16 solidMask, bool ignoreOneWay) const noexcept`
-- `[[nodiscard]] RayHit2D Raycast(f32 originX, f32 originY, f32 dirX, f32 dirY, f32 maxDist, u16 layerMask, world::EntityId ignoreId = world::kNullEntity) const noexcept`
-- `[[nodiscard]] u32 GatherCombatOverlaps(const world::World& world, const assets::AssetBank& assetBank, std::span<ResolvedHitEvent> outHits) const noexcept`
+## 3. Subsystem APIs
+### `SpatialIndex2D` (`engine/gameplay/SpatialIndex2D.h`)
+- `BindArena(span<u8>)`, `BindCollisionMapBlob(BlobRecord)` $\to$ `Result<void, GameplayErrc>`, `ClearCollisionMap()`
+- `RebuildDynamicGrid(World)`, `SweepAabb(...)` $\to$ `SlabImpact2D`, `Raycast(...)` $\to$ `RayHit2D`
+- `GatherCombatOverlaps(World, AssetBank, span<ResolvedHitEvent>)` $\to$ `u32`.
 
-### `KinematicSolver2D` & `StateAndCombatSolver` (`gameplay/KinematicSolver2D.h` & `StateAndCombatSolver.h`)
-- `static void KinematicSolver2D::StepCarriersAndRiders(world::World& world, const SpatialIndex2D& spatial, time::SimStepView step) noexcept`
-- `static void KinematicSolver2D::StepMotorsAndMotionStacks(world::World& world, const SpatialIndex2D& spatial, time::SimStepView step, const KinematicStepConfig& cfg = {}) noexcept`
-- `static void StateAndCombatSolver::DispatchAnimationFrameDirectives(world::World& world, const assets::AssetBank& assetBank, time::SimStepView step, GameplayPipeline& pipeline) noexcept`
-- `static void StateAndCombatSolver::ResolveCombatHits(world::World& world, time::SimStepView step, std::span<const ResolvedHitEvent> hits, const GameplayPolicyTable& policies, GameplayPipeline& pipeline) noexcept`
+### `KinematicSolver2D` & `StateAndCombatSolver` (`engine/gameplay/`)
+- `KinematicSolver2D::StepCarriersAndRiders(World&, SpatialIndex2D&, SimStepView)`
+- `KinematicSolver2D::StepMotorsAndMotionStacks(World&, SpatialIndex2D&, SimStepView, KinematicStepConfig)`
+- `AnimationSubsystem::StepAnimationsAndDirectives(World&, AssetBank&, SimStepView, GameplayPipeline&)`
+- `StateAndCombatSolver::StepStateMachinesAndPolicies(World&, AssetBank&, SimStepView, TickInput&, ActionBuffer&, GameplayPolicyTable&, GameplayPipeline&)`
+- `StateAndCombatSolver::ResolveCombatHits(World&, SimStepView, span<const ResolvedHitEvent>, GameplayPolicyTable&, GameplayPipeline&)`.
 
-### `GameplayPipeline` (`gameplay/GameplayPipeline.h` — Move-Only RAII 120 Hz Coordinator)
-- `[[nodiscard]] std::expected<void, GameplayErrc> Init(world::World& world, const GameplayPolicyTable& policies = {}, const GameplayPipelineConfig& cfg = {}) noexcept`
-- `void Shutdown() noexcept`, `void SetPolicyTable(const GameplayPolicyTable& policies) noexcept`
-- `[[nodiscard]] std::expected<void, GameplayErrc> SetActiveRoomCollision(const assets::AssetBank& bank, assets::BlobHandle collisionMapBlob) noexcept`
-- `void Tick(world::World& world, const assets::AssetBank& assetBank, time::SimStepView step, const input::TickInput& tickInput, input::ActionBuffer& actionBuffer) noexcept`
-- `void EmitCue(const SimCue& cue) noexcept`, `[[nodiscard]] constexpr std::span<const SimCue> DrainCues() noexcept`
-- `constexpr void SetWorldFlag(u16 flagId, bool value = true) noexcept`, `[[nodiscard]] constexpr bool TestWorldFlag(u16 flagId) const noexcept`
-- `[[nodiscard]] u64 ComputeAuditHash(const world::World& world) const noexcept`
+### `GameplayPipeline` (`engine/gameplay/GameplayPipeline.h` — 120Hz Coordinator)
+- `Init(World&, GameplayPolicyTable, GameplayPipelineConfig)` $\to$ `Result<void, GameplayErrc>`, `Shutdown()`
+- `SetActiveRoomCollision(AssetBank&, BlobHandle)` $\to$ `Result<void, GameplayErrc>`
+- `Tick(World&, AssetBank&, SimStepView, TickInput&, ActionBuffer&)`: Runs Stages 1..6.
+- `EmitCue(SimCue)`, `DrainCues()` $\to$ `span<const SimCue>`
+- `SetWorldFlag(flagId, value)`, `TestWorldFlag(flagId)` $\to$ `bool`, `ClearWorldFlags()`
+- `Spatial()` $\to$ `const SpatialIndex2D&`, `ComputeAuditHash(World)` $\to$ `u64`.
 
-## 4. Canonical Main Loop Usage
+## 4. Main Loop Integration
 ```cpp
-m_assets.Pump(m_renderer);
-m_input.BeginFrame();
-SDL_Event ev;
-while (SDL_PollEvent(&ev)) {
-    en::input::IngestSdlEvent(m_input, ev);
-}
-const auto& frameInput = m_input.EndFrame();
-
 m_time.BeginFrame();
 while (const auto step = m_time.PollTick()) {
     const auto tickInput = m_input.PollTick(step.TickIndex());
@@ -75,9 +58,8 @@ while (const auto step = m_time.PollTick()) {
     m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);
     m_world.EndTick(step);
 }
+
 for (const auto& cue : m_gameplay.DrainCues()) {
-    m_presentation.ConsumeCue(cue, m_world, m_assets.Bank());
+    // Audio / VFX / Haptics handling
 }
-en::renderer::RenderList& list = m_renderer.BeginFrame();
-en::world::WorldExtractor::Extract(m_world, m_assets.Bank(), m_time.GetRenderView(), list);
-m_renderer.Submit(list);
+```

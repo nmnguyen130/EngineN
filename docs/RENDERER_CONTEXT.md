@@ -1,51 +1,55 @@
-# EngineN — Renderer Subsystem Context (`renderer/`)
+# EngineN — Renderer Subsystem Context (`engine/renderer/`)
 
 ## 1. Architecture & Invariants
-- **Standard:** C++23, zero heap allocation in hot paths, minimal 5-file footprint (`RendererTypes.h`, `RenderList.h/.cpp`, `Renderer.h/.cpp`), two-layer separation (Pure C++ Core + SDL3 Hardware Adapter).
+- **Core:** C++23, zero heap allocation in hot paths, 5-file footprint (`RendererTypes.h`, `RenderList.h/.cpp`, `Renderer.h/.cpp`), two-layer design (Pure C++ Core + SDL3 Hardware Presentation Adapter).
 - **Two-Layer Zero-Virtual Seam:**
-  - **Layer 1 (`RendererTypes.h`, `RenderList.h/.cpp`):** Pure C++23 command recorder, view-space frustum culler, 6-byte LSD radix sorter, state coalescer, and SIMD-friendly vertex expander. Zero OS or SDL dependencies; 100% testable in headless CI via `RenderList::ComputeAuditHash()`.
-  - **Layer 2 (`Renderer.h/.cpp`):** Thin SDL3 hardware presentation coordinator and **Asset Sink**. Owns `SDL_Renderer` and a generational `SDL_Texture` slot pool (`kMaxTextures = 4096`). `<SDL3/SDL_*.h>` headers are strictly confined to `Renderer.cpp`.
-- **Self-Contained 64-Bit `SortKey` (In-Register Sorting):**
-  - Layout: `Pass (4b) > Layer (8b) > Depth (16b) > Blend (2b) > View (4b) > TextureIdx (14b) > QuadIndex (16b)`.
-  - Embedding `QuadIndex` in the lowest 16 bits eliminates separate `SortEntry` structs (50% memory reduction), preserves strict submission order as a tie-breaker, and restricts LSD Radix Sort to bytes `[2..7]` (at most 6 passes).
-- **O(1) Histogram Accumulation & Pass Skipping:** Byte histograms (`m_histograms[6][256]`) are accumulated on insertion during `PushQuad`. During `Compile()`, monotonic frames bypass sorting entirely, and any radix byte where `hist[firstByte] == m_quadCount` is skipped in $O(1)$.
-- **Early View-Space Frustum Culling:** `RenderList::PushQuad` transforms quads into view-space and performs a branchless $L_1$ bounding-radius AABB check against the active `Camera2D::viewport` prior to allocation. Culled quads incur zero sorting or vertex expansion cost.
-- **Zero-Conversion Hardware Submission:** `Vertex2D` (32B) and `Color` (16B premultiplied float) match `SDL_Vertex` and `SDL_FColor` binary layouts 1:1. `Renderer::Submit` streams chunked vertices (`4096` quads/chunk) and a `consteval` `u16` static index buffer (`SharedQuadIndices`) directly into `SDL_RenderGeometryRaw(..., size_indices = 2)`.
-- **Generational Asset Sink & Slot 0 White Texture:** Slot `0` (`kWhiteTexture = {0, 1}`) is permanently initialized as a `1x1` opaque white texture. Unloaded or stale `TextureHandle` references automatically fall back to Slot `0` without crashing.
+  - **Layer 1 (`RenderList`):** Pure C++23 command recorder, view-space frustum culler, 6-byte LSD radix sorter, state coalescer, and vertex expander. Zero SDL headers; 100% testable headless via `ComputeAuditHash()`.
+  - **Layer 2 (`Renderer`):** SDL3 hardware coordinator & **Asset Sink**. Owns `SDL_Renderer` and generational texture pool (`kMaxTextures = 4096`). `<SDL3/...>` headers are strictly confined to `Renderer.cpp`.
+- **Self-Contained 64-Bit `SortKey`:**
+  - Layout: `[Pass:4][Layer:8][Depth:16][Blend:2][View:4][TextureIdx:14][QuadIdx:16]`.
+  - Embedding `QuadIdx` in bits [0..15] eliminates separate sort indices, guarantees stable submission order, and restricts radix sort to bytes [2..7] (at most 6 passes).
+- **$O(1)$ Histogram Accumulation & Fast Path:** Histograms (`m_histograms[6][256]`) accumulate during `PushQuad`. Monotonic frames skip radix sort entirely; byte passes where all keys share identical byte value are skipped in $O(1)$.
+- **Early View-Space Frustum Culling:** `PushQuad` computes $L_1$ view-space bounding radius (`|hxX| + |hyX|`, `|hxY| + |hyY|`) against viewport. Culled quads incur zero sorting or vertex overhead.
+- **Generational Texture Sink & Slot 0 White Texture:** Slot `0` (`kWhiteTexture = {0, 1}`) is permanently bound to a `1x1` opaque white texture. Stale or destroyed handles safely fallback to Slot `0`.
+- **Zero-Conversion Streaming:** `Vertex2D` (32B) and `Color` (16B premultiplied float) match SDL3 binary layouts. `Submit` streams chunks of 4096 quads directly into `SDL_RenderGeometryRaw`.
 
-## 2. Core Types (`renderer/RendererTypes.h`)
-- **Handles & Descriptors:**
-  - `struct TextureHandle { u16 index{0}; u16 generation{0}; };` (`kWhiteTexture = {0, 1}`).
-  - `struct TextureDesc`: `width`, `height`, `format` (`RGBA8`, `BGRA8`), `filter` (`Nearest`, `Linear`), `pixels` (`std::span<const u8>`), `pitch`.
-  - `enum class RendererErrc : u8`: `DeviceInitFailed`, `TextureCreateFailed`, `TextureUpdateFailed`, `InvalidHandle`, `PoolExhausted`, `InvalidDimension`.
-- **Rendering Primitives:**
-  - `struct alignas(16) Color`: Premultiplied linear float `{r, g, b, a}` (`sizeof == 16`). Helpers: `Color::Premultiplied()`, `Color::FromRGBA8()`.
-  - `struct alignas(16) Vertex2D`: `{x, y, Color, u, v}` (`sizeof == 32`).
-  - `struct QuadCmd`: World/screen center `(x, y)`, size `(w, h)`, precomputed `(cosRot, sinRot)`, `uv`, `color`, `texture`, `depth`, `passId`, `layer`, `viewSlot`, `blend`, `flipX`, `flipY`.
-  - `struct Camera2D`: `worldCenterX`, `worldCenterY`, `zoom`, `viewport`, `scissor`, `screenSpace`.
+## 2. Core Layouts & Types (`RendererTypes.h`)
+- `TextureHandle`: `{u16 index, u16 generation}` (`kWhiteTexture = {0, 1}`).
+- `TextureDesc`: `width`, `height`, `format` (`RGBA8`, `BGRA8`), `filter` (`Nearest`, `Linear`), `pixels` (`span<const u8>`), `pitch`.
+- `RendererErrc`: `DeviceInitFailed`, `TextureCreateFailed`, `TextureUpdateFailed`, `InvalidHandle`, `PoolExhausted`, `InvalidDimension`.
+- `Color` (`alignas(16)`, 16B): Premultiplied `{r, g, b, a}` float. Helpers: `Premultiplied()`, `FromRGBA8(r,g,b,a)`.
+- `Vertex2D` (`alignas(16)`, 32B): `{x, y, Color, u, v}`. Binary-compatible with `SDL_Vertex`.
+- `QuadCmd`: Center `(x, y)`, `(w, h)`, precomputed `(cosRot, sinRot)`, `uv`, `color`, `texture`, `depth`, `passId`, `layer`, `viewSlot`, `blend`, `flipX`, `flipY`.
+- `PreparedQuad` (`alignas(64)`, 64B): View-space transformed quad cacheline.
+- `Camera2D`: `worldCenterX`, `worldCenterY`, `zoom`, `rotationRad`, `viewport`, `scissor`, `screenSpace`.
+- `RenderPassDesc`: `clearColor`, `clear`, `enabled`.
+- `RenderStats`: `submittedQuads`, `culledQuads`, `droppedQuads`, `drawBatches`, `radixPassesRun`, `monotonicFastPath`.
 
-## 3. Public Interfaces & Signatures
-### `RenderList` (`renderer/RenderList.h` — Pure C++ Command Buffer & Batch Compiler)
-- `void Reset(platform::Extent2i size) noexcept`
-- `void SetPass(u8 passId, const RenderPassDesc& desc) noexcept`, `void SetView(u8 viewSlot, const Camera2D& cam) noexcept`
-- `void PushQuad(const QuadCmd& cmd) noexcept`
-- `void PushRect(FRect rect, Color color, u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept`
-- `void PushLine(f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, Color color, u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept`
-- `void Compile() noexcept`
-- `void ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D> outVertices) const noexcept`
-- `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
+## 3. Subsystem APIs
+### `RenderList` (`engine/renderer/RenderList.h` — Command Buffer & Batch Compiler)
+- `Reset(Extent2i size)`: Clears buffer, sets default screen-space views & passes.
+- `SetPass(passId, RenderPassDesc)`, `SetView(viewSlot, Camera2D)`
+- `PushQuad(QuadCmd)`, `PushRect(rect, color, ...)`, `PushLine(x0, y0, x1, y1, thickness, color, ...)`
+- `Compile()`: Runs 6-byte LSD radix sort (if non-monotonic) and coalesces batches.
+- `ExpandVertices(firstQuad, quadCount, span<Vertex2D>)`: Generates 4 vertices per quad.
+- `ComputeAuditHash()` $\to$ `u64`: Deterministic 64-bit FNV-1a state hash.
 
-### `Renderer` (`renderer/Renderer.h` — Move-Only RAII Hardware Adapter & Asset Sink)
-- Lifecycle & Viewport:
-  - `[[nodiscard]] std::expected<void, RendererErrc> Init(platform::Window& window, const RendererConfig& cfg = {}) noexcept`
-  - `void Shutdown() noexcept`
-  - `void ResizeViewport(platform::Extent2i pixelSize) noexcept`
-  - `[[nodiscard]] std::expected<void, RendererErrc> SetPresentMode(PresentMode mode) noexcept`
-- Asset Sink API (For Asset Manager Integration):
-  - `[[nodiscard]] std::expected<TextureHandle, RendererErrc> CreateTexture(const TextureDesc& desc) noexcept`
-  - `[[nodiscard]] std::expected<void, RendererErrc> UpdateTexture(TextureHandle handle, FRect region, std::span<const u8> pixels, u32 pitch = 0) noexcept`
-  - `void DestroyTexture(TextureHandle handle) noexcept`
-  - `[[nodiscard]] constexpr bool IsTextureValid(TextureHandle handle) const noexcept`
-- Frame Execution:
-  - `[[nodiscard]] RenderList& BeginFrame() noexcept`
-  - `void Submit() noexcept`, `void Submit(RenderList& list) noexcept`
+### `Renderer` (`engine/renderer/Renderer.h` — Hardware Adapter & Asset Sink)
+- **Lifecycle & Configuration:**
+  - `Init(Window&, RendererConfig)` $\to$ `Result<void, RendererErrc>`, `Shutdown()`
+  - `ResizeViewport(Extent2i)`, `SetPresentMode(PresentMode)` $\to$ `Result<void, RendererErrc>`
+- **Generational Texture Pool:**
+  - `CreateTexture(TextureDesc)` $\to$ `Result<TextureHandle, RendererErrc>`
+  - `UpdateTexture(handle, region, pixels, pitch)` $\to$ `Result<void, RendererErrc>`
+  - `DestroyTexture(handle)`, `IsTextureValid(handle)` $\to$ `bool`
+- **Frame Submission:**
+  - `BeginFrame()` $\to$ `RenderList&`: Resets internal `RenderList`.
+  - `Submit()`, `Submit(RenderList&)`: Compiles list, sets camera viewports, clears passes, and submits chunks via `SDL_RenderGeometryRaw`.
+
+## 4. Main Loop Integration
+```cpp
+auto& renderList = m_renderer.BeginFrame();
+// Extraction binds CameraRig2D view slots and emits quads
+world::WorldExtractor::Extract(m_world, m_assetBank, m_time.GetRenderView(), renderList);
+m_renderer.Submit(renderList);
+```

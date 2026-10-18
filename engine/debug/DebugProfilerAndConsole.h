@@ -1,10 +1,8 @@
 #pragma once
 
-#include "debug/DebugTypes.h"
-#include "debug/DebugBatcher.h"
 #include "core/time/TimeTypes.h"
-#include "audio/AudioTypes.h"
-#include "platform/PlatformTypes.h"
+#include "debug/DebugBatcher.h"
+#include "debug/DebugTypes.h"
 
 #include <array>
 #include <span>
@@ -14,7 +12,7 @@ namespace en::debug {
 
 // O(1) rolling 256-frame telemetry profiler with 64-bucket quantized percentile tracker.
 // Non-owning view over the 32 KB FrameProfileSample ring in DebugSystem's arena.
-// Invariant: m_writeIdx < kHistoryFrames (256) and sum(m_buckets) <= kHistoryFrames.
+// Invariant: m_currentIdx < kHistoryFrames (256), m_activeBucketMask tracks non-empty buckets for O(1) percentile scan.
 class DebugProfiler {
 public:
     static constexpr usize kHistoryFrames = 256;
@@ -25,17 +23,12 @@ public:
 
     void BeginFrame(u64 frameIndex, u64 simTickIndex) noexcept;
     void RecordScopeUs(ProfileScopeId scope, u32 durationUs) noexcept;
-    void RecordSubsystemTelemetry(u8 catchupTicks, u16 aliveEntities,
-                                  u16 submittedQuads, u16 culledQuads, u16 drawBatches,
-                                  u8 radixPasses,
-                                  const audio::AudioTelemetrySnapshot& audioSnap,
-                                  std::span<const f32, 8> channelScales,
-                                  u8 frozenChannelMask) noexcept;
+    void RecordSubsystemTelemetry(const SubsystemTelemetryDesc& desc) noexcept;
     void EndFrame() noexcept;
 
     [[nodiscard]] u32 ComputePercentileUs(u32 targetRankOutOf256) const noexcept;
     [[nodiscard]] constexpr const FrameProfileSample& Latest() const noexcept {
-        return m_samples[m_latestIdx];
+        return m_samples[m_currentIdx];
     }
 
     void EmitProfilerAndTimeHud(OverlayFlags flags,
@@ -45,15 +38,16 @@ public:
 private:
     std::span<FrameProfileSample> m_samples{};
     std::array<u16, kBucketCount> m_buckets{};
-    u32 m_writeIdx{0};
-    u32 m_latestIdx{0};
+    u64 m_activeBucketMask{0};
+    u32 m_currentIdx{0};
     u32 m_validFrames{0};
 };
 
-// RAII scope timer compiled out when EN_ENABLE_DEBUG_TOOLS == 0.
+// RAII scope timer compiled down to a zero-byte no-op when EN_ENABLE_DEBUG_TOOLS == 0.
 template <time::ClockSource ClockT>
 class ScopedProfileTimer {
 public:
+#if EN_ENABLE_DEBUG_TOOLS
     ScopedProfileTimer(DebugProfiler& profiler, const ClockT& clock, ProfileScopeId scope) noexcept
         : m_profiler(profiler), m_clock(clock), m_scope(scope), m_startNs(clock.NowNs()) {}
 
@@ -61,15 +55,21 @@ public:
         const u64 elapsedUs = (m_clock.NowNs() - m_startNs) / 1000ull;
         m_profiler.RecordScopeUs(m_scope, static_cast<u32>(elapsedUs));
     }
+#else
+    constexpr ScopedProfileTimer(DebugProfiler&, const ClockT&, ProfileScopeId) noexcept {}
+    constexpr ~ScopedProfileTimer() noexcept = default;
+#endif
 
     ScopedProfileTimer(const ScopedProfileTimer&) = delete;
     ScopedProfileTimer& operator=(const ScopedProfileTimer&) = delete;
 
 private:
+#if EN_ENABLE_DEBUG_TOOLS
     DebugProfiler& m_profiler;
     const ClockT& m_clock;
     ProfileScopeId m_scope;
     u64 m_startNs;
+#endif
 };
 
 enum class SymbolKind : u8 { Empty = 0, Command, CVarF32, CVarI32, CVarU32, CVarBool };
@@ -111,6 +111,7 @@ struct alignas(32) ConsoleSymbol {
         ConsoleCmdCallback cmdFn{nullptr};
         struct { f32 minVal; f32 maxVal; } f32Bounds;
         struct { i32 minVal; i32 maxVal; } i32Bounds;
+        struct { u32 minVal; u32 maxVal; } u32Bounds;
     };
 };
 static_assert(sizeof(ConsoleSymbol) == 32);
@@ -134,11 +135,12 @@ public:
     static constexpr usize kLogTextBytes   = 16384;
     static constexpr usize kMaxHistory     = 32;
     static constexpr usize kMaxPendingCmds = 4;
+    static constexpr usize kMaxLineChars   = 128;
 
     void BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
                    std::span<LogEntryMeta, kMaxLogEntries> logMeta,
                    std::span<char, kLogTextBytes> logText,
-                   std::span<std::array<char, 128>, kMaxHistory> historyBuf) noexcept;
+                   std::span<std::array<char, kMaxLineChars>, kMaxHistory> historyBuf) noexcept;
     void ClearLog() noexcept;
 
     [[nodiscard]] Result<void, DebugErrc> RegisterCommand(
@@ -153,6 +155,10 @@ public:
     [[nodiscard]] Result<void, DebugErrc> RegisterCVarI32(
         std::string_view staticName,
         i32* target, i32 minVal, i32 maxVal) noexcept;
+
+    [[nodiscard]] Result<void, DebugErrc> RegisterCVarU32(
+        std::string_view staticName,
+        u32* target, u32 minVal, u32 maxVal) noexcept;
 
     [[nodiscard]] Result<void, DebugErrc> RegisterCVarBool(
         std::string_view staticName,
@@ -173,18 +179,20 @@ public:
     [[nodiscard]] constexpr std::span<const ConsoleSymbol> Symbols() const noexcept { return m_symbols; }
 
     void EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatcher& hudBatcher) const noexcept;
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
     [[nodiscard]] Result<ConsoleSymbol*, DebugErrc> InsertSymbolSlot(std::string_view staticName) noexcept;
     [[nodiscard]] ConsoleSymbol* FindSymbol(std::string_view name) noexcept;
+    void PushHistoryLine(std::string_view line) noexcept;
 
     std::span<ConsoleSymbol> m_symbols{};
     std::span<LogEntryMeta>  m_logMeta{};
     std::span<char>          m_logText{};
-    std::span<std::array<char, 128>> m_history{};
-    std::array<std::array<char, 120>, kMaxPendingCmds> m_pendingCmds{};
+    std::span<std::array<char, kMaxLineChars>> m_history{};
+    std::array<std::array<char, kMaxLineChars>, kMaxPendingCmds> m_pendingCmds{};
     std::array<u8, kMaxPendingCmds> m_pendingLens{};
-    std::array<char, 120> m_inputBuf{};
+    std::array<char, kMaxLineChars> m_inputBuf{};
     u8  m_pendingCount{0};
     u8  m_inputLen{0};
     u8  m_cursorPos{0};

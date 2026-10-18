@@ -4,14 +4,13 @@
 
 #include <memory>
 #include <span>
-#include <string_view>
 
 namespace en::assets {
 
 // Pure C++23 data-oriented asset storage, Robin Hood hash index, LZ4 codec, and scope lifetime engine.
-// Owns pre-sized SoA tables and a contiguous blob arena; zero OS or SDL3 dependencies.
+// Owns a single 64-byte aligned arena slab carving all SoA tables and blob storage; zero OS or SDL3 dependencies.
 // Invariant: Slot 0 of every typed table is permanently initialized to a valid fallback record.
-class AssetBank {
+class alignas(64) AssetBank {
 public:
     AssetBank() = default;
     ~AssetBank() noexcept = default;
@@ -22,7 +21,7 @@ public:
     AssetBank& operator=(AssetBank&&) noexcept = default;
 
     [[nodiscard]] Result<void, AssetErrc> Init(const AssetBankConfig& cfg = {}) noexcept;
-    void Shutdown() noexcept;
+    void Shutdown() noexcept { *this = AssetBank{}; }
 
     [[nodiscard]] Result<ScopeId, AssetErrc> BeginScope() noexcept;
     void EndScope(ScopeId scope) noexcept;
@@ -58,35 +57,44 @@ public:
     }
 
     [[nodiscard]] constexpr const SpriteFrame& GetAtlasFrame(AtlasHandle h, u16 frameOffset) const noexcept {
-        const u32 aIdx = (h.index < m_atlasCap && m_atlasGens[h.index] == h.generation) ? h.index : 0u;
+        const u32 aIdx = (h.index < m_highWaterAtlas && m_atlases[h.index].generation == h.generation)
+                             ? h.index
+                             : 0u;
         const AtlasRecord& rec = m_atlases[aIdx];
         const u32 clamped = (frameOffset < rec.spriteCount) ? frameOffset : 0u;
         return m_sprites[rec.firstSprite + clamped];
     }
 
     [[nodiscard]] constexpr SpriteHandle GetSpriteHandle(AtlasHandle h, u16 frameOffset) const noexcept {
-        const u32 aIdx = (h.index < m_atlasCap && m_atlasGens[h.index] == h.generation) ? h.index : 0u;
+        const u32 aIdx = (h.index < m_highWaterAtlas && m_atlases[h.index].generation == h.generation)
+                             ? h.index
+                             : 0u;
         const AtlasRecord& rec = m_atlases[aIdx];
         const u16 clamped = (frameOffset < rec.spriteCount) ? frameOffset : 0u;
-        return SpriteHandle{static_cast<u16>(rec.firstSprite + clamped), m_atlasGens[aIdx]};
+        return SpriteHandle{static_cast<u16>(rec.firstSprite + clamped), rec.generation};
     }
 
     [[nodiscard]] constexpr const TextureRecord& GetTexture(TextureAssetHandle h) const noexcept {
-        const u32 idx = (h.index < m_texCap && m_texGens[h.index] == h.generation) ? h.index : 0u;
+        const u16 slot = (h.index < m_highWaterTex) ? m_texMasterSlot[h.index] : 0u;
+        const u32 idx  = (slot != 0 && m_slots[slot].generation == h.generation) ? h.index : 0u;
         return m_textures[idx];
     }
 
     [[nodiscard]] constexpr const BlobRecord& GetBlob(BlobHandle h) const noexcept {
-        const u32 idx = (h.index < m_blobCap && m_blobGens[h.index] == h.generation) ? h.index : 0u;
+        const u32 idx = (h.index < m_highWaterBlob && h.generation == 1u) ? h.index : 0u;
         return m_blobs[idx];
     }
 
     [[nodiscard]] constexpr const AudioRecord& GetAudio(AudioHandle h) const noexcept {
-        const u32 idx = (h.index < m_audioCap && m_audioGens[h.index] == h.generation) ? h.index : 0u;
+        const u32 idx = (h.index < m_highWaterAudio && h.generation == 1u) ? h.index : 0u;
         return m_audio[idx];
     }
 
     [[nodiscard]] u16 FindNamedFrame(AtlasHandle h, u32 nameHash) const noexcept;
+
+    [[nodiscard]] Result<std::span<u8>, AssetErrc> AllocateArenaSlice(u32 sizeBytes) noexcept;
+    constexpr void RollbackArenaSlice(u32 prevHead) noexcept { m_blobArenaHead = prevHead; }
+    [[nodiscard]] constexpr u32 BlobArenaHead() const noexcept { return m_blobArenaHead; }
 
     Result<void, AssetErrc> CommitTexture(
         u16 slot,
@@ -117,7 +125,10 @@ public:
 
     [[nodiscard]] u32 EvictUnpinned(std::span<renderer::TextureHandle> outDestroyedTextures) noexcept;
 
-    [[nodiscard]] bool IsScopeSimReady(ScopeId scope) const noexcept;
+    [[nodiscard]] constexpr bool IsScopeSimReady(ScopeId scope) const noexcept {
+        return scope >= kMaxScopes || m_scopeSimPending[scope] == 0;
+    }
+    [[nodiscard]] constexpr bool IsOverVramBudget() const noexcept { return m_currentVramBytes > m_cfg.vramBudgetBytes; }
     [[nodiscard]] constexpr u64 CurrentVramBytes() const noexcept { return m_currentVramBytes; }
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
@@ -132,18 +143,39 @@ private:
         u16 psl{0};
         u32 reserved{0};
     };
+    static_assert(sizeof(HashSlot) == 16 && alignof(HashSlot) == 16);
 
-    struct AtlasCold {
+    struct alignas(16) AtlasCold {
         u32 firstNamedFrame{0};
         u16 namedFrameCount{0};
-        u16 masterSlot{0};
+        u16 allocNamedCap{0};
+        u16 allocFirstSprite{0};
+        u16 allocSpriteCap{0};
+        u32 reserved{0};
     };
+    static_assert(sizeof(AtlasCold) == 16 && alignof(AtlasCold) == 16);
 
     template <typename H>
     [[nodiscard]] constexpr H ToHandle(u16 slot, AssetKind expected) const noexcept {
-        return (slot < m_slotCap && m_slots[slot].kind == expected)
+        return (slot < m_highWaterSlot && m_slots[slot].kind == expected)
                    ? H{m_slots[slot].payloadSlot, m_slots[slot].generation}
                    : H{};
+    }
+
+    constexpr void CompleteSlot(SlotMeta& meta, AssetState finalState) noexcept {
+        if (meta.state == AssetState::Loading) {
+            for (u32 mask = meta.lastUsedFrame; mask != 0; mask &= (mask - 1u)) {
+                const u32 s = static_cast<u32>(std::countr_zero(mask));
+                if (m_scopeSimPending[s] > 0) {
+                    --m_scopeSimPending[s];
+                }
+            }
+            meta.lastUsedFrame = m_currentFrame;
+        }
+        meta.state = finalState;
+        if (finalState == AssetState::Ready) {
+            ++meta.version;
+        }
     }
 
     void InsertHash(u64 key, u16 slotIndex) noexcept;
@@ -152,61 +184,47 @@ private:
         std::span<const u8> rawPayload,
         bool isMemoryMapped) noexcept;
 
-    AssetBankConfig m_cfg{};
+    // Cache Line 0 (offset 0..63): Hot 120Hz/240Hz read-only table pointers and active high-water bounds.
+    SpriteFrame* m_sprites{nullptr};
+    u16* m_spriteGens{nullptr};
+    AtlasRecord* m_atlases{nullptr};
+    TextureRecord* m_textures{nullptr};
+    BlobRecord* m_blobs{nullptr};
+    AudioRecord* m_audio{nullptr};
+    u32 m_spriteCount{1};
     u32 m_activeScopesMask{0};
+    u16 m_highWaterAtlas{1};
+    u16 m_highWaterTex{1};
+    u16 m_highWaterBlob{1};
+    u16 m_highWaterAudio{1};
+
+    // Cache Line 1 (offset 64..127): Slot metadata, Robin Hood hash index, and cold tables.
+    SlotMeta* m_slots{nullptr};
+    AssetId* m_slotIds{nullptr};
+    HashSlot* m_hashTable{nullptr};
+    u16* m_texMasterSlot{nullptr};
+    u32* m_texVramBytes{nullptr};
+    AtlasCold* m_atlasCold{nullptr};
+    CookedFrameName* m_namedFrames{nullptr};
+    u8* m_blobArena{nullptr};
+
+    // Cache Line 2 (offset 128..191): O(1) per-scope Sim-residency pending counters (32 scopes x 2B = 64B).
+    u16 m_scopeSimPending[kMaxScopes]{};
+
+    // Cache Line 3+: Intrusive freelist heads, capacities, VRAM telemetry, and single arena slab owner.
+    u16 m_highWaterSlot{1};
+    u16 m_freeSlotHead{0};
+    u16 m_freeTexHead{0};
+    u16 m_freeAtlasHead{0};
+    u32 m_hashCap{0};
+    u32 m_hashMask{0};
+    u32 m_namedFrameCount{0};
+    u32 m_blobArenaHead{0};
     u32 m_currentFrame{0};
     u64 m_currentVramBytes{0};
 
-    u16 m_slotCap{0};
-    u16 m_freeSlotTop{0};
-    std::unique_ptr<SlotMeta[]> m_slots;
-    std::unique_ptr<AssetId[]> m_slotIds;
-    std::unique_ptr<u8[]> m_slotResidency;
-    std::unique_ptr<u16[]> m_freeSlots;
-
-    u32 m_hashCap{0};
-    u32 m_hashMask{0};
-    std::unique_ptr<HashSlot[]> m_hashTable;
-
-    u16 m_texCap{0};
-    u16 m_freeTexTop{0};
-    std::unique_ptr<TextureRecord[]> m_textures;
-    std::unique_ptr<u16[]> m_texGens;
-    std::unique_ptr<u32[]> m_texVramBytes;
-    std::unique_ptr<u16[]> m_texMasterSlot;
-    std::unique_ptr<u16[]> m_freeTex;
-
-    u16 m_atlasCap{0};
-    u16 m_freeAtlasTop{0};
-    std::unique_ptr<AtlasRecord[]> m_atlases;
-    std::unique_ptr<u16[]> m_atlasGens;
-    std::unique_ptr<AtlasCold[]> m_atlasCold;
-    std::unique_ptr<u16[]> m_freeAtlases;
-
-    u32 m_spriteCap{0};
-    u32 m_spriteCount{1};
-    std::unique_ptr<SpriteFrame[]> m_sprites;
-    std::unique_ptr<u16[]> m_spriteGens;
-
-    u32 m_namedFrameCap{0};
-    u32 m_namedFrameCount{0};
-    std::unique_ptr<CookedFrameName[]> m_namedFrames;
-
-    u16 m_blobCap{0};
-    u16 m_freeBlobTop{0};
-    std::unique_ptr<BlobRecord[]> m_blobs;
-    std::unique_ptr<u16[]> m_blobGens;
-    std::unique_ptr<u16[]> m_freeBlobs;
-
-    u16 m_audioCap{0};
-    u16 m_freeAudioTop{0};
-    std::unique_ptr<AudioRecord[]> m_audio;
-    std::unique_ptr<u16[]> m_audioGens;
-    std::unique_ptr<u16[]> m_freeAudio;
-
-    u32 m_blobArenaCap{0};
-    u32 m_blobArenaHead{0};
-    std::unique_ptr<u8[]> m_blobArena;
+    AssetBankConfig m_cfg{};
+    std::unique_ptr<u64[]> m_arena;
 };
 
 } // namespace en::assets

@@ -4,6 +4,7 @@
 #include "core/Types.h"
 #include "renderer/RendererTypes.h"
 
+#include <bit>
 #include <span>
 #include <string_view>
 
@@ -47,9 +48,31 @@ enum class Residency : u8 {
     Sim
 };
 
+[[nodiscard]] constexpr u32 NextPow2(u32 v) noexcept {
+    return (v <= 16u) ? 16u : (1u << (32u - std::countl_zero(v - 1u)));
+}
+
+[[nodiscard]] constexpr u32 FibonacciHash(u64 key, u32 mask) noexcept {
+    return static_cast<u32>((key * 11400714819323198485ULL) >> 32) & mask;
+}
+
+[[nodiscard]] constexpr std::size_t Align64(std::size_t bytes) noexcept {
+    return (bytes + 63u) & ~static_cast<std::size_t>(63u);
+}
+
+template <typename T>
+[[nodiscard]] T* CarveAligned64(u8*& cursor, std::size_t count) noexcept {
+    if (count == 0) {
+        return nullptr;
+    }
+    auto* ptr = reinterpret_cast<T*>(cursor);
+    cursor += Align64(count * sizeof(T));
+    return ptr;
+}
+
 // Normalized 64-bit FNV-1a path identifier.
-// Invariant: backslashes are converted to forward slashes and ASCII uppercase is folded to lowercase.
-struct AssetId {
+// Invariant: backslashes are normalized to forward slashes and ASCII uppercase is folded to lowercase.
+struct alignas(8) AssetId {
     u64 value{0};
 
     constexpr bool operator==(const AssetId&) const noexcept = default;
@@ -60,20 +83,24 @@ struct AssetId {
             return {};
         }
         u64 h = 14695981039346656037ULL;
-        for (char raw : path) {
-            const char c = (raw == '\\') ? '/' : ((raw >= 'A' && raw <= 'Z') ? static_cast<char>(raw + 32) : raw);
-            h = (h ^ static_cast<u8>(c)) * 1099511628211ULL;
+        for (char ch : path) {
+            const u8 raw = static_cast<u8>(ch);
+            const u8 norm = (raw == '\\')
+                                ? static_cast<u8>('/')
+                                : ((raw >= 'A' && raw <= 'Z') ? static_cast<u8>(raw + 32u) : raw);
+            h = (h ^ norm) * 1099511628211ULL;
         }
         return AssetId{h};
     }
 };
+static_assert(sizeof(AssetId) == 8 && alignof(AssetId) == 8);
 
 [[nodiscard]] consteval AssetId operator""_aid(const char* str, std::size_t len) noexcept {
     return AssetId::Hash(std::string_view{str, len});
 }
 
 template <typename Tag>
-struct Handle {
+struct alignas(4) Handle {
     u16 index{0};
     u16 generation{0};
 
@@ -85,22 +112,24 @@ using TextureAssetHandle = Handle<struct TextureAssetTag>;
 using AtlasHandle        = Handle<struct AtlasAssetTag>;
 using BlobHandle         = Handle<struct BlobAssetTag>;
 using AudioHandle        = Handle<struct AudioAssetTag>;
+static_assert(sizeof(TextureAssetHandle) == 4 && alignof(TextureAssetHandle) == 4);
 
-// Direct 1-hop handle into AssetBank's flat SpriteFrame array.
-struct SpriteHandle {
+// Direct 1-hop generational handle into AssetBank's flat SpriteFrame table.
+struct alignas(4) SpriteHandle {
     u16 spriteIndex{0};
     u16 generation{0};
 
     constexpr bool operator==(const SpriteHandle&) const noexcept = default;
     [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0; }
 };
+static_assert(sizeof(SpriteHandle) == 4 && alignof(SpriteHandle) == 4);
 
 using ScopeId = u8;
 inline constexpr ScopeId kInvalidScope = 0xFF;
 inline constexpr u32 kMaxScopes        = 32;
 
-// Cache-line half-sized (32B) hot sprite record consumed directly by RenderList extraction.
-// Packs generation into the trailing 4 bytes so SpriteHandle validation requires zero extra arrays.
+// Half-cache-line (32B) hot sprite record consumed directly by WorldExtractor and RenderList.
+// Embeds the resolved GPU TextureHandle so GetSprite() requires a single array read with zero indirection.
 struct alignas(32) SpriteFrame {
     renderer::FRect uv{0.0f, 0.0f, 1.0f, 1.0f};
     f32 width{1.0f};
@@ -111,24 +140,28 @@ struct alignas(32) SpriteFrame {
 };
 static_assert(sizeof(SpriteFrame) == 32 && alignof(SpriteFrame) == 32);
 
-struct TextureRecord {
+struct alignas(8) TextureRecord {
     renderer::TextureHandle gpu{renderer::kWhiteTexture};
     u16 width{1};
     u16 height{1};
 };
+static_assert(sizeof(TextureRecord) == 8 && alignof(TextureRecord) == 8);
 
-struct AtlasRecord {
+// 8-byte hot atlas slice record embedding its generation for single-load validation.
+struct alignas(8) AtlasRecord {
     u16 firstSprite{0};
     u16 spriteCount{1};
     u16 textureSlot{0};
-    u16 reserved{0};
+    u16 generation{0};
 };
+static_assert(sizeof(AtlasRecord) == 8 && alignof(AtlasRecord) == 8);
 
 struct alignas(16) BlobRecord {
     const u8* data{nullptr};
     u32 size{0};
     u32 schemaHash{0};
 };
+static_assert(sizeof(BlobRecord) == 16 && alignof(BlobRecord) == 16);
 
 struct alignas(16) AudioRecord {
     const i16* pcm{nullptr};
@@ -137,8 +170,10 @@ struct alignas(16) AudioRecord {
     u8 channels{2};
     u8 reserved{0};
 };
+static_assert(sizeof(AudioRecord) == 16 && alignof(AudioRecord) == 16);
 
 // Unified 16-byte slot control metadata with 32-bit scope bitmask pinning.
+// Invariant: while state == AssetState::Loading, lastUsedFrame stores the 32-bit Sim-residency scope mask.
 struct alignas(16) SlotMeta {
     u32 scopeMask{0};
     u32 lastUsedFrame{0};
@@ -148,7 +183,7 @@ struct alignas(16) SlotMeta {
     AssetKind kind{AssetKind::None};
     AssetState state{AssetState::Empty};
 };
-static_assert(sizeof(SlotMeta) == 16);
+static_assert(sizeof(SlotMeta) == 16 && alignof(SlotMeta) == 16);
 
 inline constexpr u32 kPakMagic   = 0x4B504E45u; // 'ENPK'
 inline constexpr u32 kPakVersion = 1u;
@@ -161,7 +196,7 @@ struct alignas(32) PakHeader {
     u64 tocOffset{0};
     u64 contentHash{0};
 };
-static_assert(sizeof(PakHeader) == 32);
+static_assert(sizeof(PakHeader) == 32 && alignof(PakHeader) == 32);
 
 struct alignas(32) PakEntry {
     u64 assetId{0};
@@ -173,22 +208,22 @@ struct alignas(32) PakEntry {
     AssetKind kind{AssetKind::None};
     AssetCodec codec{AssetCodec::Raw};
 };
-static_assert(sizeof(PakEntry) == 32);
+static_assert(sizeof(PakEntry) == 32 && alignof(PakEntry) == 32);
 
-struct CookedAtlasHeader {
+struct alignas(8) CookedAtlasHeader {
     u64 backingTextureId{0};
     u16 spriteCount{0};
     u16 namedFrameCount{0};
     u32 reserved{0};
 };
-static_assert(sizeof(CookedAtlasHeader) == 16);
+static_assert(sizeof(CookedAtlasHeader) == 16 && alignof(CookedAtlasHeader) == 8);
 
-struct CookedFrameName {
+struct alignas(4) CookedFrameName {
     u32 nameHash{0};
     u16 frameOffset{0};
     u16 reserved{0};
 };
-static_assert(sizeof(CookedFrameName) == 8);
+static_assert(sizeof(CookedFrameName) == 8 && alignof(CookedFrameName) == 4);
 
 struct AssetBankConfig {
     u16 maxSlots{4096};

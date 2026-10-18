@@ -1,178 +1,40 @@
 #include "platform/Platform.h"
 
-#include "input/InputPipeline.h"
-
 #include <SDL3/SDL_clipboard.h>
-#include <SDL3/SDL_error.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_messagebox.h>
+#include <SDL3/SDL_mouse.h>
 
 namespace en::platform {
-
-using input::GamepadAxis;
-using input::InputPipeline;
-using input::Source;
-using math::Vec2;
-
-static_assert(Platform::kMaxGamepads == input::kMaxGamepads);
-static_assert(
-    static_cast<int>(GamepadAxis::LeftX) - 1 == SDL_GAMEPAD_AXIS_LEFTX &&
-    static_cast<int>(GamepadAxis::RightTrigger) - 1 == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER &&
-    6 == SDL_GAMEPAD_AXIS_COUNT,
-    "GamepadAxis enum must match SDL3 gamepad axis layout"
-);
-
-Error MakePlatformError(PlatformErrc code, std::string_view detail) noexcept {
-    if (!detail.empty()) {
-        return Error{detail, static_cast<i32>(code)};
-    }
-    if (const char* sdlErr = SDL_GetError(); sdlErr && sdlErr[0] != '\0') {
-        return Error{sdlErr, static_cast<i32>(code)};
-    }
-    return Error{"Platform error", static_cast<i32>(code)};
-}
-
-namespace {
-
-[[nodiscard]] constexpr bool IsSafeRelativePath(std::string_view rel) noexcept {
-    if (rel.empty() || rel[0] == '/' || rel[0] == '\\') return false;
-    if (rel.size() >= 2 && rel[1] == ':') return false;
-    if (rel == ".." || rel.starts_with("../") || rel.starts_with("..\\")) return false;
-    if (rel.find("/../") != std::string_view::npos || rel.find("\\..\\") != std::string_view::npos) return false;
-    if (rel.ends_with("/..") || rel.ends_with("\\..")) return false;
-    return rel.find('\0') == std::string_view::npos;
-}
-
-[[nodiscard]] Result<FilePath, Error> JoinSandboxed(std::string_view root, std::string_view rel) noexcept {
-    if (!IsSafeRelativePath(rel)) {
-        return Err(MakePlatformError(PlatformErrc::PathRejected));
-    }
-
-    std::array<char, kMaxPathBytes> buf{};
-    usize len = 0;
-
-    auto appendNormalized = [&](std::string_view s) noexcept -> bool {
-        for (char c : s) {
-            if (len >= buf.size() - 1) return false;
-            buf[len++] = (c == '\\') ? '/' : c;
-        }
-        return true;
-    };
-
-    if (!appendNormalized(root)) {
-        return Err(MakePlatformError(PlatformErrc::PathUnavailable));
-    }
-    if (len > 0 && buf[len - 1] != '/') {
-        if (len >= buf.size() - 1) return Err(MakePlatformError(PlatformErrc::PathUnavailable));
-        buf[len++] = '/';
-    }
-    if (!appendNormalized(rel)) {
-        return Err(MakePlatformError(PlatformErrc::PathUnavailable));
-    }
-    buf[len] = '\0';
-
-    return FilePath(std::string_view(buf.data(), len));
-}
-
-// Anti-sticking filter: only suppresses Press and Continuous motion events.
-// Release events (KEY_UP, BUTTON_UP) always pass through so InputPipeline never retains stuck bits.
-[[nodiscard]] constexpr bool ShouldSuppressInput(const SDL_Event& ev, EventCapture cap, u32 winId) noexcept {
-    switch (ev.type) {
-        case SDL_EVENT_KEY_DOWN:
-            return (ev.key.windowID != 0 && ev.key.windowID != winId) ||
-                   HasCapture(cap, EventCapture::Keyboard);
-        case SDL_EVENT_KEY_UP:
-            return (ev.key.windowID != 0 && ev.key.windowID != winId);
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-            return (ev.button.windowID != 0 && ev.button.windowID != winId) ||
-                   HasCapture(cap, EventCapture::Mouse);
-        case SDL_EVENT_MOUSE_BUTTON_UP:
-            return (ev.button.windowID != 0 && ev.button.windowID != winId);
-        case SDL_EVENT_MOUSE_MOTION:
-            return (ev.motion.windowID != 0 && ev.motion.windowID != winId) ||
-                   HasCapture(cap, EventCapture::Mouse);
-        case SDL_EVENT_MOUSE_WHEEL:
-            return (ev.wheel.windowID != 0 && ev.wheel.windowID != winId) ||
-                   HasCapture(cap, EventCapture::Mouse);
-        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-            return HasCapture(cap, EventCapture::Gamepad);
-        default:
-            return false;
-    }
-}
-
-constexpr void DispatchInputEvent(InputPipeline& input, const SDL_Event& ev, f32 density) noexcept {
-    switch (ev.type) {
-        case SDL_EVENT_KEY_DOWN:
-        case SDL_EVENT_KEY_UP:
-            if (!ev.key.repeat) {
-                input.FeedButton(Source::Key(static_cast<u16>(ev.key.scancode)), ev.key.down);
-            }
-            break;
-
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        case SDL_EVENT_MOUSE_BUTTON_UP:
-            if (ev.button.which != SDL_TOUCH_MOUSEID) {
-                input.FeedButton(Source::Mouse(ev.button.button), ev.button.down);
-            }
-            break;
-
-        case SDL_EVENT_MOUSE_MOTION:
-            if (ev.motion.which != SDL_TOUCH_MOUSEID) {
-                input.FeedMouseMotion(
-                    Vec2{ev.motion.x * density, ev.motion.y * density},
-                    Vec2{ev.motion.xrel * density, ev.motion.yrel * density});
-            }
-            break;
-
-        case SDL_EVENT_MOUSE_WHEEL:
-            if (ev.wheel.which != SDL_TOUCH_MOUSEID) {
-                const f32 flip = (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -1.0f : 1.0f;
-                input.FeedMouseWheel(Vec2{ev.wheel.x * flip, ev.wheel.y * flip});
-            }
-            break;
-
-        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        case SDL_EVENT_GAMEPAD_BUTTON_UP:
-            input.FeedGamepadButton(static_cast<u32>(ev.gbutton.which), ev.gbutton.button, ev.gbutton.down);
-            break;
-
-        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-            input.FeedGamepadAxis(static_cast<u32>(ev.gaxis.which), ev.gaxis.axis, ev.gaxis.value);
-            break;
-
-        default:
-            break;
-    }
-}
-
-} // namespace
 
 Platform::~Platform() noexcept {
     Shutdown();
 }
 
-Result<void, Error> Platform::Init(std::string_view appName, std::string_view orgName) noexcept {
+Result<void, PlatformErrc> Platform::Init(std::string_view appName, std::string_view orgName) noexcept {
     if (m_initialized) return {};
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-        return Err(MakePlatformError(PlatformErrc::SdlInitFailed));
+        return Err(PlatformErrc::SdlInitFailed);
     }
 
     if (const char* base = SDL_GetBasePath()) {
-        m_basePath.Assign(base);
+        (void)m_basePath.AssignNormalizedDir(base);
     }
 
-    FixedString<128> org(orgName);
-    FixedString<128> app(appName);
+    const FixedString<128> org(orgName);
+    const FixedString<128> app(appName);
     if (char* pref = SDL_GetPrefPath(org.CStr(), app.CStr())) {
-        m_prefPath.Assign(pref);
+        (void)m_prefPath.AssignNormalizedDir(pref);
         SDL_free(pref);
     }
 
+    m_activeGamepadMask = 0;
+    m_rumbleGamepadMask = 0;
+    m_frameEvents.ClearInput(false);
     m_initialized = true;
     m_quit = false;
     return {};
@@ -181,75 +43,103 @@ Result<void, Error> Platform::Init(std::string_view appName, std::string_view or
 void Platform::Shutdown() noexcept {
     if (!m_initialized) return;
 
-    for (auto& slot : m_gamepads) {
-        if (slot.handle) {
-            SDL_CloseGamepad(slot.handle);
-            slot = {};
+    for (u32 m = m_activeGamepadMask; m != 0; m &= (m - 1u)) {
+        const u8 slot = static_cast<u8>(std::countr_zero(m));
+        if (m_gamepadHandles[slot]) {
+            SDL_CloseGamepad(m_gamepadHandles[slot]);
+            m_gamepadHandles[slot] = nullptr;
+            m_gamepadIds[slot] = 0;
         }
     }
 
+    m_activeGamepadMask = 0;
+    m_rumbleGamepadMask = 0;
     SDL_Quit();
     m_initialized = false;
 }
 
-void Platform::OpenGamepad(u32 id) noexcept {
-    for (const auto& slot : m_gamepads) {
-        if (slot.handle && slot.id == id) return;
-    }
-    for (auto& slot : m_gamepads) {
-        if (!slot.handle) {
-            if (SDL_Gamepad* pad = SDL_OpenGamepad(id)) {
-                slot.id = id;
-                slot.handle = pad;
-            }
-            return;
-        }
+void Platform::OpenGamepad(u32 instanceId) noexcept {
+    if (FindGamepadSlot(instanceId) < kMaxGamepads) return;
+
+    const u32 freeSlot = static_cast<u32>(std::countr_one(m_activeGamepadMask));
+    if (freeSlot >= kMaxGamepads) return;
+
+    if (SDL_Gamepad* pad = SDL_OpenGamepad(instanceId)) {
+        (void)SDL_SetGamepadPlayerIndex(pad, static_cast<int>(freeSlot));
+        m_gamepadHandles[freeSlot] = pad;
+        m_gamepadIds[freeSlot] = instanceId;
+        m_activeGamepadMask |= static_cast<u8>(1u << freeSlot);
     }
 }
 
-void Platform::CloseGamepad(u32 id) noexcept {
-    for (auto& slot : m_gamepads) {
-        if (slot.handle && slot.id == id) {
-            SDL_CloseGamepad(slot.handle);
-            slot = {};
-            return;
-        }
-    }
+u8 Platform::CloseGamepad(u32 instanceId) noexcept {
+    const u8 slot = FindGamepadSlot(instanceId);
+    if (slot >= kMaxGamepads) return 0xFFu;
+
+    SDL_CloseGamepad(m_gamepadHandles[slot]);
+    m_gamepadHandles[slot] = nullptr;
+    m_gamepadIds[slot] = 0;
+
+    const u8 clearBit = static_cast<u8>(~(1u << slot));
+    m_activeGamepadMask &= clearBit;
+    m_rumbleGamepadMask &= clearBit;
+    return slot;
 }
 
 bool Platform::RumbleGamepad(u8 padSlot, u16 lowFreq, u16 highFreq, u32 durationMs) noexcept {
-    if (padSlot >= kMaxGamepads || !m_gamepads[padSlot].handle) return false;
-    return SDL_RumbleGamepad(m_gamepads[padSlot].handle, lowFreq, highFreq, durationMs);
+    if (padSlot >= kMaxGamepads) return false;
+    const u8 bit = static_cast<u8>(1u << padSlot);
+    if ((m_activeGamepadMask & bit) == 0) return false;
+
+    const bool ok = SDL_RumbleGamepad(m_gamepadHandles[padSlot], lowFreq, highFreq, durationMs);
+    if (ok) {
+        if ((lowFreq | highFreq) != 0 && durationMs != 0) {
+            m_rumbleGamepadMask |= bit;
+        } else {
+            m_rumbleGamepadMask &= static_cast<u8>(~bit);
+        }
+    }
+    return ok;
 }
 
 void Platform::StopAllRumble() noexcept {
-    for (auto& slot : m_gamepads) {
-        if (slot.handle) {
-            (void)SDL_RumbleGamepad(slot.handle, 0, 0, 0);
+    if (m_rumbleGamepadMask == 0) return;
+
+    for (u32 m = m_rumbleGamepadMask; m != 0; m &= (m - 1u)) {
+        const u8 slot = static_cast<u8>(std::countr_zero(m));
+        if (m_gamepadHandles[slot]) {
+            (void)SDL_RumbleGamepad(m_gamepadHandles[slot], 0, 0, 0);
         }
     }
+    m_rumbleGamepadMask = 0;
 }
 
-WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) noexcept {
-    WindowFlags flags = WindowFlags::None;
-    input.BeginFrame();
+WindowFlags Platform::Pump(Window& window, EventTap tap) noexcept {
+    m_frameEvents.ClearInput(false);
 
+    WindowFlags flags = WindowFlags::None;
+    bool needMetricRefresh = false;
     const u32 winId = window.Id();
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        const EventCapture capture = tap.callback ? tap.callback(tap.user, ev) : EventCapture::None;
-
         if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) {
-            const WindowFlags winFlags = window.ProcessEvent(ev);
+            const WindowFlags winFlags = window.ProcessEvent(ev, needMetricRefresh);
             flags |= winFlags;
             if (HasFlag(winFlags, WindowFlags::FocusLost)) {
                 StopAllRumble();
-                input.ClearPhysicalState();
+                m_frameEvents.ClearInput(true);
+            }
+            if (HasFlag(winFlags, WindowFlags::CloseRequested)) {
+                m_quit = true;
             }
             continue;
         }
 
         switch (ev.type) {
+            case SDL_EVENT_POLL_SENTINEL:
+                continue;
+
             case SDL_EVENT_QUIT:
             case SDL_EVENT_TERMINATING:
                 m_quit = true;
@@ -257,7 +147,8 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
 
             case SDL_EVENT_WILL_ENTER_BACKGROUND:
                 StopAllRumble();
-                input.ClearPhysicalState();
+                m_frameEvents.ClearInput(true);
+                needMetricRefresh = true;
                 continue;
 
             case SDL_EVENT_GAMEPAD_ADDED:
@@ -265,8 +156,9 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
                 continue;
 
             case SDL_EVENT_GAMEPAD_REMOVED:
-                input.DisconnectGamepad(ev.gdevice.which);
-                CloseGamepad(ev.gdevice.which);
+                if (const u8 slot = CloseGamepad(ev.gdevice.which); slot < kMaxGamepads) {
+                    m_frameEvents.disconnectedPadMask |= static_cast<u8>(1u << slot);
+                }
                 continue;
 
             case SDL_EVENT_DISPLAY_ADDED:
@@ -274,7 +166,7 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
             case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
             case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
             case SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED:
-                window.RefreshMetrics();
+                needMetricRefresh = true;
                 flags |= WindowFlags::DisplayChanged | WindowFlags::Resized;
                 continue;
 
@@ -282,21 +174,90 @@ WindowFlags Platform::Pump(Window& window, InputPipeline& input, EventTap tap) n
                 break;
         }
 
-        if (!ShouldSuppressInput(ev, capture, winId)) {
-            DispatchInputEvent(input, ev, window.State().pixelDensity);
+        const EventCapture capture = tap.callback ? tap.callback(tap.user, ev) : EventCapture::None;
+        const bool isFocused = window.State().focused;
+
+        switch (ev.type) {
+            case SDL_EVENT_KEY_DOWN:
+            case SDL_EVENT_KEY_UP:
+                if (!ev.key.repeat && (ev.key.windowID == 0 || ev.key.windowID == winId)) {
+                    if (!ev.key.down || (isFocused && !HasCapture(capture, EventCapture::Keyboard))) {
+                        m_frameEvents.PushEvent(
+                            InputEventKind::Key, 0, static_cast<u16>(ev.key.scancode), ev.key.down ? i16{1} : i16{0});
+                    }
+                }
+                break;
+
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if (ev.button.which != SDL_TOUCH_MOUSEID && (ev.button.windowID == 0 || ev.button.windowID == winId)) {
+                    if (!ev.button.down || (isFocused && !HasCapture(capture, EventCapture::Mouse))) {
+                        m_frameEvents.PushEvent(
+                            InputEventKind::MouseButton, 0, ev.button.button, ev.button.down ? i16{1} : i16{0});
+                    }
+                }
+                break;
+
+            case SDL_EVENT_MOUSE_MOTION:
+                if (isFocused &&
+                    ev.motion.which != SDL_TOUCH_MOUSEID &&
+                    (ev.motion.windowID == 0 || ev.motion.windowID == winId) &&
+                    !HasCapture(capture, EventCapture::Mouse)) {
+                    m_frameEvents.mouseX = ev.motion.x;
+                    m_frameEvents.mouseY = ev.motion.y;
+                    m_frameEvents.mouseDx += ev.motion.xrel;
+                    m_frameEvents.mouseDy += ev.motion.yrel;
+                    m_frameEvents.hasMouseMotion = true;
+                }
+                break;
+
+            case SDL_EVENT_MOUSE_WHEEL:
+                if (isFocused &&
+                    ev.wheel.which != SDL_TOUCH_MOUSEID &&
+                    (ev.wheel.windowID == 0 || ev.wheel.windowID == winId) &&
+                    !HasCapture(capture, EventCapture::Mouse)) {
+                    const f32 flip = (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) ? -1.0f : 1.0f;
+                    m_frameEvents.wheelX += ev.wheel.x * flip;
+                    m_frameEvents.wheelY += ev.wheel.y * flip;
+                }
+                break;
+
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_UP:
+                if (!ev.gbutton.down || (isFocused && !HasCapture(capture, EventCapture::Gamepad))) {
+                    if (const u8 slot = FindGamepadSlot(ev.gbutton.which); slot < kMaxGamepads) {
+                        m_frameEvents.PushEvent(
+                            InputEventKind::GamepadButton, slot, ev.gbutton.button, ev.gbutton.down ? i16{1} : i16{0});
+                    }
+                }
+                break;
+
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+                if (isFocused) {
+                    if (const u8 slot = FindGamepadSlot(ev.gaxis.which); slot < kMaxGamepads) {
+                        m_frameEvents.PushEvent(InputEventKind::GamepadAxis, slot, ev.gaxis.axis, ev.gaxis.value);
+                    }
+                }
+                break;
+
+            default:
+                break;
         }
     }
 
-    (void)input.EndFrame();
+    if (needMetricRefresh) {
+        window.RefreshMetrics();
+    }
+
+    if (m_frameEvents.hasMouseMotion) {
+        const f32 density = window.State().pixelDensity;
+        m_frameEvents.mouseX *= density;
+        m_frameEvents.mouseY *= density;
+        m_frameEvents.mouseDx *= density;
+        m_frameEvents.mouseDy *= density;
+    }
+
     return flags;
-}
-
-Result<FilePath, Error> Platform::ResolveAsset(std::string_view relative) const noexcept {
-    return JoinSandboxed(m_basePath.View(), relative);
-}
-
-Result<FilePath, Error> Platform::ResolveUser(std::string_view relative) const noexcept {
-    return JoinSandboxed(m_prefPath.View(), relative);
 }
 
 std::string_view Platform::GetClipboard(std::span<char> outBuf) noexcept {
@@ -316,17 +277,17 @@ std::string_view Platform::GetClipboard(std::span<char> outBuf) noexcept {
     return {outBuf.data(), i};
 }
 
-Result<void, Error> Platform::SetClipboard(std::string_view utf8) noexcept {
-    FixedString<4096> buf(utf8);
+Result<void, PlatformErrc> Platform::SetClipboard(std::string_view utf8) noexcept {
+    const FixedString<4096> buf(utf8);
     if (!SDL_SetClipboardText(buf.CStr())) {
-        return Err(MakePlatformError(PlatformErrc::ClipboardFailed));
+        return Err(PlatformErrc::ClipboardFailed);
     }
     return {};
 }
 
 void Platform::ShowErrorBox(std::string_view title, std::string_view message, const Window* parent) noexcept {
-    FixedString<256> t(title);
-    FixedString<1024> m(message);
+    const FixedString<256> t(title);
+    const FixedString<1024> m(message);
     SDL_Window* nativeParent = parent ? parent->Native() : nullptr;
     (void)SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, t.CStr(), m.CStr(), nativeParent);
 }

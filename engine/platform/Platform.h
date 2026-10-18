@@ -3,32 +3,9 @@
 #include "platform/PlatformTypes.h"
 #include "platform/Window.h"
 
-#include <span>
-
 struct SDL_Gamepad;
 
-namespace en::input { class InputPipeline; }
-
 namespace en::platform {
-
-// Bitmask returned by EventTap to block Press/Motion events from reaching InputPipeline
-// while allowing Release events through to guarantee zero stuck keys.
-enum class EventCapture : u8 {
-    None     = 0,
-    Keyboard = 1u << 0,
-    Mouse    = 1u << 1,
-    Gamepad  = 1u << 2,
-};
-
-[[nodiscard]] constexpr EventCapture operator|(EventCapture a, EventCapture b) noexcept {
-    return static_cast<EventCapture>(static_cast<u8>(a) | static_cast<u8>(b));
-}
-[[nodiscard]] constexpr EventCapture operator&(EventCapture a, EventCapture b) noexcept {
-    return static_cast<EventCapture>(static_cast<u8>(a) & static_cast<u8>(b));
-}
-[[nodiscard]] constexpr bool HasCapture(EventCapture val, EventCapture mask) noexcept {
-    return (val & mask) != EventCapture::None;
-}
 
 struct EventTap {
     using Fn = EventCapture (*)(void* user, const SDL_Event& ev) noexcept;
@@ -46,12 +23,12 @@ struct EventTap {
     }
 };
 
-// Owns SDL3 subsystem lifecycle, gamepad handles, sandboxed filesystem paths, and frame event pumping.
-// Single-instance OS coordinator; non-copyable and non-movable.
-// Invariant: All active SDL_Gamepad handles are closed prior to SDL_Quit().
-class Platform {
+// Owns SDL3 subsystem lifecycle, SoA gamepad handles, sandboxed filesystem roots, and coalesced frame pumping.
+// Places all hot runtime state (gamepad SoA arrays, active/rumble bitmasks, flags) in Cache Line 0 (offset 0..51).
+// Invariant: Active SDL_Gamepad slots match set bits in m_activeGamepadMask and are closed prior to SDL_Quit().
+class alignas(64) Platform {
 public:
-    static constexpr usize kMaxGamepads = 4;
+    static constexpr usize kMaxGamepads = en::platform::kMaxGamepads;
 
     constexpr Platform() noexcept = default;
     ~Platform() noexcept;
@@ -59,40 +36,80 @@ public:
     Platform(const Platform&) = delete;
     Platform& operator=(const Platform&) = delete;
 
-    [[nodiscard]] Result<void, Error> Init(
+    [[nodiscard]] Result<void, PlatformErrc> Init(
         std::string_view appName = "EngineN",
         std::string_view orgName = "EngineN") noexcept;
     void Shutdown() noexcept;
 
-    WindowFlags Pump(Window& window, input::InputPipeline& input, EventTap tap = {}) noexcept;
+    WindowFlags Pump(Window& window, EventTap tap = {}) noexcept;
 
+    template <typename InputSinkT>
+        requires requires(InputSinkT& sink, const PlatformFrameEvents& ev) { sink.IngestPlatformFrame(ev); }
+    WindowFlags Pump(Window& window, InputSinkT& input, EventTap tap = {}) noexcept {
+        const WindowFlags flags = Pump(window, tap);
+        input.IngestPlatformFrame(m_frameEvents);
+        return flags;
+    }
+
+    [[nodiscard]] constexpr const PlatformFrameEvents& FrameEvents() const noexcept { return m_frameEvents; }
     [[nodiscard]] constexpr bool ShouldQuit() const noexcept { return m_quit; }
     constexpr void RequestQuit() noexcept { m_quit = true; }
+    [[nodiscard]] constexpr u8 ActiveGamepadMask() const noexcept { return m_activeGamepadMask; }
 
     bool RumbleGamepad(u8 padSlot, u16 lowFreq, u16 highFreq, u32 durationMs) noexcept;
     void StopAllRumble() noexcept;
 
-    [[nodiscard]] Result<FilePath, Error> ResolveAsset(std::string_view relative) const noexcept;
-    [[nodiscard]] Result<FilePath, Error> ResolveUser(std::string_view relative) const noexcept;
+    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveAsset(std::string_view relative) const noexcept {
+        return m_basePath.Resolve(relative);
+    }
+
+    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveUser(std::string_view relative) const noexcept {
+        return m_prefPath.Resolve(relative);
+    }
+
+    [[nodiscard]] constexpr std::string_view BasePath() const noexcept { return m_basePath.View(); }
+    [[nodiscard]] constexpr std::string_view PrefPath() const noexcept { return m_prefPath.View(); }
 
     [[nodiscard]] static std::string_view GetClipboard(std::span<char> outBuf) noexcept;
-    [[nodiscard]] static Result<void, Error> SetClipboard(std::string_view utf8) noexcept;
+    [[nodiscard]] static Result<void, PlatformErrc> SetClipboard(std::string_view utf8) noexcept;
     static void ShowErrorBox(std::string_view title, std::string_view message, const Window* parent = nullptr) noexcept;
 
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
+        const u64 stateBits =
+            (static_cast<u64>(m_activeGamepadMask) << 24) |
+            (static_cast<u64>(m_rumbleGamepadMask) << 16) |
+            (static_cast<u64>(m_initialized) << 8) |
+            static_cast<u64>(m_quit);
+        return detail::MixAuditBits(m_frameEvents.ComputeAuditHash() ^ detail::MixAuditBits(stateBits));
+    }
+
 private:
-    struct GamepadSlot {
-        u32 id{0};
-        SDL_Gamepad* handle{nullptr};
-    };
+    void OpenGamepad(u32 instanceId) noexcept;
+    [[nodiscard]] u8 CloseGamepad(u32 instanceId) noexcept;
 
-    void OpenGamepad(u32 id) noexcept;
-    void CloseGamepad(u32 id) noexcept;
+    [[nodiscard]] constexpr u8 FindGamepadSlot(u32 instanceId) const noexcept {
+        for (u32 m = m_activeGamepadMask; m != 0; m &= (m - 1u)) {
+            const u8 slot = static_cast<u8>(std::countr_zero(m));
+            if (m_gamepadIds[slot] == instanceId) return slot;
+        }
+        return 0xFFu;
+    }
 
+    // Cache Line 0 (offset 0..51): Hot runtime state and SoA gamepad lookup tables.
+    std::array<SDL_Gamepad*, kMaxGamepads> m_gamepadHandles{};
+    std::array<u32, kMaxGamepads> m_gamepadIds{};
+    u8 m_activeGamepadMask{0};
+    u8 m_rumbleGamepadMask{0};
     bool m_initialized{false};
     bool m_quit{false};
-    std::array<GamepadSlot, kMaxGamepads> m_gamepads{};
+
+    // Cache Lines 1..4 (offset 64..319, 256B): Coalesced frame events.
+    PlatformFrameEvents m_frameEvents{};
+
+    // Cold Cache Lines 5..36 (offset 320..2367, 2048B): Pre-normalized filesystem roots.
     FilePath m_basePath{};
     FilePath m_prefPath{};
 };
+static_assert(sizeof(Platform) == 2368);
 
 } // namespace en::platform

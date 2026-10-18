@@ -1,19 +1,14 @@
 #pragma once
 
-#include "core/time/TimeViews.h"
 #include "debug/DebugBatcher.h"
 #include "debug/DebugInspector.h"
 #include "debug/DebugProfilerAndConsole.h"
 #include "debug/DebugTypes.h"
-#include "input/InputTypes.h"
-#include "platform/PlatformTypes.h"
 
-namespace en::assets { class AssetBank; }
-namespace en::audio { class AudioSystem; }
-namespace en::gameplay { class GameplayPipeline; }
-namespace en::input { class ActionBuffer; class InputPipeline; }
-namespace en::renderer { class Renderer; class RenderList; }
-namespace en::world { class World; }
+#include <utility>
+
+namespace en::input { class InputPipeline; }
+namespace en::renderer { class Renderer; }
 
 namespace en::debug {
 
@@ -22,28 +17,8 @@ struct DebugSystemConfig {
     u16 toggleConsoleScancode{53}; // SDL_SCANCODE_GRAVE (`~`)
 };
 
-// Consolidated read-only frame context passed to DebugSystem::BeginFrame().
-struct DebugBeginFrameContext {
-    const world::World& world;
-    time::RenderTimeView timeView{};
-    const input::FrameInput& frameInput;
-    platform::Extent2i viewportSize{};
-    bool isPaused{false};
-};
-
-// Consolidated read-only context passed to DebugSystem::EmitOverlays().
-struct DebugEmitOverlayContext {
-    const world::World& world;
-    const gameplay::GameplayPipeline& gameplay;
-    const audio::AudioSystem& audio;
-    const assets::AssetBank& assetBank;
-    time::RenderTimeView timeView{};
-    const input::FrameInput& frameInput;
-    platform::Extent2i viewportSize{};
-};
-
 // Move-only RAII coordinator owning the single 192 KB debug arena and 128x64 unified debug atlas.
-// Compiles down to a stateless no-op struct when EN_ENABLE_DEBUG_TOOLS == 0; stores zero dangling subsystem pointers.
+// Compiles down to a stateless no-op struct when EN_ENABLE_DEBUG_TOOLS == 0; stores zero subsystem pointers.
 // Invariant: Zero heap allocations occur after Init().
 class DebugSystem {
 public:
@@ -62,29 +37,27 @@ public:
         const DebugSystemConfig& cfg = {}) noexcept;
     void Shutdown(renderer::Renderer* renderer = nullptr) noexcept;
 
+    [[nodiscard]] constexpr platform::EventCapture GetEventCapture() const noexcept {
+        if (m_console.IsOpen()) {
+            return static_cast<platform::EventCapture>(
+                static_cast<u8>(platform::EventCapture::Keyboard) |
+                static_cast<u8>(platform::EventCapture::Mouse));
+        }
+        return platform::EventCapture::None;
+    }
+
+    bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl) noexcept;
     bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl,
-                            input::InputPipeline& input) noexcept;
+                            input::InputPipeline&) noexcept {
+        return OnPlatformKeyEvent(scancode, down, shift, ctrl);
+    }
     bool OnPlatformTextInput(std::string_view textUtf8) noexcept;
 
-    // Flushes pending console commands, performs mouse entity picking, and returns loop directives.
     [[nodiscard]] DebugLoopDirectives BeginFrame(const DebugBeginFrameContext& ctx) noexcept {
+        m_shapePool.SetCurrentTick(ctx.timeView.tickIndex);
         m_console.FlushPendingCommands(ctx.timeView.tickIndex);
 
-        DebugLoopDirectives directives{};
-        if (m_pendingStepTicks > 0) {
-            directives.forcePause = true;
-            directives.stepTicks  = 1u;
-            --m_pendingStepTicks;
-        }
-        if (m_pendingPauseToggle) {
-            directives.togglePause = true;
-            m_pendingPauseToggle   = false;
-        }
-        if (m_pendingTimeScaleChannel <= 8u) {
-            directives.targetTimeChannel = m_pendingTimeScaleChannel;
-            directives.channelTimeScale  = m_pendingTimeScaleValue;
-            m_pendingTimeScaleChannel    = 0xFFu;
-        }
+        const DebugLoopDirectives directives = std::exchange(m_pendingDirectives, DebugLoopDirectives{});
 
         if (ctx.isPaused || HasOverlay(m_overlays, OverlayFlags::EntityInspector)) {
             if ((ctx.frameInput.pressed & 1u) != 0 && !m_console.IsOpen()) {
@@ -105,31 +78,42 @@ public:
     void EmitOverlays(const DebugEmitOverlayContext& ctx,
                       renderer::RenderList& outList) noexcept;
 
-    [[nodiscard]] constexpr DebugShapePool& Shapes(this auto&& self) noexcept { return self.m_shapePool; }
-    [[nodiscard]] constexpr DebugInspector& Inspector(this auto&& self) noexcept { return self.m_inspector; }
-    [[nodiscard]] constexpr DebugProfiler& Profiler(this auto&& self) noexcept { return self.m_profiler; }
-    [[nodiscard]] constexpr DebugConsole& Console(this auto&& self) noexcept { return self.m_console; }
+    [[nodiscard]] constexpr auto&& Shapes(this auto&& self) noexcept { return self.m_shapePool; }
+    [[nodiscard]] constexpr auto&& Inspector(this auto&& self) noexcept { return self.m_inspector; }
+    [[nodiscard]] constexpr auto&& Profiler(this auto&& self) noexcept { return self.m_profiler; }
+    [[nodiscard]] constexpr auto&& Console(this auto&& self) noexcept { return self.m_console; }
     [[nodiscard]] constexpr OverlayFlags ActiveOverlays() const noexcept { return m_overlays; }
     constexpr void SetActiveOverlays(OverlayFlags flags) noexcept { m_overlays = flags; }
 
-    constexpr void RequestSteps(u16 ticks) noexcept { m_pendingStepTicks = ticks; }
-    constexpr void RequestPauseToggle() noexcept { m_pendingPauseToggle = true; }
-    constexpr void RequestChannelTimeScale(u8 channel, f32 scale) noexcept {
-        m_pendingTimeScaleChannel = channel;
-        m_pendingTimeScaleValue   = scale;
+    constexpr void RequestSteps(u16 ticks) noexcept {
+        m_pendingDirectives.stepTicks = ticks;
+        m_pendingDirectives.controlFlags |= DebugLoopDirectives::kFlagForcePause;
     }
+    constexpr void RequestPauseToggle() noexcept {
+        m_pendingDirectives.controlFlags |= DebugLoopDirectives::kFlagTogglePause;
+    }
+    constexpr void RequestChannelTimeScale(u8 channel, f32 scale) noexcept {
+        m_pendingDirectives.targetTimeChannel = channel;
+        m_pendingDirectives.channelTimeScale  = scale;
+    }
+
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 #else
     [[nodiscard]] constexpr Result<void, DebugErrc> Init(
         renderer::Renderer&, const DebugSystemConfig& = {}) noexcept { return Ok; }
     constexpr void Shutdown(renderer::Renderer* = nullptr) noexcept {}
-    constexpr bool OnPlatformKeyEvent(u16, bool, bool, bool,
-                                      input::InputPipeline&) noexcept { return false; }
+    [[nodiscard]] constexpr platform::EventCapture GetEventCapture() const noexcept {
+        return platform::EventCapture::None;
+    }
+    constexpr bool OnPlatformKeyEvent(u16, bool, bool, bool) noexcept { return false; }
+    constexpr bool OnPlatformKeyEvent(u16, bool, bool, bool, input::InputPipeline&) noexcept { return false; }
     constexpr bool OnPlatformTextInput(std::string_view) noexcept { return false; }
     [[nodiscard]] constexpr DebugLoopDirectives BeginFrame(const DebugBeginFrameContext&) noexcept { return {}; }
     constexpr void EndSimTick(const world::World&, time::SimStepView,
                               const input::TickInput&,
                               const input::ActionBuffer&) noexcept {}
     constexpr void EmitOverlays(const DebugEmitOverlayContext&, renderer::RenderList&) noexcept {}
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept { return 0; }
 #endif
 
 private:
@@ -140,11 +124,7 @@ private:
     renderer::TextureHandle m_debugAtlas{};
     OverlayFlags m_overlays{OverlayFlags::None};
     u16 m_toggleConsoleScancode{53};
-    u16 m_savedActionMask{0xFFFFu};
-    u16 m_pendingStepTicks{0};
-    f32 m_pendingTimeScaleValue{1.0f};
-    u8  m_pendingTimeScaleChannel{0xFFu};
-    bool m_pendingPauseToggle{false};
+    DebugLoopDirectives m_pendingDirectives{};
 
     DebugShapePool m_shapePool{};
     DebugInspector m_inspector{};

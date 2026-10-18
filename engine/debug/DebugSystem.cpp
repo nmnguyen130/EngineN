@@ -1,15 +1,10 @@
 #include "debug/DebugSystem.h"
 
-#include "assets/AssetBank.h"
-#include "audio/AudioSystem.h"
-#include "gameplay/GameplayPipeline.h"
-#include "input/ActionBuffer.h"
-#include "input/InputPipeline.h"
+#include "renderer/RenderList.h"
 #include "renderer/Renderer.h"
-#include "renderer/RendererList.h"
-#include "world/World.h"
 
-#include <cstdlib>
+#include <algorithm>
+#include <cstring>
 #include <new>
 
 namespace en::debug {
@@ -18,263 +13,123 @@ namespace en::debug {
 
 namespace {
 
-void CmdHelp(void* /*ctx*/, const ConsoleArgs& /*args*/, DebugConsole& console) noexcept {
-    console.Print(LogSeverity::Info, "Registered Commands & CVars:");
-    for (const ConsoleSymbol& sym : console.Symbols()) {
-        if (sym.kind != SymbolKind::Empty) {
-            console.Print(LogSeverity::Info, std::string_view(sym.namePtr, sym.nameLen));
-        }
-    }
-}
+inline constexpr usize kOffsetShapes  = 0;
+inline constexpr usize kOffsetSamples = kOffsetShapes  + sizeof(DebugShapeCmd) * DebugShapePool::kMaxShapes;
+inline constexpr usize kOffsetTicks   = kOffsetSamples + sizeof(FrameProfileSample) * DebugProfiler::kHistoryFrames;
+inline constexpr usize kOffsetSymbols = kOffsetTicks   + sizeof(ActorTickRecord) * DebugInspector::kHistoryTicks;
+inline constexpr usize kOffsetLogMeta = kOffsetSymbols + sizeof(ConsoleSymbol) * DebugConsole::kMaxSymbols;
+inline constexpr usize kOffsetLogText = kOffsetLogMeta + sizeof(LogEntryMeta) * DebugConsole::kMaxLogEntries;
+inline constexpr usize kOffsetHistory = kOffsetLogText + DebugConsole::kLogTextBytes;
+inline constexpr usize kTotalUsedArena =
+    kOffsetHistory + DebugConsole::kMaxLineChars * DebugConsole::kMaxHistory;
 
-void CmdClear(void* /*ctx*/, const ConsoleArgs& /*args*/, DebugConsole& console) noexcept {
-    console.ClearLog();
-}
+static_assert(kTotalUsedArena <= DebugSystem::kArenaSizeBytes);
+static_assert((kOffsetSamples & 63u) == 0);
+static_assert((kOffsetTicks & 63u) == 0);
+static_assert((kOffsetSymbols & 63u) == 0);
 
-void CmdOverlay(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr || args.Count() < 2) {
-        console.Print(LogSeverity::Warning, "Usage: overlay <all|none|bounds|hitboxes|prof|time|input|scrub>");
-        return;
-    }
-    const std::string_view cat = args[1];
-    OverlayFlags cur = sys->ActiveOverlays();
-    if (cat == "all")         cur = OverlayFlags::AllWorld | OverlayFlags::AllHud;
-    else if (cat == "none")   cur = OverlayFlags::None;
-    else if (cat == "bounds") cur = cur ^ (OverlayFlags::KinematicBounds | OverlayFlags::VelocityVectors);
-    else if (cat == "hitboxes") cur = cur ^ OverlayFlags::CombatHitboxes;
-    else if (cat == "prof")   cur = cur ^ OverlayFlags::ProfilerHud;
-    else if (cat == "time")   cur = cur ^ OverlayFlags::TimeChannelHud;
-    else if (cat == "input")  cur = cur ^ OverlayFlags::InputViewerHud;
-    else if (cat == "scrub")  cur = cur ^ OverlayFlags::FlightScrubber;
-    else {
-        console.Print(LogSeverity::Error, "Unknown overlay category.");
-        return;
-    }
-    sys->SetActiveOverlays(cur);
-    console.Print(LogSeverity::Success, "Overlay mask updated.");
-}
+struct OverlayNameEntry {
+    std::string_view name;
+    OverlayFlags flag;
+};
 
-void CmdTimePause(void* ctx, const ConsoleArgs& /*args*/, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys != nullptr) {
-        sys->RequestPauseToggle();
-        console.Print(LogSeverity::Success, "Toggled simulation pause.");
-    }
-}
-
-void CmdTimeStep(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr) return;
-    u16 ticks = 1;
-    if (args.Count() >= 2) {
-        if (auto v = args.GetInt(1)) {
-            ticks = static_cast<u16>(std::clamp<i64>(*v, 1, 1200));
-        }
-    }
-    sys->RequestSteps(ticks);
-    console.Print(LogSeverity::Success, "Stepping simulation ticks.");
-}
-
-void CmdWorldTp(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr || sys->ActiveWorld() == nullptr || args.Count() < 4) {
-        console.Print(LogSeverity::Warning, "Usage: world.tp <entityIdx> <x> <y>");
-        return;
-    }
-    const auto idxRes = args.GetInt(1);
-    const auto xRes   = args.GetFloat(2);
-    const auto yRes   = args.GetFloat(3);
-    if (!idxRes || !xRes || !yRes) {
-        console.Print(LogSeverity::Error, "Invalid arguments for world.tp.");
-        return;
-    }
-
-    world::World& w = *sys->ActiveWorld();
-    const u16 targetIdx = static_cast<u16>(*idxRes);
-    for (auto [id, ltRef] : w.View<world::LocalTransform2D>()) {
-        if (id.index == targetIdx) {
-            world::LocalTransform2D lt = w.GetLocalTransform(id);
-            lt.x = *xRes;
-            lt.y = *yRes;
-            w.Teleport(id, lt);
-            console.Print(LogSeverity::Success, "Entity teleported cleanly.");
-            return;
-        }
-    }
-    console.Print(LogSeverity::Error, "Entity index not found or not spatial.");
-}
-
-void CmdWorldFlag(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr || sys->ActiveGameplay() == nullptr || args.Count() < 2) {
-        console.Print(LogSeverity::Warning, "Usage: world.flag <id 0..4095> [0|1]");
-        return;
-    }
-    const auto idRes = args.GetInt(1);
-    if (!idRes || *idRes < 0 || *idRes >= 4096) {
-        console.Print(LogSeverity::Error, "Flag ID must be in [0..4095].");
-        return;
-    }
-    const u16 flagId = static_cast<u16>(*idRes);
-    if (args.Count() >= 3) {
-        if (auto bRes = args.GetBool(2)) {
-            sys->ActiveGameplay()->SetWorldFlag(flagId, *bRes);
-        }
-    }
-    const bool cur = sys->ActiveGameplay()->TestWorldFlag(flagId);
-    console.Print(LogSeverity::Success, cur ? "Flag = true" : "Flag = false");
-}
-
-void CmdAudioBus(void* ctx, const ConsoleArgs& args, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr || sys->ActiveAudio() == nullptr || args.Count() < 3) {
-        console.Print(LogSeverity::Warning, "Usage: audio.bus <busIdx 0..7> <gain 0.0..2.0>");
-        return;
-    }
-    const auto busRes  = args.GetInt(1);
-    const auto gainRes = args.GetFloat(2);
-    if (!busRes || !gainRes || *busRes < 0 || *busRes >= 8) {
-        console.Print(LogSeverity::Error, "Invalid bus index or gain.");
-        return;
-    }
-    sys->ActiveAudio()->SetBusGain(static_cast<audio::AudioBusId>(*busRes), *gainRes);
-    console.Print(LogSeverity::Success, "Updated audio bus gain.");
-}
-
-void CmdAuditHash(void* ctx, const ConsoleArgs& /*args*/, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(ctx);
-    if (sys == nullptr || sys->ActiveWorld() == nullptr ||
-        sys->ActiveGameplay() == nullptr || sys->ActiveAudio() == nullptr) {
-        return;
-    }
-    const u64 wHash = sys->ActiveWorld()->ComputeAuditHash();
-    const u64 gHash = sys->ActiveGameplay()->ComputeAuditHash(*sys->ActiveWorld());
-    const u64 aHash = sys->ActiveAudio()->ComputeAuditHash();
-
-    std::array<char, 80> buf{};
-    char* p = buf.data();
-    char* end = buf.data() + buf.size();
-    for (char c : std::string_view("W:")) *p++ = c;
-    p = DebugBatcher::FormatU64Hex(p, end, wHash, 16);
-    for (char c : std::string_view(" G:")) *p++ = c;
-    p = DebugBatcher::FormatU64Hex(p, end, gHash, 16);
-    for (char c : std::string_view(" A:")) *p++ = c;
-    p = DebugBatcher::FormatU64Hex(p, end, aHash, 16);
-    console.Print(LogSeverity::Success, std::string_view(buf.data(), static_cast<usize>(p - buf.data())));
-}
+inline constexpr std::array<OverlayNameEntry, 17> kOverlayNames{{
+    {"none",        OverlayFlags::None},
+    {"all",         OverlayFlags::AllWorld | OverlayFlags::AllHud},
+    {"world",       OverlayFlags::AllWorld},
+    {"hud",         OverlayFlags::AllHud},
+    {"transforms",  OverlayFlags::SpatialTransforms},
+    {"bounds",      OverlayFlags::KinematicBounds},
+    {"velocity",    OverlayFlags::VelocityVectors},
+    {"hitboxes",    OverlayFlags::CombatHitboxes},
+    {"tiles",       OverlayFlags::TileCollisionMap},
+    {"grid",        OverlayFlags::DynamicSpatialGrid},
+    {"breadcrumbs", OverlayFlags::SafeBreadcrumbs},
+    {"camera",      OverlayFlags::CameraRigOverlay},
+    {"audio",       OverlayFlags::AudioEmitters},
+    {"inspector",   OverlayFlags::EntityInspector},
+    {"scrubber",    OverlayFlags::FlightScrubber},
+    {"profiler",    OverlayFlags::ProfilerHud},
+    {"time",        OverlayFlags::TimeChannelHud}
+}};
 
 } // namespace
 
-DebugSystem::DebugSystem(DebugSystem&& other) noexcept
-    : m_arenaSlab(other.m_arenaSlab),
-      m_debugAtlas(other.m_debugAtlas),
-      m_overlays(other.m_overlays),
-      m_toggleConsoleScancode(other.m_toggleConsoleScancode),
-      m_savedActionMask(other.m_savedActionMask),
-      m_pendingStepTicks(other.m_pendingStepTicks),
-      m_pendingTimeScaleChannel(other.m_pendingTimeScaleChannel),
-      m_pendingPauseToggle(other.m_pendingPauseToggle),
-      m_boundWorld(other.m_boundWorld),
-      m_boundGameplay(other.m_boundGameplay),
-      m_boundAudio(other.m_boundAudio),
-      m_shapePool(other.m_shapePool),
-      m_inspector(other.m_inspector),
-      m_profiler(other.m_profiler),
-      m_console(other.m_console) {
-    other.m_arenaSlab  = nullptr;
-    other.m_debugAtlas = {};
+DebugSystem::DebugSystem(DebugSystem&& other) noexcept {
+    *this = std::move(other);
 }
 
 DebugSystem& DebugSystem::operator=(DebugSystem&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_arenaSlab               = other.m_arenaSlab;
-        m_debugAtlas              = other.m_debugAtlas;
-        m_overlays                = other.m_overlays;
-        m_toggleConsoleScancode   = other.m_toggleConsoleScancode;
-        m_savedActionMask         = other.m_savedActionMask;
-        m_pendingStepTicks        = other.m_pendingStepTicks;
-        m_pendingTimeScaleChannel = other.m_pendingTimeScaleChannel;
-        m_pendingPauseToggle      = other.m_pendingPauseToggle;
-        m_boundWorld              = other.m_boundWorld;
-        m_boundGameplay           = other.m_boundGameplay;
-        m_boundAudio              = other.m_boundAudio;
-        m_shapePool               = other.m_shapePool;
-        m_inspector               = other.m_inspector;
-        m_profiler                = other.m_profiler;
-        m_console                 = other.m_console;
-        other.m_arenaSlab         = nullptr;
-        other.m_debugAtlas        = {};
+        m_arenaSlab             = std::exchange(other.m_arenaSlab, nullptr);
+        m_debugAtlas            = std::exchange(other.m_debugAtlas, renderer::TextureHandle{});
+        m_overlays              = other.m_overlays;
+        m_toggleConsoleScancode = other.m_toggleConsoleScancode;
+        m_pendingDirectives     = other.m_pendingDirectives;
+        m_shapePool             = other.m_shapePool;
+        m_inspector             = other.m_inspector;
+        m_profiler              = other.m_profiler;
+        m_console               = other.m_console;
     }
     return *this;
 }
 
-Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer,
-                                         const DebugSystemConfig& cfg) noexcept {
+Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer, const DebugSystemConfig& cfg) noexcept {
     Shutdown(&renderer);
 
     void* rawMem = ::operator new(kArenaSizeBytes, std::align_val_t{64}, std::nothrow);
     if (rawMem == nullptr) {
         return Err(DebugErrc::OutOfMemory);
     }
+    std::memset(rawMem, 0, kArenaSizeBytes);
     m_arenaSlab = static_cast<u8*>(rawMem);
 
-    // Deterministic 192 KB Slab Partitioning:
-    // [0 .. 64KB)     : DebugShapeCmd[2048] (65,536 B)
-    // [64KB .. 96KB)  : FrameProfileSample[256] (32,768 B)
-    // [96KB .. 100KB) : ActorTickRecord[64] (4,096 B)
-    // [100KB .. 108KB): ConsoleSymbol[256] (8,192 B)
-    // [108KB .. 112KB): LogEntryMeta[512] (4,096 B)
-    // [112KB .. 128KB): char LogText[16384] (16,384 B)
-    // [128KB .. 132KB): char History[32][128] (4,096 B)
-    // [132KB .. 192KB): Scratch buffer used for 32 KB RGBA8 atlas unpacking at Init()
-    auto* shapePtr   = reinterpret_cast<DebugShapeCmd*>(m_arenaSlab + 0);
-    auto* profPtr    = reinterpret_cast<FrameProfileSample*>(m_arenaSlab + 65536);
-    auto* tickPtr    = reinterpret_cast<ActorTickRecord*>(m_arenaSlab + 98304);
-    auto* symPtr     = reinterpret_cast<ConsoleSymbol*>(m_arenaSlab + 102400);
-    auto* logMetaPtr = reinterpret_cast<LogEntryMeta*>(m_arenaSlab + 110592);
-    auto* logTextPtr = reinterpret_cast<char*>(m_arenaSlab + 114688);
-    auto* histPtr    = reinterpret_cast<std::array<char, 128>*>(m_arenaSlab + 131072);
-    auto* atlasBytes = m_arenaSlab + 135168;
-
-    m_shapePool.BindArena(std::span<DebugShapeCmd, DebugShapePool::kMaxShapes>(shapePtr, DebugShapePool::kMaxShapes));
-    m_profiler.BindArena(std::span<FrameProfileSample, DebugProfiler::kHistoryFrames>(profPtr, DebugProfiler::kHistoryFrames));
-    m_inspector.BindArena(std::span<ActorTickRecord, DebugInspector::kHistoryTicks>(tickPtr, DebugInspector::kHistoryTicks));
-    m_console.BindArena(
-        std::span<ConsoleSymbol, DebugConsole::kMaxSymbols>(symPtr, DebugConsole::kMaxSymbols),
-        std::span<LogEntryMeta, DebugConsole::kMaxLogEntries>(logMetaPtr, DebugConsole::kMaxLogEntries),
-        std::span<char, DebugConsole::kLogTextBytes>(logTextPtr, DebugConsole::kLogTextBytes),
-        std::span<std::array<char, 128>, DebugConsole::kMaxHistory>(histPtr, DebugConsole::kMaxHistory));
-
-    // Unpack 8x8 ASCII glyphs + solid white UV block into the 32 KB scratch slice and upload once.
-    std::span<u8, kDebugAtlasWidth * kDebugAtlasHeight * 4> pixelSpan(
-        atlasBytes, kDebugAtlasWidth * kDebugAtlasHeight * 4);
-    UnpackDebugAtlasRGBA8(pixelSpan);
+    std::array<u8, kDebugAtlasWidth * kDebugAtlasHeight * 4> atlasPixels{};
+    UnpackDebugAtlasRGBA8(atlasPixels);
 
     renderer::TextureDesc texDesc{};
     texDesc.width  = kDebugAtlasWidth;
     texDesc.height = kDebugAtlasHeight;
     texDesc.format = renderer::TextureFormat::RGBA8;
     texDesc.filter = renderer::TextureFilter::Nearest;
-    texDesc.pixels = pixelSpan;
-    texDesc.pitch  = kDebugAtlasWidth * 4u;
+    texDesc.pixels = atlasPixels;
+    texDesc.pitch  = kDebugAtlasWidth * 4;
 
     auto texRes = renderer.CreateTexture(texDesc);
     if (!texRes) {
-        Shutdown();
+        ::operator delete(m_arenaSlab, std::align_val_t{64});
+        m_arenaSlab = nullptr;
         return Err(DebugErrc::AtlasCreateFailed);
     }
     m_debugAtlas            = *texRes;
     m_overlays              = cfg.initialOverlays;
     m_toggleConsoleScancode = cfg.toggleConsoleScancode;
+    m_pendingDirectives     = {};
+
+    m_shapePool.BindArena(std::span<DebugShapeCmd, DebugShapePool::kMaxShapes>(
+        reinterpret_cast<DebugShapeCmd*>(m_arenaSlab + kOffsetShapes), DebugShapePool::kMaxShapes));
+    m_profiler.BindArena(std::span<FrameProfileSample, DebugProfiler::kHistoryFrames>(
+        reinterpret_cast<FrameProfileSample*>(m_arenaSlab + kOffsetSamples), DebugProfiler::kHistoryFrames));
+    m_inspector.BindArena(std::span<ActorTickRecord, DebugInspector::kHistoryTicks>(
+        reinterpret_cast<ActorTickRecord*>(m_arenaSlab + kOffsetTicks), DebugInspector::kHistoryTicks));
+    m_console.BindArena(
+        std::span<ConsoleSymbol, DebugConsole::kMaxSymbols>(
+            reinterpret_cast<ConsoleSymbol*>(m_arenaSlab + kOffsetSymbols), DebugConsole::kMaxSymbols),
+        std::span<LogEntryMeta, DebugConsole::kMaxLogEntries>(
+            reinterpret_cast<LogEntryMeta*>(m_arenaSlab + kOffsetLogMeta), DebugConsole::kMaxLogEntries),
+        std::span<char, DebugConsole::kLogTextBytes>(
+            reinterpret_cast<char*>(m_arenaSlab + kOffsetLogText), DebugConsole::kLogTextBytes),
+        std::span<std::array<char, DebugConsole::kMaxLineChars>, DebugConsole::kMaxHistory>(
+            reinterpret_cast<std::array<char, DebugConsole::kMaxLineChars>*>(m_arenaSlab + kOffsetHistory),
+            DebugConsole::kMaxHistory));
 
     RegisterBuiltInCommands();
-    return {};
+    return Ok;
 }
 
 void DebugSystem::Shutdown(renderer::Renderer* renderer) noexcept {
-    if (renderer != nullptr && m_debugAtlas.index != 0) {
+    if (renderer != nullptr && m_debugAtlas.generation != 0) {
         renderer->DestroyTexture(m_debugAtlas);
     }
     m_debugAtlas = {};
@@ -284,79 +139,18 @@ void DebugSystem::Shutdown(renderer::Renderer* renderer) noexcept {
     }
 }
 
-void DebugSystem::RegisterBuiltInCommands() noexcept {
-    (void)m_console.RegisterCommand("help", CmdHelp, this);
-    (void)m_console.RegisterCommand("clear", CmdClear, this);
-    (void)m_console.RegisterCommand("overlay", CmdOverlay, this);
-    (void)m_console.RegisterCommand("time.pause", CmdTimePause, this);
-    (void)m_console.RegisterCommand("time.step", CmdTimeStep, this);
-    (void)m_console.RegisterCommand("world.tp", CmdWorldTp, this);
-    (void)m_console.RegisterCommand("world.flag", CmdWorldFlag, this);
-    (void)m_console.RegisterCommand("audio.bus", CmdAudioBus, this);
-    (void)m_console.RegisterCommand("audit.hash", CmdAuditHash, this);
-}
-
-bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl,
-                                     input::InputPipeline& input) noexcept {
-    if (!down) {
-        return m_console.IsOpen();
-    }
-
-    if (scancode == m_toggleConsoleScancode) {
-        const bool nextOpen = !m_console.IsOpen();
-        m_console.SetOpen(nextOpen);
-        if (nextOpen) {
-            m_savedActionMask = input.GetActionMask();
-            input.SetActionMask(0);
-        } else {
-            input.SetActionMask(m_savedActionMask);
-        }
+bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl) noexcept {
+    if (down && scancode == m_toggleConsoleScancode) {
+        m_console.SetOpen(!m_console.IsOpen());
         return true;
     }
-
-    if (m_console.IsOpen()) {
+    if (!m_console.IsOpen()) {
+        return false;
+    }
+    if (down) {
         m_console.OnKeyPress(scancode, shift, ctrl);
-        return true;
     }
-
-    // Function key hotkeys: F1=58, F2=59, F3=60, F4=61, F5=62, F6=63; '['=47, ']'=48.
-    switch (scancode) {
-        case 58: // F1: Profiler + Time Channel HUD
-            m_overlays = m_overlays ^ (OverlayFlags::ProfilerHud | OverlayFlags::TimeChannelHud);
-            return true;
-        case 59: // F2: Kinematic Bounds + Velocity Vectors + Safe Breadcrumbs
-            m_overlays = m_overlays ^ (OverlayFlags::KinematicBounds | OverlayFlags::VelocityVectors | OverlayFlags::SafeBreadcrumbs);
-            return true;
-        case 60: // F3: Combat Hitboxes & Hurtboxes
-            m_overlays = m_overlays ^ OverlayFlags::CombatHitboxes;
-            return true;
-        case 61: // F4: Entity Inspector + Input Viewer + Flight Scrubber
-            m_overlays = m_overlays ^ (OverlayFlags::EntityInspector | OverlayFlags::InputViewerHud | OverlayFlags::FlightScrubber);
-            return true;
-        case 62: // F5: Toggle Simulation Pause
-            m_pendingPauseToggle = true;
-            m_inspector.ResetScrubOffset();
-            return true;
-        case 63: // F6: Single-Step 1 Tick
-            m_pendingStepTicks = 1;
-            m_inspector.ResetScrubOffset();
-            return true;
-        case 47: // '[': Scrub Backward 1 Tick in Flight Recorder
-            if (HasOverlay(m_overlays, OverlayFlags::FlightScrubber)) {
-                m_inspector.StepScrubOffset(+1);
-                return true;
-            }
-            break;
-        case 48: // ']': Scrub Forward 1 Tick in Flight Recorder
-            if (HasOverlay(m_overlays, OverlayFlags::FlightScrubber)) {
-                m_inspector.StepScrubOffset(-1);
-                return true;
-            }
-            break;
-        default:
-            break;
-    }
-    return false;
+    return true;
 }
 
 bool DebugSystem::OnPlatformTextInput(std::string_view textUtf8) noexcept {
@@ -375,38 +169,128 @@ void DebugSystem::EndSimTick(const world::World& world,
     m_inspector.RecordActorTick(world, step.TickIndex(), tickInput, actionBuffer);
 }
 
-void DebugSystem::EmitOverlays(const world::World& world,
-                               const gameplay::GameplayPipeline& gameplay,
-                               const audio::AudioSystem& audio,
-                               const assets::AssetBank& assetBank,
-                               time::RenderTimeView timeView,
-                               const input::FrameInput& frameInput,
-                               platform::Extent2i viewportSize,
+void DebugSystem::EmitOverlays(const DebugEmitOverlayContext& ctx,
                                renderer::RenderList& outList) noexcept {
-    // Configure screen-space camera on ViewSlot 15 for crisp 1:1 pixel HUD & Console rendering.
     renderer::Camera2D hudCam{};
-    hudCam.worldCenterX = static_cast<f32>(viewportSize.w) * 0.5f;
-    hudCam.worldCenterY = static_cast<f32>(viewportSize.h) * 0.5f;
-    hudCam.zoom         = 1.0f;
-    hudCam.viewport     = {0.0f, 0.0f, static_cast<f32>(viewportSize.w), static_cast<f32>(viewportSize.h)};
-    hudCam.scissor      = hudCam.viewport;
-    hudCam.screenSpace  = true;
+    hudCam.viewport    = {0.0f, 0.0f, static_cast<f32>(ctx.viewportSize.w), static_cast<f32>(ctx.viewportSize.h)};
+    hudCam.scissor     = hudCam.viewport;
+    hudCam.zoom        = 1.0f;
+    hudCam.screenSpace = true;
     outList.SetView(kDebugHudViewSlot, hudCam);
 
-    m_shapePool.EmitAndExpire(timeView.tickIndex, m_debugAtlas, outList);
-
-    if (m_overlays != OverlayFlags::None) {
-        m_inspector.EmitWorldAndInspectorOverlays(
-            m_overlays, world, gameplay, audio, assetBank,
-            timeView, frameInput, viewportSize, m_debugAtlas, outList);
-    }
-
-    m_profiler.EndFrame();
+    DebugBatcher worldBatcher(outList, m_debugAtlas, kDebugWorldPassId, 0);
     DebugBatcher hudBatcher(outList, m_debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
-    m_profiler.EmitProfilerAndTimeHud(m_overlays, viewportSize, hudBatcher);
-    m_console.EmitConsoleOverlay(viewportSize, hudBatcher);
+
+    m_shapePool.EmitAndExpire(ctx.timeView.tickIndex, worldBatcher, hudBatcher);
+    m_inspector.EmitWorldAndInspectorOverlays(m_overlays, ctx, worldBatcher, hudBatcher);
+    m_profiler.EmitProfilerAndTimeHud(m_overlays, ctx.viewportSize, hudBatcher);
+    m_console.EmitConsoleOverlay(ctx.viewportSize, hudBatcher);
 }
 
-#endif // EN_ENABLE_DEBUG_TOOLS
+void DebugSystem::RegisterBuiltInCommands() noexcept {
+    (void)m_console.RegisterCommand("help", [](void*, const ConsoleArgs&, DebugConsole& con) noexcept {
+        for (const ConsoleSymbol& sym : con.Symbols()) {
+            if (sym.kind != SymbolKind::Empty) {
+                con.Print(LogSeverity::Info, {sym.namePtr, sym.nameLen});
+            }
+        }
+    }, this);
+
+    (void)m_console.RegisterCommand("clear", [](void*, const ConsoleArgs&, DebugConsole& con) noexcept {
+        con.ClearLog();
+    }, this);
+
+    (void)m_console.RegisterCommand("pause", [](void* ctx, const ConsoleArgs&, DebugConsole& con) noexcept {
+        static_cast<DebugSystem*>(ctx)->RequestPauseToggle();
+        con.Print(LogSeverity::Success, "Toggled simulation pause");
+    }, this);
+
+    (void)m_console.RegisterCommand("step", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
+        auto* self = static_cast<DebugSystem*>(ctx);
+        i64 ticks  = 1;
+        if (args.Count() >= 2) {
+            const auto res = args.GetInt(1);
+            if (!res || *res < 1 || *res > 120) {
+                con.Print(LogSeverity::Error, "Usage: step [1..120]");
+                return;
+            }
+            ticks = *res;
+        }
+        self->RequestSteps(static_cast<u16>(ticks));
+        con.Print(LogSeverity::Success, "Queued simulation step");
+    }, this);
+
+    (void)m_console.RegisterCommand("timescale", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
+        if (args.Count() < 3) {
+            con.Print(LogSeverity::Error, "Usage: timescale <channel 0..7> <scale 0..4>");
+            return;
+        }
+        const auto chRes = args.GetInt(1);
+        const auto scRes = args.GetFloat(2);
+        if (!chRes || !scRes || *chRes < 0 || *chRes > 7) {
+            con.Print(LogSeverity::Error, "Invalid channel or scale");
+            return;
+        }
+        static_cast<DebugSystem*>(ctx)->RequestChannelTimeScale(
+            static_cast<u8>(*chRes), std::clamp(*scRes, 0.0f, 4.0f));
+        con.Print(LogSeverity::Success, "Updated channel time scale");
+    }, this);
+
+    (void)m_console.RegisterCommand("overlay", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
+        if (args.Count() < 2) {
+            con.Print(LogSeverity::Error, "Usage: overlay <name|all|none|world|hud>");
+            return;
+        }
+        auto* self = static_cast<DebugSystem*>(ctx);
+        const std::string_view name = args[1];
+        for (const OverlayNameEntry& entry : kOverlayNames) {
+            if (entry.name == name) {
+                if (entry.flag == OverlayFlags::None) {
+                    self->m_overlays = OverlayFlags::None;
+                } else {
+                    self->m_overlays = self->m_overlays ^ entry.flag;
+                }
+                con.Print(LogSeverity::Success, "Updated overlay flags");
+                return;
+            }
+        }
+        con.Print(LogSeverity::Error, "Unknown overlay flag");
+    }, this);
+
+    (void)m_console.RegisterCommand("scrub", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
+        if (args.Count() < 2) {
+            con.Print(LogSeverity::Error, "Usage: scrub <deltaTicks|reset>");
+            return;
+        }
+        auto* self = static_cast<DebugSystem*>(ctx);
+        if (args[1] == "reset") {
+            self->m_inspector.ResetScrubOffset();
+            con.Print(LogSeverity::Success, "Reset flight scrubber");
+            return;
+        }
+        const auto dRes = args.GetInt(1);
+        if (!dRes) {
+            con.Print(LogSeverity::Error, "Invalid scrub delta");
+            return;
+        }
+        self->m_inspector.StepScrubOffset(static_cast<i32>(*dRes));
+        con.Print(LogSeverity::Success, "Updated flight scrubber offset");
+    }, this);
+}
+
+u64 DebugSystem::ComputeAuditHash() const noexcept {
+    u64 h = MixAuditHash(0xDEB065957E401ull, static_cast<u32>(m_overlays));
+    h = MixAuditHash(h, m_shapePool.ComputeAuditHash());
+    h = MixAuditHash(h, m_inspector.ComputeAuditHash());
+    h = MixAuditHash(h, m_console.ComputeAuditHash());
+    return h;
+}
+
+#else
+
+DebugSystem::DebugSystem(DebugSystem&&) noexcept = default;
+DebugSystem& DebugSystem::operator=(DebugSystem&&) noexcept = default;
+
+#endif
 
 } // namespace en::debug

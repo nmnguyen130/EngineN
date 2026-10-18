@@ -3,7 +3,9 @@
 #include "core/Result.h"
 #include "core/Types.h"
 
+#include <concepts>
 #include <span>
+#include <type_traits>
 
 namespace en::renderer {
 
@@ -16,24 +18,45 @@ enum class RendererErrc : u8 {
     InvalidDimension
 };
 
+// Lightweight 2D pixel extent that converts implicitly from platform::Extent2i or {w, h}
+// so renderer headers remain decoupled from platform headers.
+struct alignas(8) ViewportExtent {
+    i32 w{0};
+    i32 h{0};
+
+    constexpr ViewportExtent() noexcept = default;
+    constexpr ViewportExtent(i32 width, i32 height) noexcept : w(width), h(height) {}
+
+    template <typename T>
+        requires (!std::same_as<std::remove_cvref_t<T>, ViewportExtent> &&
+                  requires(const T& e) { e.w; e.h; })
+    constexpr ViewportExtent(const T& extent) noexcept
+        : w(static_cast<i32>(extent.w))
+        , h(static_cast<i32>(extent.h)) {}
+
+    [[nodiscard]] constexpr bool IsValid() const noexcept { return w > 0 && h > 0; }
+    constexpr bool operator==(const ViewportExtent&) const noexcept = default;
+};
+static_assert(sizeof(ViewportExtent) == 8 && alignof(ViewportExtent) == 8);
+
 // Generational handle for GPU textures managed by Renderer (Asset Sink).
 // Slot 0 (generation 1) is permanently bound to the built-in 1x1 opaque white texture.
-struct TextureHandle {
+struct alignas(4) TextureHandle {
     u16 index{0};
     u16 generation{0};
 
     [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0; }
     constexpr bool operator==(const TextureHandle&) const noexcept = default;
 };
+static_assert(sizeof(TextureHandle) == 4 && alignof(TextureHandle) == 4);
 
 inline constexpr TextureHandle kWhiteTexture{0, 1};
 
-enum class TextureFormat : u8 { RGBA8, BGRA8 };
-enum class TextureFilter : u8 { Nearest, Linear };
+enum class TextureFormat : u8 { RGBA8 = 0, BGRA8 = 1 };
+enum class TextureFilter : u8 { Nearest = 0, Linear = 1 };
 enum class BlendMode : u8 { AlphaPMA = 0, Additive = 1, Multiply = 2, Opaque = 3 };
-enum class PresentMode : u8 { VSync, Immediate, Adaptive };
+enum class PresentMode : u8 { VSync = 0, Immediate = 1, Adaptive = 2 };
 
-// Descriptor passed by Asset Manager or procedural generators into Renderer::CreateTexture.
 struct TextureDesc {
     u16 width{0};
     u16 height{0};
@@ -70,8 +93,7 @@ struct Color {
             static_cast<u8>((rgba8 >> 24u) & 0xFFu),
             static_cast<u8>((rgba8 >> 16u) & 0xFFu),
             static_cast<u8>((rgba8 >> 8u) & 0xFFu),
-            static_cast<u8>(rgba8 & 0xFFu)
-        );
+            static_cast<u8>(rgba8 & 0xFFu));
     }
 
     constexpr bool operator==(const Color&) const noexcept = default;
@@ -85,7 +107,7 @@ namespace Colors {
     inline constexpr Color Red         = Color::Premultiplied(1.0f, 0.0f, 0.0f, 1.0f);
     inline constexpr Color Green       = Color::Premultiplied(0.0f, 1.0f, 0.0f, 1.0f);
     inline constexpr Color Blue        = Color::Premultiplied(0.0f, 0.0f, 1.0f, 1.0f);
-}
+} // namespace Colors
 
 struct FRect {
     f32 x{0.0f};
@@ -96,8 +118,9 @@ struct FRect {
     [[nodiscard]] constexpr bool IsEmpty() const noexcept { return w <= 0.0f || h <= 0.0f; }
     constexpr bool operator==(const FRect&) const noexcept = default;
 };
+static_assert(sizeof(FRect) == 16 && alignof(FRect) == 4);
 
-// Binary-compatible with SDL_Vertex (32 bytes = 2 vertices per 64-byte cache line).
+// Binary-compatible with SDL_Vertex (32 bytes = 2 vertices per 64-byte L1 cache line).
 struct alignas(16) Vertex2D {
     f32 x{0.0f};
     f32 y{0.0f};
@@ -105,7 +128,7 @@ struct alignas(16) Vertex2D {
     f32 u{0.0f};
     f32 v{0.0f};
 };
-static_assert(sizeof(Vertex2D) == 32);
+static_assert(sizeof(Vertex2D) == 32 && alignof(Vertex2D) == 16);
 
 struct QuadCmd {
     f32 x{0.0f};
@@ -136,12 +159,13 @@ struct SortKey {
         (0x3FFFULL << 16);
 
     [[nodiscard]] static constexpr u64 Pack(const QuadCmd& cmd, u16 quadIdx) noexcept {
+        const u16 texIdx = cmd.texture.IsValid() ? (cmd.texture.index & 0x3FFFu) : 0u;
         return (static_cast<u64>(cmd.passId & 0x0Fu) << 60) |
                (static_cast<u64>(cmd.layer) << 52) |
                (static_cast<u64>(cmd.depth) << 36) |
                (static_cast<u64>(static_cast<u8>(cmd.blend) & 0x03u) << 34) |
                (static_cast<u64>(cmd.viewSlot & 0x0Fu) << 30) |
-               (static_cast<u64>(cmd.texture.index & 0x3FFFu) << 16) |
+               (static_cast<u64>(texIdx) << 16) |
                static_cast<u64>(quadIdx);
     }
 
@@ -152,30 +176,41 @@ struct SortKey {
     [[nodiscard]] static constexpr u8 PassId(u64 key) noexcept { return static_cast<u8>((key >> 60) & 0x0Fu); }
 };
 
-struct DrawBatch {
+struct alignas(16) DrawBatch {
     u32 firstQuad{0};
     u32 quadCount{0};
     TextureHandle texture{kWhiteTexture};
     u8 passId{0};
     u8 viewSlot{0};
     BlendMode blend{BlendMode::AlphaPMA};
-};
+    u8 reserved{0};
 
-struct Camera2D {
+    constexpr bool operator==(const DrawBatch&) const noexcept = default;
+};
+static_assert(sizeof(DrawBatch) == 16 && alignof(DrawBatch) == 16);
+
+struct alignas(16) Camera2D {
     f32 worldCenterX{0.0f};
     f32 worldCenterY{0.0f};
     f32 zoom{1.0f};
-    f32 rotationRad{0.0f};
     FRect viewport{};
     FRect scissor{};
     bool screenSpace{false};
+    u8 reserved[3]{0, 0, 0};
+
+    constexpr bool operator==(const Camera2D&) const noexcept = default;
 };
+static_assert(sizeof(Camera2D) == 48 && alignof(Camera2D) == 16);
 
 struct RenderPassDesc {
     Color clearColor{Colors::Black};
     bool clear{false};
     bool enabled{true};
+    u16 reserved{0};
+
+    constexpr bool operator==(const RenderPassDesc&) const noexcept = default;
 };
+static_assert(sizeof(RenderPassDesc) == 20 && alignof(RenderPassDesc) == 4);
 
 struct RenderStats {
     u32 submittedQuads{0};
@@ -184,6 +219,10 @@ struct RenderStats {
     u32 drawBatches{0};
     u32 radixPassesRun{0};
     bool monotonicFastPath{false};
+    u8 reserved[3]{0, 0, 0};
+
+    constexpr bool operator==(const RenderStats&) const noexcept = default;
 };
+static_assert(sizeof(RenderStats) == 24 && alignof(RenderStats) == 4);
 
 } // namespace en::renderer

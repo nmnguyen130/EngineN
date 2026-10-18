@@ -2,12 +2,14 @@
 
 #include "core/Result.h"
 #include "core/Types.h"
+#include "core/time/TimeViews.h"
+#include "input/InputTypes.h"
+#include "platform/PlatformTypes.h"
 #include "renderer/RendererTypes.h"
 #include "world/WorldTypes.h"
 
 #include <array>
 #include <bit>
-#include <cmath>
 #include <span>
 #include <string_view>
 
@@ -18,6 +20,8 @@
         #define EN_ENABLE_DEBUG_TOOLS 1
     #endif
 #endif
+
+namespace en::world { class World; }
 
 namespace en::debug {
 
@@ -66,8 +70,8 @@ enum class OverlayFlags : u32 {
     ProfilerHud        = 1u << 11,
     TimeChannelHud     = 1u << 12,
     InputViewerHud     = 1u << 13,
-    AllWorld           = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 6) | (1u << 7) | (1u << 8),
-    AllHud             = (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13)
+    AllWorld           = (1u << 9) - 1u,
+    AllHud             = ((1u << 14) - 1u) & ~AllWorld
 };
 
 [[nodiscard]] constexpr OverlayFlags operator|(OverlayFlags a, OverlayFlags b) noexcept {
@@ -86,16 +90,56 @@ enum class OverlayFlags : u32 {
     return (static_cast<u32>(mask) & static_cast<u32>(bit)) != 0;
 }
 
-// Decoupled command packet returned by DebugSystem::BeginFrame() so the outer loop mutates TimePipeline
-// without DebugSystem holding raw subsystem pointers or including heavy template headers.
+// Single-register 8-byte command packet returned by DebugSystem::BeginFrame() so the outer loop
+// mutates TimePipeline without DebugSystem holding subsystem pointers or including template headers.
 struct alignas(8) DebugLoopDirectives {
-    u16 stepTicks{0};
+    static constexpr u8 kFlagTogglePause = 1u << 0;
+    static constexpr u8 kFlagForcePause  = 1u << 1;
+
     f32 channelTimeScale{1.0f};
+    u16 stepTicks{0};
     u8  targetTimeChannel{0xFFu};
-    bool togglePause{false};
-    bool forcePause{false};
+    u8  controlFlags{0};
+
+    [[nodiscard]] constexpr bool TogglePause() const noexcept {
+        return (controlFlags & kFlagTogglePause) != 0;
+    }
+    [[nodiscard]] constexpr bool ForcePause() const noexcept {
+        return (controlFlags & kFlagForcePause) != 0;
+    }
 };
-static_assert(sizeof(DebugLoopDirectives) == 12);
+static_assert(sizeof(DebugLoopDirectives) == 8);
+
+// Unified read-only per-frame context for DebugSystem::BeginFrame() and DebugSystem::EmitOverlays().
+// Eliminates cross-subsystem references to AudioSystem, AssetBank, and GameplayPipeline.
+struct DebugFrameContext {
+    const world::World& world;
+    time::RenderTimeView timeView{};
+    const input::FrameInput& frameInput;
+    platform::Extent2i viewportSize{};
+    bool isPaused{false};
+};
+
+using DebugBeginFrameContext  = DebugFrameContext;
+using DebugEmitOverlayContext = DebugFrameContext;
+
+// Self-contained POD telemetry descriptor passed once per frame to DebugProfiler::RecordSubsystemTelemetry().
+struct SubsystemTelemetryDesc {
+    std::span<const f32> channelScales{};
+    f32 audioCpuLoadRatio{0.0f};
+    f32 audioPeakL{0.0f};
+    f32 audioPeakR{0.0f};
+    u16 aliveEntities{0};
+    u16 submittedQuads{0};
+    u16 culledQuads{0};
+    u16 drawBatches{0};
+    u8  catchupTicks{0};
+    u8  radixPasses{0};
+    u8  frozenChannelMask{0};
+    u8  activePhysVoices{0};
+    u8  activeVirtVoices{0};
+    u8  audioUnderruns{0};
+};
 
 enum class DebugShapeKind : u8 {
     Line = 0,
@@ -196,7 +240,6 @@ struct alignas(64) ActorTickRecord {
 };
 static_assert(sizeof(ActorTickRecord) == 64);
 
-// Computes 32-bit FNV-1a hash at compile time or runtime for ConsoleSymbol lookup.
 [[nodiscard]] constexpr u32 HashSymbolName(std::string_view str) noexcept {
     u32 hash = 2166136261u;
     for (const char c : str) {
@@ -204,6 +247,13 @@ static_assert(sizeof(ActorTickRecord) == 64);
         hash *= 16777619u;
     }
     return hash == 0 ? 1u : hash;
+}
+
+[[nodiscard]] constexpr u64 MixAuditHash(u64 seed, u64 val) noexcept {
+    u64 z = seed ^ (val + 0x9E3779B97F4A7C15ull + (seed << 6) + (seed >> 2));
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
 }
 
 // 96 printable ASCII 8x8 1-bit glyphs (0x20 Space .. 0x7F Del), MSB = left pixel.
@@ -234,40 +284,38 @@ inline constexpr std::array<u64, 96> kEmbeddedFont8x8 = {
     0x1818180018181800ull, 0x7018180E18187000ull, 0x76DC000000000000ull, 0xFFAA55AA55AA55AAull
 };
 
-// Unpacks the 96 1-bit ASCII glyphs + bottom-right 8x8 solid white block into a 128x64 RGBA8 buffer.
 constexpr void UnpackDebugAtlasRGBA8(std::span<u8, kDebugAtlasWidth * kDebugAtlasHeight * 4> outPixels) noexcept {
     for (u8& b : outPixels) {
         b = 0;
     }
 
+    auto setWhitePixel = [&](usize pixelIdx) noexcept {
+        const usize byteIdx = pixelIdx * 4u;
+        outPixels[byteIdx + 0] = 255;
+        outPixels[byteIdx + 1] = 255;
+        outPixels[byteIdx + 2] = 255;
+        outPixels[byteIdx + 3] = 255;
+    };
+
     for (u32 glyphIdx = 0; glyphIdx < 96; ++glyphIdx) {
-        const u32 col   = glyphIdx & 15u;
-        const u32 row   = glyphIdx >> 4u;
-        const u32 baseX = col * 8u;
-        const u32 baseY = row * 8u;
+        const u32 baseX = (glyphIdx & 15u) * 8u;
+        const u32 baseY = (glyphIdx >> 4u) * 8u;
         const u64 bits  = kEmbeddedFont8x8[glyphIdx];
 
         for (u32 py = 0; py < 8; ++py) {
-            const u8 rowBits = static_cast<u8>((bits >> ((7u - py) * 8u)) & 0xFFu);
-            for (u32 px = 0; px < 8; ++px) {
-                if ((rowBits & (0x80u >> px)) != 0) {
-                    const usize idx = ((baseY + py) * kDebugAtlasWidth + (baseX + px)) * 4u;
-                    outPixels[idx + 0] = 255;
-                    outPixels[idx + 1] = 255;
-                    outPixels[idx + 2] = 255;
-                    outPixels[idx + 3] = 255;
-                }
+            u32 rowBits = static_cast<u32>((bits >> ((7u - py) * 8u)) & 0xFFu);
+            while (rowBits != 0u) {
+                const u32 bitPos = static_cast<u32>(std::countr_zero(rowBits));
+                rowBits &= (rowBits - 1u);
+                const u32 px = 7u - bitPos;
+                setWhitePixel((baseY + py) * kDebugAtlasWidth + (baseX + px));
             }
         }
     }
 
     for (u32 py = 56; py < 64; ++py) {
         for (u32 px = 120; px < 128; ++px) {
-            const usize idx = (py * kDebugAtlasWidth + px) * 4u;
-            outPixels[idx + 0] = 255;
-            outPixels[idx + 1] = 255;
-            outPixels[idx + 2] = 255;
-            outPixels[idx + 3] = 255;
+            setWhitePixel(py * kDebugAtlasWidth + px);
         }
     }
 }
