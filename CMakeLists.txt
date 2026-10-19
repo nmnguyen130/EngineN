@@ -92,3 +92,30 @@ add_engine_test(WorldTests)
 add_engine_test(GameplayTests)
 add_engine_test(AudioTests)
 add_engine_test(FrameworkTests)
+
+# Veil of the Silent - Native EngineN Client Game
+add_executable(veil_game
+    game/main.cpp
+    game/app/GameApp.cpp
+    game/app/GameplayPolicies.cpp
+    game/app/VeilStateLayers.cpp
+    game/movement/TraversalSystem.cpp
+    game/combat/CombatSystem.cpp
+    game/ai/BossSystem.cpp
+    game/world/WorldSystem.cpp
+    game/tests/VeilTests.cpp
+)
+
+target_link_libraries(veil_game PRIVATE engine)
+
+target_compile_options(veil_game PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/WX>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>
+)
+
+target_link_options(veil_game PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/STACK:16777216>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wl,--stack,16777216>
+)
+
+add_test(NAME VeilGameTests COMMAND veil_game --test)

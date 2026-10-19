@@ -1,0 +1,131 @@
+{
+  "gameTitle": "Veil of the Silent",
+  "version": "3.0.0",
+  "protagonist": {
+    "name": "Kaelen",
+    "archetype": "The Off-Beat Scavenger (Kẻ Lỗi Nhịp)",
+    "artifact": "The Resonance Lantern (Ngọn Đèn Cổ Vật — Pharos of Twelve Wicks)"
+  },
+  "echoes": [
+    {
+      "id": 0,
+      "name": "Ignis",
+      "category": "ElementalWave",
+      "wavePhysics": "Thermal Acoustics (Nhiệt Âm)",
+      "weapon": "Searing Katana",
+      "traversal": "Blaze Jet-Dash",
+      "assist": "Thermo-Acoustic Flare",
+      "counter": "Glacies"
+    },
+    {
+      "id": 1,
+      "name": "Terra",
+      "category": "ElementalWave",
+      "wavePhysics": "Seismic Infrasound (Hạ Âm Địa Chấn)",
+      "weapon": "Executioner War-Axe",
+      "traversal": "Tectonic Quake-Plunge",
+      "assist": "Faultline Bulwark",
+      "counter": "Fulgur"
+    },
+    {
+      "id": 2,
+      "name": "Fulgur",
+      "category": "ElementalWave",
+      "wavePhysics": "Piezoelectric Wave (Áp Điện Cao Tần)",
+      "weapon": "Volt Twin-Daggers",
+      "traversal": "Piezo Blink-Step",
+      "assist": "Arc Lattice",
+      "counter": "Terra"
+    },
+    {
+      "id": 3,
+      "name": "Glacies",
+      "category": "ElementalWave",
+      "wavePhysics": "Cryo-Cymatics (Sóng Kết Tinh Lạnh)",
+      "weapon": "Cryo Halberd",
+      "traversal": "Cymatic Ice-Vault",
+      "assist": "Absolute-Zero Spire",
+      "counter": "Ignis"
+    },
+    {
+      "id": 4,
+      "name": "Ventus",
+      "category": "ElementalWave",
+      "wavePhysics": "Aero-Acoustic Vortex (Sóng Xoáy Khí Động)",
+      "weapon": "Gale Twinblade",
+      "traversal": "Slipstream Updraft",
+      "assist": "Cyclone Funnel",
+      "counter": "Aqua"
+    },
+    {
+      "id": 5,
+      "name": "Aqua",
+      "category": "ElementalWave",
+      "wavePhysics": "Hydro-Cavitation (Thủy Kích Chân Không)",
+      "weapon": "Tidal Whip-Sword",
+      "traversal": "Cavitation Wire-Swing",
+      "assist": "Implosion Surge",
+      "counter": "Ventus"
+    },
+    {
+      "id": 6,
+      "name": "Lux",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Sonoluminescence (Phát Quang Âm Học)",
+      "weapon": "Radiant Claymore",
+      "traversal": "Photon Ray-Grapple",
+      "assist": "Prism Refraction Beam",
+      "counter": "Umbra"
+    },
+    {
+      "id": 7,
+      "name": "Umbra",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Anechoic Null-Wave (Hố Đen Triệt Tiêu Âm)",
+      "weapon": "Abyssal Great-Scythe",
+      "traversal": "Null Phase-Step",
+      "assist": "Anechoic Ward",
+      "counter": "Lux"
+    },
+    {
+      "id": 8,
+      "name": "Gravitas",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Acoustic Levitation (Sóng Trọng Trường)",
+      "weapon": "Singularity Great-Maul",
+      "traversal": "Graviton Slingshot",
+      "assist": "Heavy-G Well",
+      "counter": "Tempus"
+    },
+    {
+      "id": 9,
+      "name": "Tempus",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Temporal Delay-Line (Sóng Trễ Thời Gian)",
+      "weapon": "Chronos Odachi",
+      "traversal": "Temporal Anchor Recall",
+      "assist": "Delay-Line Dome",
+      "counter": "Gravitas"
+    },
+    {
+      "id": 10,
+      "name": "Aether",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Bio-Sympathetic Pulse (Sóng Cộng Hưởng Huyết)",
+      "weapon": "Crimson Rapier",
+      "traversal": "Pulse Tether-Swap",
+      "assist": "Sympathetic Thread",
+      "counter": "Stridor"
+    },
+    {
+      "id": 11,
+      "name": "Stridor",
+      "category": "PhenomenonWave",
+      "wavePhysics": "Mach Cone Shockwave (Xung Kích Siêu Thanh)",
+      "weapon": "Sonic Pile-Gauntlets",
+      "traversal": "Mach Recoil Pogo",
+      "assist": "Concussive Boom",
+      "counter": "Aether"
+    }
+  ]
+}
