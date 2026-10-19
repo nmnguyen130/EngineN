@@ -21,35 +21,39 @@ struct HierarchyStep {
 static_assert(sizeof(HierarchyStep) == 4);
 
 // Manages direct-indexed SoA spatial transforms and a flat topological hierarchy array.
-// Non-owning over arena memory slabs carved by World::Init().
-// Invariant: In m_hierarchyOrder[0..m_childCount), every parentIdx appears before its descendants.
-class TransformSolver final {
+// Non-owning 64B L1-aligned descriptor (1 cache line) over arena slabs carved by World::Init().
+// Invariant: If bit idx in m_movedWords is 0, m_prev[idx] is identical to m_world[idx].ToSnapshot().
+class alignas(64) TransformSolver final {
 public:
     void BindArena(
         std::span<LocalTransform2D> local,
         std::span<WorldTransform2D> world,
         std::span<PrevWorldSnapshot2D> prev,
         std::span<HierarchyNode> treeNodes,
-        std::span<u8> depths,
         std::span<HierarchyStep> hierarchyOrder,
-        std::span<u64> spatialAliveWords,
-        std::span<u64> spatialDynamicWords,
-        std::span<u64> rootDirtyWords,
-        std::span<u64> childDirtyWords,
-        std::span<u64> subtreeDirtyWords) noexcept;
+        std::span<u64> dirtyAndAliveWords,
+        std::span<u64> movedWords) noexcept;
 
-    void Clear() noexcept;
+    void Clear(u16 maxAllocatedIndex = 0) noexcept;
 
-    void InitSlot(u16 idx, const LocalTransform2D& initialLocal, bool isStatic) noexcept;
+    void InitSlot(u16 idx, const LocalTransform2D& initialLocal) noexcept;
     void DisableSlot(u16 idx) noexcept;
 
     [[nodiscard]] constexpr const LocalTransform2D& GetLocal(u16 idx) const noexcept { return m_local[idx]; }
     [[nodiscard]] constexpr const WorldTransform2D& GetWorld(u16 idx) const noexcept { return m_world[idx]; }
     [[nodiscard]] constexpr const PrevWorldSnapshot2D& GetPrevWorld(u16 idx) const noexcept { return m_prev[idx]; }
-    [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldSpan() const noexcept { return m_world; }
-    [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevWorldSpan() const noexcept { return m_prev; }
+    [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldSpan() const noexcept { return {m_world, m_maxEntities}; }
+    [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevWorldSpan() const noexcept { return {m_prev, m_maxEntities}; }
+    [[nodiscard]] constexpr std::span<const u64> MovedWordsSpan() const noexcept { return {m_movedWords, m_wordCount}; }
     [[nodiscard]] constexpr u16 GetParentIndex(u16 idx) const noexcept { return m_tree[idx].parent; }
-    [[nodiscard]] constexpr u8 GetDepth(u16 idx) const noexcept { return m_depths[idx]; }
+
+    [[nodiscard]] constexpr u8 GetDepth(u16 idx) const noexcept {
+        u8 depth = 0;
+        for (u16 cur = m_tree[idx].parent; cur != 0 && depth < kMaxHierarchyDepth; cur = m_tree[cur].parent) {
+            ++depth;
+        }
+        return depth;
+    }
 
     [[nodiscard]] constexpr LocalTransform2D& ModifyLocal(u16 idx) noexcept {
         MarkDirty(idx);
@@ -62,25 +66,12 @@ public:
     }
 
     constexpr void MarkDirty(u16 idx) noexcept {
-        const u32 w = idx >> 6;
-        const u64 b = 1ULL << (idx & 63u);
-        if (m_tree[idx].parent == 0) {
-            m_rootDirtyWords[w] |= b;
-        } else {
-            m_childDirtyWords[w] |= b;
-        }
+        m_dirtyWords[idx >> 6] |= (1ULL << (idx & 63u));
     }
 
     constexpr void SyncPrevToCurrent(u16 idx) noexcept {
-        const WorldTransform2D& w = m_world[idx];
-        m_prev[idx] = PrevWorldSnapshot2D{
-            .x           = w.x,
-            .y           = w.y,
-            .scaleX      = w.scaleX,
-            .scaleY      = w.scaleY,
-            .worldRotRad = w.worldRotRad,
-            .worldDepth  = w.worldDepth,
-        };
+        m_prev[idx] = m_world[idx].ToSnapshot();
+        m_movedWords[idx >> 6] &= ~(1ULL << (idx & 63u));
     }
 
     [[nodiscard]] Result<void, WorldErrc> SetParent(u16 childIdx, u16 newParentIdx) noexcept;
@@ -89,30 +80,42 @@ public:
     void SnapshotPreviousTransforms(
         u16 maxAllocatedIndex,
         u8 activeChannelMask,
-        std::span<const time::TimeChannel> entityChannels) noexcept;
+        const time::TimeChannel* entityChannels) noexcept;
 
     void Propagate(u16 maxAllocatedIndex) noexcept;
 
 private:
+    [[nodiscard]] constexpr u64* SpatialAliveWords() noexcept { return m_dirtyWords + m_wordCount; }
+    [[nodiscard]] constexpr const u64* SpatialAliveWords() const noexcept { return m_dirtyWords + m_wordCount; }
+
+    static constexpr void ComputeRootTransform(const LocalTransform2D& loc, WorldTransform2D& wrld) noexcept {
+        wrld.x           = loc.x;
+        wrld.y           = loc.y;
+        wrld.scaleX      = loc.scaleX;
+        wrld.scaleY      = loc.scaleY;
+        wrld.worldRotRad = NormalizeAngleRad(loc.rotationRad);
+        wrld.worldDepth  = loc.depthOffset;
+        FastSinCos(wrld.worldRotRad, wrld.cosRot, wrld.sinRot);
+    }
+
     void UnlinkFromParent(u16 childIdx) noexcept;
     void RebuildHierarchyOrder(u16 maxAllocatedIndex) noexcept;
-    void AppendSubtreeDFS(u16 parentIdx) noexcept;
+    [[nodiscard]] u8 MaxSubtreeDepth(u16 rootIdx) const noexcept;
 
-    std::span<LocalTransform2D> m_local{};
-    std::span<WorldTransform2D> m_world{};
-    std::span<PrevWorldSnapshot2D> m_prev{};
-    std::span<HierarchyNode> m_tree{};
-    std::span<u8> m_depths{};
-    std::span<HierarchyStep> m_hierarchyOrder{};
+    LocalTransform2D* m_local{nullptr};
+    WorldTransform2D* m_world{nullptr};
+    PrevWorldSnapshot2D* m_prev{nullptr};
+    HierarchyNode* m_tree{nullptr};
+    HierarchyStep* m_hierarchyOrder{nullptr};
+    u64* m_dirtyWords{nullptr};
+    u64* m_movedWords{nullptr};
 
-    std::span<u64> m_spatialAliveWords{};
-    std::span<u64> m_spatialDynamicWords{};
-    std::span<u64> m_rootDirtyWords{};
-    std::span<u64> m_childDirtyWords{};
-    std::span<u64> m_subtreeDirtyWords{};
-
-    u32 m_childCount{0};
+    u16 m_maxEntities{0};
+    u16 m_wordCount{0};
+    u16 m_childCount{0};
     bool m_orderDirty{false};
+    u8 m_reserved{0};
 };
+static_assert(sizeof(TransformSolver) == 64);
 
 } // namespace en::world

@@ -24,6 +24,7 @@ namespace {
 inline constexpr u64 kFibonacciHashMult = 11400714819323198485ULL;
 inline constexpr f32 kPi                = 3.14159265358979323846f;
 inline constexpr f32 kInvSqrt2          = 0.70710678118654752440f;
+inline constexpr u32 kInvalidTick32     = 0xFFFFFFFFu;
 
 [[nodiscard]] constexpr u32 HashCueKey(u32 cueId) noexcept {
     const u64 prod = static_cast<u64>(cueId ^ 0x9E3779B9u) * kFibonacciHashMult;
@@ -35,6 +36,8 @@ inline constexpr f32 kInvSqrt2          = 0.70710678118654752440f;
     return static_cast<u16>(clamped * 16384.0f + 0.5f);
 }
 
+// Pre-warps cutoff frequency via 3rd-order Padé approximant to tan(pi * fc / fs).
+// Full Q14 range [0.001, 3.5] covers 40 Hz..19.5 kHz smoothly without mid-treble clamping cliffs.
 [[nodiscard]] constexpr u16 PrewarpCutoffToQ14(f32 cutoffHz) noexcept {
     const f32 clampedHz = std::clamp(cutoffHz, 40.0f, 20000.0f);
     if (clampedHz >= 19500.0f) {
@@ -43,7 +46,7 @@ inline constexpr f32 kInvSqrt2          = 0.70710678118654752440f;
     const f32 w  = kPi * clampedHz / static_cast<f32>(kSampleRate);
     const f32 w2 = w * w;
     const f32 g  = w * (15.0f - w2) / (15.0f - 6.0f * w2);
-    return FloatToQ14(std::clamp(g, 0.001f, 0.95f));
+    return FloatToQ14(std::clamp(g, 0.001f, 3.5f));
 }
 
 [[nodiscard]] constexpr f32 NextSignedUnitFloat(u32& state) noexcept {
@@ -83,83 +86,84 @@ inline u8 SwapTripleBufferFlags(std::atomic<u8>& tripleFlags, bool isProducerPub
     return flags;
 }
 
+// Compact 8-byte per-cue runtime metadata co-located in 1 cache line (replaces 3 disjoint arrays).
+struct alignas(8) CueRuntimeMeta {
+    u32 lastTriggerTick{kInvalidTick32};
+    u16 lastVoiceSlot{0xFFFFu};
+    u8  owningScope{0};
+    u8  flags{0};
+};
+static_assert(sizeof(CueRuntimeMeta) == 8);
+
 } // namespace
 
-// Cache-line isolated synchronization bridge residing inside the pre-allocated arena slab.
+// Cache-line isolated synchronization bridge residing at offset 0 of the single arena slab.
 struct alignas(64) AudioSystem::SharedBridgeState {
     // Wait-free Triple Buffer: bits [1:0]=Front, [3:2]=Spare, [5:4]=Back, bit [6]=hasNewSpare
     alignas(64) std::array<AudioFrameSnapshot, 3> snapshots{};
     alignas(64) std::atomic<u8> tripleFlags{0b00'10'01'00u};
 
-    // Wait-free SPSC Command Ring
+    // Wait-free SPSC Command Ring (producer & consumer indices isolated on separate 64B cache lines)
     alignas(64) std::atomic<u32> cmdWriteIdx{0};
     alignas(64) std::atomic<u32> cmdReadIdx{0};
     alignas(64) std::array<AudioCommand, kCommandRingSize> cmdRing{};
 
-    // Atomic Telemetry Return Channel
+    // Atomic Telemetry Return Channel (written by audio thread, read by main thread)
     alignas(64) std::atomic<u64> activeVoiceMask{0};
     std::atomic<u32> activeScopePinMask{0};
     std::atomic<u32> stolenVoicesTotal{0};
     std::atomic<f32> masterPeakL{0.0f};
     std::atomic<f32> masterPeakR{0.0f};
 
-    // Main-thread Cue & Voice Tables
+    // Main-thread Cue, Music & Voice Tables
     alignas(64) std::array<SoundCueDef, kMaxSoundCues> cueDefs{};
-    std::array<u8, kMaxSoundCues> cueScopes{};
-    std::array<u64, kMaxSoundCues> cueLastTriggerTick{};
-    std::array<u16, kMaxSoundCues> cueLastVoiceSlot{};
+    alignas(64) std::array<CueRuntimeMeta, kMaxSoundCues> cueMeta{};
     alignas(64) std::array<CueHashSlot, kCueHashTableSize> cueHashTable{};
     u16 cueCount{0};
 
     std::array<MusicTrackDef, kMaxMusicTracks> musicTracks{};
+    std::array<u8, kMaxMusicTracks> musicTrackScopes{};
     u16 musicTrackCount{0};
 
-    std::array<MainVoiceTracker, kMaxVoices> voiceTrackers{};
-    AudioFrameSnapshot stagingSnapshot{};
+    alignas(64) std::array<MainVoiceTracker, kMaxVoices> voiceTrackers{};
+    alignas(64) AudioFrameSnapshot stagingSnapshot{};
 };
 
 AudioSystem::~AudioSystem() noexcept {
     Shutdown();
 }
 
-AudioSystem::AudioSystem(AudioSystem&& other) noexcept
-    : m_cfg(other.m_cfg)
-    , m_stream(std::exchange(other.m_stream, nullptr))
-    , m_arenaSlab(std::exchange(other.m_arenaSlab, nullptr))
-    , m_bridge(std::exchange(other.m_bridge, nullptr))
-    , m_mixer(std::exchange(other.m_mixer, AudioMixer{}))
-    , m_trackedActiveMask(std::exchange(other.m_trackedActiveMask, 0))
-    , m_listenerX(other.m_listenerX)
-    , m_listenerY(other.m_listenerY)
-    , m_currentTick(other.m_currentTick)
-    , m_rngState(other.m_rngState)
-    , m_pendingUnpinScopeMask(other.m_pendingUnpinScopeMask)
-    , m_nextStealPoolIdx(other.m_nextStealPoolIdx) {}
+AudioSystem::AudioSystem(AudioSystem&& other) noexcept {
+    *this = std::move(other);
+}
 
 AudioSystem& AudioSystem::operator=(AudioSystem&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_cfg                   = other.m_cfg;
-        m_stream                = std::exchange(other.m_stream, nullptr);
-        m_arenaSlab             = std::exchange(other.m_arenaSlab, nullptr);
         m_bridge                = std::exchange(other.m_bridge, nullptr);
-        m_mixer                 = std::exchange(other.m_mixer, AudioMixer{});
+        m_stream                = std::exchange(other.m_stream, nullptr);
         m_trackedActiveMask     = std::exchange(other.m_trackedActiveMask, 0);
+        m_spatialActiveMask     = std::exchange(other.m_spatialActiveMask, 0);
+        m_currentTick           = other.m_currentTick;
         m_listenerX             = other.m_listenerX;
         m_listenerY             = other.m_listenerY;
-        m_currentTick           = other.m_currentTick;
+        m_invPanWidth           = other.m_invPanWidth;
         m_rngState              = other.m_rngState;
         m_pendingUnpinScopeMask = other.m_pendingUnpinScopeMask;
-        m_nextStealPoolIdx      = other.m_nextStealPoolIdx;
+        m_muteOnFocusLoss       = other.m_muteOnFocusLoss;
+        m_stagingDirty          = other.m_stagingDirty;
+        m_mixer                 = std::exchange(other.m_mixer, AudioMixer{});
     }
     return *this;
 }
 
 Result<void, AudioErrc> AudioSystem::Init(const AudioSystemConfig& cfg) noexcept {
     Shutdown();
-    m_cfg = cfg;
+    m_invPanWidth     = 1.0f / std::max(1.0f, cfg.panWidthMeters);
+    m_muteOnFocusLoss = cfg.muteOnFocusLoss;
+    m_stagingDirty    = false;
 
-    const usize minBytes   = sizeof(SharedBridgeState) + AudioMixer::RequiredArenaBytes() + 128u;
+    const usize minBytes   = sizeof(SharedBridgeState) + AudioMixer::RequiredArenaBytes();
     const usize arenaBytes = (std::max<usize>(cfg.arenaBytes, minBytes) + 63u) & ~usize(63u);
 
     void* rawMem = ::operator new(arenaBytes, std::align_val_t{64}, std::nothrow);
@@ -167,10 +171,9 @@ Result<void, AudioErrc> AudioSystem::Init(const AudioSystemConfig& cfg) noexcept
         return Err(AudioErrc::ArenaExhausted);
     }
     std::memset(rawMem, 0, arenaBytes);
-    m_arenaSlab = static_cast<u8*>(rawMem);
+    m_bridge = std::construct_at(static_cast<SharedBridgeState*>(rawMem));
 
-    m_bridge               = std::construct_at(reinterpret_cast<SharedBridgeState*>(m_arenaSlab));
-    u8* mixerStart         = m_arenaSlab + sizeof(SharedBridgeState);
+    u8* mixerStart         = reinterpret_cast<u8*>(m_bridge) + sizeof(SharedBridgeState);
     const usize mixerBytes = arenaBytes - sizeof(SharedBridgeState);
 
     if (auto res = m_mixer.Init(std::span<u8>(mixerStart, mixerBytes)); !res) {
@@ -178,7 +181,7 @@ Result<void, AudioErrc> AudioSystem::Init(const AudioSystemConfig& cfg) noexcept
         return res;
     }
 
-    auto& snap = m_bridge->stagingSnapshot;
+    auto& snap       = m_bridge->stagingSnapshot;
     const u16 sfxQ14 = FloatToQ14(cfg.initialSfxGain);
     snap.busTargetGainQ14.fill(sfxQ14);
     snap.busTargetGainQ14[static_cast<usize>(AudioBusId::Master)] = FloatToQ14(cfg.initialMasterGain);
@@ -217,11 +220,13 @@ void AudioSystem::Shutdown() noexcept {
         SDL_DestroyAudioStream(m_stream);
         m_stream = nullptr;
     }
-    if (m_arenaSlab) {
-        ::operator delete(m_arenaSlab, std::align_val_t{64});
-        m_arenaSlab         = nullptr;
-        m_bridge            = nullptr;
-        m_trackedActiveMask = 0;
+    if (m_bridge) {
+        ::operator delete(m_bridge, std::align_val_t{64});
+        m_bridge                = nullptr;
+        m_trackedActiveMask     = 0;
+        m_spatialActiveMask     = 0;
+        m_pendingUnpinScopeMask = 0;
+        m_stagingDirty          = false;
     }
 }
 
@@ -235,25 +240,22 @@ Result<void, AudioErrc> AudioSystem::RegisterCueDef(
         return Err(AudioErrc::CueTableFull);
     }
 
-    const u16 newIdx = m_bridge->cueCount++;
-    m_bridge->cueDefs[newIdx]            = def;
-    m_bridge->cueScopes[newIdx]          = owningScope;
-    m_bridge->cueLastTriggerTick[newIdx] = 0ULL;
-    m_bridge->cueLastVoiceSlot[newIdx]   = 0xFFFFu;
-
-    u32 slotIdx = HashCueKey(def.cueId.value);
+    const u16 newIdx = m_bridge->cueCount;
+    u32 slotIdx      = HashCueKey(def.cueId.value);
     CueHashSlot incoming{def.cueId.value, newIdx, 1u};
 
     for (u32 probe = 0; probe < kCueHashTableSize; ++probe) {
         CueHashSlot& existing = m_bridge->cueHashTable[slotIdx];
         if (existing.psl == 0u) {
-            existing = incoming;
+            existing                  = incoming;
+            m_bridge->cueDefs[newIdx] = def;
+            m_bridge->cueMeta[newIdx] = CueRuntimeMeta{kInvalidTick32, 0xFFFFu, owningScope, 0u};
+            ++m_bridge->cueCount;
             return {};
         }
         if (existing.key == incoming.key) {
-            m_bridge->cueDefs[existing.cueIdx]   = def;
-            m_bridge->cueScopes[existing.cueIdx] = owningScope;
-            --m_bridge->cueCount;
+            m_bridge->cueDefs[existing.cueIdx] = def;
+            m_bridge->cueMeta[existing.cueIdx] = CueRuntimeMeta{kInvalidTick32, 0xFFFFu, owningScope, 0u};
             return {};
         }
         if (incoming.psl > existing.psl) {
@@ -265,11 +267,25 @@ Result<void, AudioErrc> AudioSystem::RegisterCueDef(
     return Err(AudioErrc::CueTableFull);
 }
 
-Result<void, AudioErrc> AudioSystem::RegisterMusicTrackDef(const MusicTrackDef& def) noexcept {
-    if (!m_bridge || m_bridge->musicTrackCount >= kMaxMusicTracks) {
+Result<void, AudioErrc> AudioSystem::RegisterMusicTrackDef(
+    const MusicTrackDef& def,
+    assets::ScopeId owningScope) noexcept {
+    if (!m_bridge || def.trackId == 0u) {
+        return Err(AudioErrc::InvalidConfig);
+    }
+    for (u16 i = 0; i < m_bridge->musicTrackCount; ++i) {
+        if (m_bridge->musicTracks[i].trackId == def.trackId) {
+            m_bridge->musicTracks[i]      = def;
+            m_bridge->musicTrackScopes[i] = owningScope;
+            return {};
+        }
+    }
+    if (m_bridge->musicTrackCount >= kMaxMusicTracks) {
         return Err(AudioErrc::CueTableFull);
     }
-    m_bridge->musicTracks[m_bridge->musicTrackCount++] = def;
+    const u16 idx                   = m_bridge->musicTrackCount++;
+    m_bridge->musicTracks[idx]      = def;
+    m_bridge->musicTrackScopes[idx] = owningScope;
     return {};
 }
 
@@ -306,7 +322,7 @@ Result<void, AudioErrc> AudioSystem::RegisterCueBank(
         MusicTrackDef track{};
         std::memcpy(&track, ptr, sizeof(MusicTrackDef));
         ptr += sizeof(MusicTrackDef);
-        if (auto res = RegisterMusicTrackDef(track); !res) {
+        if (auto res = RegisterMusicTrackDef(track, owningScope); !res) {
             return res;
         }
     }
@@ -365,46 +381,55 @@ u32 AudioSystem::PollReleasableScopeMask() noexcept {
 }
 
 void AudioSystem::SetFocusMuted(bool muted) noexcept {
-    if (m_bridge && m_cfg.muteOnFocusLoss) {
-        m_bridge->stagingSnapshot.masterMuteFlag = muted ? 1u : 0u;
+    if (m_bridge && m_muteOnFocusLoss) {
+        const u8 flag = muted ? 1u : 0u;
+        if (m_bridge->stagingSnapshot.masterMuteFlag != flag) {
+            m_bridge->stagingSnapshot.masterMuteFlag = flag;
+            m_stagingDirty                           = true;
+        }
     }
 }
 
 void AudioSystem::ReconcileFinishedVoices() noexcept {
     const u64 hwActiveMask = m_bridge->activeVoiceMask.load(std::memory_order_acquire);
+    const u32 curTick32    = static_cast<u32>(m_currentTick);
     auto& snap             = m_bridge->stagingSnapshot;
     for (u64 check = m_trackedActiveMask & ~hwActiveMask; check != 0ULL; check &= (check - 1ULL)) {
         const u32 s = static_cast<u32>(std::countr_zero(check));
-        if (m_currentTick > m_bridge->voiceTrackers[s].spawnTick + 2u) {
+        if (curTick32 - m_bridge->voiceTrackers[s].spawnTick > 2u) {
+            const u64 bit           = 1ULL << s;
             snap.targetGainL_Q14[s] = 0u;
             snap.targetGainR_Q14[s] = 0u;
-            m_trackedActiveMask &= ~(1ULL << s);
+            m_trackedActiveMask    &= ~bit;
+            m_spatialActiveMask    &= ~bit;
         }
     }
 }
 
 void AudioSystem::ComputeVoiceSpatialTargets(u32 slot, AudioFrameSnapshot& snap) const noexcept {
     const MainVoiceTracker& tr = m_bridge->voiceTrackers[slot];
+    const VoiceFlags vf        = tr.Flags();
+    const AttenuationCurve crv = tr.Curve();
 
     f32 atten  = 1.0f;
     f32 panL   = kInvSqrt2;
     f32 panR   = kInvSqrt2;
     f32 airCut = 20000.0f;
 
-    const VoiceFlags vf = static_cast<VoiceFlags>(tr.flags);
-    if (HasVoiceFlag(vf, VoiceFlags::Spatialized2D) &&
-        static_cast<AttenuationCurve>(tr.curve) != AttenuationCurve::None) {
+    if (HasVoiceFlag(vf, VoiceFlags::Spatialized2D) && crv != AttenuationCurve::None) {
         const f32 dx     = tr.worldX - m_listenerX;
         const f32 dy     = tr.worldY - m_listenerY;
         const f32 distSq = dx * dx + dy * dy;
-        const f32 maxSq  = tr.maxDist * tr.maxDist;
+        const f32 minD   = tr.MinDist();
+        const f32 maxD   = tr.MaxDist();
+        const f32 maxSq  = maxD * maxD;
 
         if (distSq >= maxSq) {
             atten = 0.0f;
-        } else if (distSq > tr.minDist * tr.minDist) {
+        } else if (distSq > minD * minD) {
             const f32 dist = std::sqrt(distSq);
-            const f32 t    = (dist - tr.minDist) / std::max(0.01f, tr.maxDist - tr.minDist);
-            switch (static_cast<AttenuationCurve>(tr.curve)) {
+            const f32 t    = (dist - minD) / (maxD - minD);
+            switch (crv) {
             case AttenuationCurve::Linear:
                 atten = 1.0f - t;
                 break;
@@ -420,17 +445,16 @@ void AudioSystem::ComputeVoiceSpatialTargets(u32 slot, AudioFrameSnapshot& snap)
             airCut = 20000.0f * (1.0f - 0.65f * t);
         }
 
-        const f32 panNorm = std::clamp(dx / std::max(1.0f, m_cfg.panWidthMeters), -1.0f, 1.0f);
+        const f32 panNorm = std::clamp(dx * m_invPanWidth, -1.0f, 1.0f);
         EvalConstantPowerPan(panNorm, panL, panR);
     }
 
-    const f32 occGain   = HasVoiceFlag(vf, VoiceFlags::BypassOcclusion) ? 1.0f : tr.occlusionFactor;
-    const f32 totalGain = tr.baseGain * atten * (0.45f + 0.55f * occGain);
+    const f32 occGain   = HasVoiceFlag(vf, VoiceFlags::BypassOcclusion) ? 1.0f : tr.Occlusion();
+    const f32 totalGain = tr.BaseGain() * atten * (0.45f + 0.55f * occGain);
     const f32 cutoffHz  = std::min(airCut, 900.0f + 19100.0f * occGain);
 
     snap.targetGainL_Q14[slot] = FloatToQ14(totalGain * panL);
     snap.targetGainR_Q14[slot] = FloatToQ14(totalGain * panR);
-    snap.targetPitchQ12[slot]  = static_cast<u16>(std::clamp(tr.basePitch * 4096.0f, 1024.0f, 8192.0f));
     snap.targetSvfG_Q14[slot]  = PrewarpCutoffToQ14(cutoffHz);
 }
 
@@ -450,16 +474,18 @@ VoiceHandle AudioSystem::PlayCue(
         return {};
     }
 
-    // Stage 1: Cooldown & Same-Tick Energy-Summing Coalescer
-    const u64 lastTick = m_bridge->cueLastTriggerTick[cueIdx];
-    const u32 cooldown = def->CooldownTicks();
-    if (lastTick != 0ULL && m_currentTick >= lastTick && (m_currentTick - lastTick) <= cooldown) {
-        const u16 prevSlot = m_bridge->cueLastVoiceSlot[cueIdx];
+    // Stage 1: Cooldown & Same-Tick Energy-Summing Coalescer (supports tick 0 via kInvalidTick32 sentinel).
+    CueRuntimeMeta& meta = m_bridge->cueMeta[cueIdx];
+    const u32 curTick32  = static_cast<u32>(m_currentTick);
+    const u32 cooldown   = def->CooldownTicks();
+    if (meta.lastTriggerTick != kInvalidTick32 && (curTick32 - meta.lastTriggerTick) <= cooldown) {
+        const u16 prevSlot = meta.lastVoiceSlot;
         if (prevSlot < kMaxVoices && (m_trackedActiveMask & (1ULL << prevSlot)) != 0ULL &&
             m_bridge->voiceTrackers[prevSlot].cueId == cueId.value) {
-            auto& prevTr    = m_bridge->voiceTrackers[prevSlot];
-            prevTr.baseGain = std::min(prevTr.baseGain * 1.1892f, 1.4142f);
+            auto& prevTr       = m_bridge->voiceTrackers[prevSlot];
+            prevTr.baseGainQ14 = FloatToQ14(std::min(prevTr.BaseGain() * 1.1892f, 1.4142f));
             ComputeVoiceSpatialTargets(prevSlot, m_bridge->stagingSnapshot);
+            m_stagingDirty = true;
             return VoiceHandle{prevSlot, prevTr.generation};
         }
         return {};
@@ -472,101 +498,104 @@ VoiceHandle AudioSystem::PlayCue(
         return {};
     }
 
-    // Stage 2: Bitset-accelerated Concurrency & Physical Slot Selection
-    ReconcileFinishedVoices();
+    // Stage 2: Single-pass bitset-accelerated Concurrency, Entity Replacement & Steal Selection.
+    if (m_trackedActiveMask == ~0ULL) {
+        ReconcileFinishedVoices();
+    }
+
+    const VoiceFlags vf        = def->Flags();
+    const StealPolicy stealPol = def->Steal();
+    const bool onePerEnt       = HasVoiceFlag(vf, VoiceFlags::OneVoicePerEntity) && emitterId != kNullEmitter;
+    const bool poolFull        = (m_trackedActiveMask == ~0ULL);
+    auto& snap                 = m_bridge->stagingSnapshot;
 
     u8  sameCueCount      = 0u;
     u32 oldestSameCueSlot = 0xFFFFFFFFu;
-    u64 oldestSameCueTick = 0xFFFFFFFFFFFFFFFFULL;
-    const bool onePerEnt  = HasVoiceFlag(def->Flags(), VoiceFlags::OneVoicePerEntity) && emitterId != kNullEmitter;
+    u32 oldestSameCueAge  = 0u;
     u32 entityMatchSlot   = 0xFFFFFFFFu;
+    u32 bestStealSlot     = 0xFFFFFFFFu;
+    u64 lowestStealScore  = 0xFFFFFFFFFFFFFFFFULL;
 
     for (u64 active = m_trackedActiveMask; active != 0ULL; active &= (active - 1ULL)) {
-        const u32 s     = static_cast<u32>(std::countr_zero(active));
-        const auto& tr  = m_bridge->voiceTrackers[s];
+        const u32 s    = static_cast<u32>(std::countr_zero(active));
+        const auto& tr = m_bridge->voiceTrackers[s];
+        const u32 age  = curTick32 - tr.spawnTick;
+
         if (onePerEnt && tr.emitterId == emitterId && tr.cueId == cueId.value) {
             entityMatchSlot = s;
             break;
         }
         if (tr.cueId == cueId.value) {
             ++sameCueCount;
-            if (tr.spawnTick < oldestSameCueTick) {
-                oldestSameCueTick = tr.spawnTick;
+            if (oldestSameCueSlot == 0xFFFFFFFFu || age >= oldestSameCueAge) {
+                oldestSameCueAge  = age;
                 oldestSameCueSlot = s;
             }
         }
+        if (poolFull && stealPol != StealPolicy::Reject && tr.priority <= def->priority) {
+            const u64 metric = (stealPol == StealPolicy::StealOldest)
+                                   ? static_cast<u64>(~age)
+                                   : static_cast<u64>(snap.targetGainL_Q14[s]) + snap.targetGainR_Q14[s];
+            const u64 score  = (static_cast<u64>(tr.priority) << 32u) | metric;
+            if (score < lowestStealScore) {
+                lowestStealScore = score;
+                bestStealSlot    = s;
+            }
+        }
     }
 
-    u32 chosenSlot        = 0xFFFFFFFFu;
-    bool stoleActiveVoice = false;
-
+    u32 chosenSlot = 0xFFFFFFFFu;
     if (entityMatchSlot < kMaxVoices) {
-        chosenSlot       = entityMatchSlot;
-        stoleActiveVoice = true;
+        chosenSlot = entityMatchSlot;
     } else if (sameCueCount >= def->MaxConcurrency() && oldestSameCueSlot < kMaxVoices) {
-        chosenSlot       = oldestSameCueSlot;
-        stoleActiveVoice = true;
-    } else if (m_trackedActiveMask != ~0ULL) {
+        chosenSlot = oldestSameCueSlot;
+    } else if (!poolFull) {
         chosenSlot = static_cast<u32>(std::countr_one(m_trackedActiveMask));
+    } else if (bestStealSlot < kMaxVoices) {
+        chosenSlot = bestStealSlot;
     } else {
-        if (def->Steal() == StealPolicy::Reject) {
-            return {};
-        }
-        f32 lowestScore = 1.0e9f;
-        for (u32 s = 0; s < kMaxVoices; ++s) {
-            const auto& tr = m_bridge->voiceTrackers[s];
-            if (tr.priority > def->priority) {
-                continue;
-            }
-            const f32 score = static_cast<f32>(tr.priority) * 4.0f + tr.baseGain;
-            if (score < lowestScore) {
-                lowestScore = score;
-                chosenSlot  = s;
-            }
-        }
-        if (chosenSlot == 0xFFFFFFFFu) {
-            return {};
-        }
-        stoleActiveVoice = true;
+        return {};
     }
 
-    // Stage 3: Emit Steal Crossfade (if replacing an active voice) + Spawn Command
-    auto& tr = m_bridge->voiceTrackers[chosenSlot];
-    if (stoleActiveVoice) {
-        AudioCommand stealCmd{};
-        stealCmd.type                      = AudioCmdType::StopVoice;
-        stealCmd.voiceSlot                 = static_cast<u16>(chosenSlot);
-        stealCmd.generation                = tr.generation;
-        stealCmd.payload.stop.stealPoolIdx = m_nextStealPoolIdx;
-        m_nextStealPoolIdx                 = static_cast<u8>((m_nextStealPoolIdx + 1u) & (kStealPoolSlots - 1u));
-        EnqueueCommand(stealCmd);
-    }
-
+    // Stage 3: Populate 32B tracker & emit single SpawnVoice command (AudioMixer auto-fades stolen slot).
+    auto& tr             = m_bridge->voiceTrackers[chosenSlot];
     const u16 nextGen    = static_cast<u16>(tr.generation + 1u == 0u ? 1u : tr.generation + 1u);
     const f32 gainJitter = (static_cast<f32>(def->gainVarQ8) / 255.0f) * NextSignedUnitFloat(m_rngState);
     const f32 semiJitter = (static_cast<f32>(def->pitchVarSemitonesQ4) / 16.0f) * NextSignedUnitFloat(m_rngState);
     const f32 totalSemi  = (static_cast<f32>(def->basePitchCents) / 100.0f) + semiJitter;
+    const f32 pitchRatio = std::exp2(totalSemi / 12.0f);
+    const f32 baseGain   = std::max(0.0f, (static_cast<f32>(def->baseGainQ14) * (1.0f / 16384.0f)) + gainJitter);
 
-    tr.cueId           = cueId.value;
-    tr.emitterId       = emitterId;
-    tr.spawnTick       = m_currentTick;
-    tr.worldX          = worldX;
-    tr.worldY          = worldY;
-    tr.baseGain        = std::max(0.0f, (static_cast<f32>(def->baseGainQ14) / 16384.0f) + gainJitter);
-    tr.basePitch       = std::exp2(totalSemi / 12.0f);
-    tr.minDist         = static_cast<f32>(def->minDistQ2) * 0.25f;
-    tr.maxDist         = std::max(tr.minDist + 0.5f, static_cast<f32>(def->maxDistQ1) * 0.5f);
-    tr.occlusionFactor = 1.0f;
-    tr.generation      = nextGen;
-    tr.priority        = def->priority;
-    tr.curve           = static_cast<u8>(def->Curve());
-    tr.flags           = static_cast<u8>(def->Flags());
+    tr = MainVoiceTracker{
+        .cueId        = cueId.value,
+        .emitterId    = emitterId,
+        .spawnTick    = curTick32,
+        .worldX       = worldX,
+        .worldY       = worldY,
+        .baseGainQ14  = FloatToQ14(baseGain),
+        .occlusionQ14 = 16384u,
+        .generation   = nextGen,
+        .minDistQ2    = def->minDistQ2,
+        .maxDistQ1    = def->maxDistQ1,
+        .priority     = def->priority,
+        .curve        = static_cast<u8>(def->Curve()),
+        .flags        = static_cast<u8>(vf),
+        .scopeId      = meta.owningScope};
 
-    m_trackedActiveMask |= (1ULL << chosenSlot);
-    m_bridge->cueLastTriggerTick[cueIdx] = m_currentTick;
-    m_bridge->cueLastVoiceSlot[cueIdx]   = static_cast<u16>(chosenSlot);
+    const u64 slotBit = 1ULL << chosenSlot;
+    m_trackedActiveMask |= slotBit;
+    if (HasVoiceFlag(vf, VoiceFlags::Spatialized2D)) {
+        m_spatialActiveMask |= slotBit;
+    } else {
+        m_spatialActiveMask &= ~slotBit;
+    }
 
-    ComputeVoiceSpatialTargets(chosenSlot, m_bridge->stagingSnapshot);
+    meta.lastTriggerTick = curTick32;
+    meta.lastVoiceSlot   = static_cast<u16>(chosenSlot);
+
+    snap.targetPitchQ12[chosenSlot] = static_cast<u16>(std::clamp(pitchRatio * 4096.0f, 1024.0f, 8192.0f));
+    ComputeVoiceSpatialTargets(chosenSlot, snap);
+    m_stagingDirty = true;
 
     AudioCommand spawnCmd{};
     spawnCmd.type                = AudioCmdType::SpawnVoice;
@@ -574,15 +603,15 @@ VoiceHandle AudioSystem::PlayCue(
         (static_cast<u8>(def->Bus()) & 0x07u) | ((static_cast<u8>(def->Channel()) & 0x07u) << 3u));
     spawnCmd.voiceSlot                    = static_cast<u16>(chosenSlot);
     spawnCmd.generation                   = nextGen;
-    spawnCmd.flags                        = tr.flags;
-    spawnCmd.assetScopeId                 = m_bridge->cueScopes[cueIdx];
+    spawnCmd.flags                        = static_cast<u8>(vf);
+    spawnCmd.assetScopeId                 = meta.owningScope;
     spawnCmd.payload.spawn.pcm            = rec.pcm;
     spawnCmd.payload.spawn.frameCount     = rec.frameCount;
     spawnCmd.payload.spawn.loopStartFrame = 0u;
     spawnCmd.payload.spawn.sampleRate     = rec.sampleRate;
-    spawnCmd.payload.spawn.gainL_Q14      = m_bridge->stagingSnapshot.targetGainL_Q14[chosenSlot];
-    spawnCmd.payload.spawn.gainR_Q14      = m_bridge->stagingSnapshot.targetGainR_Q14[chosenSlot];
-    spawnCmd.payload.spawn.pitchRatioQ12  = m_bridge->stagingSnapshot.targetPitchQ12[chosenSlot];
+    spawnCmd.payload.spawn.gainL_Q14      = snap.targetGainL_Q14[chosenSlot];
+    spawnCmd.payload.spawn.gainR_Q14      = snap.targetGainR_Q14[chosenSlot];
+    spawnCmd.payload.spawn.pitchRatioQ12  = snap.targetPitchQ12[chosenSlot];
 
     EnqueueCommand(spawnCmd);
     return VoiceHandle{static_cast<u16>(chosenSlot), nextGen};
@@ -591,9 +620,13 @@ VoiceHandle AudioSystem::PlayCue(
 void AudioSystem::SubmitTriggers(
     std::span<const AudioTriggerReq> triggers,
     const assets::AssetBank& assetBank) noexcept {
+    if (!m_bridge || triggers.empty()) {
+        return;
+    }
+    ReconcileFinishedVoices();
     for (const auto& req : triggers) {
         if (req.cueId.value != 0u) {
-            PlayCue(req.cueId, assetBank, req.worldX, req.worldY, req.emitterId);
+            (void)PlayCue(req.cueId, assetBank, req.worldX, req.worldY, req.emitterId);
         }
     }
 }
@@ -602,21 +635,22 @@ void AudioSystem::StopVoice(VoiceHandle handle, u16 fadeOutBlocks) noexcept {
     if (!m_bridge || !handle.IsValid() || handle.index >= kMaxVoices) {
         return;
     }
-    const u64 bit = 1ULL << handle.index;
+    const u64 bit  = 1ULL << handle.index;
     const auto& tr = m_bridge->voiceTrackers[handle.index];
     if ((m_trackedActiveMask & bit) == 0ULL || tr.generation != handle.generation) {
         return;
     }
     m_trackedActiveMask &= ~bit;
+    m_spatialActiveMask &= ~bit;
     m_bridge->stagingSnapshot.targetGainL_Q14[handle.index] = 0u;
     m_bridge->stagingSnapshot.targetGainR_Q14[handle.index] = 0u;
+    m_stagingDirty = true;
 
     AudioCommand cmd{};
     cmd.type                       = AudioCmdType::StopVoice;
     cmd.voiceSlot                  = handle.index;
     cmd.generation                 = handle.generation;
     cmd.payload.stop.fadeOutBlocks = fadeOutBlocks;
-    cmd.payload.stop.stealPoolIdx  = 0xFFu;
     EnqueueCommand(cmd);
 }
 
@@ -625,6 +659,7 @@ void AudioSystem::SetBusGain(AudioBusId bus, f32 linearGain) noexcept {
         return;
     }
     m_bridge->stagingSnapshot.busTargetGainQ14[static_cast<usize>(bus)] = FloatToQ14(linearGain);
+    m_stagingDirty = true;
 }
 
 void AudioSystem::SetBusFilter(AudioBusId bus, FilterMode mode, f32 cutoffHz) noexcept {
@@ -637,6 +672,7 @@ void AudioSystem::SetBusFilter(AudioBusId bus, FilterMode mode, f32 cutoffHz) no
     m_bridge->stagingSnapshot.busFilterModesBits =
         static_cast<u16>((m_bridge->stagingSnapshot.busFilterModesBits & clearMask) |
                          ((static_cast<u16>(mode) & 0x03u) << (idx * 2u)));
+    m_stagingDirty = true;
 }
 
 void AudioSystem::TransitionMusic(u32 trackId, const assets::AssetBank& assetBank, u8 crossfadeBlocks) noexcept {
@@ -644,9 +680,11 @@ void AudioSystem::TransitionMusic(u32 trackId, const assets::AssetBank& assetBan
         return;
     }
     const MusicTrackDef* found = nullptr;
+    u8 trackScope              = 0u;
     for (u16 i = 0; i < m_bridge->musicTrackCount; ++i) {
         if (m_bridge->musicTracks[i].trackId == trackId) {
-            found = &m_bridge->musicTracks[i];
+            found      = &m_bridge->musicTracks[i];
+            trackScope = m_bridge->musicTrackScopes[i];
             break;
         }
     }
@@ -654,7 +692,8 @@ void AudioSystem::TransitionMusic(u32 trackId, const assets::AssetBank& assetBan
         return;
     }
 
-    const u8 stems = found->StemCount();
+    const u8 stems  = found->StemCount();
+    bool firstBound = true;
     for (u8 s = 0; s < stems; ++s) {
         const assets::AudioRecord& rec = assetBank.GetAudio(found->stems[s]);
         if (!rec.pcm || rec.frameCount == 0u) {
@@ -662,20 +701,25 @@ void AudioSystem::TransitionMusic(u32 trackId, const assets::AssetBank& assetBan
         }
         AudioCommand bindCmd{};
         bindCmd.type                          = AudioCmdType::BindMusicStem;
+        bindCmd.assetScopeId                  = trackScope;
         bindCmd.payload.music.pcm             = rec.pcm;
         bindCmd.payload.music.frameCount      = rec.frameCount;
         bindCmd.payload.music.loopStartFrame  = found->loopStartFrame;
         bindCmd.payload.music.loopEndFrame    = found->loopEndFrame;
         bindCmd.payload.music.tempoBpmQ8      = found->tempoBpmQ8;
-        bindCmd.payload.music.deckAndStemIdx  = static_cast<u8>(0x80u | (s & 0x03u));
+        bindCmd.payload.music.deckAndStemIdx  = static_cast<u8>(0x80u | (firstBound ? 0x40u : 0x00u) | (s & 0x03u));
         bindCmd.payload.music.crossfadeBlocks = crossfadeBlocks;
         EnqueueCommand(bindCmd);
+        firstBound = false;
     }
 
-    AudioCommand commitCmd{};
-    commitCmd.type                          = AudioCmdType::CommitMusicDeck;
-    commitCmd.payload.music.crossfadeBlocks = crossfadeBlocks;
-    EnqueueCommand(commitCmd);
+    if (!firstBound) {
+        AudioCommand commitCmd{};
+        commitCmd.type                          = AudioCmdType::CommitMusicDeck;
+        commitCmd.assetScopeId                  = trackScope;
+        commitCmd.payload.music.crossfadeBlocks = crossfadeBlocks;
+        EnqueueCommand(commitCmd);
+    }
 }
 
 void AudioSystem::SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weights) noexcept {
@@ -685,13 +729,15 @@ void AudioSystem::SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weigh
     for (usize s = 0; s < kMaxMusicStems; ++s) {
         m_bridge->stagingSnapshot.stemWeightsQ14[s] = FloatToQ14(weights[s]);
     }
+    m_stagingDirty = true;
 }
 
 void AudioSystem::PublishFrameSnapshot(const AudioFrameSnapshot& snap) noexcept {
-    const u8 flags  = m_bridge->tripleFlags.load(std::memory_order_relaxed);
-    const u8 backId = static_cast<u8>((flags >> 4u) & 0x03u);
+    const u8 flags              = m_bridge->tripleFlags.load(std::memory_order_relaxed);
+    const u8 backId             = static_cast<u8>((flags >> 4u) & 0x03u);
     m_bridge->snapshots[backId] = snap;
     SwapTripleBufferFlags(m_bridge->tripleFlags, true);
+    m_stagingDirty = false;
 }
 
 void AudioSystem::Update(const AudioUpdateDesc& desc) noexcept {
@@ -702,6 +748,20 @@ void AudioSystem::Update(const AudioUpdateDesc& desc) noexcept {
     m_listenerX   = desc.listenerX;
     m_listenerY   = desc.listenerY;
 
+    if (desc.focusMuteOverride >= 0) {
+        SetFocusMuted(desc.focusMuteOverride != 0);
+    }
+
+    ReconcileFinishedVoices();
+
+    if (!desc.triggers.empty() && desc.assetBank) {
+        for (const auto& req : desc.triggers) {
+            if (req.cueId.value != 0u) {
+                (void)PlayCue(req.cueId, *desc.assetBank, req.worldX, req.worldY, req.emitterId);
+            }
+        }
+    }
+
     auto& snap             = m_bridge->stagingSnapshot;
     snap.frozenChannelMask = desc.frozenChannelMask;
     const usize scaleCount = std::min<usize>(8u, desc.channelScales.size());
@@ -710,23 +770,20 @@ void AudioSystem::Update(const AudioUpdateDesc& desc) noexcept {
             static_cast<u16>(std::clamp(desc.channelScales[ch] * 4096.0f, 1024.0f, 8192.0f));
     }
 
-    ReconcileFinishedVoices();
-
-    // Staggered 30 Hz raycast occlusion strictly on the main thread across active voices only.
+    // Staggered 30 Hz raycast occlusion and spatial panning strictly across Spatialized2D voices.
     const u32 staggerGroup = static_cast<u32>(m_currentTick & 3ULL);
-    for (u64 active = m_trackedActiveMask; active != 0ULL; active &= (active - 1ULL)) {
-        const u32 slot = static_cast<u32>(std::countr_zero(active));
+    for (u64 spatial = m_spatialActiveMask; spatial != 0ULL; spatial &= (spatial - 1ULL)) {
+        const u32 slot = static_cast<u32>(std::countr_zero(spatial));
         auto& tr       = m_bridge->voiceTrackers[slot];
-        const VoiceFlags vf = static_cast<VoiceFlags>(tr.flags);
 
         if (desc.occlusionQuery && (slot & 3u) == staggerGroup &&
-            HasVoiceFlag(vf, VoiceFlags::Spatialized2D) &&
-            !HasVoiceFlag(vf, VoiceFlags::BypassOcclusion)) {
+            !HasVoiceFlag(tr.Flags(), VoiceFlags::BypassOcclusion)) {
             const f32 dx     = tr.worldX - m_listenerX;
             const f32 dy     = tr.worldY - m_listenerY;
             const f32 distSq = dx * dx + dy * dy;
+            const f32 maxD   = tr.MaxDist();
             f32 targetOcc    = 1.0f;
-            if (distSq > 0.25f && distSq < tr.maxDist * tr.maxDist) {
+            if (distSq > 0.25f && distSq < maxD * maxD) {
                 const f32 dist    = std::sqrt(distSq);
                 const f32 invDist = 1.0f / dist;
                 if (desc.occlusionQuery(
@@ -740,7 +797,8 @@ void AudioSystem::Update(const AudioUpdateDesc& desc) noexcept {
                     targetOcc = 0.0f;
                 }
             }
-            tr.occlusionFactor += (targetOcc - tr.occlusionFactor) * 0.25f;
+            const f32 curOcc = tr.Occlusion();
+            tr.occlusionQ14  = FloatToQ14(curOcc + (targetOcc - curOcc) * 0.25f);
         }
         ComputeVoiceSpatialTargets(slot, snap);
     }
@@ -793,6 +851,10 @@ void AudioSystem::ConsumeAndMixBlocks(
 
 void AudioSystem::PumpHeadlessBlocks(u32 blockCount, std::span<f32> optionalCaptureOut) noexcept {
     if (m_bridge && blockCount > 0u) {
+        if (m_stagingDirty) {
+            ++m_bridge->stagingSnapshot.snapshotSeq;
+            PublishFrameSnapshot(m_bridge->stagingSnapshot);
+        }
         ConsumeAndMixBlocks(blockCount, nullptr, optionalCaptureOut);
     }
 }
@@ -802,16 +864,14 @@ u32 AudioSystem::ExtractActiveEmitters(std::span<AudioEmitterView> outEmitters) 
         return 0u;
     }
     u32 count = 0u;
-    for (u64 active = m_trackedActiveMask; active != 0ULL && count < outEmitters.size(); active &= (active - 1ULL)) {
-        const u32 slot = static_cast<u32>(std::countr_zero(active));
+    for (u64 spatial = m_spatialActiveMask; spatial != 0ULL && count < outEmitters.size(); spatial &= (spatial - 1ULL)) {
+        const u32 slot = static_cast<u32>(std::countr_zero(spatial));
         const auto& tr = m_bridge->voiceTrackers[slot];
-        if (HasVoiceFlag(static_cast<VoiceFlags>(tr.flags), VoiceFlags::Spatialized2D)) {
-            outEmitters[count++] = AudioEmitterView{
-                tr.worldX,
-                tr.worldY,
-                tr.maxDist,
-                tr.occlusionFactor};
-        }
+        outEmitters[count++] = AudioEmitterView{
+            tr.worldX,
+            tr.worldY,
+            tr.MaxDist(),
+            tr.Occlusion()};
     }
     return count;
 }

@@ -1,16 +1,42 @@
 #pragma once
 
+#include "assets/AssetBank.h"
+#include "assets/AssetSystem.h"
+#include "audio/AudioSystem.h"
+#include "core/time/SdlClock.h"
+#include "debug/DebugSystem.h"
 #include "framework/FrameworkTypes.h"
 #include "framework/SceneDirector.h"
+#include "gameplay/GameplayPipeline.h"
+#include "input/InputPipeline.h"
+#include "platform/Window.h"
+#include "renderer/RenderList.h"
+#include "renderer/Renderer.h"
+#include "world/World.h"
 
-#include <array>
+#include <string_view>
 
 namespace en::framework {
 
-// Top-level move-only RAII runtime coordinator for EngineN.
-// Owns all core subsystems in strict dependency order and drives the 120 Hz fixed-step loop.
-// Invariant: Zero heap allocations occur inside StepFrame() or StepHeadless() after Init() succeeds.
-class Application {
+struct ApplicationConfig {
+    std::string_view appName{"EngineN"};
+    std::string_view orgName{"EngineN"};
+    std::string_view bootPakPath{"base.enpak"};
+    bool headless{false};
+    assets::PumpBudget assetPumpBudget{};
+    platform::WindowConfig window{};
+    renderer::RendererConfig renderer{};
+    assets::AssetSystemConfig assets{};
+    audio::AudioSystemConfig audio{};
+    world::WorldConfig world{};
+    gameplay::GameplayPipelineConfig gameplay{};
+    debug::DebugSystemConfig debug{};
+};
+
+// Top-level move-only RAII runtime coordinator for EngineN (Layer 2).
+// Owns all concrete subsystems in strict dependency order and drives the 120 Hz fixed-step loop.
+// Invariant: Cache Line 0 packs all hot runtime coordinator state; zero heap allocations occur after Init().
+class alignas(64) Application {
 public:
     Application() noexcept = default;
     ~Application() noexcept { Shutdown(); }
@@ -22,7 +48,7 @@ public:
 
     [[nodiscard]] Result<void, FrameworkError> Init(
         const ApplicationConfig& cfg,
-        const AppHooks& hooks) noexcept;
+        const AppHooks& hooks = {}) noexcept;
 
     void Shutdown() noexcept;
 
@@ -59,26 +85,33 @@ public:
     [[nodiscard]] constexpr auto& Input(this Self&& self) noexcept { return self.m_input; }
     template <typename Self>
     [[nodiscard]] constexpr auto& Time(this Self&& self) noexcept { return self.m_time; }
+    template <typename Self>
+    [[nodiscard]] constexpr auto& ActionBuffer(this Self&& self) noexcept { return self.m_actionBuffer; }
+    template <typename Self>
+    [[nodiscard]] constexpr auto& Debug(this Self&& self) noexcept { return self.m_debug; }
 
 private:
     [[nodiscard]] constexpr SceneLoadContext MakeLoadContext() noexcept;
-    void HandleWindowEvents(platform::WindowFlags flags) noexcept;
-    void RunSimTicks(u32& outTicksExecuted) noexcept;
+    [[nodiscard]] Result<void, FrameworkError> FailInit(
+        FrameworkErrc code,
+        SubSystemStage stage,
+        u8 subErrc = 0) noexcept;
+    [[nodiscard]] Result<void, FrameworkError> CommitSafeFrameBarrier() noexcept;
+    [[nodiscard]] u32 ExecuteSimTicks() noexcept;
     void RouteCuesAndSyncAudio(u32 ticksExecuted) noexcept;
-    void SyncAudioListenerO1() noexcept;
+    [[nodiscard]] renderer::RenderList& ExtractRenderFrame(renderer::ViewportExtent viewportSize) noexcept;
 
+    // Cache Line 0 (offset 0..63, 64B exact): Hot Runtime Coordinator State & Callbacks
+    void* m_userAppState{nullptr};
+    platform::EventTap m_devToolsTap{};
+    AppHooks::ConsumeSimCueFn m_onConsumeSimCue{nullptr};
+    AppHooks::PreShutdownFn m_onPreShutdown{nullptr};
+    u64 m_lastRenderListAuditHash{0};
+    assets::PumpBudget m_assetPumpBudget{};
+    u32 m_frameIndex{0};
     bool m_initialized{false};
     bool m_headless{false};
-    u32 m_frameIndex{0};
-    world::EntityId m_cachedCameraEntity{world::kNullEntity};
-    u8 m_latchedFrozenMask{0};
-    std::array<f32, time::kMaxTimeChannels> m_latchedChannelScales{
-        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
-    };
-    u64 m_lastRenderListAuditHash{0};
-
-    ApplicationConfig m_cfg{};
-    AppHooks m_hooks{};
+    u16 m_reserved0{0};
 
     // Strict member declaration order guarantees forward construction and reverse destruction.
     platform::Platform m_platform{};
@@ -87,11 +120,11 @@ private:
     input::ActionBuffer m_actionBuffer{};
     time::TimeManager m_time{};
     renderer::Renderer m_renderer{};
-    renderer::RenderList m_headlessRenderList{};
     assets::AssetSystem m_assets{};
     audio::AudioSystem m_audio{};
     world::World m_world{};
     gameplay::GameplayPipeline m_gameplay{};
+    debug::DebugSystem m_debug{};
     SceneDirector m_director{};
 };
 

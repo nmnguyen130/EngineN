@@ -31,6 +31,31 @@ add_library(engine STATIC
     # Assets
     engine/assets/AssetBank.cpp
     engine/assets/AssetSystem.cpp
+
+    # World
+    engine/world/TransformSolver.cpp
+    engine/world/World.cpp
+    engine/world/WorldExtractor.cpp
+
+    # Gameplay
+    engine/gameplay/GameplayPipeline.cpp
+    engine/gameplay/KinematicSolver2D.cpp
+    engine/gameplay/SpatialIndex2D.cpp
+    engine/gameplay/StateAndCombatSolver.cpp
+
+    # Audio
+    engine/audio/AudioMixer.cpp
+    engine/audio/AudioSystem.cpp
+
+    # Debug
+    engine/debug/DebugBatcher.cpp
+    engine/debug/DebugInspector.cpp
+    engine/debug/DebugProfilerAndConsole.cpp
+    engine/debug/DebugSystem.cpp
+
+    # Framework
+    engine/framework/Application.cpp
+    engine/framework/SceneDirector.cpp
 )
 
 target_compile_features(engine PUBLIC cxx_std_23)
@@ -63,3 +88,7 @@ add_engine_test(PlatformTests)
 add_engine_test(InputTests)
 add_engine_test(RendererTests)
 add_engine_test(AssetsTests)
+add_engine_test(WorldTests)
+add_engine_test(GameplayTests)
+add_engine_test(AudioTests)
+add_engine_test(FrameworkTests)

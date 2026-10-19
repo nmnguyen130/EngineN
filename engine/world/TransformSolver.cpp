@@ -11,37 +11,35 @@ void TransformSolver::BindArena(
     std::span<WorldTransform2D> world,
     std::span<PrevWorldSnapshot2D> prev,
     std::span<HierarchyNode> treeNodes,
-    std::span<u8> depths,
     std::span<HierarchyStep> hierarchyOrder,
-    std::span<u64> spatialAliveWords,
-    std::span<u64> spatialDynamicWords,
-    std::span<u64> rootDirtyWords,
-    std::span<u64> childDirtyWords,
-    std::span<u64> subtreeDirtyWords) noexcept {
-    m_local               = local;
-    m_world               = world;
-    m_prev                = prev;
-    m_tree                = treeNodes;
-    m_depths              = depths;
-    m_hierarchyOrder      = hierarchyOrder;
-    m_spatialAliveWords   = spatialAliveWords;
-    m_spatialDynamicWords = spatialDynamicWords;
-    m_rootDirtyWords      = rootDirtyWords;
-    m_childDirtyWords     = childDirtyWords;
-    m_subtreeDirtyWords   = subtreeDirtyWords;
-    Clear();
+    std::span<u64> dirtyAndAliveWords,
+    std::span<u64> movedWords) noexcept {
+    m_local          = local.data();
+    m_world          = world.data();
+    m_prev           = prev.data();
+    m_tree           = treeNodes.data();
+    m_hierarchyOrder = hierarchyOrder.data();
+    m_dirtyWords     = dirtyAndAliveWords.data();
+    m_movedWords     = movedWords.data();
+    m_maxEntities    = static_cast<u16>(local.size());
+    m_wordCount      = static_cast<u16>(movedWords.size());
+    Clear(0);
 }
 
-void TransformSolver::Clear() noexcept {
-    std::fill(m_tree.begin(), m_tree.end(), HierarchyNode{});
-    std::fill(m_depths.begin(), m_depths.end(), u8{0});
-    std::fill(m_spatialAliveWords.begin(), m_spatialAliveWords.end(), 0ULL);
-    std::fill(m_spatialDynamicWords.begin(), m_spatialDynamicWords.end(), 0ULL);
-    std::fill(m_rootDirtyWords.begin(), m_rootDirtyWords.end(), 0ULL);
-    std::fill(m_childDirtyWords.begin(), m_childDirtyWords.end(), 0ULL);
-    std::fill(m_subtreeDirtyWords.begin(), m_subtreeDirtyWords.end(), 0ULL);
+void TransformSolver::Clear(u16 maxAllocatedIndex) noexcept {
+    const u32 clearSlots = (maxAllocatedIndex == 0)
+        ? m_maxEntities
+        : std::min<u32>(static_cast<u32>(maxAllocatedIndex) + 1u, m_maxEntities);
+    const u32 clearWords = (maxAllocatedIndex == 0)
+        ? m_wordCount
+        : std::min<u32>((static_cast<u32>(maxAllocatedIndex) + 64u) >> 6, m_wordCount);
 
-    if (!m_local.empty()) {
+    std::fill_n(m_tree, clearSlots, HierarchyNode{});
+    std::memset(m_dirtyWords, 0, clearWords * sizeof(u64));
+    std::memset(SpatialAliveWords(), 0, clearWords * sizeof(u64));
+    std::memset(m_movedWords, 0, clearWords * sizeof(u64));
+
+    if (m_maxEntities > 0) {
         m_local[0] = LocalTransform2D{};
         m_world[0] = WorldTransform2D{};
         m_prev[0]  = PrevWorldSnapshot2D{};
@@ -50,53 +48,33 @@ void TransformSolver::Clear() noexcept {
     m_orderDirty = false;
 }
 
-void TransformSolver::InitSlot(u16 idx, const LocalTransform2D& initialLocal, bool isStatic) noexcept {
-    m_local[idx]  = initialLocal;
-    m_tree[idx]   = HierarchyNode{};
-    m_depths[idx] = 0;
-
-    f32 c = 1.0f;
-    f32 s = 0.0f;
-    const f32 normRot = NormalizeAngleRad(initialLocal.rotationRad);
-    FastSinCos(normRot, c, s);
-
-    m_world[idx] = WorldTransform2D{
-        .x           = initialLocal.x,
-        .y           = initialLocal.y,
-        .scaleX      = initialLocal.scaleX,
-        .scaleY      = initialLocal.scaleY,
-        .cosRot      = c,
-        .sinRot      = s,
-        .worldRotRad = normRot,
-        .worldDepth  = initialLocal.depthOffset,
-    };
+void TransformSolver::InitSlot(u16 idx, const LocalTransform2D& initialLocal) noexcept {
+    m_local[idx] = initialLocal;
+    m_tree[idx]  = HierarchyNode{};
+    ComputeRootTransform(initialLocal, m_world[idx]);
     SyncPrevToCurrent(idx);
 
     const u32 w = idx >> 6;
     const u64 b = 1ULL << (idx & 63u);
-    m_spatialAliveWords[w] |= b;
-    if (!isStatic) {
-        m_spatialDynamicWords[w] |= b;
-    } else {
-        m_spatialDynamicWords[w] &= ~b;
-    }
-    m_rootDirtyWords[w]  &= ~b;
-    m_childDirtyWords[w] &= ~b;
+    SpatialAliveWords()[w] |= b;
+    m_dirtyWords[w]        &= ~b;
 }
 
 void TransformSolver::DisableSlot(u16 idx) noexcept {
+    const u32 w = idx >> 6;
+    const u64 b = 1ULL << (idx & 63u);
+    if ((SpatialAliveWords()[w] & b) == 0) {
+        return;
+    }
     DetachChildrenToRoot(idx);
     if (m_tree[idx].parent != 0) {
         UnlinkFromParent(idx);
         m_orderDirty = true;
     }
-    const u32 w = idx >> 6;
-    const u64 mask = ~(1ULL << (idx & 63u));
-    m_spatialAliveWords[w]   &= mask;
-    m_spatialDynamicWords[w] &= mask;
-    m_rootDirtyWords[w]      &= mask;
-    m_childDirtyWords[w]     &= mask;
-    m_depths[idx] = 0;
+    const u64 mask = ~b;
+    SpatialAliveWords()[w] &= mask;
+    m_dirtyWords[w]        &= mask;
+    m_movedWords[w]        &= mask;
 }
 
 void TransformSolver::UnlinkFromParent(u16 childIdx) noexcept {
@@ -128,12 +106,37 @@ void TransformSolver::DetachChildrenToRoot(u16 parentIdx) noexcept {
         m_tree[child].parent      = 0;
         m_tree[child].prevSibling = 0;
         m_tree[child].nextSibling = 0;
-        m_depths[child]           = 0;
-        m_rootDirtyWords[child >> 6] |= (1ULL << (child & 63u));
+        MarkDirty(child);
         child = next;
     }
     m_tree[parentIdx].firstChild = 0;
     m_orderDirty = true;
+}
+
+u8 TransformSolver::MaxSubtreeDepth(u16 rootIdx) const noexcept {
+    if (m_tree[rootIdx].firstChild == 0) {
+        return 0;
+    }
+    struct StackEntry {
+        u16 node;
+        u8 depth;
+    };
+    StackEntry stack[kMaxHierarchyDepth];
+    u32 top = 0;
+    stack[top++] = {rootIdx, 0};
+    u8 maxDepth = 0;
+
+    while (top > 0) {
+        const auto [cur, d] = stack[--top];
+        for (u16 child = m_tree[cur].firstChild; child != 0; child = m_tree[child].nextSibling) {
+            const u8 childDepth = static_cast<u8>(d + 1u);
+            maxDepth = std::max(maxDepth, childDepth);
+            if (m_tree[child].firstChild != 0 && top < kMaxHierarchyDepth) {
+                stack[top++] = {child, childDepth};
+            }
+        }
+    }
+    return maxDepth;
 }
 
 Result<void, WorldErrc> TransformSolver::SetParent(u16 childIdx, u16 newParentIdx) noexcept {
@@ -144,20 +147,21 @@ Result<void, WorldErrc> TransformSolver::SetParent(u16 childIdx, u16 newParentId
         return {};
     }
 
-    u8 newDepth = 0;
     if (newParentIdx != 0) {
         u16 cursor = newParentIdx;
-        u8 steps = 1;
+        u8 ancestorSteps = 0;
         while (cursor != 0) {
             if (cursor == childIdx) [[unlikely]] {
                 return Err(WorldErrc::HierarchyCycleDetected);
             }
             cursor = m_tree[cursor].parent;
-            if (++steps > kMaxHierarchyDepth) [[unlikely]] {
+            if (++ancestorSteps > kMaxHierarchyDepth) [[unlikely]] {
                 return Err(WorldErrc::HierarchyDepthExceeded);
             }
         }
-        newDepth = static_cast<u8>(m_depths[newParentIdx] + 1u);
+        if (static_cast<u32>(ancestorSteps) + MaxSubtreeDepth(childIdx) > kMaxHierarchyDepth) [[unlikely]] {
+            return Err(WorldErrc::HierarchyDepthExceeded);
+        }
     }
 
     UnlinkFromParent(childIdx);
@@ -171,42 +175,42 @@ Result<void, WorldErrc> TransformSolver::SetParent(u16 childIdx, u16 newParentId
             m_tree[oldHead].prevSibling = childIdx;
         }
         m_tree[newParentIdx].firstChild = childIdx;
-        m_childDirtyWords[childIdx >> 6] |= (1ULL << (childIdx & 63u));
-    } else {
-        m_rootDirtyWords[childIdx >> 6] |= (1ULL << (childIdx & 63u));
     }
 
-    m_depths[childIdx] = newDepth;
+    MarkDirty(childIdx);
     m_orderDirty = true;
     return {};
 }
 
-void TransformSolver::AppendSubtreeDFS(u16 parentIdx) noexcept {
-    u16 child = m_tree[parentIdx].firstChild;
-    while (child != 0) {
-        m_depths[child] = static_cast<u8>(m_depths[parentIdx] + 1u);
-        m_hierarchyOrder[m_childCount++] = HierarchyStep{
-            .childIdx  = child,
-            .parentIdx = parentIdx,
-        };
-        if (m_tree[child].firstChild != 0) {
-            AppendSubtreeDFS(child);
-        }
-        child = m_tree[child].nextSibling;
-    }
-}
-
 void TransformSolver::RebuildHierarchyOrder(u16 maxAllocatedIndex) noexcept {
     m_childCount = 0;
-    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
+    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 64u) >> 6;
+    const u64* __restrict aliveWords = SpatialAliveWords();
+    u16 stack[kMaxHierarchyDepth];
+
     for (u32 w = 0; w < wordCount; ++w) {
-        u64 alive = m_spatialAliveWords[w];
+        u64 alive = aliveWords[w];
         while (alive != 0) {
             const u32 bit = static_cast<u32>(std::countr_zero(alive));
             alive &= (alive - 1u);
-            const u16 idx = static_cast<u16>((w << 6) + bit);
-            if (m_tree[idx].parent == 0 && m_tree[idx].firstChild != 0) {
-                AppendSubtreeDFS(idx);
+            const u16 rootIdx = static_cast<u16>((w << 6) + bit);
+            if (m_tree[rootIdx].parent != 0 || m_tree[rootIdx].firstChild == 0) {
+                continue;
+            }
+
+            u32 top = 0;
+            stack[top++] = rootIdx;
+            while (top > 0) {
+                const u16 parentIdx = stack[--top];
+                for (u16 child = m_tree[parentIdx].firstChild; child != 0; child = m_tree[child].nextSibling) {
+                    m_hierarchyOrder[m_childCount++] = HierarchyStep{
+                        .childIdx  = child,
+                        .parentIdx = parentIdx,
+                    };
+                    if (m_tree[child].firstChild != 0 && top < kMaxHierarchyDepth) {
+                        stack[top++] = child;
+                    }
+                }
             }
         }
     }
@@ -216,89 +220,97 @@ void TransformSolver::RebuildHierarchyOrder(u16 maxAllocatedIndex) noexcept {
 void TransformSolver::SnapshotPreviousTransforms(
     u16 maxAllocatedIndex,
     u8 activeChannelMask,
-    std::span<const time::TimeChannel> entityChannels) noexcept {
-    if (activeChannelMask == 0) {
+    const time::TimeChannel* entityChannels) noexcept {
+    if (activeChannelMask == 0 || maxAllocatedIndex == 0) {
         return;
     }
-    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
-    const auto* __restrict worldPtr = m_world.data();
-    auto* __restrict prevPtr        = m_prev.data();
-    const auto* __restrict chPtr    = entityChannels.data();
+    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 64u) >> 6;
+    const auto* __restrict worldPtr = m_world;
+    auto* __restrict prevPtr        = m_prev;
+    u64* __restrict movedWords      = m_movedWords;
 
     for (u32 w = 0; w < wordCount; ++w) {
-        u64 mask = m_spatialAliveWords[w] & m_spatialDynamicWords[w];
-        while (mask != 0) {
-            const u32 bit = static_cast<u32>(std::countr_zero(mask));
-            mask &= (mask - 1u);
-            const u16 idx = static_cast<u16>((w << 6) + bit);
-            if ((activeChannelMask & (1u << static_cast<u8>(chPtr[idx]))) != 0) {
-                const WorldTransform2D& cur = worldPtr[idx];
-                prevPtr[idx] = PrevWorldSnapshot2D{
-                    .x           = cur.x,
-                    .y           = cur.y,
-                    .scaleX      = cur.scaleX,
-                    .scaleY      = cur.scaleY,
-                    .worldRotRad = cur.worldRotRad,
-                    .worldDepth  = cur.worldDepth,
-                };
-            }
+        u64 moved = movedWords[w];
+        if (moved == 0) {
+            continue;
+        }
+        if (activeChannelMask == 0xFFu) [[likely]] {
+            movedWords[w] = 0;
+            do {
+                const u32 bit = static_cast<u32>(std::countr_zero(moved));
+                moved &= (moved - 1u);
+                const u16 idx = static_cast<u16>((w << 6) + bit);
+                prevPtr[idx] = worldPtr[idx].ToSnapshot();
+            } while (moved != 0);
+        } else {
+            u64 syncedBits = 0;
+            do {
+                const u32 bit = static_cast<u32>(std::countr_zero(moved));
+                moved &= (moved - 1u);
+                const u16 idx = static_cast<u16>((w << 6) + bit);
+                if ((activeChannelMask & (1u << static_cast<u8>(entityChannels[idx]))) != 0) {
+                    prevPtr[idx] = worldPtr[idx].ToSnapshot();
+                    syncedBits |= (1ULL << bit);
+                }
+            } while (moved != 0);
+            movedWords[w] &= ~syncedBits;
         }
     }
 }
 
 void TransformSolver::Propagate(u16 maxAllocatedIndex) noexcept {
+    if (maxAllocatedIndex == 0) {
+        return;
+    }
     if (m_orderDirty) [[unlikely]] {
         RebuildHierarchyOrder(maxAllocatedIndex);
     }
 
-    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 63u) >> 6;
-    bool anyRootUpdated = false;
+    const u32 wordCount = (static_cast<u32>(maxAllocatedIndex) + 64u) >> 6;
+    const u64* __restrict aliveWords = SpatialAliveWords();
+    const bool hasChildren = (m_childCount != 0);
 
     for (u32 w = 0; w < wordCount; ++w) {
-        u64 dirty = m_rootDirtyWords[w] & m_spatialAliveWords[w];
+        u64 dirty = m_dirtyWords[w] & aliveWords[w];
         if (dirty == 0) {
             continue;
         }
-        m_rootDirtyWords[w] = 0;
-        m_subtreeDirtyWords[w] |= dirty;
-        anyRootUpdated = true;
-
-        while (dirty != 0) {
+        if (!hasChildren) [[likely]] {
+            m_dirtyWords[w] = 0;
+            m_movedWords[w] |= dirty;
+        }
+        do {
             const u32 bit = static_cast<u32>(std::countr_zero(dirty));
             dirty &= (dirty - 1u);
             const u16 idx = static_cast<u16>((w << 6) + bit);
-
-            const LocalTransform2D& loc = m_local[idx];
-            WorldTransform2D& wrld      = m_world[idx];
-            wrld.x           = loc.x;
-            wrld.y           = loc.y;
-            wrld.scaleX      = loc.scaleX;
-            wrld.scaleY      = loc.scaleY;
-            wrld.worldRotRad = NormalizeAngleRad(loc.rotationRad);
-            wrld.worldDepth  = loc.depthOffset;
-            FastSinCos(wrld.worldRotRad, wrld.cosRot, wrld.sinRot);
-        }
+            if (hasChildren && m_tree[idx].parent != 0) {
+                continue;
+            }
+            ComputeRootTransform(m_local[idx], m_world[idx]);
+            if (hasChildren) {
+                const u64 b = 1ULL << bit;
+                m_movedWords[w] |= b;
+                if (m_tree[idx].firstChild == 0) {
+                    m_dirtyWords[w] &= ~b;
+                }
+            }
+        } while (dirty != 0);
     }
 
-    if (m_childCount == 0) {
-        if (anyRootUpdated) {
-            std::memset(m_subtreeDirtyWords.data(), 0, wordCount * sizeof(u64));
-        }
+    if (!hasChildren) [[likely]] {
         return;
     }
 
-    for (u32 i = 0; i < m_childCount; ++i) {
+    for (u16 i = 0; i < m_childCount; ++i) {
         const auto [childIdx, parentIdx] = m_hierarchyOrder[i];
         const u32 cw = childIdx >> 6;
         const u64 cb = 1ULL << (childIdx & 63u);
-        const bool parentDirty = (m_subtreeDirtyWords[parentIdx >> 6] & (1ULL << (parentIdx & 63u))) != 0;
-        const bool childDirty  = (m_childDirtyWords[cw] & cb) != 0;
+        const bool parentDirty = (m_dirtyWords[parentIdx >> 6] & (1ULL << (parentIdx & 63u))) != 0;
+        const bool childDirty  = (m_dirtyWords[cw] & cb) != 0;
 
         if (!parentDirty && !childDirty) {
             continue;
         }
-        m_childDirtyWords[cw]   &= ~cb;
-        m_subtreeDirtyWords[cw] |= cb;
 
         const WorldTransform2D& p = m_world[parentIdx];
         const LocalTransform2D& l = m_local[childIdx];
@@ -313,9 +325,16 @@ void TransformSolver::Propagate(u16 maxAllocatedIndex) noexcept {
         c.worldRotRad = NormalizeAngleRad(p.worldRotRad + l.rotationRad);
         c.worldDepth  = p.worldDepth + l.depthOffset;
         FastSinCos(c.worldRotRad, c.cosRot, c.sinRot);
+
+        m_movedWords[cw] |= cb;
+        if (m_tree[childIdx].firstChild != 0) {
+            m_dirtyWords[cw] |= cb;
+        } else {
+            m_dirtyWords[cw] &= ~cb;
+        }
     }
 
-    std::memset(m_subtreeDirtyWords.data(), 0, wordCount * sizeof(u64));
+    std::memset(m_dirtyWords, 0, wordCount * sizeof(u64));
 }
 
 } // namespace en::world

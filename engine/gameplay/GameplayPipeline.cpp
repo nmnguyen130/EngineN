@@ -4,9 +4,8 @@
 #include "world/World.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <new>
 
 namespace en::gameplay {
@@ -27,26 +26,16 @@ constexpr void StepAnalyticCriticallyDampedSpring(
 }
 
 [[nodiscard]] constexpr f32 SoftCushionClamp(f32 val, f32 minB, f32 maxB, f32 cushionWidth) noexcept {
-    if (minB >= maxB) {
-        return 0.5f * (minB + maxB);
-    }
-    const f32 span = maxB - minB;
-    const f32 m    = std::min(cushionWidth, 0.25f * span);
-    if (m <= 1e-4f) {
-        return std::clamp(val, minB, maxB);
-    }
-
+    if (minB >= maxB) return 0.5f * (minB + maxB);
+    const f32 m = std::min(cushionWidth, 0.25f * (maxB - minB));
+    if (m <= 1e-4f) return std::clamp(val, minB, maxB);
     if (val < minB + m) {
-        const f32 d = (minB + m) - val;
-        const f32 t = std::min(1.0f, d / (2.0f * m));
-        const f32 s = t * (2.0f - t);
-        return (minB + m) - m * s;
+        const f32 t = std::min(1.0f, ((minB + m) - val) / (2.0f * m));
+        return (minB + m) - m * (t * (2.0f - t));
     }
     if (val > maxB - m) {
-        const f32 d = val - (maxB - m);
-        const f32 t = std::min(1.0f, d / (2.0f * m));
-        const f32 s = t * (2.0f - t);
-        return (maxB - m) + m * s;
+        const f32 t = std::min(1.0f, (val - (maxB - m)) / (2.0f * m));
+        return (maxB - m) + m * (t * (2.0f - t));
     }
     return val;
 }
@@ -56,8 +45,11 @@ constexpr void StepAnalyticCriticallyDampedSpring(
     h = (h ^ (h >> 30u)) * 0xBF58476D1CE4E5B9ULL;
     h = (h ^ (h >> 27u)) * 0x94D049BB133111EBULL;
     h = h ^ (h >> 31u);
-    const f32 norm01 = static_cast<f32>(h & 0xFFFFFFULL) * (1.0f / 16777215.0f);
-    return norm01 * 2.0f - 1.0f;
+    return static_cast<f32>(h & 0xFFFFFFULL) * (2.0f / 16777215.0f) - 1.0f;
+}
+
+[[nodiscard]] constexpr u32 CanonicalFloatBits(f32 v) noexcept {
+    return (v == 0.0f) ? 0u : std::bit_cast<u32>(v);
 }
 
 } // namespace
@@ -67,42 +59,46 @@ GameplayPipeline::~GameplayPipeline() noexcept {
 }
 
 GameplayPipeline::GameplayPipeline(GameplayPipeline&& other) noexcept
-    : m_arena(other.m_arena),
-      m_arenaBytes(other.m_arenaBytes),
-      m_policies(other.m_policies),
+    : m_policies(other.m_policies),
       m_kinematicCfg(other.m_kinematicCfg),
       m_invPixelsPerMeter(other.m_invPixelsPerMeter),
-      m_spatial(other.m_spatial),
       m_hitScratch(other.m_hitScratch),
       m_cueBuffer(other.m_cueBuffer),
+      m_spatial(other.m_spatial),
+      m_arena(other.m_arena),
+      m_arenaBytes(other.m_arenaBytes),
+      m_activeFlagWordsMask(other.m_activeFlagWordsMask),
       m_cueCount(other.m_cueCount),
       m_worldFlags(other.m_worldFlags) {
-    other.m_arena      = nullptr;
-    other.m_arenaBytes = 0;
-    other.m_hitScratch = nullptr;
-    other.m_cueBuffer  = nullptr;
-    other.m_cueCount   = 0;
+    other.m_arena               = nullptr;
+    other.m_arenaBytes          = 0;
+    other.m_hitScratch          = nullptr;
+    other.m_cueBuffer           = nullptr;
+    other.m_cueCount            = 0;
+    other.m_activeFlagWordsMask = 0;
 }
 
 GameplayPipeline& GameplayPipeline::operator=(GameplayPipeline&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_arena             = other.m_arena;
-        m_arenaBytes        = other.m_arenaBytes;
-        m_policies          = other.m_policies;
-        m_kinematicCfg      = other.m_kinematicCfg;
-        m_invPixelsPerMeter = other.m_invPixelsPerMeter;
-        m_spatial           = other.m_spatial;
-        m_hitScratch        = other.m_hitScratch;
-        m_cueBuffer         = other.m_cueBuffer;
-        m_cueCount          = other.m_cueCount;
-        m_worldFlags        = other.m_worldFlags;
+        m_policies            = other.m_policies;
+        m_kinematicCfg        = other.m_kinematicCfg;
+        m_invPixelsPerMeter   = other.m_invPixelsPerMeter;
+        m_hitScratch          = other.m_hitScratch;
+        m_cueBuffer           = other.m_cueBuffer;
+        m_spatial             = other.m_spatial;
+        m_arena               = other.m_arena;
+        m_arenaBytes          = other.m_arenaBytes;
+        m_activeFlagWordsMask = other.m_activeFlagWordsMask;
+        m_cueCount            = other.m_cueCount;
+        m_worldFlags          = other.m_worldFlags;
 
-        other.m_arena      = nullptr;
-        other.m_arenaBytes = 0;
-        other.m_hitScratch = nullptr;
-        other.m_cueBuffer  = nullptr;
-        other.m_cueCount   = 0;
+        other.m_arena               = nullptr;
+        other.m_arenaBytes          = 0;
+        other.m_hitScratch          = nullptr;
+        other.m_cueBuffer           = nullptr;
+        other.m_cueCount            = 0;
+        other.m_activeFlagWordsMask = 0;
     }
     return *this;
 }
@@ -113,9 +109,11 @@ Result<void, GameplayErrc> GameplayPipeline::Init(
     const GameplayPipelineConfig& cfg) noexcept {
     Shutdown();
 
-    const usize minBytes = SpatialIndex2D::RequiredArenaBytes() +
-                           sizeof(ResolvedHitEvent) * kMaxHitsPerTick +
-                           sizeof(SimCue) * kMaxCuesPerFrame + 512u;
+    const usize spatialBytes = (SpatialIndex2D::RequiredArenaBytes() + 63u) & ~usize{63u};
+    const usize hitsBytes    = (sizeof(ResolvedHitEvent) * kMaxHitsPerTick + 63u) & ~usize{63u};
+    const usize cuesBytes    = (sizeof(SimCue) * kMaxCuesPerFrame + 63u) & ~usize{63u};
+    const usize minBytes     = spatialBytes + hitsBytes + cuesBytes;
+
     if (cfg.arenaBytes < minBytes) [[unlikely]] {
         return Err(GameplayErrc::InvalidConfig);
     }
@@ -126,24 +124,21 @@ Result<void, GameplayErrc> GameplayPipeline::Init(
         return Err(GameplayErrc::OutOfMemory);
     }
 
-    m_arena      = static_cast<u8*>(rawMem);
-    m_arenaBytes = alignedSize;
-    std::memset(m_arena, 0, m_arenaBytes);
-
-    m_policies          = policies;
-    m_kinematicCfg      = cfg.kinematicConfig;
-    m_invPixelsPerMeter = 1.0f / std::max(1.0f, cfg.pixelsPerMeter);
+    m_arena               = static_cast<u8*>(rawMem);
+    m_arenaBytes          = alignedSize;
+    m_policies            = policies;
+    m_kinematicCfg        = cfg.kinematicConfig;
+    m_invPixelsPerMeter   = 1.0f / std::max(1.0f, cfg.pixelsPerMeter);
+    m_activeFlagWordsMask = 0ULL;
     m_worldFlags.fill(0ULL);
-    m_cueCount = 0;
+    m_cueCount            = 0;
 
-    const usize spatialBytes = (SpatialIndex2D::RequiredArenaBytes() + 63u) & ~usize{63u};
     m_spatial.BindArena(std::span<u8>{m_arena, spatialBytes});
 
     u8* cursor   = m_arena + spatialBytes;
     m_hitScratch = reinterpret_cast<ResolvedHitEvent*>(cursor);
-    cursor += (sizeof(ResolvedHitEvent) * kMaxHitsPerTick + 63u) & ~usize{63u};
-
-    m_cueBuffer = reinterpret_cast<SimCue*>(cursor);
+    cursor += hitsBytes;
+    m_cueBuffer  = reinterpret_cast<SimCue*>(cursor);
 
     if (!world.RegisterComponentPool<KinematicMotor2D>(cfg.maxMotors) ||
         !world.RegisterComponentPool<KinematicCarrier2D>(cfg.maxCarriers) ||
@@ -166,17 +161,17 @@ void GameplayPipeline::Shutdown() noexcept {
         ::operator delete(m_arena, std::align_val_t{64}, std::nothrow);
         m_arena = nullptr;
     }
-    m_arenaBytes = 0;
-    m_hitScratch = nullptr;
-    m_cueBuffer  = nullptr;
-    m_cueCount   = 0;
+    m_arenaBytes          = 0;
+    m_hitScratch          = nullptr;
+    m_cueBuffer           = nullptr;
+    m_cueCount            = 0;
+    m_activeFlagWordsMask = 0;
 }
 
 Result<void, GameplayErrc> GameplayPipeline::SetActiveRoomCollision(
     const assets::AssetBank& bank,
     assets::BlobHandle collisionMapBlob) noexcept {
-    const assets::BlobRecord& blob = bank.GetBlob(collisionMapBlob);
-    return m_spatial.BindCollisionMapBlob(blob);
+    return m_spatial.BindCollisionMapBlob(bank.GetBlob(collisionMapBlob));
 }
 
 void GameplayPipeline::Tick(
@@ -186,23 +181,23 @@ void GameplayPipeline::Tick(
     const input::TickInput& tickInput,
     input::ActionBuffer& actionBuffer) noexcept {
     // Stage 1: Advance moving carriers and transfer displacements onto grounded riders.
-    KinematicSolver2D::StepCarriersAndRiders(world, m_spatial, step);
+    KinematicSolver2D::StepCarriersAndRiders(world, m_spatial, step, m_kinematicCfg);
 
-    // Stage 2: Dedicated AnimationSubsystem & frame-edge directives (0-tick hitbox latency, native channel gating).
-    AnimationSubsystem::StepAnimationsAndDirectives(world, assetBank, step, *this);
+    // Stage 2: Single-pass animation & frame-edge directives (0-tick hitbox latency).
+    StateAndCombatSolver::DispatchAnimationFrameDirectives(world, assetBank, step, *this);
 
     // Stage 3: Advance forgiveness/iframe timers and evaluate game policy callbacks against cancelMask.
     StateAndCombatSolver::StepStateMachinesAndPolicies(
         world, assetBank, step, tickInput, actionBuffer, m_policies, *this);
 
-    // Stage 4: Integrate ambient non-colliding Velocity2D, rebuild dynamic grid, solve swept motors, propagate transforms.
+    // Stage 4: Integrate ambient non-colliding Velocity2D, rebuild kinematic-only grid, solve swept motors, propagate transforms.
     world.StepAmbientVelocities(step);
-    m_spatial.RebuildDynamicGrid(world);
+    m_spatial.RebuildDynamicGrid(world, SpatialRebuildMode::KinematicsOnly);
     KinematicSolver2D::StepMotorsAndMotionStacks(world, m_spatial, step, m_kinematicCfg);
     world.PropagateTransforms();
 
-    // Stage 5: Rebuild dynamic combat grid at updated world transforms, gather overlaps, arbitrate hits.
-    m_spatial.RebuildDynamicGrid(world);
+    // Stage 5: Conditionally rebuild combat grid only if at least one hitbox slice is active, then arbitrate hits.
+    m_spatial.RebuildDynamicGrid(world, SpatialRebuildMode::CombatOnlyIfActive);
     const u32 hitCount = m_spatial.GatherCombatOverlaps(
         world, assetBank, std::span<ResolvedHitEvent>{m_hitScratch, kMaxHitsPerTick});
     if (hitCount > 0) {
@@ -210,106 +205,83 @@ void GameplayPipeline::Tick(
             world, step, std::span<const ResolvedHitEvent>{m_hitScratch, hitCount}, m_policies, *this);
     }
 
-    // Stage 6: Update Ultimate Camera Director on TimeChannel::Camera (unfrozen during combat hitstop).
+    // Stage 6: Update Camera Director on TimeChannel::Camera (unfrozen during combat hitstop).
     StepCameraControllers(world, step);
 }
 
 void GameplayPipeline::StepCameraControllers(
     world::World& world,
     time::SimStepView step) noexcept {
-    if (step.IsFrozen(time::TimeChannel::Camera)) {
-        return;
-    }
+    if (step.IsFrozen(time::TimeChannel::Camera)) return;
     const f32 dt = step.Dt(time::TimeChannel::Camera);
-    if (dt <= 0.0f) {
-        return;
-    }
+    if (dt <= 0.0f) return;
 
+    auto& camPool      = world.GetPool<CameraController2D>();
+    const u16 camCount = camPool.Size();
+    if (camCount == 0) return;
+
+    const auto camIds = camPool.Entities();
+    auto cams         = camPool.Components();
     const auto* __restrict worldTf = world.WorldTransforms().data();
 
-    for (auto [camId, cam] : world.View<CameraController2D>()) {
-        if (cam.primaryTarget == world::kNullEntity || !world.IsAlive(cam.primaryTarget)) {
-            continue;
-        }
+    constexpr world::ComponentMask kMotorBit  = world::MakeComponentMask<KinematicMotor2D>();
+    constexpr world::ComponentMask kMotionBit = world::MakeComponentMask<MotionStack2D>();
+    constexpr world::ComponentMask kRigCamBit = world::MakeComponentMask<world::CameraRig2D>();
 
+    const auto& motorPool  = world.GetPool<KinematicMotor2D>();
+    const auto& motionPool = world.GetPool<MotionStack2D>();
+    const auto& camRigPool = world.GetPool<world::CameraRig2D>();
+
+    bool anyCameraMoved = false;
+
+    for (u16 i = 0; i < camCount; ++i) {
+        CameraController2D& cam = cams[i];
+        if (cam.primaryTarget == world::kNullEntity || !world.IsAlive(cam.primaryTarget)) continue;
+
+        const world::EntityId camId       = camIds[i];
         world::LocalTransform2D& camLocal = world.ModifyLocalTransformByIndex(camId.index);
+        anyCameraMoved = true;
 
-        // Strip BOTH previous tick's kickOffset AND previous tick's trauma shake so noise never accumulates into baseCamX/Y
-        f32 prevShakeX = 0.0f;
-        f32 prevShakeY = 0.0f;
-        if (cam.trauma_q16 > 0) {
-            const f32 prevTrauma   = static_cast<f32>(cam.trauma_q16) * (1.0f / 65535.0f);
-            const f32 prevShakeMag = prevTrauma * prevTrauma;
-            const u64 prevTick     = step.TickIndex() > 0 ? (step.TickIndex() - 1ULL) : 0ULL;
-            prevShakeX = prevShakeMag * 0.35f * HashSignedNoise(prevTick, 1u);
-            prevShakeY = prevShakeMag * 0.35f * HashSignedNoise(prevTick, 2u);
-        }
+        f32 baseCamX = camLocal.x - cam.kickOffsetX;
+        f32 baseCamY = camLocal.y - cam.kickOffsetY;
 
-        f32 baseCamX = camLocal.x - cam.kickOffsetX - prevShakeX;
-        f32 baseCamY = camLocal.y - cam.kickOffsetY - prevShakeY;
+        const u16 priIdx                   = cam.primaryTarget.index;
+        const world::ComponentMask priMask = world.GetComponentMaskByIndex(priIdx);
+        const auto& priWt                  = worldTf[priIdx];
+        const auto flags                   = static_cast<CameraCtrlFlags>(cam.cameraFlags);
 
-        const auto& priWt = worldTf[cam.primaryTarget.index];
-        f32 targetX = priWt.x;
-        f32 targetY = priWt.y;
-
-        // 1. Horizontal Focus Box (Soft Deadzone + Hard Panic Window)
+        // 1. Branchless Horizontal Focus Box
         const f32 deadzoneW = static_cast<f32>(cam.deadzoneHalfW_q4) * (1.0f / 16.0f);
-        if (deadzoneW > 0.0f) {
-            if (std::abs(priWt.x - baseCamX) <= deadzoneW) {
-                targetX = baseCamX;
-            } else if (priWt.x > baseCamX + deadzoneW) {
-                targetX = priWt.x - deadzoneW;
-            } else {
-                targetX = priWt.x + deadzoneW;
-            }
-        }
+        f32 targetX         = std::clamp(baseCamX, priWt.x - deadzoneW, priWt.x + deadzoneW);
+        f32 targetY         = priWt.y;
 
         // 2. Ground-Latching, Airborne Vertical Deadzone & Fast-Fall Look-Down
         bool isGrounded = false;
-        f32 actorVx = 0.0f;
-        f32 actorVy = 0.0f;
-        if (const auto* motor = world.TryGet<KinematicMotor2D>(cam.primaryTarget)) {
-            isGrounded = HasContact(motor->contacts, ContactFlags::Ground);
-            actorVx    = motor->vx;
-            actorVy    = motor->vy;
-            if (isGrounded) {
-                cam.latchedGroundY = priWt.y;
-            }
+        f32 actorVx = 0.0f, actorVy = 0.0f;
+        if ((priMask & kMotorBit) != 0) {
+            const KinematicMotor2D& motor = motorPool.DirectAtEntityIndex(priIdx);
+            isGrounded = HasContact(motor.contacts, ContactFlags::Ground);
+            actorVx    = motor.vx;
+            actorVy    = motor.vy;
+            if (isGrounded) cam.latchedGroundY = priWt.y;
         }
 
-        if ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::LockVerticalAirborne)) != 0) {
+        if (HasFlag(flags, CameraCtrlFlags::LockVerticalAirborne)) {
             const f32 deadzoneH = static_cast<f32>(cam.deadzoneHalfH_q4) * (1.0f / 16.0f);
-            if (isGrounded) {
-                targetY = cam.latchedGroundY;
-            } else if (std::abs(priWt.y - cam.latchedGroundY) <= deadzoneH) {
-                targetY = cam.latchedGroundY;
-            } else if (priWt.y < cam.latchedGroundY - deadzoneH) {
-                cam.latchedGroundY = priWt.y + deadzoneH;
-                targetY = cam.latchedGroundY;
-            } else {
-                cam.latchedGroundY = priWt.y - deadzoneH;
-                targetY = cam.latchedGroundY;
-            }
-
+            cam.latchedGroundY  = std::clamp(cam.latchedGroundY, priWt.y - deadzoneH, priWt.y + deadzoneH);
+            targetY             = cam.latchedGroundY;
             if (!isGrounded && actorVy < -14.0f) {
-                const f32 fallFactor = std::min(1.0f, (-actorVy - 14.0f) * (1.0f / 12.0f));
-                targetY -= fallFactor * 2.2f;
+                targetY -= std::min(1.0f, (-actorVy - 14.0f) * (1.0f / 12.0f)) * 2.2f;
             }
         }
 
         // 3. Turn-Confirmation Filtered Lookahead
-        if (const auto* motion = world.TryGet<MotionStack2D>(cam.primaryTarget)) {
-            const i8 facing = motion->FacingSign();
-            const bool movingForward = (actorVx * static_cast<f32>(facing)) > 0.6f;
-
-            if (movingForward) {
-                if (cam.sustainedMoveTicks < 255u) {
-                    ++cam.sustainedMoveTicks;
-                }
+        if ((priMask & kMotionBit) != 0) {
+            const i8 facing = motionPool.DirectAtEntityIndex(priIdx).FacingSign();
+            if ((actorVx * static_cast<f32>(facing)) > 0.6f) {
+                cam.sustainedMoveTicks += (cam.sustainedMoveTicks < 255u);
             } else if (std::abs(actorVx) < 0.2f) {
-                if (cam.sustainedMoveTicks > 0u) {
-                    --cam.sustainedMoveTicks;
-                }
+                cam.sustainedMoveTicks -= (cam.sustainedMoveTicks > 0u);
             } else {
                 cam.sustainedMoveTicks = 0u;
             }
@@ -318,7 +290,7 @@ void GameplayPipeline::StepCameraControllers(
             f32 desiredLookX   = curLookX;
 
             if (cam.sustainedMoveTicks >= 10u) {
-                const f32 velScale = ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::VelocityLookahead)) != 0)
+                const f32 velScale = HasFlag(flags, CameraCtrlFlags::VelocityLookahead)
                     ? std::clamp(std::abs(actorVx) * (1.0f / 6.5f), 0.35f, 1.0f)
                     : 1.0f;
                 desiredLookX = static_cast<f32>(facing) * 1.65f * velScale;
@@ -345,17 +317,16 @@ void GameplayPipeline::StepCameraControllers(
         bool hasValidRoomBounds = false;
         f32 minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
 
-        if ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::ClampToRoom)) != 0 &&
+        if (HasFlag(flags, CameraCtrlFlags::ClampToRoom) &&
             cam.activeRoomBounds.halfW_q8 > 0 && cam.activeRoomBounds.halfH_q8 > 0) {
             hasValidRoomBounds = true;
 
-            // Compute half-viewport extent in world meters from attached CameraRig2D
-            f32 halfVpW = 0.0f;
-            f32 halfVpH = 0.0f;
-            if (const auto* rig = world.TryGet<world::CameraRig2D>(camId)) {
-                const f32 invZoom = 1.0f / std::max(0.01f, rig->zoom);
-                halfVpW = 0.5f * rig->viewport.w * m_invPixelsPerMeter * invZoom;
-                halfVpH = 0.5f * rig->viewport.h * m_invPixelsPerMeter * invZoom;
+            f32 halfVpW = 0.0f, halfVpH = 0.0f;
+            if ((world.GetComponentMaskByIndex(camId.index) & kRigCamBit) != 0) {
+                const world::CameraRig2D& rig = camRigPool.DirectAtEntityIndex(camId.index);
+                const f32 scale = 0.5f * m_invPixelsPerMeter / std::max(0.01f, rig.zoom);
+                halfVpW = rig.viewport.w * scale;
+                halfVpH = rig.viewport.h * scale;
             }
 
             minX = (cam.activeRoomBounds.OffsetX() - cam.activeRoomBounds.HalfW()) + halfVpW;
@@ -378,73 +349,54 @@ void GameplayPipeline::StepCameraControllers(
                 maxY = prevMaxY + (maxY - prevMaxY) * s;
             }
 
-            // If room is narrower/shorter than viewport, lock camera center to room midpoint
-            if (minX > maxX) {
-                const f32 midX = 0.5f * (minX + maxX);
-                minX = maxX = midX;
-            }
-            if (minY > maxY) {
-                const f32 midY = 0.5f * (minY + maxY);
-                minY = maxY = midY;
-            }
-
-            if ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::SoftBoundaryCushion)) != 0) {
-                targetX = SoftCushionClamp(targetX, minX, maxX, 2.0f);
-                targetY = SoftCushionClamp(targetY, minY, maxY, 1.5f);
-            } else {
-                targetX = std::clamp(targetX, minX, maxX);
-                targetY = std::clamp(targetY, minY, maxY);
-            }
+            const bool soft = HasFlag(flags, CameraCtrlFlags::SoftBoundaryCushion);
+            targetX = SoftCushionClamp(targetX, minX, maxX, soft ? 2.0f : 0.0f);
+            targetY = SoftCushionClamp(targetY, minY, maxY, soft ? 1.5f : 0.0f);
         }
 
         // 6. Step Analytic Critically-Damped Springs on Base Camera Coordinates
         const f32 freqX = std::max(0.5f, static_cast<f32>(cam.springFreqX_q4) * (1.0f / 16.0f));
         const f32 freqY = std::max(0.5f, static_cast<f32>(cam.springFreqY_q4) * (1.0f / 16.0f));
 
-        if ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::LockAxisX)) == 0) {
-            StepAnalyticCriticallyDampedSpring(baseCamX, cam.velX, targetX, freqX, dt);
-        }
-        if ((cam.cameraFlags & static_cast<u8>(CameraCtrlFlags::LockAxisY)) == 0) {
-            StepAnalyticCriticallyDampedSpring(baseCamY, cam.velY, targetY, freqY, dt);
-        }
+        if (!HasFlag(flags, CameraCtrlFlags::LockAxisX)) StepAnalyticCriticallyDampedSpring(baseCamX, cam.velX, targetX, freqX, dt);
+        if (!HasFlag(flags, CameraCtrlFlags::LockAxisY)) StepAnalyticCriticallyDampedSpring(baseCamY, cam.velY, targetY, freqY, dt);
 
         if (hasValidRoomBounds) {
-            if (baseCamX <= minX && cam.velX < 0.0f) { baseCamX = minX; cam.velX = 0.0f; }
-            if (baseCamX >= maxX && cam.velX > 0.0f) { baseCamX = maxX; cam.velX = 0.0f; }
-            if (baseCamY <= minY && cam.velY < 0.0f) { baseCamY = minY; cam.velY = 0.0f; }
-            if (baseCamY >= maxY && cam.velY > 0.0f) { baseCamY = maxY; cam.velY = 0.0f; }
+            if (minX > maxX) minX = maxX = 0.5f * (minX + maxX);
+            if (minY > maxY) minY = maxY = 0.5f * (minY + maxY);
+            if ((baseCamX <= minX && cam.velX < 0.0f) || (baseCamX >= maxX && cam.velX > 0.0f)) cam.velX = 0.0f;
+            if ((baseCamY <= minY && cam.velY < 0.0f) || (baseCamY >= maxY && cam.velY > 0.0f)) cam.velY = 0.0f;
+            baseCamX = std::clamp(baseCamX, minX, maxX);
+            baseCamY = std::clamp(baseCamY, minY, maxY);
         }
 
-        // 7. Directional combat hit-kick spring recovery
-        f32 kickVx = static_cast<f32>(cam.kickVelX_q8) * (1.0f / 256.0f);
-        f32 kickVy = static_cast<f32>(cam.kickVelY_q8) * (1.0f / 256.0f);
-        StepAnalyticCriticallyDampedSpring(cam.kickOffsetX, kickVx, 0.0f, 12.0f, dt);
-        StepAnalyticCriticallyDampedSpring(cam.kickOffsetY, kickVy, 0.0f, 12.0f, dt);
-        cam.kickVelX_q8 = static_cast<i16>(std::clamp(kickVx * 256.0f, -32767.0f, 32767.0f));
-        cam.kickVelY_q8 = static_cast<i16>(std::clamp(kickVy * 256.0f, -32767.0f, 32767.0f));
-
-        // 8. Decay trauma & compute current tick's deterministic hash-noise shake
-        f32 shakeX   = 0.0f;
-        f32 shakeY   = 0.0f;
-        f32 shakeRot = 0.0f;
+        // 7. Decay trauma & step unified 2nd-order kick + trauma displacement spring
+        f32 shakeTargetX = 0.0f, shakeTargetY = 0.0f;
         if (cam.trauma_q16 > 0) {
             const u32 decay = static_cast<u32>(dt * 1.8f * 65535.0f);
-            cam.trauma_q16 = (cam.trauma_q16 > decay)
-                ? static_cast<u16>(cam.trauma_q16 - decay)
-                : u16{0};
+            cam.trauma_q16  = (cam.trauma_q16 > decay) ? static_cast<u16>(cam.trauma_q16 - decay) : u16{0};
 
             if (cam.trauma_q16 > 0) {
                 const f32 trauma   = static_cast<f32>(cam.trauma_q16) * (1.0f / 65535.0f);
-                const f32 shakeMag = trauma * trauma;
-                shakeX   = shakeMag * 0.35f * HashSignedNoise(step.TickIndex(), 1u);
-                shakeY   = shakeMag * 0.35f * HashSignedNoise(step.TickIndex(), 2u);
-                shakeRot = shakeMag * 0.025f * HashSignedNoise(step.TickIndex(), 3u);
+                const f32 shakeMag = trauma * trauma * 0.35f;
+                shakeTargetX = shakeMag * HashSignedNoise(step.TickIndex(), 1u);
+                shakeTargetY = shakeMag * HashSignedNoise(step.TickIndex(), 2u);
             }
         }
 
-        camLocal.x           = baseCamX + cam.kickOffsetX + shakeX;
-        camLocal.y           = baseCamY + cam.kickOffsetY + shakeY;
-        camLocal.rotationRad = shakeRot;
+        f32 kickVx = static_cast<f32>(cam.kickVelX_q8) * (1.0f / 256.0f);
+        f32 kickVy = static_cast<f32>(cam.kickVelY_q8) * (1.0f / 256.0f);
+        StepAnalyticCriticallyDampedSpring(cam.kickOffsetX, kickVx, shakeTargetX, 14.0f, dt);
+        StepAnalyticCriticallyDampedSpring(cam.kickOffsetY, kickVy, shakeTargetY, 14.0f, dt);
+        cam.kickVelX_q8 = static_cast<i16>(std::clamp(kickVx * 256.0f, -32767.0f, 32767.0f));
+        cam.kickVelY_q8 = static_cast<i16>(std::clamp(kickVy * 256.0f, -32767.0f, 32767.0f));
+
+        camLocal.x = baseCamX + cam.kickOffsetX;
+        camLocal.y = baseCamY + cam.kickOffsetY;
+    }
+
+    if (anyCameraMoved) {
+        world.PropagateTransforms();
     }
 }
 
@@ -455,13 +407,24 @@ u64 GameplayPipeline::ComputeAuditHash(const world::World& world) const noexcept
         hash *= 0x100000001B3ULL;
     };
 
-    for (u64 word : m_worldFlags) {
-        mixU64(word);
+    mixU64(m_activeFlagWordsMask);
+    for (u64 m = m_activeFlagWordsMask; m != 0ULL; m &= (m - 1ULL)) {
+        const u32 w = static_cast<u32>(std::countr_zero(m));
+        mixU64((static_cast<u64>(w) << 32u) ^ m_worldFlags[w]);
     }
     mixU64(m_cueCount);
     for (u32 i = 0; i < m_cueCount; ++i) {
-        mixU64(m_cueBuffer[i].assetId.value);
-        mixU64(static_cast<u64>(m_cueBuffer[i].kind));
+        const SimCue& c = m_cueBuffer[i];
+        mixU64(c.assetId.value);
+        mixU64((static_cast<u64>(CanonicalFloatBits(c.worldX)) << 32u) |
+               static_cast<u64>(CanonicalFloatBits(c.worldY)));
+        mixU64((static_cast<u64>(c.emitter.generation) << 48u) |
+               (static_cast<u64>(c.emitter.index) << 32u) |
+               (static_cast<u64>(c.magnitude_q16) << 16u) |
+               static_cast<u64>(c.durationTicks));
+        mixU64((static_cast<u64>(c.userTag) << 16u) |
+               (static_cast<u64>(c.channel) << 8u) |
+               static_cast<u64>(c.kind));
     }
     return hash;
 }

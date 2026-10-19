@@ -2,12 +2,12 @@
 
 #include "core/Result.h"
 #include "core/Types.h"
-#include "core/time/TimeViews.h"
+#include "core/time/TimeModulator.h"
 #include "input/InputTypes.h"
-#include "platform/PlatformTypes.h"
 #include "renderer/RendererTypes.h"
 #include "world/WorldTypes.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <span>
@@ -34,8 +34,8 @@ inline constexpr u32 kDebugAtlasWidth  = 128;
 inline constexpr u32 kDebugAtlasHeight = 64;
 
 // The solid white 8x8 block occupies pixel region [120..127, 56..63] in the 128x64 debug atlas.
-// Sampling its center at (124.0 / 128.0, 60.0 / 64.0) with zero UV span enables untextured
-// geometry and monospace text to share a single TextureHandle and skip radix sort passes in O(1).
+// Sampling its center at (124.0 / 128.0, 60.0 / 64.0) with zero UV span lets untextured
+// geometry and monospace text share a single TextureHandle and bypass radix sorting in O(1).
 inline constexpr renderer::FRect kSolidWhiteUv{
     124.0f / static_cast<f32>(kDebugAtlasWidth),
     60.0f / static_cast<f32>(kDebugAtlasHeight),
@@ -86,6 +86,9 @@ enum class OverlayFlags : u32 {
 [[nodiscard]] constexpr OverlayFlags operator~(OverlayFlags a) noexcept {
     return static_cast<OverlayFlags>(~static_cast<u32>(a));
 }
+constexpr OverlayFlags& operator|=(OverlayFlags& a, OverlayFlags b) noexcept { return a = a | b; }
+constexpr OverlayFlags& operator&=(OverlayFlags& a, OverlayFlags b) noexcept { return a = a & b; }
+constexpr OverlayFlags& operator^=(OverlayFlags& a, OverlayFlags b) noexcept { return a = a ^ b; }
 [[nodiscard]] constexpr bool HasOverlay(OverlayFlags mask, OverlayFlags bit) noexcept {
     return (static_cast<u32>(mask) & static_cast<u32>(bit)) != 0;
 }
@@ -110,13 +113,23 @@ struct alignas(8) DebugLoopDirectives {
 };
 static_assert(sizeof(DebugLoopDirectives) == 8);
 
+// 16-byte spatial audio emitter view matching audio::AudioEmitterView without audio/ header coupling.
+struct alignas(16) DebugAudioEmitter {
+    f32 worldX{0.0f};
+    f32 worldY{0.0f};
+    f32 maxDist{0.0f};
+    f32 occlusionFactor{1.0f};
+};
+static_assert(sizeof(DebugAudioEmitter) == 16);
+
 // Unified read-only per-frame context for DebugSystem::BeginFrame() and DebugSystem::EmitOverlays().
-// Eliminates cross-subsystem references to AudioSystem, AssetBank, and GameplayPipeline.
+// Eliminates cross-subsystem references to AudioSystem, AssetBank, Platform, and GameplayPipeline.
 struct DebugFrameContext {
     const world::World& world;
     time::RenderTimeView timeView{};
     const input::FrameInput& frameInput;
-    platform::Extent2i viewportSize{};
+    renderer::ViewportExtent viewportSize{};
+    std::span<const DebugAudioEmitter> audioEmitters{};
     bool isPaused{false};
 };
 
@@ -189,10 +202,10 @@ enum class ProfileScopeId : u8 {
 };
 inline constexpr usize kProfileScopeCount = static_cast<usize>(ProfileScopeId::Count);
 
-// Compact 128-byte (2 cache lines) per-frame telemetry snapshot.
+// Exact 64-byte (1 cache line, zero padding) per-frame telemetry snapshot.
 struct alignas(64) FrameProfileSample {
-    u64 frameIndex{0};
-    u64 simTickIndex{0};
+    u32 frameIndex{0};
+    u32 simTickIndex{0};
     std::array<u16, kProfileScopeCount> scopeUs{};
     u16 aliveEntities{0};
     u16 submittedQuads{0};
@@ -200,19 +213,16 @@ struct alignas(64) FrameProfileSample {
     u16 drawBatches{0};
     std::array<u16, 8> channelScaleQ8{};
     u16 audioCpuPermille{0};
-    u16 audioPeakL_Q10{0};
-    u16 audioPeakR_Q10{0};
     u8  catchupTicks{0};
     u8  activePhysVoices{0};
     u8  activeVirtVoices{0};
     u8  frozenChannelMask{0};
     u8  audioUnderruns{0};
     u8  radixPassesExecuted{0};
-    std::array<u8, 10> reserved{};
 };
-static_assert(sizeof(FrameProfileSample) == 128);
+static_assert(sizeof(FrameProfileSample) == 64);
 
-// 64-byte (1 cache line) per-tick flight recorder snapshot for frame-by-frame hitbox/input scrubbing.
+// Exact 64-byte (1 cache line, zero padding) per-tick flight recorder snapshot for hitbox/input scrubbing.
 struct alignas(64) ActorTickRecord {
     u32 tickIndex{0};
     world::EntityId entityId{world::kNullEntity};
@@ -285,9 +295,7 @@ inline constexpr std::array<u64, 96> kEmbeddedFont8x8 = {
 };
 
 constexpr void UnpackDebugAtlasRGBA8(std::span<u8, kDebugAtlasWidth * kDebugAtlasHeight * 4> outPixels) noexcept {
-    for (u8& b : outPixels) {
-        b = 0;
-    }
+    std::fill(outPixels.begin(), outPixels.end(), u8{0});
 
     auto setWhitePixel = [&](usize pixelIdx) noexcept {
         const usize byteIdx = pixelIdx * 4u;

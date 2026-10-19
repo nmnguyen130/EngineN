@@ -8,20 +8,20 @@
 #include <array>
 #include <span>
 
+namespace en::assets { class AssetBank; }
+
 namespace en::audio {
 
-inline constexpr u32 kSampleRate        = 48000;
-inline constexpr u32 kMixBlockFrames    = 256;
-inline constexpr u32 kMaxVoices         = 64;
-inline constexpr u32 kStealPoolSlots    = 16;
-inline constexpr u32 kMaxVirtualVoices  = 128;
-inline constexpr u32 kMaxSoundCues      = 512;
-inline constexpr u32 kCueHashTableSize  = 1024;
-inline constexpr u32 kMaxMusicTracks    = 32;
-inline constexpr u32 kMaxMusicStems     = 4;
-inline constexpr u32 kCommandRingSize   = 256;
-inline constexpr u32 kCookedAudioMagic  = 0x44554145u; // 'EAUD'
-inline constexpr u32 kNullEmitter       = 0xFFFFFFFFu;
+inline constexpr u32 kSampleRate       = 48000;
+inline constexpr u32 kMixBlockFrames   = 256;
+inline constexpr u32 kMaxVoices        = 64;
+inline constexpr u32 kMaxSoundCues     = 512;
+inline constexpr u32 kCueHashTableSize = 1024;
+inline constexpr u32 kMaxMusicTracks   = 32;
+inline constexpr u32 kMaxMusicStems    = 4;
+inline constexpr u32 kCommandRingSize  = 256;
+inline constexpr u32 kCookedAudioMagic = 0x44554145u; // 'EAUD'
+inline constexpr u32 kNullEmitter      = 0xFFFFFFFFu;
 
 enum class AudioErrc : u8 {
     InvalidConfig = 0,
@@ -63,8 +63,7 @@ enum class AttenuationCurve : u8 {
 enum class StealPolicy : u8 {
     Reject = 0,
     StealOldest,
-    StealQuietest,
-    Virtualize
+    StealQuietest
 };
 
 enum class VoiceFlags : u8 {
@@ -85,15 +84,16 @@ enum class VoiceFlags : u8 {
     return (static_cast<u8>(val) & static_cast<u8>(mask)) != 0;
 }
 
-struct VoiceHandle {
+struct alignas(4) VoiceHandle {
     u16 index{0};
     u16 generation{0};
 
     [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0; }
     constexpr bool operator==(const VoiceHandle&) const noexcept = default;
 };
+static_assert(sizeof(VoiceHandle) == 4);
 
-struct SoundCueId {
+struct alignas(4) SoundCueId {
     u32 value{0};
 
     [[nodiscard]] static constexpr SoundCueId FromAssetId(assets::AssetId id) noexcept {
@@ -102,6 +102,7 @@ struct SoundCueId {
 
     constexpr bool operator==(const SoundCueId&) const noexcept = default;
 };
+static_assert(sizeof(SoundCueId) == 4);
 
 // Branchless exact-center constant-power stereo panner on panNorm in [-1, 1] (<0.09 dB power error).
 // Preserves exact -3.0103 dB (0.70710678) at center (panNorm = 0) and unit power at hard L/R extremes.
@@ -148,9 +149,12 @@ struct AudioUpdateDesc {
     f32 listenerX{0.0f};
     f32 listenerY{0.0f};
     std::span<const f32> channelScales{};
-    u8 frozenChannelMask{0};
+    std::span<const AudioTriggerReq> triggers{};
+    const assets::AssetBank* assetBank{nullptr};
     AudioOcclusionQueryFn occlusionQuery{nullptr};
     const void* occlusionUserCtx{nullptr};
+    u8 frozenChannelMask{0};
+    i8 focusMuteOverride{-1}; // -1 = preserve current, 0 = unmuted, 1 = muted
 };
 
 // Cooked 32-byte acoustic definition (2 records per 64B cache line, zero padding).
@@ -211,7 +215,7 @@ struct alignas(16) CookedAudioBankHeader {
     u16 version{1};
     u16 cueCount{0};
     u16 musicTrackCount{0};
-    u16 reserved{0};
+    u16 buildFlags{0};
     u32 contentHash{0};
 };
 static_assert(sizeof(CookedAudioBankHeader) == 16);
@@ -221,43 +225,40 @@ enum class AudioCmdType : u8 {
     StopVoice,
     BindMusicStem,
     CommitMusicDeck,
-    TriggerStinger,
     PanicReset
 };
 
 // Exact 32-byte discrete lifecycle command passed via the SPSC ring buffer.
 // Continuous spatial, filter, and timescale updates use the triple-buffered AudioFrameSnapshot.
 struct alignas(32) AudioCommand {
-    AudioCmdType type{AudioCmdType::SpawnVoice};     // 1B  [0..1)
-    u8  packedBusAndChannel{0};                      // 1B  [1..2) [2:0]=AudioBusId, [5:3]=TimeChannel
-    u16 voiceSlot{0};                                // 2B  [2..4) physical slot [0..63]
-    u16 generation{0};                               // 2B  [4..6) handle generation
-    u8  flags{0};                                    // 1B  [6..7) VoiceFlags bitmask
-    u8  assetScopeId{0};                             // 1B  [7..8) ScopeId [0..31]
+    AudioCmdType type{AudioCmdType::SpawnVoice}; // 1B [0..1)
+    u8  packedBusAndChannel{0};                  // 1B [1..2) [2:0]=AudioBusId, [5:3]=TimeChannel
+    u16 voiceSlot{0};                            // 2B [2..4) physical slot [0..63]
+    u16 generation{0};                           // 2B [4..6) handle generation
+    u8  flags{0};                                // 1B [6..7) VoiceFlags bitmask
+    u8  assetScopeId{0};                         // 1B [7..8) ScopeId [0..31]
 
     union Payload {
         struct Spawn {
-            const i16* pcm;                          // 8B  [8..16)
-            u32 frameCount;                          // 4B  [16..20)
-            u32 loopStartFrame;                      // 4B  [20..24)
-            u16 sampleRate;                          // 2B  [24..26)
-            u16 gainL_Q14;                           // 2B  [26..28)
-            u16 gainR_Q14;                           // 2B  [28..30)
-            u16 pitchRatioQ12;                       // 2B  [30..32) 4096 == 1.0x
+            const i16* pcm;                      // 8B [8..16)
+            u32 frameCount;                      // 4B [16..20)
+            u32 loopStartFrame;                  // 4B [20..24)
+            u16 sampleRate;                      // 2B [24..26)
+            u16 gainL_Q14;                       // 2B [26..28)
+            u16 gainR_Q14;                       // 2B [28..30)
+            u16 pitchRatioQ12;                   // 2B [30..32) 4096 == 1.0x
         } spawn;
         struct Stop {
-            u16 fadeOutBlocks;                       // 2B  [8..10)
-            u8  stealPoolIdx;                        // 1B  [10..11) [0..15] or 0xFF
-            u8  pad[21];                             // 21B [11..32)
+            u16 fadeOutBlocks;                   // 2B [8..10)
         } stop;
         struct MusicStem {
-            const i16* pcm;                          // 8B  [8..16)
-            u32 frameCount;                          // 4B  [16..20)
-            u32 loopStartFrame;                      // 4B  [20..24)
-            u32 loopEndFrame;                        // 4B  [24..28)
-            u16 tempoBpmQ8;                          // 2B  [28..30)
-            u8  deckAndStemIdx;                      // 1B  [30..31) [7]=Deck B/A, [1:0]=stemIdx 0..3
-            u8  crossfadeBlocks;                     // 1B  [31..32)
+            const i16* pcm;                      // 8B [8..16)
+            u32 frameCount;                      // 4B [16..20)
+            u32 loopStartFrame;                  // 4B [20..24)
+            u32 loopEndFrame;                    // 4B [24..28)
+            u16 tempoBpmQ8;                      // 2B [28..30)
+            u8  deckAndStemIdx;                  // 1B [30..31) [7]=Deck B/A, [6]=resetDeck, [1:0]=stemIdx
+            u8  crossfadeBlocks;                 // 1B [31..32)
         } music;
     } payload{};
     static_assert(sizeof(Payload) == 24);
@@ -283,14 +284,14 @@ struct alignas(64) AudioFrameSnapshot {
 static_assert(sizeof(AudioFrameSnapshot) == 576);
 
 struct alignas(32) AudioTelemetrySnapshot {
-    u64 activeVoiceMask{0};             // 8B [0..8)   Bit i == 1 if physical voice i is active
-    u32 activeScopePinMask{0};          // 4B [8..12)  Bit s == 1 if any active voice reads ScopeId s
-    u32 stolenVoicesTotal{0};           // 4B [12..16)
-    f32 masterPeakL{0.0f};              // 4B [16..20)
-    f32 masterPeakR{0.0f};              // 4B [20..24)
-    f32 callbackCpuLoadRatio{0.0f};     // 4B [24..28)
-    u16 activeVirtualVoices{0};         // 2B [28..30)
-    u16 underrunCount{0};               // 2B [30..32)
+    u64 activeVoiceMask{0};         // 8B [0..8)   Bit i == 1 if physical voice i is active
+    u32 activeScopePinMask{0};      // 4B [8..12)  Bit s == 1 if any active voice/deck reads ScopeId s
+    u32 stolenVoicesTotal{0};       // 4B [12..16)
+    f32 masterPeakL{0.0f};          // 4B [16..20)
+    f32 masterPeakR{0.0f};          // 4B [20..24)
+    f32 callbackCpuLoadRatio{0.0f}; // 4B [24..28)
+    u16 activeVirtualVoices{0};     // 2B [28..30)
+    u16 underrunCount{0};           // 2B [30..32)
 };
 static_assert(sizeof(AudioTelemetrySnapshot) == 32);
 

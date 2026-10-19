@@ -25,7 +25,7 @@ enum class WorldErrc : u8 {
     CorruptedPrefabBlob,
 };
 
-struct EntityId {
+struct alignas(4) EntityId {
     u16 index{0};
     u16 generation{0};
 
@@ -34,6 +34,7 @@ struct EntityId {
     }
     constexpr bool operator==(const EntityId&) const noexcept = default;
 };
+static_assert(sizeof(EntityId) == 4);
 
 inline constexpr EntityId kNullEntity{0, 0};
 inline constexpr u16 kInvalidDenseIndex = 0xFFFF;
@@ -41,28 +42,6 @@ inline constexpr u8 kMaxComponentTypes  = 64;
 inline constexpr u8 kMaxHierarchyDepth  = 32;
 
 using ComponentMask = u64;
-
-enum class EntityFlags : u8 {
-    None          = 0,
-    Alive         = 1 << 0,
-    Enabled       = 1 << 1,
-    Spatial       = 1 << 2,
-    StaticSpatial = 1 << 3,
-    Teleported    = 1 << 4,
-};
-
-[[nodiscard]] constexpr EntityFlags operator|(EntityFlags a, EntityFlags b) noexcept {
-    return static_cast<EntityFlags>(static_cast<u8>(a) | static_cast<u8>(b));
-}
-[[nodiscard]] constexpr EntityFlags operator&(EntityFlags a, EntityFlags b) noexcept {
-    return static_cast<EntityFlags>(static_cast<u8>(a) & static_cast<u8>(b));
-}
-[[nodiscard]] constexpr EntityFlags operator~(EntityFlags a) noexcept {
-    return static_cast<EntityFlags>(~static_cast<u8>(a));
-}
-[[nodiscard]] constexpr bool HasFlag(EntityFlags flags, EntityFlags test) noexcept {
-    return (static_cast<u8>(flags) & static_cast<u8>(test)) != 0;
-}
 
 template <typename T>
 concept Component =
@@ -95,19 +74,6 @@ struct LocalTransform2D {
 };
 static_assert(sizeof(LocalTransform2D) == 24);
 
-// 32B cache-aligned world spatial state (2 per 64B cache line).
-struct alignas(32) WorldTransform2D {
-    f32 x{0.0f};
-    f32 y{0.0f};
-    f32 scaleX{1.0f};
-    f32 scaleY{1.0f};
-    f32 cosRot{1.0f};
-    f32 sinRot{0.0f};
-    f32 worldRotRad{0.0f};
-    f32 worldDepth{0.0f};
-};
-static_assert(sizeof(WorldTransform2D) == 32);
-
 // 24B previous-tick world snapshot for per-channel render interpolation.
 struct PrevWorldSnapshot2D {
     f32 x{0.0f};
@@ -118,6 +84,31 @@ struct PrevWorldSnapshot2D {
     f32 worldDepth{0.0f};
 };
 static_assert(sizeof(PrevWorldSnapshot2D) == 24);
+
+// 32B cache-aligned world spatial state (2 per 64B cache line).
+// Leading 24B matches PrevWorldSnapshot2D layout for contiguous snapshot copies.
+struct alignas(32) WorldTransform2D {
+    f32 x{0.0f};
+    f32 y{0.0f};
+    f32 scaleX{1.0f};
+    f32 scaleY{1.0f};
+    f32 worldRotRad{0.0f};
+    f32 worldDepth{0.0f};
+    f32 cosRot{1.0f};
+    f32 sinRot{0.0f};
+
+    [[nodiscard]] constexpr PrevWorldSnapshot2D ToSnapshot() const noexcept {
+        return PrevWorldSnapshot2D{
+            .x           = x,
+            .y           = y,
+            .scaleX      = scaleX,
+            .scaleY      = scaleY,
+            .worldRotRad = worldRotRad,
+            .worldDepth  = worldDepth,
+        };
+    }
+};
+static_assert(sizeof(WorldTransform2D) == 32);
 
 // 16B linear & angular velocity integrated at 120 Hz for non-colliding ambient entities.
 struct alignas(16) Velocity2D {
@@ -155,7 +146,6 @@ struct alignas(32) Sprite2D {
 static_assert(sizeof(Sprite2D) == 32);
 
 // 16B Q8.8 fixed-point 120 Hz atlas frame animator (4 per 64B cache line).
-// Stepped exclusively by gameplay::AnimationSubsystem in lockstep with Sprite2D.
 struct alignas(16) SpriteAnimator2D {
     static constexpr u8 kTypeId = 3;
     static constexpr u16 kSubTicksPerTick = 256;
@@ -195,9 +185,11 @@ struct EntitySpawnDesc {
 
 struct WorldConfig {
     u16 maxEntities{16384};
-    u32 commandBufferBytes{262144};
     u16 defaultComponentPoolCapacity{4096};
+    u32 commandBufferBytes{262144};
+    u32 arenaBytes{4u * 1024u * 1024u};
 };
+static_assert(sizeof(WorldConfig) == 12);
 
 [[nodiscard]] constexpr f32 NormalizeAngleRad(f32 rad) noexcept {
     constexpr f32 kTwoPi    = 6.2831853071795864769f;

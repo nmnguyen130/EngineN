@@ -4,6 +4,7 @@
 #include "debug/DebugInspector.h"
 #include "debug/DebugProfilerAndConsole.h"
 #include "debug/DebugTypes.h"
+#include "platform/PlatformTypes.h"
 
 #include <utility>
 
@@ -17,12 +18,16 @@ struct DebugSystemConfig {
     u16 toggleConsoleScancode{53}; // SDL_SCANCODE_GRAVE (`~`)
 };
 
-// Move-only RAII coordinator owning the single 192 KB debug arena and 128x64 unified debug atlas.
+// Move-only RAII coordinator owning the single 116 KB debug arena and 128x64 unified debug atlas.
 // Compiles down to a stateless no-op struct when EN_ENABLE_DEBUG_TOOLS == 0; stores zero subsystem pointers.
-// Invariant: Zero heap allocations occur after Init().
-class DebugSystem {
+// Invariant: Zero heap allocations occur after Init(); Cache Line 0 holds hot per-frame dispatch state and DebugInspector.
+class
+#if EN_ENABLE_DEBUG_TOOLS
+alignas(64)
+#endif
+DebugSystem {
 public:
-    static constexpr usize kArenaSizeBytes = 192 * 1024;
+    static constexpr usize kArenaSizeBytes = 116 * 1024;
 
     DebugSystem() noexcept = default;
     ~DebugSystem() noexcept { Shutdown(); }
@@ -48,9 +53,7 @@ public:
 
     bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl) noexcept;
     bool OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl,
-                            input::InputPipeline&) noexcept {
-        return OnPlatformKeyEvent(scancode, down, shift, ctrl);
-    }
+                            input::InputPipeline& input) noexcept;
     bool OnPlatformTextInput(std::string_view textUtf8) noexcept;
 
     [[nodiscard]] DebugLoopDirectives BeginFrame(const DebugBeginFrameContext& ctx) noexcept {
@@ -61,8 +64,7 @@ public:
 
         if (ctx.isPaused || HasOverlay(m_overlays, OverlayFlags::EntityInspector)) {
             if ((ctx.frameInput.pressed & 1u) != 0 && !m_console.IsOpen()) {
-                m_inspector.PickEntityAtScreenPos(ctx.world, ctx.timeView,
-                                                  ctx.frameInput.mousePos, ctx.viewportSize);
+                m_inspector.PickEntityAtScreenPos(ctx.world, ctx.frameInput.mousePos, ctx.viewportSize);
             }
         }
 
@@ -100,7 +102,7 @@ public:
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 #else
     [[nodiscard]] constexpr Result<void, DebugErrc> Init(
-        renderer::Renderer&, const DebugSystemConfig& = {}) noexcept { return Ok; }
+        renderer::Renderer&, const DebugSystemConfig& = {}) noexcept { return {}; }
     constexpr void Shutdown(renderer::Renderer* = nullptr) noexcept {}
     [[nodiscard]] constexpr platform::EventCapture GetEventCapture() const noexcept {
         return platform::EventCapture::None;
@@ -123,11 +125,12 @@ private:
     u8* m_arenaSlab{nullptr};
     renderer::TextureHandle m_debugAtlas{};
     OverlayFlags m_overlays{OverlayFlags::None};
-    u16 m_toggleConsoleScancode{53};
     DebugLoopDirectives m_pendingDirectives{};
+    u16 m_toggleConsoleScancode{53};
+    u16 m_savedActionMask{0xFFFFu};
+    DebugInspector m_inspector{};
 
     DebugShapePool m_shapePool{};
-    DebugInspector m_inspector{};
     DebugProfiler  m_profiler{};
     DebugConsole   m_console{};
 #endif

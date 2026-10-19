@@ -46,7 +46,7 @@ public:
     static void Extract(
         const World& world,
         const assets::AssetBank& assetBank,
-        time::RenderTimeView timeView,
+        const time::RenderTimeView& timeView,
         renderer::RenderList& outRenderList) noexcept;
 
     [[nodiscard]] static Result<EntityId, WorldErrc> InstantiatePrefab(

@@ -27,9 +27,26 @@ inline constexpr std::array<std::string_view, 8> kChannelNames{{
     "World", "Player", "Enemy", "Proj", "Vfx", "Camera", "Ui", "Custom"
 }};
 
+inline constexpr FrameProfileSample kEmptyProfileSample{};
+
 [[nodiscard]] constexpr u32 QuantizeFrameBucket(u16 frameTotalUs) noexcept {
     // 256 us per bucket (>> 8), covering 0..16.38 ms across 64 buckets.
     return std::min<u32>(static_cast<u32>(frameTotalUs) >> 8u, 63u);
+}
+
+// Packs length in byte 127 and null-terminates so each 128B LineBuffer needs zero side-table length arrays.
+void PackLineBuffer(DebugConsole::LineBuffer& dst, std::string_view sv) noexcept {
+    const u8 len = static_cast<u8>(std::min<usize>(sv.size(), DebugConsole::kMaxLineChars - 2));
+    if (len > 0) {
+        std::memcpy(dst.data(), sv.data(), len);
+    }
+    dst[len] = '\0';
+    dst[DebugConsole::kMaxLineChars - 1] = static_cast<char>(len);
+}
+
+[[nodiscard]] constexpr std::string_view UnpackLineBuffer(const DebugConsole::LineBuffer& src) noexcept {
+    const u8 len = static_cast<u8>(src[DebugConsole::kMaxLineChars - 1]);
+    return {src.data(), std::min<usize>(len, DebugConsole::kMaxLineChars - 2)};
 }
 
 } // namespace
@@ -40,9 +57,6 @@ void DebugProfiler::BindArena(std::span<FrameProfileSample, kHistoryFrames> samp
 }
 
 void DebugProfiler::Clear() noexcept {
-    for (FrameProfileSample& s : m_samples) {
-        s = FrameProfileSample{};
-    }
     m_buckets.fill(0);
     m_activeBucketMask = 0;
     m_currentIdx       = 0;
@@ -66,8 +80,8 @@ void DebugProfiler::BeginFrame(u64 frameIndex, u64 simTickIndex) noexcept {
 
     FrameProfileSample& cur = m_samples[m_currentIdx];
     cur              = FrameProfileSample{};
-    cur.frameIndex   = frameIndex;
-    cur.simTickIndex = simTickIndex;
+    cur.frameIndex   = static_cast<u32>(frameIndex);
+    cur.simTickIndex = static_cast<u32>(simTickIndex);
     cur.channelScaleQ8.fill(256);
 }
 
@@ -97,8 +111,6 @@ void DebugProfiler::RecordSubsystemTelemetry(const SubsystemTelemetryDesc& desc)
     s.activeVirtVoices    = desc.activeVirtVoices;
     s.audioUnderruns      = desc.audioUnderruns;
     s.audioCpuPermille    = static_cast<u16>(std::clamp(desc.audioCpuLoadRatio * 1000.0f, 0.0f, 65535.0f));
-    s.audioPeakL_Q10      = static_cast<u16>(std::clamp(desc.audioPeakL * 1024.0f, 0.0f, 65535.0f));
-    s.audioPeakR_Q10      = static_cast<u16>(std::clamp(desc.audioPeakR * 1024.0f, 0.0f, 65535.0f));
 
     const usize count = std::min<usize>(desc.channelScales.size(), 8u);
     for (usize i = 0; i < count; ++i) {
@@ -117,6 +129,10 @@ void DebugProfiler::EndFrame() noexcept {
     if (m_validFrames < kHistoryFrames) {
         ++m_validFrames;
     }
+}
+
+const FrameProfileSample& DebugProfiler::Latest() const noexcept {
+    return m_samples.empty() ? kEmptyProfileSample : m_samples[m_currentIdx];
 }
 
 u32 DebugProfiler::ComputePercentileUs(u32 targetRankOutOf256) const noexcept {
@@ -139,7 +155,7 @@ u32 DebugProfiler::ComputePercentileUs(u32 targetRankOutOf256) const noexcept {
 }
 
 void DebugProfiler::EmitProfilerAndTimeHud(OverlayFlags flags,
-                                           platform::Extent2i,
+                                           renderer::ViewportExtent,
                                            DebugBatcher& hudBatcher) const noexcept {
     if (m_samples.empty()) {
         return;
@@ -189,9 +205,9 @@ void DebugProfiler::EmitProfilerAndTimeHud(OverlayFlags flags,
 
         const u32 count = std::min<u32>(m_validFrames, 256u);
         for (u32 i = 0; i < count; ++i) {
-            const u32 idx   = (m_currentIdx + kHistoryFrames - i) & static_cast<u32>(kHistoryFrames - 1);
-            const f32 ms    = static_cast<f32>(m_samples[idx].scopeUs[0]) * 0.001f;
-            const f32 barH  = std::clamp(ms * 3.5f, 1.0f, graphH);
+            const u32 idx  = (m_currentIdx + kHistoryFrames - i) & static_cast<u32>(kHistoryFrames - 1);
+            const f32 ms   = static_cast<f32>(m_samples[idx].scopeUs[0]) * 0.001f;
+            const f32 barH = std::clamp(ms * 3.5f, 1.0f, graphH);
             const renderer::Color col = (ms > 16.67f)
                 ? renderer::Color::FromRGBA8(0xFF4444FFu)
                 : (ms > 8.33f ? renderer::Color::FromRGBA8(0xFFCC33FFu)
@@ -302,7 +318,7 @@ Result<bool, DebugErrc> ConsoleArgs::GetBool(usize idx) const noexcept {
 void DebugConsole::BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
                              std::span<LogEntryMeta, kMaxLogEntries> logMeta,
                              std::span<char, kLogTextBytes> logText,
-                             std::span<std::array<char, kMaxLineChars>, kMaxHistory> historyBuf) noexcept {
+                             std::span<LineBuffer, kMaxHistory> historyBuf) noexcept {
     m_symbols = symbolTable;
     m_logMeta = logMeta;
     m_logText = logText;
@@ -311,9 +327,7 @@ void DebugConsole::BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
     for (ConsoleSymbol& sym : m_symbols) {
         sym = ConsoleSymbol{};
     }
-    for (auto& h : m_history) {
-        h.fill('\0');
-    }
+    m_symbolHash       = 0;
     m_pendingCount     = 0;
     m_inputLen         = 0;
     m_cursorPos        = 0;
@@ -325,34 +339,32 @@ void DebugConsole::BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
 }
 
 void DebugConsole::ClearLog() noexcept {
-    for (LogEntryMeta& meta : m_logMeta) {
-        meta = LogEntryMeta{};
-    }
-    if (!m_logText.empty()) {
-        std::memset(m_logText.data(), 0, m_logText.size());
-    }
     m_textWriteCursor = 0;
     m_logWriteIdx     = 0;
     m_logCount        = 0;
     m_scrollOffset    = 0;
 }
 
-Result<ConsoleSymbol*, DebugErrc> DebugConsole::InsertSymbolSlot(std::string_view staticName) noexcept {
+Result<ConsoleSymbol*, DebugErrc> DebugConsole::InsertSymbolSlot(
+    std::string_view staticName, SymbolKind kind, void* targetPtr) noexcept {
     if (staticName.empty() || staticName.size() > 255 || m_symbols.empty()) {
         return Err(DebugErrc::InvalidArguments);
     }
-    const u32 hash  = HashSymbolName(staticName);
-    u32 slot        = (hash * 2654435769u) >> 24u;
+    const u32 hash = HashSymbolName(staticName);
+    u32 slot       = (hash * 2654435769u) >> 24u;
     for (usize i = 0; i < kMaxSymbols; ++i) {
         ConsoleSymbol& sym = m_symbols[slot];
         if (sym.kind == SymbolKind::Empty) {
-            sym.nameHash = hash;
-            sym.nameLen  = static_cast<u8>(staticName.size());
-            sym.namePtr  = staticName.data();
+            sym.nameHash  = hash;
+            sym.kind      = kind;
+            sym.nameLen   = static_cast<u8>(staticName.size());
+            sym.namePtr   = staticName.data();
+            sym.targetPtr = targetPtr;
+            m_symbolHash ^= MixAuditHash(0x594B017AB1E01ull ^ slot,
+                                         (static_cast<u64>(hash) << 8) | static_cast<u8>(kind));
             return &sym;
         }
-        if (sym.nameHash == hash && sym.nameLen == staticName.size() &&
-            std::string_view(sym.namePtr, sym.nameLen) == staticName) {
+        if (sym.nameHash == hash && sym.Name() == staticName) {
             return Err(DebugErrc::DuplicateSymbol);
         }
         slot = (slot + 1u) & static_cast<u32>(kMaxSymbols - 1);
@@ -371,8 +383,7 @@ ConsoleSymbol* DebugConsole::FindSymbol(std::string_view name) noexcept {
         if (sym.kind == SymbolKind::Empty) {
             return nullptr;
         }
-        if (sym.nameHash == hash && sym.nameLen == name.size() &&
-            std::string_view(sym.namePtr, sym.nameLen) == name) {
+        if (sym.nameHash == hash && sym.Name() == name) {
             return &sym;
         }
         slot = (slot + 1u) & static_cast<u32>(kMaxSymbols - 1);
@@ -385,15 +396,10 @@ Result<void, DebugErrc> DebugConsole::RegisterCommand(
     if (fn == nullptr) {
         return Err(DebugErrc::InvalidArguments);
     }
-    auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) {
-        return Err(slotRes.error());
-    }
-    ConsoleSymbol* sym = *slotRes;
-    sym->kind      = SymbolKind::Command;
-    sym->targetPtr = userCtx;
-    sym->cmdFn     = fn;
-    return Ok;
+    auto slotRes = InsertSymbolSlot(staticName, SymbolKind::Command, userCtx);
+    if (!slotRes) return Err(slotRes.error());
+    (*slotRes)->cmdFn = fn;
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarF32(
@@ -401,15 +407,10 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarF32(
     if (target == nullptr || minVal > maxVal) {
         return Err(DebugErrc::InvalidArguments);
     }
-    auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) {
-        return Err(slotRes.error());
-    }
-    ConsoleSymbol* sym = *slotRes;
-    sym->kind      = SymbolKind::CVarF32;
-    sym->targetPtr = target;
-    sym->f32Bounds = {minVal, maxVal};
-    return Ok;
+    auto slotRes = InsertSymbolSlot(staticName, SymbolKind::CVarF32, target);
+    if (!slotRes) return Err(slotRes.error());
+    (*slotRes)->f32Bounds = {minVal, maxVal};
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarI32(
@@ -417,15 +418,10 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarI32(
     if (target == nullptr || minVal > maxVal) {
         return Err(DebugErrc::InvalidArguments);
     }
-    auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) {
-        return Err(slotRes.error());
-    }
-    ConsoleSymbol* sym = *slotRes;
-    sym->kind      = SymbolKind::CVarI32;
-    sym->targetPtr = target;
-    sym->i32Bounds = {minVal, maxVal};
-    return Ok;
+    auto slotRes = InsertSymbolSlot(staticName, SymbolKind::CVarI32, target);
+    if (!slotRes) return Err(slotRes.error());
+    (*slotRes)->i32Bounds = {minVal, maxVal};
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarU32(
@@ -433,15 +429,10 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarU32(
     if (target == nullptr || minVal > maxVal) {
         return Err(DebugErrc::InvalidArguments);
     }
-    auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) {
-        return Err(slotRes.error());
-    }
-    ConsoleSymbol* sym = *slotRes;
-    sym->kind      = SymbolKind::CVarU32;
-    sym->targetPtr = target;
-    sym->u32Bounds = {minVal, maxVal};
-    return Ok;
+    auto slotRes = InsertSymbolSlot(staticName, SymbolKind::CVarU32, target);
+    if (!slotRes) return Err(slotRes.error());
+    (*slotRes)->u32Bounds = {minVal, maxVal};
+    return {};
 }
 
 Result<void, DebugErrc> DebugConsole::RegisterCVarBool(
@@ -449,14 +440,9 @@ Result<void, DebugErrc> DebugConsole::RegisterCVarBool(
     if (target == nullptr) {
         return Err(DebugErrc::InvalidArguments);
     }
-    auto slotRes = InsertSymbolSlot(staticName);
-    if (!slotRes) {
-        return Err(slotRes.error());
-    }
-    ConsoleSymbol* sym = *slotRes;
-    sym->kind      = SymbolKind::CVarBool;
-    sym->targetPtr = target;
-    return Ok;
+    auto slotRes = InsertSymbolSlot(staticName, SymbolKind::CVarBool, target);
+    if (!slotRes) return Err(slotRes.error());
+    return {};
 }
 
 void DebugConsole::Print(LogSeverity severity, std::string_view msg, u64 tickIndex) noexcept {
@@ -469,9 +455,9 @@ void DebugConsole::Print(LogSeverity severity, std::string_view msg, u64 tickInd
     }
     std::memcpy(m_logText.data() + m_textWriteCursor, msg.data(), len);
 
-    const u32 slot       = m_logWriteIdx & static_cast<u32>(kMaxLogEntries - 1);
-    m_logMeta[slot]      = {m_textWriteCursor, static_cast<u16>(tickIndex), len, severity, 0};
-    m_textWriteCursor    = static_cast<u16>(m_textWriteCursor + len);
+    const u32 slot    = m_logWriteIdx & static_cast<u32>(kMaxLogEntries - 1);
+    m_logMeta[slot]   = {m_textWriteCursor, static_cast<u16>(tickIndex), len, severity};
+    m_textWriteCursor = static_cast<u16>(m_textWriteCursor + len);
     ++m_logWriteIdx;
     if (m_logCount < kMaxLogEntries) {
         ++m_logCount;
@@ -479,18 +465,14 @@ void DebugConsole::Print(LogSeverity severity, std::string_view msg, u64 tickInd
 }
 
 void DebugConsole::EnqueueCommandLine(std::string_view line) noexcept {
-    if (line.empty() || m_pendingCount >= kMaxPendingCmds) {
-        return;
+    if (!line.empty() && m_pendingCount < kMaxPendingCmds) {
+        PackLineBuffer(m_pendingCmds[m_pendingCount++], line);
     }
-    const u8 len = static_cast<u8>(std::min<usize>(line.size(), kMaxLineChars));
-    std::memcpy(m_pendingCmds[m_pendingCount].data(), line.data(), len);
-    m_pendingLens[m_pendingCount] = len;
-    ++m_pendingCount;
 }
 
 void DebugConsole::FlushPendingCommands(u64 currentTickIndex) noexcept {
     for (u8 i = 0; i < m_pendingCount; ++i) {
-        ExecuteImmediate({m_pendingCmds[i].data(), m_pendingLens[i]}, currentTickIndex);
+        ExecuteImmediate(UnpackLineBuffer(m_pendingCmds[i]), currentTickIndex);
     }
     m_pendingCount = 0;
 }
@@ -516,7 +498,7 @@ void DebugConsole::ExecuteImmediate(std::string_view line, u64 currentTickIndex)
     }
 
     DebugTextLine out{};
-    out.Str({sym->namePtr, sym->nameLen}).Str(" = ");
+    out.Str(sym->Name()).Str(" = ");
 
     if (args.Count() == 1) {
         switch (sym->kind) {
@@ -571,15 +553,22 @@ void DebugConsole::PushHistoryLine(std::string_view line) noexcept {
     if (m_history.empty() || line.empty()) {
         return;
     }
-    const usize len = std::min<usize>(line.size(), kMaxLineChars - 1);
-    auto& slot      = m_history[m_historyWriteIdx];
-    slot.fill('\0');
-    std::memcpy(slot.data(), line.data(), len);
+    PackLineBuffer(m_history[m_historyWriteIdx], line);
     m_historyWriteIdx = static_cast<u8>((m_historyWriteIdx + 1u) & (kMaxHistory - 1u));
     if (m_historyCount < kMaxHistory) {
         ++m_historyCount;
     }
     m_historyBrowseIdx = -1;
+}
+
+void DebugConsole::LoadHistoryEntry(u8 browseOffset) noexcept {
+    const u8 idx = static_cast<u8>((m_historyWriteIdx + kMaxHistory - 1u - browseOffset) & (kMaxHistory - 1u));
+    const std::string_view h = UnpackLineBuffer(m_history[idx]);
+    m_inputLen = static_cast<u8>(h.size());
+    if (m_inputLen > 0) {
+        std::memcpy(m_inputBuf.data(), h.data(), m_inputLen);
+    }
+    m_cursorPos = m_inputLen;
 }
 
 void DebugConsole::OnTextInput(std::string_view utf8) noexcept {
@@ -592,8 +581,10 @@ void DebugConsole::OnTextInput(std::string_view utf8) noexcept {
             continue;
         }
         if (static_cast<usize>(m_inputLen) + 1u < kMaxLineChars) {
-            for (u8 i = m_inputLen; i > m_cursorPos; --i) {
-                m_inputBuf[i] = m_inputBuf[i - 1];
+            if (m_cursorPos < m_inputLen) {
+                std::memmove(m_inputBuf.data() + m_cursorPos + 1,
+                             m_inputBuf.data() + m_cursorPos,
+                             m_inputLen - m_cursorPos);
             }
             m_inputBuf[m_cursorPos++] = c;
             ++m_inputLen;
@@ -622,8 +613,10 @@ void DebugConsole::OnKeyPress(u16 scancode, bool, bool) noexcept {
             break;
         case kKeyBackspace:
             if (m_cursorPos > 0) {
-                for (u8 i = m_cursorPos - 1; i + 1 < m_inputLen; ++i) {
-                    m_inputBuf[i] = m_inputBuf[i + 1];
+                if (m_cursorPos < m_inputLen) {
+                    std::memmove(m_inputBuf.data() + m_cursorPos - 1,
+                                 m_inputBuf.data() + m_cursorPos,
+                                 m_inputLen - m_cursorPos);
                 }
                 --m_cursorPos;
                 --m_inputLen;
@@ -631,8 +624,10 @@ void DebugConsole::OnKeyPress(u16 scancode, bool, bool) noexcept {
             break;
         case kKeyDelete:
             if (m_cursorPos < m_inputLen) {
-                for (u8 i = m_cursorPos; i + 1 < m_inputLen; ++i) {
-                    m_inputBuf[i] = m_inputBuf[i + 1];
+                if (m_cursorPos + 1 < m_inputLen) {
+                    std::memmove(m_inputBuf.data() + m_cursorPos,
+                                 m_inputBuf.data() + m_cursorPos + 1,
+                                 m_inputLen - m_cursorPos - 1);
                 }
                 --m_inputLen;
             }
@@ -657,21 +652,13 @@ void DebugConsole::OnKeyPress(u16 scancode, bool, bool) noexcept {
                 if (m_historyBrowseIdx + 1 < static_cast<i8>(m_historyCount)) {
                     ++m_historyBrowseIdx;
                 }
-                const u8 idx = static_cast<u8>((m_historyWriteIdx + kMaxHistory - 1u - m_historyBrowseIdx) & (kMaxHistory - 1u));
-                const std::string_view h(m_history[idx].data());
-                m_inputLen  = static_cast<u8>(std::min<usize>(h.size(), kMaxLineChars - 1));
-                std::memcpy(m_inputBuf.data(), h.data(), m_inputLen);
-                m_cursorPos = m_inputLen;
+                LoadHistoryEntry(static_cast<u8>(m_historyBrowseIdx));
             }
             break;
         case kKeyDown:
             if (m_historyBrowseIdx > 0 && !m_history.empty()) {
                 --m_historyBrowseIdx;
-                const u8 idx = static_cast<u8>((m_historyWriteIdx + kMaxHistory - 1u - m_historyBrowseIdx) & (kMaxHistory - 1u));
-                const std::string_view h(m_history[idx].data());
-                m_inputLen  = static_cast<u8>(std::min<usize>(h.size(), kMaxLineChars - 1));
-                std::memcpy(m_inputBuf.data(), h.data(), m_inputLen);
-                m_cursorPos = m_inputLen;
+                LoadHistoryEntry(static_cast<u8>(m_historyBrowseIdx));
             } else {
                 m_historyBrowseIdx = -1;
                 m_inputLen         = 0;
@@ -696,8 +683,8 @@ void DebugConsole::AutoCompleteInput() noexcept {
         return;
     }
     const std::string_view prefix(m_inputBuf.data(), m_inputLen);
-    for (const char c : prefix) {
-        if (c == ' ') return;
+    if (prefix.find(' ') != std::string_view::npos) {
+        return;
     }
 
     const ConsoleSymbol* best = nullptr;
@@ -705,9 +692,9 @@ void DebugConsole::AutoCompleteInput() noexcept {
         if (sym.kind == SymbolKind::Empty || sym.nameLen < prefix.size()) {
             continue;
         }
-        const std::string_view candidate(sym.namePtr, sym.nameLen);
+        const std::string_view candidate = sym.Name();
         if (candidate.starts_with(prefix)) {
-            if (best == nullptr || candidate < std::string_view(best->namePtr, best->nameLen)) {
+            if (best == nullptr || candidate < best->Name()) {
                 best = &sym;
             }
         }
@@ -722,16 +709,16 @@ void DebugConsole::AutoCompleteInput() noexcept {
     }
 }
 
-void DebugConsole::EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatcher& hudBatcher) const noexcept {
+void DebugConsole::EmitConsoleOverlay(renderer::ViewportExtent viewportSize, DebugBatcher& hudBatcher) const noexcept {
     if (!m_isOpen) {
         return;
     }
     const f32 w = static_cast<f32>(viewportSize.w);
     const f32 h = std::min(static_cast<f32>(viewportSize.h) * 0.45f, 280.0f);
 
-    hudBatcher.PushSolidRect({0.0f, 0.0f, w, h}, renderer::Color::FromRGBA8(0x0B0E17EB));
-    hudBatcher.PushSolidRect({0.0f, h - 22.0f, w, 22.0f}, renderer::Color::FromRGBA8(0x161C2EFF));
-    hudBatcher.PushLine(0.0f, h, w, h, 1.5f, renderer::Color::FromRGBA8(0x4488CCFF));
+    hudBatcher.PushSolidRect({0.0f, 0.0f, w, h}, renderer::Color::FromRGBA8(0x0B0E17EBu));
+    hudBatcher.PushSolidRect({0.0f, h - 22.0f, w, 22.0f}, renderer::Color::FromRGBA8(0x161C2EFFu));
+    hudBatcher.PushLine(0.0f, h, w, h, 1.5f, renderer::Color::FromRGBA8(0x4488CCFFu));
 
     const u32 maxRows  = static_cast<u32>((h - 28.0f) / 11.0f);
     const u32 avail    = (m_logCount > m_scrollOffset) ? (m_logCount - m_scrollOffset) : 0u;
@@ -766,12 +753,7 @@ void DebugConsole::EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatc
 u64 DebugConsole::ComputeAuditHash() const noexcept {
     u64 h = MixAuditHash(0xC04501E99001ull, m_logCount);
     h = MixAuditHash(h, m_logWriteIdx);
-    for (const ConsoleSymbol& sym : m_symbols) {
-        if (sym.kind != SymbolKind::Empty) {
-            h = MixAuditHash(h, (static_cast<u64>(sym.nameHash) << 8) | static_cast<u8>(sym.kind));
-        }
-    }
-    return h;
+    return MixAuditHash(h, m_symbolHash);
 }
 
 } // namespace en::debug

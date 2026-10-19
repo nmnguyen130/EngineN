@@ -10,19 +10,15 @@ namespace en::world {
 void WorldExtractor::Extract(
     const World& world,
     const assets::AssetBank& assetBank,
-    time::RenderTimeView timeView,
+    const time::RenderTimeView& timeView,
     renderer::RenderList& outRenderList) noexcept {
 
-    alignas(32) std::array<f32, 8> chAlphas{};
-    for (u8 c = 0; c < 8; ++c) {
-        chAlphas[c] = timeView.Alpha(static_cast<time::TimeChannel>(c));
-    }
+    const auto* __restrict currSpan   = world.WorldTransforms().data();
+    const auto* __restrict prevSpan   = world.PrevWorldTransforms().data();
+    const auto* __restrict chSpan     = world.TimeChannels().data();
+    const auto* __restrict movedWords = world.MovedWords().data();
 
-    const auto* __restrict currSpan = world.WorldTransforms().data();
-    const auto* __restrict prevSpan = world.PrevWorldTransforms().data();
-    const auto* __restrict chSpan   = world.TimeChannels().data();
-
-    // 1. Extract active CameraRig2D views into RenderList (including interpolated worldRotRad)
+    // 1. Extract active CameraRig2D views into RenderList
     const auto& camPool    = world.GetPool<CameraRig2D>();
     const auto camEntities = camPool.Entities();
     const auto camRigs     = camPool.Components();
@@ -32,56 +28,83 @@ void WorldExtractor::Extract(
         if (!rig.active) {
             continue;
         }
-        const u16 idx                   = camEntities[i].index;
-        const f32 alpha                 = chAlphas[static_cast<u8>(chSpan[idx])];
-        const PrevWorldSnapshot2D& prev = prevSpan[idx];
-        const WorldTransform2D& curr    = currSpan[idx];
+        const u16 idx                = camEntities[i].index;
+        const WorldTransform2D& curr = currSpan[idx];
+        f32 camX = curr.x;
+        f32 camY = curr.y;
 
-        const f32 camRotRad = (alpha < 0.9999f && prev.worldRotRad != curr.worldRotRad)
-            ? NormalizeAngleRad(prev.worldRotRad + alpha * ShortestAngleDelta(prev.worldRotRad, curr.worldRotRad))
-            : curr.worldRotRad;
+        if ((movedWords[idx >> 6] & (1ULL << (idx & 63u))) != 0) {
+            const f32 alpha = timeView.Alpha(chSpan[idx]);
+            if (alpha < 0.9999f) {
+                const PrevWorldSnapshot2D& prev = prevSpan[idx];
+                camX = prev.x + alpha * (curr.x - prev.x);
+                camY = prev.y + alpha * (curr.y - prev.y);
+            }
+        }
 
         outRenderList.SetView(rig.viewSlot, renderer::Camera2D{
-            .worldCenterX = prev.x + alpha * (curr.x - prev.x),
-            .worldCenterY = prev.y + alpha * (curr.y - prev.y),
+            .worldCenterX = camX,
+            .worldCenterY = camY,
             .zoom         = rig.zoom,
-            .rotationRad  = camRotRad,
             .viewport     = rig.viewport,
             .scissor      = rig.scissor,
             .screenSpace  = rig.screenSpace,
         });
     }
 
-    // 2. Linearly sweep dense Sprite2D array with symmetric pivot-aware flip math
-    const auto& spritePool    = world.GetPool<Sprite2D>();
-    const auto spriteEntities = spritePool.Entities();
-    const auto sprites        = spritePool.Components();
+    // 2. Linearly sweep dense Sprite2D array with stationary fast path & direct animator resolution
+    const auto& spritePool = world.GetPool<Sprite2D>();
+    const auto& animPool   = world.GetPool<SpriteAnimator2D>();
+    const usize spriteCount = spritePool.Size();
+    const auto* __restrict spriteEntities = spritePool.Entities().data();
+    const auto* __restrict sprites        = spritePool.Components().data();
+    constexpr ComponentMask kAnimatorBit  = ComponentMask{1} << SpriteAnimator2D::kTypeId;
 
-    for (usize i = 0; i < spriteEntities.size(); ++i) {
+    for (usize i = 0; i < spriteCount; ++i) {
         const Sprite2D& sp = sprites[i];
         if ((sp.blendAndFlags & static_cast<u8>(SpriteFlags::Hidden)) != 0) [[unlikely]] {
             continue;
         }
 
-        const u16 idx                 = spriteEntities[i].index;
-        const f32 alpha               = chAlphas[static_cast<u8>(chSpan[idx])];
-        const PrevWorldSnapshot2D& t0 = prevSpan[idx];
-        const WorldTransform2D& t1    = currSpan[idx];
+        const u16 idx              = spriteEntities[i].index;
+        const WorldTransform2D& t1 = currSpan[idx];
 
-        const f32 wx = t0.x + alpha * (t1.x - t0.x);
-        const f32 wy = t0.y + alpha * (t1.y - t0.y);
-        const f32 sx = t0.scaleX + alpha * (t1.scaleX - t0.scaleX);
-        const f32 sy = t0.scaleY + alpha * (t1.scaleY - t0.scaleY);
-        const f32 wd = t0.worldDepth + alpha * (t1.worldDepth - t0.worldDepth);
-
+        f32 wx   = t1.x;
+        f32 wy   = t1.y;
+        f32 sx   = t1.scaleX;
+        f32 sy   = t1.scaleY;
+        f32 wd   = t1.worldDepth;
         f32 cosR = t1.cosRot;
         f32 sinR = t1.sinRot;
-        if (alpha < 0.9999f && t0.worldRotRad != t1.worldRotRad) [[unlikely]] {
-            const f32 lerpedAngle = t0.worldRotRad + alpha * ShortestAngleDelta(t0.worldRotRad, t1.worldRotRad);
-            FastSinCos(lerpedAngle, cosR, sinR);
+
+        // Stationary sprites (bit == 0 in movedWords) bypass prevSpan and chSpan cache misses completely.
+        if ((movedWords[idx >> 6] & (1ULL << (idx & 63u))) != 0) {
+            const f32 alpha = timeView.Alpha(chSpan[idx]);
+            if (alpha < 0.9999f) {
+                const PrevWorldSnapshot2D& t0 = prevSpan[idx];
+                wx = t0.x + alpha * (t1.x - t0.x);
+                wy = t0.y + alpha * (t1.y - t0.y);
+                sx = t0.scaleX + alpha * (t1.scaleX - t0.scaleX);
+                sy = t0.scaleY + alpha * (t1.scaleY - t0.scaleY);
+                wd = t0.worldDepth + alpha * (t1.worldDepth - t0.worldDepth);
+
+                if (t0.worldRotRad != t1.worldRotRad) [[unlikely]] {
+                    const f32 lerpedAngle = t0.worldRotRad + alpha * ShortestAngleDelta(t0.worldRotRad, t1.worldRotRad);
+                    FastSinCos(lerpedAngle, cosR, sinR);
+                }
+            }
         }
 
-        const assets::SpriteFrame& frame = assetBank.GetSprite(sp.sprite);
+        const bool hasAnimator = (world.GetComponentMaskByIndex(idx) & kAnimatorBit) != 0;
+        const assets::SpriteFrame& frame = hasAnimator
+            ? [&]() noexcept -> const assets::SpriteFrame& {
+                const SpriteAnimator2D& anim = animPool.DirectAtEntityIndex(idx);
+                return anim.atlas.IsValid()
+                    ? assetBank.GetAtlasFrame(anim.atlas, static_cast<u16>(anim.firstFrame + anim.currentFrame))
+                    : assetBank.GetSprite(sp.sprite);
+            }()
+            : assetBank.GetSprite(sp.sprite);
+
         const f32 quadW = static_cast<f32>(frame.width) * std::abs(sx);
         const f32 quadH = static_cast<f32>(frame.height) * std::abs(sy);
 
@@ -138,8 +161,8 @@ Result<EntityId, WorldErrc> WorldExtractor::InstantiatePrefab(
     }
 
     const auto* records = reinterpret_cast<const CookedPrefabEntityRecord*>(blob.data + sizeof(CookedPrefabHeader));
-    std::array<EntityId, 256> localStackIds{};
-    const u16 count = std::min<u16>(hdr->entityCount, 256u);
+    std::array<EntityId, 64> localStackIds{};
+    const u16 count = std::min<u16>(hdr->entityCount, static_cast<u16>(localStackIds.size()));
 
     for (u16 i = 0; i < count; ++i) {
         const CookedPrefabEntityRecord& rec = records[i];
@@ -161,34 +184,37 @@ Result<EntityId, WorldErrc> WorldExtractor::InstantiatePrefab(
             outSpawnedEntities[i] = entityId;
         }
 
-        const u16 atlasSlot = assetBank.FindSlot(rec.atlasOrTextureId);
-        const assets::AtlasHandle resolvedAtlas = assetBank.ToAtlasHandle(atlasSlot);
-        const assets::SpriteHandle initialSprite = assetBank.GetSpriteHandle(resolvedAtlas, rec.firstFrame);
+        if ((rec.flags & 0x03u) != 0) {
+            const u16 atlasSlot = assetBank.FindSlot(rec.atlasOrTextureId);
+            const assets::AtlasHandle resolvedAtlas = assetBank.ToAtlasHandle(atlasSlot);
 
-        if ((rec.flags & 0x01u) != 0) {
-            (void)world.Emplace<Sprite2D>(entityId, Sprite2D{
-                .tint       = rec.tint,
-                .sprite     = initialSprite,
-                .baseDepth  = rec.baseDepth,
-                .ySortScale = rec.ySortScale,
-                .passId     = rec.passId,
-                .layer      = rec.layer,
-            });
-        }
-        if ((rec.flags & 0x02u) != 0) {
-            (void)world.Emplace<SpriteAnimator2D>(entityId, SpriteAnimator2D{
-                .atlas         = resolvedAtlas,
-                .firstFrame    = rec.firstFrame,
-                .frameCount    = std::max<u16>(1u, rec.frameCount),
-                .currentFrame  = 0,
-                .ticksPerFrame = std::max<u16>(1u, rec.ticksPerFrame),
-                .subTickAccum  = 0,
-                .loop          = 1,
-                .playing       = 1,
-            });
+            if ((rec.flags & 0x01u) != 0) {
+                const assets::SpriteHandle initialSprite = assetBank.GetSpriteHandle(resolvedAtlas, rec.firstFrame);
+                (void)world.Emplace<Sprite2D>(entityId, Sprite2D{
+                    .tint       = rec.tint,
+                    .sprite     = initialSprite,
+                    .baseDepth  = rec.baseDepth,
+                    .ySortScale = rec.ySortScale,
+                    .passId     = rec.passId,
+                    .layer      = rec.layer,
+                });
+            }
+            if ((rec.flags & 0x02u) != 0) {
+                (void)world.Emplace<SpriteAnimator2D>(entityId, SpriteAnimator2D{
+                    .atlas         = resolvedAtlas,
+                    .firstFrame    = rec.firstFrame,
+                    .frameCount    = std::max<u16>(1u, rec.frameCount),
+                    .currentFrame  = 0,
+                    .ticksPerFrame = std::max<u16>(1u, rec.ticksPerFrame),
+                    .subTickAccum  = 0,
+                    .loop          = 1,
+                    .playing       = 1,
+                });
+            }
         }
     }
 
+    world.PropagateTransforms();
     return localStackIds[0];
 }
 

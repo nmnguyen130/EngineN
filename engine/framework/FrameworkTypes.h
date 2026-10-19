@@ -1,23 +1,48 @@
 #pragma once
 
-#include "assets/AssetSystem.h"
-#include "audio/AudioSystem.h"
+#include "assets/AssetTypes.h"
 #include "core/Result.h"
 #include "core/Types.h"
-#include "core/time/SdlClock.h"
-#include "gameplay/GameplayPipeline.h"
-#include "platform/Platform.h"
-#include "platform/Window.h"
+#include "core/time/TimePipeline.h"
+#include "gameplay/GameplayTypes.h"
 #include "input/ActionBuffer.h"
-#include "input/InputPipeline.h"
-#include "renderer/Renderer.h"
-#include "world/World.h"
+#include "input/InputTypes.h"
+#include "platform/Platform.h"
+#include "world/WorldTypes.h"
 
-#include <array>
-#include <span>
-#include <string_view>
+namespace en::assets {
+class AssetBank;
+class AssetSystem;
+} // namespace en::assets
+
+namespace en::audio {
+class AudioSystem;
+} // namespace en::audio
+
+namespace en::debug {
+class DebugSystem;
+} // namespace en::debug
+
+namespace en::gameplay {
+class GameplayPipeline;
+} // namespace en::gameplay
+
+namespace en::input {
+class InputPipeline;
+} // namespace en::input
+
+namespace en::renderer {
+class RenderList;
+class Renderer;
+} // namespace en::renderer
+
+namespace en::world {
+class World;
+} // namespace en::world
 
 namespace en::framework {
+
+class SceneDirector;
 
 inline constexpr usize kMaxStateStackDepth = 8;
 inline constexpr usize kMaxPendingStateCmds = 8;
@@ -34,6 +59,7 @@ enum class FrameworkErrc : u8 {
     AudioInitFailed,
     WorldInitFailed,
     GameplayInitFailed,
+    DebugInitFailed,
     ClientBootFailed,
     StateStackOverflow,
     StateStackUnderflow,
@@ -52,6 +78,7 @@ enum class SubSystemStage : u8 {
     Audio,
     World,
     Gameplay,
+    Debug,
     SceneDirector,
     ClientApp
 };
@@ -77,6 +104,10 @@ enum class StateLayerFlags : u8 {
     return static_cast<StateLayerFlags>(static_cast<u8>(a) | static_cast<u8>(b));
 }
 
+[[nodiscard]] constexpr StateLayerFlags operator&(StateLayerFlags a, StateLayerFlags b) noexcept {
+    return static_cast<StateLayerFlags>(static_cast<u8>(a) & static_cast<u8>(b));
+}
+
 [[nodiscard]] constexpr bool HasStateFlag(StateLayerFlags val, StateLayerFlags mask) noexcept {
     return (static_cast<u8>(val) & static_cast<u8>(mask)) != 0;
 }
@@ -97,7 +128,9 @@ struct alignas(64) SimContext {
     const input::TickInput* tickInput{nullptr};
     void* userState{nullptr};
     time::SimStepView step{};
+    SceneDirector* director{nullptr};
 };
+static_assert(sizeof(SimContext) == 128);
 
 // Non-owning view passed to client state callbacks during presentation extraction.
 // Ownership: Borrowed subsystem references; valid strictly during OnRenderExtract.
@@ -110,10 +143,14 @@ struct alignas(64) RenderContext {
     const input::FrameInput& frameInput;
     const platform::WindowState& windowState;
     void* userState{nullptr};
+    SceneDirector* director{nullptr};
     time::RenderTimeView timeView{};
 };
+static_assert(sizeof(RenderContext) == 128);
 
 // Non-owning view passed to state/scene load, activation, and teardown callbacks.
+// Ownership: Borrowed subsystem references; valid during safe frame mutation points and boot/shutdown.
+// Invariant: Fits in a single 64-byte L1 cache line with zero padding.
 struct alignas(64) SceneLoadContext {
     world::World& world;
     gameplay::GameplayPipeline& gameplay;
@@ -125,7 +162,7 @@ struct alignas(64) SceneLoadContext {
     assets::ScopeId sceneScope{assets::kInvalidScope};
     assets::ScopeId persistentScope{assets::kInvalidScope};
     u16 reserved{0};
-    u64 userPadding{0};
+    SceneDirector* director{nullptr};
 };
 static_assert(sizeof(SceneLoadContext) == 64);
 
@@ -143,23 +180,22 @@ struct alignas(16) StateLayerDesc {
     StateId id{kInvalidStateId};
     u16 inputActionMask{0xFFFF};
     StateLayerFlags flags{StateLayerFlags::None};
-    u8 reserved0{0};
-    u16 reserved1{0};
+    u8 cmdKind{0};
+    u16 reserved{0};
 };
 static_assert(sizeof(StateLayerDesc) == 48);
 
 enum class SceneTransitionMode : u8 {
-    FullReset = 0, // Invokes World::Clear(), binds new collision map, instantiates root prefab.
-    RoomSwap  = 1  // Preserves surviving entities, swaps collision blob & retires old asset scope.
+    FullReset = 0,
+    RoomSwap  = 1
 };
 
 enum class SceneWaitPolicy : u8 {
-    StreamNonBlocking = 0, // Streams across frames while current state/loading overlay renders; activates when ready.
-    ImmediateBarrier  = 1  // Blocks inside CommitSafeFramePoint via AssetSystem::WaitSimReady on next frame.
+    StreamNonBlocking = 0,
+    ImmediateBarrier  = 1
 };
 
 // Cooked binary scene manifest header ('ESCN', Residency::Sim BlobRecord).
-// Eliminates heap vectors and dangling spans during asynchronous scene transitions.
 struct alignas(16) CookedSceneManifestHeader {
     u32 magic{kSceneManifestMagic};
     u16 version{kSceneManifestVersion};
@@ -188,7 +224,7 @@ using SceneDeactivateFn = void (*)(SceneLoadContext& ctx, assets::AssetId sceneI
 // Zero-padding 64-byte self-contained scene transition request descriptor (1 cache line).
 struct alignas(64) SceneTransitionDesc {
     assets::AssetId sceneId{};
-    assets::AssetId manifestBlobId{};   // Optional 'ESCN' blob; if 0, uses inline fields below.
+    assets::AssetId manifestBlobId{};
     assets::AssetId collisionMapId{};
     assets::AssetId rootPrefabId{};
     assets::AssetId cueBankId{};
@@ -216,29 +252,19 @@ struct alignas(64) FrameAuditDigest {
 static_assert(sizeof(FrameAuditDigest) == 64);
 
 struct alignas(64) AppHooks {
+    using RegisterComponentsFn = Result<void, u8> (*)(world::World& world, void* appState) noexcept;
+    using BootFn = Result<void, u8> (*)(SceneLoadContext& ctx, SceneDirector& director) noexcept;
+    using PreShutdownFn = void (*)(SceneLoadContext& ctx) noexcept;
+    using ConsumeSimCueFn = void (*)(const gameplay::SimCue& cue, world::World& world,
+                                     const assets::AssetBank& bank, void* appState) noexcept;
+
     void* userAppState{nullptr};
     platform::EventTap devToolsTap{};
     gameplay::GameplayPolicyTable gameplayPolicies{};
-
-    Result<void, u8> (*OnRegisterComponents)(world::World& world, void* appState) noexcept = nullptr;
-    Result<void, u8> (*OnBoot)(SceneLoadContext& ctx, class SceneDirector& director) noexcept = nullptr;
-    void (*OnPreShutdown)(SceneLoadContext& ctx) noexcept = nullptr;
-    void (*OnConsumeSimCue)(const gameplay::SimCue& cue, world::World& world,
-                            const assets::AssetBank& bank, void* appState) noexcept = nullptr;
-};
-
-struct ApplicationConfig {
-    std::string_view appName{"EngineN"};
-    std::string_view orgName{"EngineN"};
-    std::string_view bootPakPath{"base.enpak"};
-    bool headless{false};
-    assets::PumpBudget assetPumpBudget{};
-    platform::WindowConfig window{};
-    renderer::RendererConfig renderer{};
-    assets::AssetSystemConfig assets{};
-    audio::AudioSystemConfig audio{};
-    world::WorldConfig world{};
-    gameplay::GameplayPipelineConfig gameplay{};
+    RegisterComponentsFn OnRegisterComponents{nullptr};
+    BootFn OnBoot{nullptr};
+    PreShutdownFn OnPreShutdown{nullptr};
+    ConsumeSimCueFn OnConsumeSimCue{nullptr};
 };
 
 } // namespace en::framework

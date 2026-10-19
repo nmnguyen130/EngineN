@@ -24,7 +24,8 @@ public:
     static void StepCarriersAndRiders(
         world::World& world,
         const SpatialIndex2D& spatial,
-        time::SimStepView step) noexcept;
+        time::SimStepView step,
+        const KinematicStepConfig& cfg = {}) noexcept;
 
     static void StepMotorsAndMotionStacks(
         world::World& world,

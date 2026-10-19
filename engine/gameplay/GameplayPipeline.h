@@ -6,32 +6,10 @@
 #include "gameplay/StateAndCombatSolver.h"
 
 #include <array>
+#include <bit>
 #include <span>
 
 namespace en::gameplay {
-
-enum class SimCueKind : u8 {
-    AudioOneShot = 0,
-    SpawnPrefabEffect,
-    CameraTraumaPulse,
-    GamepadRumblePulse,
-    CustomGameEvent
-};
-
-// Outgoing presentation cue emitted during 120 Hz simulation ticks.
-// Carries generational EntityId emitter so downstream Audio/VFX/Debug consumers can track or attach safely.
-struct alignas(8) SimCue {
-    assets::AssetId assetId{};
-    f32 worldX{0.0f};
-    f32 worldY{0.0f};
-    world::EntityId emitter{world::kNullEntity};
-    u16 magnitude_q16{0};
-    u16 durationTicks{0};
-    SimCueKind kind{SimCueKind::AudioOneShot};
-    u8 channel{0};
-    u16 userTag{0};
-};
-static_assert(sizeof(SimCue) == 32);
 
 struct GameplayPipelineConfig {
     usize arenaBytes{512u * 1024u};
@@ -47,9 +25,11 @@ struct GameplayPipelineConfig {
 };
 
 // Top-level 120 Hz gameplay mechanism orchestrator, camera director, and persistent world-flag container.
-// Move-only RAII owner of a single 512 KB pre-allocated arena slab; zero dynamic allocation during Tick().
+// Move-only RAII owner of a single 64B-aligned pre-allocated arena slab; zero dynamic allocation during Tick().
+// Cache Line 0 (offset 0..63): Hot policy pointers, kinematic config, scale, and scratch buffer pointers.
+// Cache Line 1 (offset 64..127): 64B SpatialIndex2D accelerator.
 // Invariant: Never calls AudioSystem, Renderer, or DebugSystem directly; communicates strictly via DrainCues() and World ECS.
-class GameplayPipeline final {
+class alignas(64) GameplayPipeline final {
 public:
     static constexpr u32 kMaxWorldFlags   = 4096;
     static constexpr u32 kMaxCuesPerFrame = 256;
@@ -70,7 +50,7 @@ public:
 
     void Shutdown() noexcept;
 
-    void SetPolicyTable(const GameplayPolicyTable& policies) noexcept {
+    constexpr void SetPolicyTable(const GameplayPolicyTable& policies) noexcept {
         m_policies = policies;
     }
 
@@ -89,7 +69,7 @@ public:
         const input::TickInput& tickInput,
         input::ActionBuffer& actionBuffer) noexcept;
 
-    void EmitCue(const SimCue& cue) noexcept {
+    constexpr void EmitCue(const SimCue& cue) noexcept {
         if (m_cueBuffer != nullptr && m_cueCount < kMaxCuesPerFrame) {
             m_cueBuffer[m_cueCount++] = cue;
         }
@@ -105,8 +85,15 @@ public:
         if (flagId < kMaxWorldFlags) {
             const u32 word = static_cast<u32>(flagId) >> 6u;
             const u64 bit  = 1ULL << (flagId & 63u);
-            if (value) m_worldFlags[word] |= bit;
-            else       m_worldFlags[word] &= ~bit;
+            if (value) {
+                m_worldFlags[word]    |= bit;
+                m_activeFlagWordsMask |= (1ULL << word);
+            } else {
+                m_worldFlags[word] &= ~bit;
+                if (m_worldFlags[word] == 0ULL) {
+                    m_activeFlagWordsMask &= ~(1ULL << word);
+                }
+            }
         }
     }
 
@@ -116,7 +103,10 @@ public:
     }
 
     constexpr void ClearWorldFlags() noexcept {
-        m_worldFlags.fill(0ULL);
+        for (u64 m = m_activeFlagWordsMask; m != 0ULL; m &= (m - 1ULL)) {
+            m_worldFlags[std::countr_zero(m)] = 0ULL;
+        }
+        m_activeFlagWordsMask = 0ULL;
     }
 
     [[nodiscard]] constexpr const SpatialIndex2D& Spatial() const noexcept { return m_spatial; }
@@ -127,16 +117,25 @@ private:
         world::World& world,
         time::SimStepView step) noexcept;
 
-    u8* m_arena{nullptr};
-    usize m_arenaBytes{0};
+    // Cache Line 0 (64B exact): Hot 120 Hz dispatch state & scratch pointers
     GameplayPolicyTable m_policies{};
     KinematicStepConfig m_kinematicCfg{};
     f32 m_invPixelsPerMeter{1.0f / 64.0f};
-    SpatialIndex2D m_spatial{};
     ResolvedHitEvent* m_hitScratch{nullptr};
     SimCue* m_cueBuffer{nullptr};
+
+    // Cache Line 1 (64B exact): Spatial accelerator
+    SpatialIndex2D m_spatial{};
+
+    // Cache Line 2 (64B): Arena ownership, cue count, and sparse world-flag summary bitmask
+    u8* m_arena{nullptr};
+    usize m_arenaBytes{0};
+    u64 m_activeFlagWordsMask{0};
     u32 m_cueCount{0};
-    std::array<u64, 64> m_worldFlags{};
+
+    // Cache Lines 3..10 (512B): 4096-bit world flag storage
+    alignas(64) std::array<u64, 64> m_worldFlags{};
 };
+static_assert(sizeof(GameplayPipeline) == 704);
 
 } // namespace en::gameplay

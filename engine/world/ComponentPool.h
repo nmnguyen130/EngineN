@@ -3,44 +3,45 @@
 #include "world/WorldTypes.h"
 
 #include <algorithm>
+#include <cstring>
 #include <span>
 #include <utility>
 
 namespace en::world {
 
-// Non-virtual function pointer table for type-erased pool operations.
-struct PoolOps {
+// 32B cache-aligned function pointer table for type-erased pool operations (2 per 64B cache line).
+// removeOrClearFn removes a single entity when id.IsValid(), or clears the pool when id == kNullEntity.
+struct alignas(32) PoolOps {
     void* poolInstance{nullptr};
-    void (*removeUncheckedFn)(void* pool, EntityId id) noexcept {nullptr};
+    void (*removeOrClearFn)(void* pool, EntityId id) noexcept {nullptr};
     Result<void, WorldErrc> (*emplaceRawFn)(void* pool, EntityId id, const void* rawComponent) noexcept {nullptr};
-    void (*clearFn)(void* pool) noexcept {nullptr};
     u64 (*hashCanonicalFn)(const void* pool, u16 maxEntityIndex) noexcept {nullptr};
 };
+static_assert(sizeof(PoolOps) == 32);
 
-// Manages contiguous dense component storage with O(1) sparse indexing and 64-bit presence bitsets.
-// Non-owning over backing arena slabs carved by World::Init().
+// Manages contiguous dense component storage with O(1) sparse indexing.
+// Non-owning 32B descriptor (2 pools per 64B cache line) over arena slabs carved by World::Init().
 // Invariant: For all i in [0, m_size), m_sparse[m_denseEntities[i].index] == i.
 template <Component T>
-class ComponentPool final {
+class alignas(32) ComponentPool final {
 public:
     void BindArena(
         std::span<u16> sparse,
-        std::span<u64> presenceWords,
         std::span<EntityId> denseEntities,
         std::span<T> denseComponents) noexcept {
-        m_sparse          = sparse;
-        m_presenceWords   = presenceWords;
-        m_denseEntities   = denseEntities;
-        m_denseComponents = denseComponents;
+        m_sparse          = sparse.data();
+        m_denseEntities   = denseEntities.data();
+        m_denseComponents = denseComponents.data();
         m_capacity        = static_cast<u16>(denseComponents.size());
-        Clear();
+        m_size            = 0;
+        std::fill(sparse.begin(), sparse.end(), kInvalidDenseIndex);
     }
 
-    void Clear() noexcept {
-        std::fill(m_sparse.begin(), m_sparse.end(), kInvalidDenseIndex);
-        std::fill(m_presenceWords.begin(), m_presenceWords.end(), 0ULL);
-        m_size       = 0;
-        m_groupCount = 0;
+    constexpr void Clear() noexcept {
+        for (u16 i = 0; i < m_size; ++i) {
+            m_sparse[m_denseEntities[i].index] = kInvalidDenseIndex;
+        }
+        m_size = 0;
     }
 
     [[nodiscard]] constexpr bool Contains(EntityId id) const noexcept {
@@ -62,8 +63,13 @@ public:
         return self.m_denseComponents[self.m_sparse[entityIndex]];
     }
 
+    template <typename Self>
+    [[nodiscard]] constexpr auto& ComponentAtDense(this Self&& self, usize denseIdx) noexcept {
+        return self.m_denseComponents[denseIdx];
+    }
+
     template <typename... Args>
-    [[nodiscard]] Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
+    [[nodiscard]] constexpr Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
         const u16 existing = m_sparse[id.index];
         if (existing < m_size && m_denseEntities[existing] == id) {
             m_denseComponents[existing] = T{std::forward<Args>(args)...};
@@ -74,13 +80,29 @@ public:
         }
         const u16 denseIdx = m_size++;
         m_sparse[id.index] = denseIdx;
-        m_presenceWords[id.index >> 6] |= (1ULL << (id.index & 63u));
         m_denseEntities[denseIdx]   = id;
         m_denseComponents[denseIdx] = T{std::forward<Args>(args)...};
         return &m_denseComponents[denseIdx];
     }
 
-    bool Remove(EntityId id) noexcept {
+    // Alignment-safe raw component insertion for the 8B-aligned deferred command tape.
+    [[nodiscard]] Result<void, WorldErrc> EmplaceRaw(EntityId id, const void* rawComponent) noexcept {
+        const u16 existing = m_sparse[id.index];
+        if (existing < m_size && m_denseEntities[existing] == id) {
+            std::memcpy(&m_denseComponents[existing], rawComponent, sizeof(T));
+            return {};
+        }
+        if (m_size >= m_capacity) [[unlikely]] {
+            return Err(WorldErrc::ComponentPoolExhausted);
+        }
+        const u16 denseIdx = m_size++;
+        m_sparse[id.index] = denseIdx;
+        m_denseEntities[denseIdx] = id;
+        std::memcpy(&m_denseComponents[denseIdx], rawComponent, sizeof(T));
+        return {};
+    }
+
+    constexpr bool Remove(EntityId id) noexcept {
         const u16 denseIdx = m_sparse[id.index];
         if (denseIdx >= m_size || m_denseEntities[denseIdx] != id) [[unlikely]] {
             return false;
@@ -89,79 +111,46 @@ public:
         return true;
     }
 
-    void RemoveUnchecked(EntityId id) noexcept {
+    constexpr void RemoveUnchecked(EntityId id) noexcept {
         const u16 denseIdx = m_sparse[id.index];
         if (denseIdx < m_size) [[likely]] {
             RemoveAtDense(denseIdx, id.index);
         }
     }
 
-    constexpr void SwapDenseSlots(u16 idxA, u16 idxB) noexcept {
-        if (idxA == idxB) {
-            return;
-        }
-        const EntityId entA = m_denseEntities[idxA];
-        const EntityId entB = m_denseEntities[idxB];
-        std::swap(m_denseEntities[idxA], m_denseEntities[idxB]);
-        std::swap(m_denseComponents[idxA], m_denseComponents[idxB]);
-        m_sparse[entA.index] = idxB;
-        m_sparse[entB.index] = idxA;
-    }
-
-    constexpr u16 PromoteToGroup(u16 entityIndex) noexcept {
-        const u16 currentIdx = m_sparse[entityIndex];
-        const u16 groupSlot  = m_groupCount++;
-        if (currentIdx != groupSlot) {
-            SwapDenseSlots(currentIdx, groupSlot);
-        }
-        return groupSlot;
-    }
-
-    constexpr void DemoteFromGroup(u16 entityIndex) noexcept {
-        const u16 currentIdx = m_sparse[entityIndex];
-        if (currentIdx < m_groupCount) {
-            const u16 groupLast = --m_groupCount;
-            if (currentIdx != groupLast) {
-                SwapDenseSlots(currentIdx, groupLast);
-            }
-        }
-    }
-
     [[nodiscard]] constexpr u16 Size() const noexcept { return m_size; }
-    [[nodiscard]] constexpr u16 GroupSize() const noexcept { return m_groupCount; }
+    [[nodiscard]] constexpr u16 Capacity() const noexcept { return m_capacity; }
     [[nodiscard]] constexpr u16 DenseIndexOf(u16 entityIndex) const noexcept { return m_sparse[entityIndex]; }
-    [[nodiscard]] constexpr u64 PresenceWord(u32 wordIdx) const noexcept { return m_presenceWords[wordIdx]; }
-    [[nodiscard]] constexpr std::span<const EntityId> Entities() const noexcept { return m_denseEntities.first(m_size); }
+
+    [[nodiscard]] constexpr std::span<const EntityId> Entities() const noexcept {
+        return {m_denseEntities, m_size};
+    }
 
     template <typename Self>
     [[nodiscard]] constexpr auto Components(this Self&& self) noexcept {
-        return self.m_denseComponents.first(self.m_size);
+        using ElemT = std::conditional_t<std::is_const_v<std::remove_reference_t<Self>>, const T, T>;
+        return std::span<ElemT>{self.m_denseComponents, self.m_size};
     }
 
 private:
     constexpr void RemoveAtDense(u16 targetIdx, u16 entityIndex) noexcept {
-        if (targetIdx < m_groupCount) {
-            const u16 groupLast = --m_groupCount;
-            if (targetIdx != groupLast) {
-                SwapDenseSlots(targetIdx, groupLast);
-                targetIdx = groupLast;
-            }
-        }
         const u16 lastIdx = --m_size;
         if (targetIdx != lastIdx) {
-            SwapDenseSlots(targetIdx, lastIdx);
+            const EntityId movedEnt      = m_denseEntities[lastIdx];
+            m_denseEntities[targetIdx]   = movedEnt;
+            m_denseComponents[targetIdx] = m_denseComponents[lastIdx];
+            m_sparse[movedEnt.index]     = targetIdx;
         }
         m_sparse[entityIndex] = kInvalidDenseIndex;
-        m_presenceWords[entityIndex >> 6] &= ~(1ULL << (entityIndex & 63u));
     }
 
-    std::span<u16> m_sparse{};
-    std::span<u64> m_presenceWords{};
-    std::span<EntityId> m_denseEntities{};
-    std::span<T> m_denseComponents{};
+    u16* m_sparse{nullptr};
+    EntityId* m_denseEntities{nullptr};
+    T* m_denseComponents{nullptr};
     u16 m_size{0};
     u16 m_capacity{0};
-    u16 m_groupCount{0};
+    u32 m_reserved{0};
 };
+static_assert(sizeof(ComponentPool<Velocity2D>) == 32);
 
 } // namespace en::world

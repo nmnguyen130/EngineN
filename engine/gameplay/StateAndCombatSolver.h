@@ -6,23 +6,25 @@
 
 namespace en::gameplay {
 
-// Dedicated 120 Hz Animation & Frame-Directive Subsystem.
-// Steps lockstep [Sprite2D + SpriteAnimator2D] pools with native TimeChannel freeze gating
-// and dispatches cooked .erig frame-edge directives (hitboxes, hurtboxes, root-motion, cancel masks) in a single pass.
-// Invariant: Executes in Stage 2 before kinematics so hitbox activations have 0-tick latency.
-class AnimationSubsystem final {
+// Stateless evaluator for cooked .erig frame directives, actor state machines, cancel windows, and combat hits.
+// Operates directly on dense World component pools and cooked AssetBank blobs with zero dynamic allocations.
+// Invariant: DispatchAnimationFrameDirectives executes in Stage 2 before kinematics for 0-tick hitbox latency.
+class StateAndCombatSolver final {
 public:
-    static void StepAnimationsAndDirectives(
+    static void DispatchAnimationFrameDirectives(
         world::World& world,
         const assets::AssetBank& assetBank,
         time::SimStepView step,
         GameplayPipeline& pipeline) noexcept;
-};
 
-// Stateless evaluator for actor state machines, cancel windows, and combat hit arbitration.
-// Operates in-place on World component pools and cooked AssetBank blobs with zero dynamic allocations.
-class StateAndCombatSolver final {
-public:
+    static void StepAnimationsAndDirectives(
+        world::World& world,
+        const assets::AssetBank& assetBank,
+        time::SimStepView step,
+        GameplayPipeline& pipeline) noexcept {
+        DispatchAnimationFrameDirectives(world, assetBank, step, pipeline);
+    }
+
     static void StepStateMachinesAndPolicies(
         world::World& world,
         const assets::AssetBank& assetBank,
@@ -39,5 +41,7 @@ public:
         const GameplayPolicyTable& policies,
         GameplayPipeline& pipeline) noexcept;
 };
+
+using AnimationSubsystem = StateAndCombatSolver;
 
 } // namespace en::gameplay

@@ -11,9 +11,9 @@
 namespace en::debug {
 
 // O(1) rolling 256-frame telemetry profiler with 64-bucket quantized percentile tracker.
-// Non-owning view over the 32 KB FrameProfileSample ring in DebugSystem's arena.
+// Non-owning view over the 16 KB FrameProfileSample ring in DebugSystem's arena; Cache Line 0 holds hot control state.
 // Invariant: m_currentIdx < kHistoryFrames (256), m_activeBucketMask tracks non-empty buckets for O(1) percentile scan.
-class DebugProfiler {
+class alignas(64) DebugProfiler {
 public:
     static constexpr usize kHistoryFrames = 256;
     static constexpr usize kBucketCount   = 64;
@@ -27,21 +27,20 @@ public:
     void EndFrame() noexcept;
 
     [[nodiscard]] u32 ComputePercentileUs(u32 targetRankOutOf256) const noexcept;
-    [[nodiscard]] constexpr const FrameProfileSample& Latest() const noexcept {
-        return m_samples[m_currentIdx];
-    }
+    [[nodiscard]] const FrameProfileSample& Latest() const noexcept;
 
     void EmitProfilerAndTimeHud(OverlayFlags flags,
-                                platform::Extent2i viewportSize,
+                                renderer::ViewportExtent viewportSize,
                                 DebugBatcher& hudBatcher) const noexcept;
 
 private:
     std::span<FrameProfileSample> m_samples{};
-    std::array<u16, kBucketCount> m_buckets{};
     u64 m_activeBucketMask{0};
     u32 m_currentIdx{0};
     u32 m_validFrames{0};
+    alignas(64) std::array<u16, kBucketCount> m_buckets{};
 };
+static_assert(sizeof(DebugProfiler) == 192);
 
 // RAII scope timer compiled down to a zero-byte no-op when EN_ENABLE_DEBUG_TOOLS == 0.
 template <time::ClockSource ClockT>
@@ -101,10 +100,6 @@ using ConsoleCmdCallback = void (*)(void* ctx, const ConsoleArgs& args, DebugCon
 
 // Exact 32-byte cache-aligned unified symbol entry (2 symbols per 64B cache line).
 struct alignas(32) ConsoleSymbol {
-    u32 nameHash{0};
-    SymbolKind kind{SymbolKind::Empty};
-    u8 nameLen{0};
-    u16 reserved{0};
     const char* namePtr{nullptr};
     void* targetPtr{nullptr};
     union {
@@ -113,22 +108,27 @@ struct alignas(32) ConsoleSymbol {
         struct { i32 minVal; i32 maxVal; } i32Bounds;
         struct { u32 minVal; u32 maxVal; } u32Bounds;
     };
+    u32 nameHash{0};
+    SymbolKind kind{SymbolKind::Empty};
+    u8 nameLen{0};
+
+    [[nodiscard]] constexpr std::string_view Name() const noexcept { return {namePtr, nameLen}; }
 };
 static_assert(sizeof(ConsoleSymbol) == 32);
 
 // 8-byte log descriptor indexing into the 16 KB contiguous circular text buffer.
-struct LogEntryMeta {
+struct alignas(8) LogEntryMeta {
     u16 textOffset{0};
     u16 tickLow16{0};
     u8  textLength{0};
     LogSeverity severity{LogSeverity::Info};
-    u16 reserved{0};
 };
 static_assert(sizeof(LogEntryMeta) == 8);
 
 // Zero-allocation in-game command & CVar console with Fibonacci open-addressed symbol lookup.
 // Non-owning view over symbol, log metadata, log text, and command history slices in DebugSystem's arena.
-class DebugConsole {
+// Invariant: Cache Line 0 holds hot spans, log counters, and incremental symbol hash for O(1) audit hashing.
+class alignas(64) DebugConsole {
 public:
     static constexpr usize kMaxSymbols     = 256;
     static constexpr usize kMaxLogEntries  = 512;
@@ -136,11 +136,12 @@ public:
     static constexpr usize kMaxHistory     = 32;
     static constexpr usize kMaxPendingCmds = 4;
     static constexpr usize kMaxLineChars   = 128;
+    using LineBuffer = std::array<char, kMaxLineChars>;
 
     void BindArena(std::span<ConsoleSymbol, kMaxSymbols> symbolTable,
                    std::span<LogEntryMeta, kMaxLogEntries> logMeta,
                    std::span<char, kLogTextBytes> logText,
-                   std::span<std::array<char, kMaxLineChars>, kMaxHistory> historyBuf) noexcept;
+                   std::span<LineBuffer, kMaxHistory> historyBuf) noexcept;
     void ClearLog() noexcept;
 
     [[nodiscard]] Result<void, DebugErrc> RegisterCommand(
@@ -178,32 +179,35 @@ public:
 
     [[nodiscard]] constexpr std::span<const ConsoleSymbol> Symbols() const noexcept { return m_symbols; }
 
-    void EmitConsoleOverlay(platform::Extent2i viewportSize, DebugBatcher& hudBatcher) const noexcept;
+    void EmitConsoleOverlay(renderer::ViewportExtent viewportSize, DebugBatcher& hudBatcher) const noexcept;
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
-    [[nodiscard]] Result<ConsoleSymbol*, DebugErrc> InsertSymbolSlot(std::string_view staticName) noexcept;
+    [[nodiscard]] Result<ConsoleSymbol*, DebugErrc> InsertSymbolSlot(
+        std::string_view staticName, SymbolKind kind, void* targetPtr) noexcept;
     [[nodiscard]] ConsoleSymbol* FindSymbol(std::string_view name) noexcept;
     void PushHistoryLine(std::string_view line) noexcept;
+    void LoadHistoryEntry(u8 browseOffset) noexcept;
 
     std::span<ConsoleSymbol> m_symbols{};
     std::span<LogEntryMeta>  m_logMeta{};
     std::span<char>          m_logText{};
-    std::span<std::array<char, kMaxLineChars>> m_history{};
-    std::array<std::array<char, kMaxLineChars>, kMaxPendingCmds> m_pendingCmds{};
-    std::array<u8, kMaxPendingCmds> m_pendingLens{};
-    std::array<char, kMaxLineChars> m_inputBuf{};
+    u64 m_symbolHash{0};
+    u32 m_logWriteIdx{0};
+    u32 m_logCount{0};
+
+    std::span<LineBuffer> m_history{};
+    u32 m_scrollOffset{0};
+    u16 m_textWriteCursor{0};
     u8  m_pendingCount{0};
     u8  m_inputLen{0};
     u8  m_cursorPos{0};
     u8  m_historyWriteIdx{0};
     u8  m_historyCount{0};
     i8  m_historyBrowseIdx{-1};
-    u16 m_textWriteCursor{0};
-    u32 m_logWriteIdx{0};
-    u32 m_logCount{0};
-    u32 m_scrollOffset{0};
     bool m_isOpen{false};
+    LineBuffer m_inputBuf{};
+    std::array<LineBuffer, kMaxPendingCmds> m_pendingCmds{};
 };
 
 } // namespace en::debug

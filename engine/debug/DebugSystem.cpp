@@ -1,10 +1,10 @@
 #include "debug/DebugSystem.h"
 
+#include "input/InputPipeline.h"
 #include "renderer/RenderList.h"
 #include "renderer/Renderer.h"
 
 #include <algorithm>
-#include <cstring>
 #include <new>
 
 namespace en::debug {
@@ -13,20 +13,20 @@ namespace en::debug {
 
 namespace {
 
-inline constexpr usize kOffsetShapes  = 0;
-inline constexpr usize kOffsetSamples = kOffsetShapes  + sizeof(DebugShapeCmd) * DebugShapePool::kMaxShapes;
-inline constexpr usize kOffsetTicks   = kOffsetSamples + sizeof(FrameProfileSample) * DebugProfiler::kHistoryFrames;
-inline constexpr usize kOffsetSymbols = kOffsetTicks   + sizeof(ActorTickRecord) * DebugInspector::kHistoryTicks;
-inline constexpr usize kOffsetLogMeta = kOffsetSymbols + sizeof(ConsoleSymbol) * DebugConsole::kMaxSymbols;
-inline constexpr usize kOffsetLogText = kOffsetLogMeta + sizeof(LogEntryMeta) * DebugConsole::kMaxLogEntries;
-inline constexpr usize kOffsetHistory = kOffsetLogText + DebugConsole::kLogTextBytes;
-inline constexpr usize kTotalUsedArena =
-    kOffsetHistory + DebugConsole::kMaxLineChars * DebugConsole::kMaxHistory;
+inline constexpr usize kOffsetShapes   = 0;
+inline constexpr usize kOffsetSamples  = kOffsetShapes  + sizeof(DebugShapeCmd) * DebugShapePool::kMaxShapes;
+inline constexpr usize kOffsetTicks    = kOffsetSamples + sizeof(FrameProfileSample) * DebugProfiler::kHistoryFrames;
+inline constexpr usize kOffsetSymbols  = kOffsetTicks   + sizeof(ActorTickRecord) * DebugInspector::kHistoryTicks;
+inline constexpr usize kOffsetLogMeta  = kOffsetSymbols + sizeof(ConsoleSymbol) * DebugConsole::kMaxSymbols;
+inline constexpr usize kOffsetLogText  = kOffsetLogMeta + sizeof(LogEntryMeta) * DebugConsole::kMaxLogEntries;
+inline constexpr usize kOffsetHistory  = kOffsetLogText + DebugConsole::kLogTextBytes;
+inline constexpr usize kTotalUsedArena = kOffsetHistory + sizeof(DebugConsole::LineBuffer) * DebugConsole::kMaxHistory;
 
-static_assert(kTotalUsedArena <= DebugSystem::kArenaSizeBytes);
+static_assert(kTotalUsedArena == DebugSystem::kArenaSizeBytes);
 static_assert((kOffsetSamples & 63u) == 0);
-static_assert((kOffsetTicks & 63u) == 0);
+static_assert((kOffsetTicks   & 63u) == 0);
 static_assert((kOffsetSymbols & 63u) == 0);
+static_assert((kOffsetHistory & 63u) == 0);
 
 struct OverlayNameEntry {
     std::string_view name;
@@ -65,10 +65,11 @@ DebugSystem& DebugSystem::operator=(DebugSystem&& other) noexcept {
         m_arenaSlab             = std::exchange(other.m_arenaSlab, nullptr);
         m_debugAtlas            = std::exchange(other.m_debugAtlas, renderer::TextureHandle{});
         m_overlays              = other.m_overlays;
-        m_toggleConsoleScancode = other.m_toggleConsoleScancode;
         m_pendingDirectives     = other.m_pendingDirectives;
-        m_shapePool             = other.m_shapePool;
+        m_toggleConsoleScancode = other.m_toggleConsoleScancode;
+        m_savedActionMask       = other.m_savedActionMask;
         m_inspector             = other.m_inspector;
+        m_shapePool             = other.m_shapePool;
         m_profiler              = other.m_profiler;
         m_console               = other.m_console;
     }
@@ -82,7 +83,6 @@ Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer, const De
     if (rawMem == nullptr) {
         return Err(DebugErrc::OutOfMemory);
     }
-    std::memset(rawMem, 0, kArenaSizeBytes);
     m_arenaSlab = static_cast<u8*>(rawMem);
 
     std::array<u8, kDebugAtlasWidth * kDebugAtlasHeight * 4> atlasPixels{};
@@ -104,8 +104,9 @@ Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer, const De
     }
     m_debugAtlas            = *texRes;
     m_overlays              = cfg.initialOverlays;
-    m_toggleConsoleScancode = cfg.toggleConsoleScancode;
     m_pendingDirectives     = {};
+    m_toggleConsoleScancode = cfg.toggleConsoleScancode;
+    m_savedActionMask       = 0xFFFFu;
 
     m_shapePool.BindArena(std::span<DebugShapeCmd, DebugShapePool::kMaxShapes>(
         reinterpret_cast<DebugShapeCmd*>(m_arenaSlab + kOffsetShapes), DebugShapePool::kMaxShapes));
@@ -120,12 +121,11 @@ Result<void, DebugErrc> DebugSystem::Init(renderer::Renderer& renderer, const De
             reinterpret_cast<LogEntryMeta*>(m_arenaSlab + kOffsetLogMeta), DebugConsole::kMaxLogEntries),
         std::span<char, DebugConsole::kLogTextBytes>(
             reinterpret_cast<char*>(m_arenaSlab + kOffsetLogText), DebugConsole::kLogTextBytes),
-        std::span<std::array<char, DebugConsole::kMaxLineChars>, DebugConsole::kMaxHistory>(
-            reinterpret_cast<std::array<char, DebugConsole::kMaxLineChars>*>(m_arenaSlab + kOffsetHistory),
-            DebugConsole::kMaxHistory));
+        std::span<DebugConsole::LineBuffer, DebugConsole::kMaxHistory>(
+            reinterpret_cast<DebugConsole::LineBuffer*>(m_arenaSlab + kOffsetHistory), DebugConsole::kMaxHistory));
 
     RegisterBuiltInCommands();
-    return Ok;
+    return {};
 }
 
 void DebugSystem::Shutdown(renderer::Renderer* renderer) noexcept {
@@ -151,6 +151,21 @@ bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool c
         m_console.OnKeyPress(scancode, shift, ctrl);
     }
     return true;
+}
+
+bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl,
+                                     input::InputPipeline& input) noexcept {
+    const bool wasOpen = m_console.IsOpen();
+    const bool handled = OnPlatformKeyEvent(scancode, down, shift, ctrl);
+    const bool nowOpen = m_console.IsOpen();
+
+    if (!wasOpen && nowOpen) {
+        m_savedActionMask = input.GetActionMask();
+        input.SetActionMask(0);
+    } else if (wasOpen && !nowOpen) {
+        input.SetActionMask(m_savedActionMask);
+    }
+    return handled;
 }
 
 bool DebugSystem::OnPlatformTextInput(std::string_view textUtf8) noexcept {
@@ -191,7 +206,7 @@ void DebugSystem::RegisterBuiltInCommands() noexcept {
     (void)m_console.RegisterCommand("help", [](void*, const ConsoleArgs&, DebugConsole& con) noexcept {
         for (const ConsoleSymbol& sym : con.Symbols()) {
             if (sym.kind != SymbolKind::Empty) {
-                con.Print(LogSeverity::Info, {sym.namePtr, sym.nameLen});
+                con.Print(LogSeverity::Info, sym.Name());
             }
         }
     }, this);
@@ -206,8 +221,7 @@ void DebugSystem::RegisterBuiltInCommands() noexcept {
     }, this);
 
     (void)m_console.RegisterCommand("step", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
-        auto* self = static_cast<DebugSystem*>(ctx);
-        i64 ticks  = 1;
+        i64 ticks = 1;
         if (args.Count() >= 2) {
             const auto res = args.GetInt(1);
             if (!res || *res < 1 || *res > 120) {
@@ -216,19 +230,15 @@ void DebugSystem::RegisterBuiltInCommands() noexcept {
             }
             ticks = *res;
         }
-        self->RequestSteps(static_cast<u16>(ticks));
+        static_cast<DebugSystem*>(ctx)->RequestSteps(static_cast<u16>(ticks));
         con.Print(LogSeverity::Success, "Queued simulation step");
     }, this);
 
     (void)m_console.RegisterCommand("timescale", [](void* ctx, const ConsoleArgs& args, DebugConsole& con) noexcept {
-        if (args.Count() < 3) {
-            con.Print(LogSeverity::Error, "Usage: timescale <channel 0..7> <scale 0..4>");
-            return;
-        }
         const auto chRes = args.GetInt(1);
         const auto scRes = args.GetFloat(2);
-        if (!chRes || !scRes || *chRes < 0 || *chRes > 7) {
-            con.Print(LogSeverity::Error, "Invalid channel or scale");
+        if (args.Count() < 3 || !chRes || !scRes || *chRes < 0 || *chRes > 7) {
+            con.Print(LogSeverity::Error, "Usage: timescale <channel 0..7> <scale 0..4>");
             return;
         }
         static_cast<DebugSystem*>(ctx)->RequestChannelTimeScale(
@@ -242,14 +252,11 @@ void DebugSystem::RegisterBuiltInCommands() noexcept {
             return;
         }
         auto* self = static_cast<DebugSystem*>(ctx);
-        const std::string_view name = args[1];
         for (const OverlayNameEntry& entry : kOverlayNames) {
-            if (entry.name == name) {
-                if (entry.flag == OverlayFlags::None) {
-                    self->m_overlays = OverlayFlags::None;
-                } else {
-                    self->m_overlays = self->m_overlays ^ entry.flag;
-                }
+            if (entry.name == args[1]) {
+                self->m_overlays = (entry.flag == OverlayFlags::None)
+                    ? OverlayFlags::None
+                    : (self->m_overlays ^ entry.flag);
                 con.Print(LogSeverity::Success, "Updated overlay flags");
                 return;
             }

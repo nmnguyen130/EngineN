@@ -3,9 +3,8 @@
 #include "world/WorldTypes.h"
 #include "world/ComponentPool.h"
 #include "world/TransformSolver.h"
-#include "core/time/TimeViews.h"
+#include "core/time/TimePipeline.h"
 
-#include <array>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -29,7 +28,13 @@ struct alignas(8) WorldCmdHeader {
 };
 static_assert(sizeof(WorldCmdHeader) == 8);
 
+struct alignas(64) AlignedArenaLine {
+    u8 bytes[64];
+};
+static_assert(sizeof(AlignedArenaLine) == 64 && alignof(AlignedArenaLine) == 64);
+
 // Bitmask-accelerated multi-component view selecting the smallest dense pool as lead iterator.
+// Single-component unfiltered views bypass mask and sparse lookups at compile time.
 template <typename WorldPtr, typename ExcludeTag, Component... IncludeTs>
 class WorldView;
 
@@ -38,6 +43,7 @@ class WorldView<WorldPtr, Exclude<ExcludeTs...>, IncludeTs...> final {
     static_assert(sizeof...(IncludeTs) >= 1, "WorldView requires at least one Include component.");
     static constexpr ComponentMask kIncludeMask = MakeComponentMask<IncludeTs...>();
     static constexpr ComponentMask kExcludeMask = MakeComponentMask<ExcludeTs...>();
+    static constexpr bool kSingleUnfiltered = (sizeof...(IncludeTs) == 1) && (sizeof...(ExcludeTs) == 0);
 
     using PoolTuple = std::tuple<decltype(&std::declval<WorldPtr>()->template GetPool<IncludeTs>())...>;
 
@@ -50,12 +56,16 @@ public:
             std::span<const EntityId> leadEntities,
             usize idx) noexcept
             : m_masks(masks), m_pools(pools), m_lead(leadEntities), m_idx(idx) {
-            AdvanceToValid();
+            if constexpr (!kSingleUnfiltered) {
+                AdvanceToValid();
+            }
         }
 
         constexpr Iterator& operator++() noexcept {
             ++m_idx;
-            AdvanceToValid();
+            if constexpr (!kSingleUnfiltered) {
+                AdvanceToValid();
+            }
             return *this;
         }
 
@@ -65,14 +75,20 @@ public:
 
         [[nodiscard]] constexpr auto operator*() const noexcept {
             const EntityId id = m_lead[m_idx];
-            return std::apply(
-                [id](auto*... poolPtrs) noexcept {
-                    return std::tuple<EntityId, decltype(poolPtrs->DirectAtEntityIndex(id.index))...>(
-                        id, poolPtrs->DirectAtEntityIndex(id.index)...
-                    );
-                },
-                m_pools
-            );
+            if constexpr (kSingleUnfiltered) {
+                return std::tuple<EntityId, decltype(std::get<0>(m_pools)->ComponentAtDense(m_idx))>(
+                    id, std::get<0>(m_pools)->ComponentAtDense(m_idx)
+                );
+            } else {
+                return std::apply(
+                    [id](auto*... poolPtrs) noexcept {
+                        return std::tuple<EntityId, decltype(poolPtrs->DirectAtEntityIndex(id.index))...>(
+                            id, poolPtrs->DirectAtEntityIndex(id.index)...
+                        );
+                    },
+                    m_pools
+                );
+            }
         }
 
     private:
@@ -105,9 +121,9 @@ private:
 };
 
 // Authoritative simulation container owning entity lifetimes, SoA spatial spine, and component pools.
-// Move-only RAII owner of a single pre-allocated memory slab; zero heap allocations in hot paths.
-// Invariant: Slot 0 is permanently reserved as the null/root identity sentinel.
-class World final {
+// Move-only 192B (3-cache-line) RAII owner of a single 64B-aligned memory slab; zero heap allocations in hot paths.
+// Invariant: Slot 0 is reserved as kNullEntity (m_generations[0] == 0); dead slots thread an intrusive FIFO freelist in m_componentMasks.
+class alignas(64) World final {
 public:
     World() = default;
     ~World() noexcept { Shutdown(); }
@@ -127,49 +143,48 @@ public:
         if (m_poolOps[tid].poolInstance != nullptr) {
             return {};
         }
-        const u16 cap = (capacity == 0) ? m_cfg.defaultComponentPoolCapacity : capacity;
-        const u32 wordCount = static_cast<u32>(m_cfg.maxEntities) >> 6;
+        const u16 cap = (capacity == 0) ? m_defaultPoolCap : capacity;
 
-        auto* poolMem      = CarveAligned<ComponentPool<T>>(1);
-        auto* sparseMem    = CarveAligned<u16>(m_cfg.maxEntities);
-        auto* presenceMem  = CarveAligned<u64>(wordCount);
-        auto* denseEntMem  = CarveAligned<EntityId>(cap);
+        auto* poolMem      = CarveAligned<ComponentPool<T>>(1, alignof(ComponentPool<T>));
+        auto* sparseMem    = CarveAligned<u16>(m_maxEntities, 64);
+        auto* denseEntMem  = CarveAligned<EntityId>(cap, 64);
         auto* denseCompMem = CarveAligned<T>(cap, std::max<usize>(alignof(T), 64));
 
-        if (!poolMem || !sparseMem || !presenceMem || !denseEntMem || !denseCompMem) [[unlikely]] {
+        if (!poolMem || !sparseMem || !denseEntMem || !denseCompMem) [[unlikely]] {
             return Err(WorldErrc::OutOfMemory);
         }
 
         auto* pool = std::construct_at(poolMem);
         pool->BindArena(
-            {sparseMem, m_cfg.maxEntities},
-            {presenceMem, wordCount},
+            {sparseMem, m_maxEntities},
             {denseEntMem, cap},
             {denseCompMem, cap}
         );
 
         m_poolOps[tid] = PoolOps{
             .poolInstance = pool,
-            .removeUncheckedFn = [](void* p, EntityId id) noexcept {
-                static_cast<ComponentPool<T>*>(p)->RemoveUnchecked(id);
+            .removeOrClearFn = [](void* p, EntityId id) noexcept {
+                auto* cp = static_cast<ComponentPool<T>*>(p);
+                if (id.index != 0) [[likely]] {
+                    cp->RemoveUnchecked(id);
+                } else {
+                    cp->Clear();
+                }
             },
             .emplaceRawFn = [](void* p, EntityId id, const void* raw) noexcept -> Result<void, WorldErrc> {
-                auto res = static_cast<ComponentPool<T>*>(p)->Emplace(id, *static_cast<const T*>(raw));
-                if (!res) [[unlikely]] {
-                    return Err(res.error());
-                }
-                return {};
-            },
-            .clearFn = [](void* p) noexcept {
-                static_cast<ComponentPool<T>*>(p)->Clear();
+                return static_cast<ComponentPool<T>*>(p)->EmplaceRaw(id, raw);
             },
             .hashCanonicalFn = [](const void* p, u16 maxIdx) noexcept -> u64 {
                 const auto* cp = static_cast<const ComponentPool<T>*>(p);
+                if (cp->Size() == 0) {
+                    return 0ULL;
+                }
                 u64 h = 14695981039346656037ULL ^ T::kTypeId;
                 const auto comps = cp->Components();
                 for (u16 idx = 1; idx <= maxIdx; ++idx) {
                     const u16 dense = cp->DenseIndexOf(idx);
                     if (dense < cp->Size()) {
+                        h = (h ^ idx) * 1099511628211ULL;
                         const auto* bytes = reinterpret_cast<const u8*>(&comps[dense]);
                         for (usize b = 0; b < sizeof(T); ++b) {
                             h = (h ^ bytes[b]) * 1099511628211ULL;
@@ -186,10 +201,13 @@ public:
     bool Destroy(EntityId id) noexcept;
 
     [[nodiscard]] constexpr bool IsAlive(EntityId id) const noexcept {
-        return id.index > 0 && id.index < m_cfg.maxEntities &&
+        return id.index < m_maxEntities &&
                m_generations[id.index] == id.generation &&
-               HasFlag(m_flags[id.index], EntityFlags::Alive);
+               id.generation != 0;
     }
+
+    [[nodiscard]] constexpr u32 AliveCount() const noexcept { return m_aliveCount; }
+    [[nodiscard]] constexpr u16 MaxAllocatedIndex() const noexcept { return m_maxAllocatedIndex; }
 
     template <Component T, typename... Args>
     [[nodiscard]] Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
@@ -201,18 +219,8 @@ public:
             return Err(WorldErrc::ComponentNotRegistered);
         }
         auto res = GetPool<T>().Emplace(id, std::forward<Args>(args)...);
-        if (!res) [[unlikely]] {
-            return res;
-        }
-        const ComponentMask prevMask = m_componentMasks[id.index];
-        const ComponentMask newMask  = prevMask | (ComponentMask{1} << tid);
-        m_componentMasks[id.index]   = newMask;
-
-        if constexpr (tid == Sprite2D::kTypeId || tid == SpriteAnimator2D::kTypeId) {
-            constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
-            if ((prevMask & kAnimGroupMask) != kAnimGroupMask && (newMask & kAnimGroupMask) == kAnimGroupMask) {
-                SyncLockstepAnimationGroupOnAdd(id.index);
-            }
+        if (res) [[likely]] {
+            m_componentMasks[id.index] |= (ComponentMask{1} << tid);
         }
         return res;
     }
@@ -222,16 +230,9 @@ public:
         if (!IsAlive(id)) [[unlikely]] {
             return false;
         }
-        constexpr u8 tid = T::kTypeId;
-        const ComponentMask bit = ComponentMask{1} << tid;
+        constexpr ComponentMask bit = ComponentMask{1} << T::kTypeId;
         if ((m_componentMasks[id.index] & bit) == 0) {
             return false;
-        }
-        if constexpr (tid == Sprite2D::kTypeId || tid == SpriteAnimator2D::kTypeId) {
-            constexpr ComponentMask kAnimGroupMask = MakeComponentMask<Sprite2D, SpriteAnimator2D>();
-            if ((m_componentMasks[id.index] & kAnimGroupMask) == kAnimGroupMask) {
-                SyncLockstepAnimationGroupOnRemove(id.index);
-            }
         }
         m_componentMasks[id.index] &= ~bit;
         GetPool<T>().RemoveUnchecked(id);
@@ -281,7 +282,7 @@ public:
     [[nodiscard]] constexpr LocalTransform2D& ModifyLocalTransformByIndex(u16 idx) noexcept {
         return m_transforms.ModifyLocal(idx);
     }
-    void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
+    constexpr void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
         if (IsAlive(id)) {
             m_transforms.SetLocal(id.index, local);
         }
@@ -307,13 +308,16 @@ public:
         return m_transforms.PrevWorldSpan();
     }
     [[nodiscard]] constexpr std::span<const time::TimeChannel> TimeChannels() const noexcept {
-        return m_timeChannels;
+        return {m_timeChannels, m_maxEntities};
+    }
+    [[nodiscard]] constexpr std::span<const u64> MovedWords() const noexcept {
+        return m_transforms.MovedWordsSpan();
     }
     [[nodiscard]] constexpr ComponentMask GetComponentMaskByIndex(u16 idx) const noexcept {
-        return m_componentMasks[idx];
+        return (m_generations[idx] != 0) ? m_componentMasks[idx] : 0ULL;
     }
     [[nodiscard]] Result<void, WorldErrc> SetParent(EntityId child, EntityId parent) noexcept;
-    void PropagateTransforms() noexcept { m_transforms.Propagate(m_maxAllocatedIndex); }
+    void PropagateTransforms() noexcept;
 
     template <Component... IncludeTs, Component... ExcludeTs, typename Self>
     [[nodiscard]] constexpr auto View(this Self&& self, Exclude<ExcludeTs...> = {}) noexcept {
@@ -336,14 +340,15 @@ public:
         );
 
         return WorldView<decltype(&self), Exclude<ExcludeTs...>, IncludeTs...>(
-            self.m_componentMasks.data(), pools, smallestLead
+            self.m_componentMasks, pools, smallestLead
         );
     }
 
-    // Pure Layer-1 Spatial & Ambient Velocity Lifecycle (Animation moved to AnimationSubsystem)
+    // Pure Layer 1 120 Hz Spatial, Ambient Velocity & Atlas Animation Lifecycle
     void BeginTick(time::SimStepView step) noexcept;
     void StepAmbientVelocities(time::SimStepView step) noexcept;
-    void EndTick(time::SimStepView step) noexcept;
+    void StepAnimations(time::SimStepView step) noexcept;
+    void EndTick(time::SimStepView step = {}) noexcept;
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
@@ -357,40 +362,42 @@ private:
             return nullptr;
         }
         m_arenaOffset = alignedOffset + bytes;
-        return reinterpret_cast<T*>(m_arenaSlab.get() + alignedOffset);
+        auto* rawBase = reinterpret_cast<u8*>(m_arenaSlab.get());
+        return reinterpret_cast<T*>(rawBase + alignedOffset);
     }
 
     [[nodiscard]] Result<void, WorldErrc> PushRawCommand(
         WorldCmdOp op, u8 componentTypeId, EntityId target, const void* payload, u16 payloadBytes) noexcept;
 
-    void SyncLockstepAnimationGroupOnAdd(u16 entityIndex) noexcept;
-    void SyncLockstepAnimationGroupOnRemove(u16 entityIndex) noexcept;
+    void SyncTeleportedSnapshots() noexcept;
 
-    WorldConfig m_cfg{};
-    std::unique_ptr<u8[]> m_arenaSlab{};
-    usize m_arenaCapacity{0};
-    usize m_arenaOffset{0};
-
-    std::span<u16> m_generations{};
-    std::span<EntityFlags> m_flags{};
-    std::span<time::TimeChannel> m_timeChannels{};
-    std::span<ComponentMask> m_componentMasks{};
-    std::span<u64> m_aliveWords{};
-    std::span<u64> m_teleportedWords{};
-
-    std::span<u16> m_freeRing{};
-    u32 m_freeHead{0};
-    u32 m_freeTail{0};
-    u32 m_freeCount{0};
-    u16 m_nextFreshSlot{1};
+    // Cache Line 0 (offset 0..63): Hot 120 Hz / 240 Hz entity & component state
+    u16* m_generations{nullptr};
+    ComponentMask* m_componentMasks{nullptr};
+    time::TimeChannel* m_timeChannels{nullptr};
+    u64* m_aliveWords{nullptr};
+    u64* m_teleportedWords{nullptr};
+    PoolOps* m_poolOps{nullptr};
+    u16 m_maxEntities{0};
     u16 m_maxAllocatedIndex{0};
+    u16 m_nextFreshSlot{1};
+    u16 m_freeHead{0};
+    u16 m_freeTail{0};
+    u16 m_defaultPoolCap{0};
     u32 m_aliveCount{0};
 
-    std::span<u8> m_cmdTape{};
-    u32 m_cmdWriteOffset{0};
-
+    // Cache Line 1 (offset 64..127): 64B L1-aligned spatial & hierarchy solver
     TransformSolver m_transforms{};
-    std::array<PoolOps, kMaxComponentTypes> m_poolOps{};
+
+    // Cache Line 2 (offset 128..191): Command tape & 64B-aligned arena slab ownership
+    u8* m_cmdTape{nullptr};
+    u32 m_cmdWriteOffset{0};
+    u32 m_cmdCapacity{0};
+    std::unique_ptr<AlignedArenaLine[]> m_arenaSlab{};
+    usize m_arenaCapacity{0};
+    usize m_arenaOffset{0};
+    u8 m_reserved[24]{};
 };
+static_assert(sizeof(World) == 192);
 
 } // namespace en::world

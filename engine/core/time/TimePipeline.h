@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/time/ChannelModulator.h"
+#include "core/time/TimeModulator.h"
 
 #include <algorithm>
 #include <bit>
@@ -25,7 +25,7 @@ struct TimeTelemetry {
 };
 
 // Coordinates deterministic 120Hz fixed-timestep simulation using an exact rational accumulator.
-// Owns the clock instance and ChannelModulator (placed at offset 0 for L1 cache alignment).
+// Owns the clock instance and TimeModulator (placed at offset 0 for L1 cache alignment).
 // Invariant: m_accUnits is scaled by (ns * kSimHz) where kNsPerSecond units == 1 exact simulation tick.
 template <ClockSource ClockT = ManualClock>
 class alignas(64) TimePipeline {
@@ -173,8 +173,8 @@ public:
     [[nodiscard]] constexpr const TimeTelemetry& Telemetry() const noexcept { return m_telemetry; }
     [[nodiscard]] constexpr const TimePipelineConfig& Config() const noexcept { return m_config; }
 
-    [[nodiscard]] constexpr ChannelModulator& Modulator() noexcept { return m_modulator; }
-    [[nodiscard]] constexpr const ChannelModulator& Modulator() const noexcept { return m_modulator; }
+    [[nodiscard]] constexpr TimeModulator& Modulator() noexcept { return m_modulator; }
+    [[nodiscard]] constexpr const TimeModulator& Modulator() const noexcept { return m_modulator; }
 
     [[nodiscard]] constexpr ClockT& Clock() noexcept { return m_clock; }
     [[nodiscard]] constexpr const ClockT& Clock() const noexcept { return m_clock; }
@@ -236,7 +236,7 @@ private:
     }
 
     // Placed at offset 0 (Cache Line 0) so BakedTickState aligns directly with the pipeline base address.
-    ChannelModulator             m_modulator{};
+    TimeModulator                m_modulator{};
     TimePipelineConfig           m_config{};
     [[no_unique_address]] ClockT m_clock{};
 

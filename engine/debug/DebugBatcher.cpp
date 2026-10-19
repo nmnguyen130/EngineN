@@ -3,6 +3,7 @@
 #include "renderer/RenderList.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 
@@ -19,84 +20,66 @@ struct Rotor2D {
     u8  segments;
     f32 cosStep;
     f32 sinStep;
+    f32 chordScale; // 2.0f * sin(pi / segments)
 };
 
-// Precomputed unit-circle incremental rotors for common segment counts to avoid runtime sin/cos loops.
+// Precomputed unit-circle incremental rotors and chord scales to eliminate runtime sin/cos/sqrt loops.
 inline constexpr std::array<Rotor2D, 6> kCircleRotors{{
-    {8,  0.70710678f, 0.70710678f},
-    {12, 0.86602540f, 0.50000000f},
-    {16, 0.92387953f, 0.38268343f},
-    {20, 0.95105652f, 0.30901699f},
-    {24, 0.96592583f, 0.25881905f},
-    {32, 0.98078528f, 0.19509032f}
+    {8,  0.70710678f, 0.70710678f, 0.76536686f},
+    {12, 0.86602540f, 0.50000000f, 0.51763809f},
+    {16, 0.92387953f, 0.38268343f, 0.39018064f},
+    {20, 0.95105652f, 0.30901699f, 0.31286893f},
+    {24, 0.96592583f, 0.25881905f, 0.26105238f},
+    {32, 0.98078528f, 0.19509032f, 0.19603428f}
 }};
 
 } // namespace
-
-DebugBatcher::DebugBatcher(renderer::RenderList& list,
-                           renderer::TextureHandle debugAtlas,
-                           u8 passId,
-                           u8 viewSlot) noexcept
-    : m_list(list) {
-    m_templateQuad.cosRot   = 1.0f;
-    m_templateQuad.sinRot   = 0.0f;
-    m_templateQuad.uv       = kSolidWhiteUv;
-    m_templateQuad.texture  = debugAtlas;
-    m_templateQuad.depth    = kDebugFixedDepth;
-    m_templateQuad.passId   = passId;
-    m_templateQuad.layer    = 0;
-    m_templateQuad.viewSlot = viewSlot;
-    m_templateQuad.blend    = renderer::BlendMode::PremultipliedAlpha;
-    m_templateQuad.flipX    = false;
-    m_templateQuad.flipY    = false;
-}
 
 void DebugBatcher::PushSolidRect(renderer::FRect rect, renderer::Color color) noexcept {
     if (rect.w <= 0.0f || rect.h <= 0.0f) {
         return;
     }
-    renderer::QuadCmd cmd = m_templateQuad;
-    cmd.x     = rect.x + rect.w * 0.5f;
-    cmd.y     = rect.y + rect.h * 0.5f;
-    cmd.w     = rect.w;
-    cmd.h     = rect.h;
-    cmd.color = color;
-    m_list.PushQuad(cmd);
+    m_list.PushQuad(MakeQuad(rect.x + rect.w * 0.5f, rect.y + rect.h * 0.5f, rect.w, rect.h, color));
 }
 
 void DebugBatcher::PushBoxOutline(renderer::FRect rect, f32 thickness, renderer::Color color) noexcept {
     if (rect.w <= 0.0f || rect.h <= 0.0f || thickness <= 0.0f) {
         return;
     }
-    const f32 t = std::min({thickness, rect.w * 0.5f, rect.h * 0.5f});
-    PushSolidRect({rect.x, rect.y, rect.w, t}, color);
-    PushSolidRect({rect.x, rect.y + rect.h - t, rect.w, t}, color);
-    if (rect.h > t * 2.0f) {
-        const f32 innerH = rect.h - t * 2.0f;
-        PushSolidRect({rect.x, rect.y + t, t, innerH}, color);
-        PushSolidRect({rect.x + rect.w - t, rect.y + t, t, innerH}, color);
+    const f32 t    = std::min({thickness, rect.w * 0.5f, rect.h * 0.5f});
+    const f32 half = t * 0.5f;
+    const f32 midX = rect.x + rect.w * 0.5f;
+
+    renderer::QuadCmd cmd = MakeQuad(midX, rect.y + half, rect.w, t, color);
+    m_list.PushQuad(cmd);
+
+    cmd.y = rect.y + rect.h - half;
+    m_list.PushQuad(cmd);
+
+    const f32 innerH = rect.h - t * 2.0f;
+    if (innerH > 0.0f) {
+        cmd.x = rect.x + half;
+        cmd.y = rect.y + rect.h * 0.5f;
+        cmd.w = t;
+        cmd.h = innerH;
+        m_list.PushQuad(cmd);
+
+        cmd.x = rect.x + rect.w - half;
+        m_list.PushQuad(cmd);
     }
 }
 
 void DebugBatcher::PushLine(f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, renderer::Color color) noexcept {
-    const f32 dx     = x1 - x0;
-    const f32 dy     = y1 - y0;
-    const f32 lenSq  = dx * dx + dy * dy;
+    const f32 dx    = x1 - x0;
+    const f32 dy    = y1 - y0;
+    const f32 lenSq = dx * dx + dy * dy;
     if (lenSq < 1e-6f || thickness <= 0.0f) {
         return;
     }
     const f32 len    = std::sqrt(lenSq);
     const f32 invLen = 1.0f / len;
-
-    renderer::QuadCmd cmd = m_templateQuad;
-    cmd.x      = (x0 + x1) * 0.5f;
-    cmd.y      = (y0 + y1) * 0.5f;
-    cmd.w      = len;
-    cmd.h      = thickness;
-    cmd.cosRot = dx * invLen;
-    cmd.sinRot = dy * invLen;
-    cmd.color  = color;
-    m_list.PushQuad(cmd);
+    m_list.PushQuad(MakeQuad((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, len, thickness,
+                             color, kSolidWhiteUv, dx * invLen, dy * invLen));
 }
 
 void DebugBatcher::PushArrow(f32 x0, f32 y0, f32 x1, f32 y1, f32 headSize, f32 thickness, renderer::Color color) noexcept {
@@ -111,7 +94,9 @@ void DebugBatcher::PushArrow(f32 x0, f32 y0, f32 x1, f32 y1, f32 headSize, f32 t
     const f32 ux     = dx * invLen;
     const f32 uy     = dy * invLen;
 
-    PushLine(x0, y0, x1, y1, thickness, color);
+    m_list.PushQuad(MakeQuad((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, len, thickness,
+                             color, kSolidWhiteUv, ux, uy));
+
     if (headSize > 0.0f) {
         const f32 hLen = std::min(headSize, len * 0.6f);
         const f32 bx   = x1 - ux * hLen;
@@ -128,25 +113,28 @@ void DebugBatcher::PushCircleOutline(f32 cx, f32 cy, f32 radius, u8 segments, f3
         return;
     }
     const u8 segCount = std::clamp<u8>(segments, 8u, 32u);
-    f32 cosStep = 0.92387953f;
-    f32 sinStep = 0.38268343f;
-    u8  actualSegs = 16;
-
+    Rotor2D rotor     = kCircleRotors[2];
     for (const Rotor2D& r : kCircleRotors) {
         if (segCount <= r.segments) {
-            actualSegs = r.segments;
-            cosStep    = r.cosStep;
-            sinStep    = r.sinStep;
+            rotor = r;
             break;
         }
     }
 
+    const f32 chordLen    = radius * rotor.chordScale;
+    const f32 invChordLen = 1.0f / chordLen;
+    renderer::QuadCmd cmd = MakeQuad(0.0f, 0.0f, chordLen, thickness, color);
+
     f32 vx = radius;
     f32 vy = 0.0f;
-    for (u8 i = 0; i < actualSegs; ++i) {
-        const f32 nx = vx * cosStep - vy * sinStep;
-        const f32 ny = vx * sinStep + vy * cosStep;
-        PushLine(cx + vx, cy + vy, cx + nx, cy + ny, thickness, color);
+    for (u8 i = 0; i < rotor.segments; ++i) {
+        const f32 nx = vx * rotor.cosStep - vy * rotor.sinStep;
+        const f32 ny = vx * rotor.sinStep + vy * rotor.cosStep;
+        cmd.x      = cx + (vx + nx) * 0.5f;
+        cmd.y      = cy + (vy + ny) * 0.5f;
+        cmd.cosRot = (nx - vx) * invChordLen;
+        cmd.sinRot = (ny - vy) * invChordLen;
+        m_list.PushQuad(cmd);
         vx = nx;
         vy = ny;
     }
@@ -168,10 +156,7 @@ void DebugBatcher::PushText(f32 x, f32 y, std::string_view text, renderer::Color
     const f32 halfW = quadW * 0.5f;
     const f32 halfH = quadH * 0.5f;
 
-    renderer::QuadCmd cmd = m_templateQuad;
-    cmd.w     = quadW;
-    cmd.h     = quadH;
-    cmd.color = color;
+    renderer::QuadCmd cmd = MakeQuad(0.0f, 0.0f, quadW, quadH, color, {0.0f, 0.0f, kGlyphUvW, kGlyphUvH});
 
     f32 curX = x;
     f32 curY = y;
@@ -187,12 +172,10 @@ void DebugBatcher::PushText(f32 x, f32 y, std::string_view text, renderer::Color
             continue;
         }
         const u32 glyphIdx = (code <= 0x7Fu) ? static_cast<u32>(code - 0x20u) : 95u;
-        const f32 u0       = static_cast<f32>((glyphIdx & 15u) * 8u) * kInvAtlasW;
-        const f32 v0       = static_cast<f32>((glyphIdx >> 4u) * 8u) * kInvAtlasH;
-
-        cmd.x  = curX + halfW;
-        cmd.y  = curY + halfH;
-        cmd.uv = {u0, v0, kGlyphUvW, kGlyphUvH};
+        cmd.x    = curX + halfW;
+        cmd.y    = curY + halfH;
+        cmd.uv.x = static_cast<f32>((glyphIdx & 15u) * 8u) * kInvAtlasW;
+        cmd.uv.y = static_cast<f32>((glyphIdx >> 4u) * 8u) * kInvAtlasH;
         m_list.PushQuad(cmd);
         curX += advX;
     }
@@ -202,28 +185,8 @@ char* DebugBatcher::FormatI64(char* out, char* end, i64 val) noexcept {
     if (out >= end) {
         return out;
     }
-    u64 mag = 0;
-    if (val < 0) {
-        *out++ = '-';
-        if (out >= end) {
-            return out;
-        }
-        mag = static_cast<u64>(-(val + 1)) + 1ull;
-    } else {
-        mag = static_cast<u64>(val);
-    }
-
-    std::array<char, 20> rev{};
-    u32 len = 0;
-    do {
-        rev[len++] = static_cast<char>('0' + (mag % 10ull));
-        mag /= 10ull;
-    } while (mag != 0ull);
-
-    while (len > 0 && out < end) {
-        *out++ = rev[--len];
-    }
-    return out;
+    const auto [ptr, ec] = std::to_chars(out, end, val);
+    return ec == std::errc{} ? ptr : out;
 }
 
 char* DebugBatcher::FormatU64Hex(char* out, char* end, u64 val, u8 digits) noexcept {
@@ -241,17 +204,14 @@ char* DebugBatcher::FormatF32Fixed2(char* out, char* end, f32 val) noexcept {
         return out;
     }
     if (!std::isfinite(val)) {
-        const std::string_view nanStr = "NaN";
-        for (const char c : nanStr) {
+        for (const char c : std::string_view{"NaN"}) {
             if (out < end) *out++ = c;
         }
         return out;
     }
     if (val < 0.0f) {
         *out++ = '-';
-        if (out >= end) {
-            return out;
-        }
+        if (out >= end) return out;
         val = -val;
     }
     const u64 scaled = static_cast<u64>(val * 100.0f + 0.5f);
@@ -267,13 +227,22 @@ char* DebugBatcher::FormatF32Fixed2(char* out, char* end, f32 val) noexcept {
 
 void DebugShapePool::BindArena(std::span<DebugShapeCmd, kMaxShapes> pool) noexcept {
     m_pool = pool;
-    Clear();
+    m_activeWords.fill(0ull);
+    m_nonEmptyWordMask = 0u;
+    m_nonFullWordMask  = 0xFFFFFFFFu;
+    m_activeCount      = 0u;
 }
 
 void DebugShapePool::Clear() noexcept {
-    m_activeWords.fill(0ull);
-    m_allocCursor = 0;
-    m_activeCount = 0;
+    u32 mask = m_nonEmptyWordMask;
+    while (mask != 0u) {
+        const u32 w = static_cast<u32>(std::countr_zero(mask));
+        mask &= (mask - 1u);
+        m_activeWords[w] = 0ull;
+    }
+    m_nonEmptyWordMask = 0u;
+    m_nonFullWordMask  = 0xFFFFFFFFu;
+    m_activeCount      = 0u;
 }
 
 DebugShapeCmd* DebugShapePool::AllocateSlot(DebugShapeKind kind, f32 x0, f32 y0,
@@ -281,25 +250,21 @@ DebugShapeCmd* DebugShapePool::AllocateSlot(DebugShapeKind kind, f32 x0, f32 y0,
     if (m_pool.empty()) {
         return nullptr;
     }
-    u32 chosenSlot = m_allocCursor & static_cast<u32>(kMaxShapes - 1);
-    const u32 startWord = chosenSlot >> 6u;
-
-    for (u32 i = 0; i < kWordCount; ++i) {
-        const u32 w    = (startWord + i) & static_cast<u32>(kWordCount - 1);
-        const u64 word = m_activeWords[w];
-        if (word != ~0ull) {
-            const u32 bit = static_cast<u32>(std::countr_one(word));
-            chosenSlot    = (w << 6u) | bit;
-            m_activeWords[w] |= (1ull << bit);
-            ++m_activeCount;
-            m_allocCursor = (chosenSlot + 1u) & static_cast<u32>(kMaxShapes - 1);
-            goto init_slot;
+    u32 chosenSlot = m_currentTickLow & static_cast<u32>(kMaxShapes - 1);
+    if (m_nonFullWordMask != 0u) {
+        // Pack active shapes into the lowest available word/bit to keep active commands in L1D cache.
+        const u32 w       = static_cast<u32>(std::countr_zero(m_nonFullWordMask));
+        const u32 bit     = static_cast<u32>(std::countr_one(m_activeWords[w]));
+        chosenSlot        = (w << 6u) | bit;
+        const u64 newWord = m_activeWords[w] | (1ull << bit);
+        m_activeWords[w]  = newWord;
+        m_nonEmptyWordMask |= (1u << w);
+        if (newWord == ~0ull) {
+            m_nonFullWordMask &= ~(1u << w);
         }
+        ++m_activeCount;
     }
-    // Pool is full; overwrite cursor slot in O(1) without growing memory.
-    m_allocCursor = (chosenSlot + 1u) & static_cast<u32>(kMaxShapes - 1);
 
-init_slot:
     DebugShapeCmd& cmd = m_pool[chosenSlot];
     cmd.x0          = x0;
     cmd.y0          = y0;
@@ -340,38 +305,40 @@ void DebugShapePool::AddCircle(f32 cx, f32 cy, f32 radius, u32 rgba8,
     }
 }
 
-void DebugShapePool::AddTextWorld(f32 wx, f32 wy, std::string_view text12, u32 rgba8, u32 durationTicks) noexcept {
-    if (DebugShapeCmd* cmd = AllocateSlot(DebugShapeKind::TextWorld, wx, wy, rgba8, 1.0f, durationTicks)) {
+void DebugShapePool::AddTextInternal(DebugShapeKind kind, f32 x, f32 y,
+                                     std::string_view text12, u32 rgba8, u32 durationTicks) noexcept {
+    if (DebugShapeCmd* cmd = AllocateSlot(kind, x, y, rgba8, 1.0f, durationTicks)) {
         const u8 len  = static_cast<u8>(std::min<usize>(text12.size(), cmd->inlineText.size()));
         cmd->auxParam = len;
-        cmd->inlineText.fill('\0');
-        std::memcpy(cmd->inlineText.data(), text12.data(), len);
+        if (len > 0) {
+            std::memcpy(cmd->inlineText.data(), text12.data(), len);
+        }
     }
 }
 
+void DebugShapePool::AddTextWorld(f32 wx, f32 wy, std::string_view text12, u32 rgba8, u32 durationTicks) noexcept {
+    AddTextInternal(DebugShapeKind::TextWorld, wx, wy, text12, rgba8, durationTicks);
+}
+
 void DebugShapePool::AddTextScreen(f32 sx, f32 sy, std::string_view text12, u32 rgba8, u32 durationTicks) noexcept {
-    if (DebugShapeCmd* cmd = AllocateSlot(DebugShapeKind::TextScreen, sx, sy, rgba8, 1.0f, durationTicks)) {
-        const u8 len  = static_cast<u8>(std::min<usize>(text12.size(), cmd->inlineText.size()));
-        cmd->auxParam = len;
-        cmd->inlineText.fill('\0');
-        std::memcpy(cmd->inlineText.data(), text12.data(), len);
-    }
+    AddTextInternal(DebugShapeKind::TextScreen, sx, sy, text12, rgba8, durationTicks);
 }
 
 void DebugShapePool::EmitAndExpire(u64 currentTickIndex,
                                    DebugBatcher& worldBatcher,
                                    DebugBatcher& hudBatcher) noexcept {
     m_currentTickLow = static_cast<u32>(currentTickIndex);
-    if (m_activeCount == 0 || m_pool.empty()) {
+    if (m_nonEmptyWordMask == 0u || m_pool.empty()) {
         return;
     }
 
     constexpr f32 kInvQ8 = 1.0f / 256.0f;
-    for (u32 w = 0; w < kWordCount; ++w) {
-        u64 word = m_activeWords[w];
-        if (word == 0ull) {
-            continue;
-        }
+    u32 activeWordMask   = m_nonEmptyWordMask;
+    while (activeWordMask != 0u) {
+        const u32 w = static_cast<u32>(std::countr_zero(activeWordMask));
+        activeWordMask &= (activeWordMask - 1u);
+
+        u64 word        = m_activeWords[w];
         u64 expiredMask = 0ull;
         while (word != 0ull) {
             const u32 bit  = static_cast<u32>(std::countr_zero(word));
@@ -421,22 +388,25 @@ void DebugShapePool::EmitAndExpire(u64 currentTickIndex,
                 --m_activeCount;
             }
         }
-        m_activeWords[w] &= ~expiredMask;
+
+        if (expiredMask != 0ull) {
+            const u64 remaining = m_activeWords[w] & ~expiredMask;
+            m_activeWords[w]    = remaining;
+            m_nonFullWordMask  |= (1u << w);
+            if (remaining == 0ull) {
+                m_nonEmptyWordMask &= ~(1u << w);
+            }
+        }
     }
 }
 
-void DebugShapePool::EmitAndExpire(u64 currentTickIndex,
-                                   renderer::TextureHandle debugAtlas,
-                                   renderer::RenderList& outList) noexcept {
-    DebugBatcher worldBatcher(outList, debugAtlas, kDebugWorldPassId, 0);
-    DebugBatcher hudBatcher(outList, debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
-    EmitAndExpire(currentTickIndex, worldBatcher, hudBatcher);
-}
-
 u64 DebugShapePool::ComputeAuditHash() const noexcept {
-    u64 h = MixAuditHash(0xD3B654A9E001ull, m_activeCount);
-    for (const u64 word : m_activeWords) {
-        h = MixAuditHash(h, word);
+    u64 h = MixAuditHash(0xD3B654A9E001ull, (static_cast<u64>(m_nonEmptyWordMask) << 32) | m_activeCount);
+    u32 mask = m_nonEmptyWordMask;
+    while (mask != 0u) {
+        const u32 w = static_cast<u32>(std::countr_zero(mask));
+        mask &= (mask - 1u);
+        h = MixAuditHash(h, m_activeWords[w] ^ (static_cast<u64>(w) << 56));
     }
     return h;
 }

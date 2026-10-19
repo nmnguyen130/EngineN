@@ -6,215 +6,156 @@
 #include "world/World.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 namespace en::gameplay {
 
-namespace {
-
-void ExecuteFrameDirectivesForRange(
-    world::EntityId entity,
-    const CookedAnimRigHeader* rigHdr,
-    const u8* blobBase,
-    u8 clipId,
-    u16 fromFrameInclusive,
-    u16 toFrameInclusive,
-    StateMachine2D& fsm,
-    MotionStack2D* optMotion,
-    HitboxRig2D* optRig,
-    const world::WorldTransform2D& worldTf,
-    GameplayPipeline& pipeline) noexcept {
-
-    if (fromFrameInclusive > toFrameInclusive) {
-        return;
-    }
-
-    const auto* directives   = reinterpret_cast<const CookedFrameDirective*>(blobBase + rigHdr->directiveOffset);
-    const auto* hurtProfiles = reinterpret_cast<const CompactAabb2D*>(blobBase + rigHdr->hurtboxProfileOffset);
-    const auto* slices       = reinterpret_cast<const CookedHitboxSlice*>(blobBase + rigHdr->hitboxSliceOffset);
-
-    const i8 facingSign = optMotion != nullptr ? optMotion->FacingSign() : i8{1};
-
-    for (u16 d = 0; d < rigHdr->directiveCount; ++d) {
-        const CookedFrameDirective& dir = directives[d];
-        if (dir.clipId != clipId) {
-            continue;
-        }
-        const u16 f = dir.frameIndex;
-        if (f < fromFrameInclusive || f > toFrameInclusive) {
-            continue;
-        }
-
-        switch (dir.kind) {
-            case FrameDirectiveKind::SetCancelMask:
-                fsm.cancelMask = dir.paramU16;
-                break;
-            case FrameDirectiveKind::SetOnHitCancelMask:
-                fsm.onHitCancelMask = dir.paramU16;
-                break;
-            case FrameDirectiveKind::SetHurtboxProfile:
-                if (optRig != nullptr && dir.paramU8 < rigHdr->hurtboxProfileCount) {
-                    fsm.hurtboxProfileId = dir.paramU8;
-                    optRig->hurtbox = hurtProfiles[dir.paramU8];
-                }
-                break;
-            case FrameDirectiveKind::ActivateHitboxSlice:
-                if (optRig != nullptr && dir.paramU8 < rigHdr->hitboxSliceCount) {
-                    const CookedHitboxSlice& sl = slices[dir.paramU8];
-                    const bool newSwing = (dir.paramU16 != 0);
-                    optRig->ActivateSlice(dir.paramU8, sl.boundingUnion, newSwing);
-                }
-                break;
-            case FrameDirectiveKind::DeactivateHitbox:
-                if (optRig != nullptr) {
-                    optRig->DeactivateHitbox();
-                }
-                break;
-            case FrameDirectiveKind::ApplyRootMotionDelta:
-                if (optMotion != nullptr) {
-                    const i16 dx = static_cast<i16>(static_cast<i32>(dir.paramI16) * facingSign);
-                    const i16 dy = static_cast<i16>(dir.paramU16);
-                    optMotion->rootMotionDx_q8 = static_cast<i16>(optMotion->rootMotionDx_q8 + dx);
-                    optMotion->rootMotionDy_q8 = static_cast<i16>(optMotion->rootMotionDy_q8 + dy);
-                }
-                break;
-            case FrameDirectiveKind::ApplyVelocityImpulse:
-                if (optMotion != nullptr) {
-                    const f32 vx = static_cast<f32>(dir.paramI16) * (1.0f / 256.0f) * static_cast<f32>(facingSign);
-                    const f32 vy = static_cast<f32>(static_cast<i16>(dir.paramU16)) * (1.0f / 256.0f);
-                    optMotion->impulseVx += vx;
-                    optMotion->impulseVy += vy;
-                }
-                break;
-            case FrameDirectiveKind::EmitSimCue:
-                pipeline.EmitCue(SimCue{
-                    .assetId       = assets::AssetId{static_cast<u64>(dir.paramU16)},
-                    .worldX        = worldTf.x,
-                    .worldY        = worldTf.y,
-                    .emitter       = entity,
-                    .magnitude_q16 = 65535u,
-                    .durationTicks = 0,
-                    .kind          = static_cast<SimCueKind>(dir.paramU8),
-                    .channel       = 0,
-                    .userTag       = static_cast<u16>(dir.paramI16),
-                });
-                break;
-        }
-    }
-}
-
-} // namespace
-
-void AnimationSubsystem::StepAnimationsAndDirectives(
+void StateAndCombatSolver::DispatchAnimationFrameDirectives(
     world::World& world,
     const assets::AssetBank& assetBank,
     time::SimStepView step,
     GameplayPipeline& pipeline) noexcept {
 
+    const u8 activeChannelMask = static_cast<u8>(~step.FrozenMask());
+    if (activeChannelMask == 0) return;
+
     alignas(16) std::array<u16, 8> chSubTicks{};
-    u8 activeChannelMask = 0;
-    for (u8 c = 0; c < 8; ++c) {
-        const auto ch = static_cast<time::TimeChannel>(c);
-        if (!step.IsFrozen(ch)) {
-            activeChannelMask |= static_cast<u8>(1u << c);
-            chSubTicks[c] = static_cast<u16>(
-                std::lround(step.EffectiveScale(ch) * static_cast<f32>(world::SpriteAnimator2D::kSubTicksPerTick))
-            );
-        }
-    }
-    if (activeChannelMask == 0) {
-        return;
+    for (u32 m = activeChannelMask; m != 0; m &= (m - 1u)) {
+        const u8 c = static_cast<u8>(std::countr_zero(m));
+        chSubTicks[c] = static_cast<u16>(
+            step.EffectiveScale(static_cast<time::TimeChannel>(c)) *
+            static_cast<f32>(world::SpriteAnimator2D::kSubTicksPerTick) + 0.5f);
     }
 
-    auto& spritePool         = world.GetPool<world::Sprite2D>();
-    auto& animPool           = world.GetPool<world::SpriteAnimator2D>();
-    const u16 groupCount     = spritePool.GroupSize();
-    const auto groupEntities = animPool.Entities();
-    auto sprites             = spritePool.Components();
-    auto anims               = animPool.Components();
-    const auto* __restrict channels = world.TimeChannels().data();
+    constexpr world::ComponentMask kSpriteBit = world::MakeComponentMask<world::Sprite2D>();
+    constexpr world::ComponentMask kFsmBit    = world::MakeComponentMask<StateMachine2D>();
+    constexpr world::ComponentMask kMotionBit = world::MakeComponentMask<MotionStack2D>();
+    constexpr world::ComponentMask kRigBit    = world::MakeComponentMask<HitboxRig2D>();
 
-    for (u16 i = 0; i < groupCount; ++i) {
-        world::SpriteAnimator2D& anim = anims[i];
-        if (!anim.playing || anim.frameCount <= 1) {
-            continue;
-        }
-        const u16 entityIdx = groupEntities[i].index;
-        const u16 deltaSub  = chSubTicks[static_cast<u8>(channels[entityIdx])];
-        if (deltaSub == 0) {
-            continue;
-        }
+    auto& spritePool = world.GetPool<world::Sprite2D>();
+    auto& animPool   = world.GetPool<world::SpriteAnimator2D>();
+    auto& fsmPool    = world.GetPool<StateMachine2D>();
+    auto& motionPool = world.GetPool<MotionStack2D>();
+    auto& rigPool    = world.GetPool<HitboxRig2D>();
 
-        const u32 targetSubTicks = static_cast<u32>(std::max<u16>(1u, anim.ticksPerFrame)) *
-                                   world::SpriteAnimator2D::kSubTicksPerTick;
-        u32 accum = static_cast<u32>(anim.subTickAccum) + deltaSub;
-
-        if (accum >= targetSubTicks) {
-            const u32 framesAdvanced = accum / targetSubTicks;
-            accum %= targetSubTicks;
-            const u32 nextFrame = static_cast<u32>(anim.currentFrame) + framesAdvanced;
-            if (nextFrame >= anim.frameCount) {
-                if (anim.loop) {
-                    anim.currentFrame = static_cast<u16>(nextFrame % anim.frameCount);
-                } else {
-                    anim.currentFrame = static_cast<u16>(anim.frameCount - 1u);
-                    anim.playing      = 0;
-                    accum             = 0;
-                }
-            } else {
-                anim.currentFrame = static_cast<u16>(nextFrame);
-            }
-            sprites[i].sprite = assetBank.GetSpriteHandle(
-                anim.atlas,
-                static_cast<u16>(anim.firstFrame + anim.currentFrame)
-            );
-        }
-        anim.subTickAccum = static_cast<u16>(accum);
-    }
-
+    const auto entities = animPool.Entities();
+    auto anims          = animPool.Components();
+    const auto* __restrict channels        = world.TimeChannels().data();
     const auto* __restrict worldTransforms = world.WorldTransforms().data();
-    for (auto [entity, fsm, anim] : world.View<StateMachine2D, world::SpriteAnimator2D>()) {
-        if ((activeChannelMask & (1u << static_cast<u8>(channels[entity.index]))) == 0) {
-            continue;
+
+    for (u16 i = 0, animCount = animPool.Size(); i < animCount; ++i) {
+        const world::EntityId entity = entities[i];
+        const u16 idx                = entity.index;
+        const u8 chIdx               = static_cast<u8>(channels[idx]);
+        if ((activeChannelMask & (1u << chIdx)) == 0) continue;
+
+        world::SpriteAnimator2D& anim  = anims[i];
+        const world::ComponentMask msk = world.GetComponentMaskByIndex(idx);
+        const u16 deltaSub             = chSubTicks[chIdx];
+
+        if (anim.playing && anim.frameCount > 1 && deltaSub > 0) {
+            const u32 targetSub = static_cast<u32>(std::max<u16>(1u, anim.ticksPerFrame)) *
+                                  world::SpriteAnimator2D::kSubTicksPerTick;
+            u32 accum = static_cast<u32>(anim.subTickAccum) + deltaSub;
+            if (accum >= targetSub) {
+                const u32 nextFrame = static_cast<u32>(anim.currentFrame) + (accum / targetSub);
+                accum %= targetSub;
+                if (nextFrame >= anim.frameCount) {
+                    if (anim.loop) {
+                        anim.currentFrame = static_cast<u16>(nextFrame % anim.frameCount);
+                    } else {
+                        anim.currentFrame = static_cast<u16>(anim.frameCount - 1u);
+                        anim.playing      = 0;
+                        accum             = 0;
+                    }
+                } else {
+                    anim.currentFrame = static_cast<u16>(nextFrame);
+                }
+                if ((msk & kSpriteBit) != 0) {
+                    spritePool.DirectAtEntityIndex(idx).sprite = assetBank.GetSpriteHandle(
+                        anim.atlas, static_cast<u16>(anim.firstFrame + anim.currentFrame));
+                }
+            }
+            anim.subTickAccum = static_cast<u16>(accum);
         }
+
+        if ((msk & kFsmBit) == 0) continue;
+
+        StateMachine2D& fsm = fsmPool.DirectAtEntityIndex(idx);
         const u16 currFrame = anim.currentFrame;
         const u16 prevFrame = fsm.lastAnimFrame;
-        if (currFrame == prevFrame) {
-            continue;
-        }
+        if (currFrame == prevFrame) continue;
+        fsm.lastAnimFrame = currFrame;
 
         const assets::BlobRecord& blob = assetBank.GetBlob(fsm.rigBlob);
-        if (blob.data != nullptr && blob.size >= sizeof(CookedAnimRigHeader)) {
-            const auto* rigHdr = reinterpret_cast<const CookedAnimRigHeader*>(blob.data);
-            if (rigHdr->magic == CookedAnimRigHeader::kMagic) {
-                auto* optMotion = world.TryGet<MotionStack2D>(entity);
-                auto* optRig    = world.TryGet<HitboxRig2D>(entity);
-                const auto& wtf = worldTransforms[entity.index];
+        if (blob.data == nullptr || blob.size < sizeof(CookedAnimRigHeader)) continue;
+        const auto* rigHdr = reinterpret_cast<const CookedAnimRigHeader*>(blob.data);
+        if (rigHdr->magic != CookedAnimRigHeader::kMagic) continue;
 
-                if (prevFrame == 0xFFFFu) {
-                    ExecuteFrameDirectivesForRange(
-                        entity, rigHdr, blob.data, fsm.animClipId,
-                        0u, currFrame, fsm, optMotion, optRig, wtf, pipeline);
-                } else if (currFrame > prevFrame) {
-                    ExecuteFrameDirectivesForRange(
-                        entity, rigHdr, blob.data, fsm.animClipId,
-                        static_cast<u16>(prevFrame + 1u), currFrame,
-                        fsm, optMotion, optRig, wtf, pipeline);
-                } else if (anim.frameCount > 0) {
-                    const u16 lastValidFrame = static_cast<u16>(anim.frameCount - 1u);
-                    if (prevFrame < lastValidFrame) {
-                        ExecuteFrameDirectivesForRange(
-                            entity, rigHdr, blob.data, fsm.animClipId,
-                            static_cast<u16>(prevFrame + 1u), lastValidFrame,
-                            fsm, optMotion, optRig, wtf, pipeline);
-                    }
-                    ExecuteFrameDirectivesForRange(
-                        entity, rigHdr, blob.data, fsm.animClipId,
-                        0u, currFrame, fsm, optMotion, optRig, wtf, pipeline);
+        MotionStack2D* const optMotion = ((msk & kMotionBit) != 0) ? &motionPool.DirectAtEntityIndex(idx) : nullptr;
+        HitboxRig2D* const optRig      = ((msk & kRigBit) != 0)    ? &rigPool.DirectAtEntityIndex(idx)    : nullptr;
+        const auto& wtf                = worldTransforms[idx];
+        const i8 facingSign            = optMotion != nullptr ? optMotion->FacingSign() : i8{1};
+
+        const auto* directives   = reinterpret_cast<const CookedFrameDirective*>(blob.data + rigHdr->directiveOffset);
+        const auto* hurtProfiles = reinterpret_cast<const CompactAabb2D*>(blob.data + rigHdr->hurtboxProfileOffset);
+        const auto* slices       = reinterpret_cast<const CookedHitboxSlice*>(blob.data + rigHdr->hitboxSliceOffset);
+
+        auto runDirectiveRange = [&](u16 fromFrame, u16 toFrame) noexcept {
+            for (u16 d = 0; d < rigHdr->directiveCount; ++d) {
+                const CookedFrameDirective& dir = directives[d];
+                if (dir.clipId != fsm.animClipId || dir.frameIndex < fromFrame || dir.frameIndex > toFrame) continue;
+                switch (dir.kind) {
+                    case FrameDirectiveKind::SetCancelMask:
+                        fsm.cancelMask = dir.paramU16;
+                        break;
+                    case FrameDirectiveKind::SetOnHitCancelMask:
+                        fsm.onHitCancelMask = dir.paramU16;
+                        break;
+                    case FrameDirectiveKind::SetHurtboxProfile:
+                        if (optRig != nullptr && dir.paramU8 < rigHdr->hurtboxProfileCount) {
+                            fsm.hurtboxProfileId = dir.paramU8;
+                            optRig->hurtbox      = hurtProfiles[dir.paramU8];
+                        }
+                        break;
+                    case FrameDirectiveKind::ActivateHitboxSlice:
+                        if (optRig != nullptr && dir.paramU8 < rigHdr->hitboxSliceCount) {
+                            optRig->ActivateSlice(dir.paramU8, slices[dir.paramU8].boundingUnion, dir.paramU16 != 0);
+                        }
+                        break;
+                    case FrameDirectiveKind::DeactivateHitbox:
+                        if (optRig != nullptr) optRig->DeactivateHitbox();
+                        break;
+                    case FrameDirectiveKind::ApplyRootMotionDelta:
+                        if (optMotion != nullptr) {
+                            optMotion->rootMotionDx_q8 = static_cast<i16>(
+                                optMotion->rootMotionDx_q8 + static_cast<i32>(dir.paramI16) * facingSign);
+                            optMotion->rootMotionDy_q8 = static_cast<i16>(
+                                optMotion->rootMotionDy_q8 + static_cast<i16>(dir.paramU16));
+                        }
+                        break;
+                    case FrameDirectiveKind::ApplyVelocityImpulse:
+                        if (optMotion != nullptr) {
+                            optMotion->impulseVx += static_cast<f32>(dir.paramI16) * (1.0f / 256.0f) * static_cast<f32>(facingSign);
+                            optMotion->impulseVy += static_cast<f32>(static_cast<i16>(dir.paramU16)) * (1.0f / 256.0f);
+                        }
+                        break;
+                    case FrameDirectiveKind::EmitSimCue:
+                        pipeline.EmitCue({assets::AssetId{static_cast<u64>(dir.paramU16)}, wtf.x, wtf.y, entity,
+                                          65535u, 0, static_cast<SimCueKind>(dir.paramU8), 0, static_cast<u16>(dir.paramI16)});
+                        break;
                 }
             }
+        };
+
+        if (prevFrame != 0xFFFFu && currFrame < prevFrame && anim.frameCount > 0) {
+            const u16 lastValid = static_cast<u16>(anim.frameCount - 1u);
+            if (prevFrame < lastValid) runDirectiveRange(static_cast<u16>(prevFrame + 1u), lastValid);
+            runDirectiveRange(0u, currFrame);
+        } else {
+            runDirectiveRange(prevFrame == 0xFFFFu ? 0u : static_cast<u16>(prevFrame + 1u), currFrame);
         }
-        fsm.lastAnimFrame = currFrame;
     }
 }
 
@@ -227,29 +168,52 @@ void StateAndCombatSolver::StepStateMachinesAndPolicies(
     const GameplayPolicyTable& policies,
     GameplayPipeline& pipeline) noexcept {
 
-    const auto* __restrict channels = world.TimeChannels().data();
+    const u8 frozenMask = step.FrozenMask();
+    if (frozenMask == 0xFFu) return;
 
-    for (auto [entity, dmg] : world.View<DamageReceiver2D>()) {
-        if (step.IsFrozen(channels[entity.index])) {
-            continue;
+    const auto* __restrict channels = world.TimeChannels().data();
+    auto& dmgPool    = world.GetPool<DamageReceiver2D>();
+    const auto dmgIds = dmgPool.Entities();
+    auto dmgs        = dmgPool.Components();
+
+    for (u16 i = 0, dmgCount = dmgPool.Size(); i < dmgCount; ++i) {
+        if ((frozenMask & (1u << static_cast<u8>(channels[dmgIds[i].index]))) == 0) {
+            DamageReceiver2D& dmg = dmgs[i];
+            dmg.iframeTicks -= (dmg.iframeTicks > 0);
+            dmg.stunTicks   -= (dmg.stunTicks > 0);
         }
-        if (dmg.iframeTicks > 0) --dmg.iframeTicks;
-        if (dmg.stunTicks > 0)   --dmg.stunTicks;
     }
 
-    for (auto [entity, motor, motion, fsm] : world.View<KinematicMotor2D, MotionStack2D, StateMachine2D>()) {
-        if (step.IsFrozen(motor.timeChannel)) {
-            continue;
-        }
+    constexpr world::ComponentMask kReqActorMask = world::MakeComponentMask<KinematicMotor2D, MotionStack2D>();
+    constexpr world::ComponentMask kRigBit       = world::MakeComponentMask<HitboxRig2D>();
+    constexpr world::ComponentMask kSpriteBit    = world::MakeComponentMask<world::Sprite2D>();
 
-        if (fsm.stateTicks < 0xFFFFu) {
-            ++fsm.stateTicks;
-        }
-        if (motion.overrideTicks > 0) {
-            if (--motion.overrideTicks == 0) {
-                motion.activePriority = 0;
-                motion.gravityScale_q8 = 256;
-            }
+    auto& fsmPool    = world.GetPool<StateMachine2D>();
+    auto& motorPool  = world.GetPool<KinematicMotor2D>();
+    auto& motionPool = world.GetPool<MotionStack2D>();
+    auto& rigPool    = world.GetPool<HitboxRig2D>();
+    auto& spritePool = world.GetPool<world::Sprite2D>();
+
+    const auto fsmIds = fsmPool.Entities();
+    auto fsms         = fsmPool.Components();
+
+    for (u16 i = 0, fsmCount = fsmPool.Size(); i < fsmCount; ++i) {
+        const world::EntityId entity   = fsmIds[i];
+        const u16 idx                  = entity.index;
+        const world::ComponentMask msk = world.GetComponentMaskByIndex(idx);
+        if ((msk & kReqActorMask) != kReqActorMask) continue;
+
+        KinematicMotor2D& motor = motorPool.DirectAtEntityIndex(idx);
+        if ((frozenMask & (1u << static_cast<u8>(motor.timeChannel))) != 0) continue;
+
+        MotionStack2D& motion = motionPool.DirectAtEntityIndex(idx);
+        StateMachine2D& fsm   = fsms[i];
+
+        fsm.stateTicks += (fsm.stateTicks < 0xFFFFu);
+
+        if (motion.overrideTicks > 0 && --motion.overrideTicks == 0) {
+            motion.activePriority  = 0;
+            motion.gravityScale_q8 = 256;
         }
         if (!HasContact(motor.contacts, ContactFlags::Ground) && motion.groundCoyoteTicks > 0) {
             --motion.groundCoyoteTicks;
@@ -260,33 +224,20 @@ void StateAndCombatSolver::StepStateMachinesAndPolicies(
         }
 
         if (policies.evaluateActor != nullptr) {
-            auto* optRig = world.TryGet<HitboxRig2D>(entity);
-            const ActorPolicyContext ctx{
-                .world        = world,
-                .assetBank    = assetBank,
-                .step         = step,
-                .tickInput    = tickInput,
-                .actionBuffer = actionBuffer,
-                .pipeline     = pipeline,
-                .entity       = entity,
-            };
+            HitboxRig2D* const optRig = ((msk & kRigBit) != 0) ? &rigPool.DirectAtEntityIndex(idx) : nullptr;
+            const ActorPolicyContext ctx{world, assetBank, step, tickInput, actionBuffer, pipeline, entity};
             policies.evaluateActor(ctx, motor, motion, fsm, optRig);
         }
 
         if (!motion.IsFacingLocked() && fsm.CanCancelInto(CancelCategory::MovementTurn)) {
-            if (motion.targetWalkVx > 0.15f) {
-                motion.SetFacingSign(1);
-            } else if (motion.targetWalkVx < -0.15f) {
-                motion.SetFacingSign(-1);
-            }
+            if (motion.targetWalkVx > 0.15f)       motion.SetFacingSign(1);
+            else if (motion.targetWalkVx < -0.15f) motion.SetFacingSign(-1);
         }
 
-        if (auto* sp = world.TryGet<world::Sprite2D>(entity)) {
-            if (motion.FacingSign() < 0) {
-                sp->blendAndFlags |= static_cast<u8>(world::SpriteFlags::FlipX);
-            } else {
-                sp->blendAndFlags &= ~static_cast<u8>(world::SpriteFlags::FlipX);
-            }
+        if ((msk & kSpriteBit) != 0) {
+            world::Sprite2D& sp = spritePool.DirectAtEntityIndex(idx);
+            if (motion.FacingSign() < 0) sp.blendAndFlags |= static_cast<u8>(world::SpriteFlags::FlipX);
+            else                         sp.blendAndFlags &= ~static_cast<u8>(world::SpriteFlags::FlipX);
         }
     }
 }
@@ -298,102 +249,71 @@ void StateAndCombatSolver::ResolveCombatHits(
     const GameplayPolicyTable& policies,
     GameplayPipeline& pipeline) noexcept {
 
+    constexpr world::ComponentMask kRigBit    = world::MakeComponentMask<HitboxRig2D>();
+    constexpr world::ComponentMask kFsmBit    = world::MakeComponentMask<StateMachine2D>();
+    constexpr world::ComponentMask kMotionBit = world::MakeComponentMask<MotionStack2D>();
+
+    auto& rigPool    = world.GetPool<HitboxRig2D>();
+    auto& fsmPool    = world.GetPool<StateMachine2D>();
+    auto& motionPool = world.GetPool<MotionStack2D>();
+
+    f32 accumCameraTrauma = 0.0f, accumKickVx = 0.0f, accumKickVy = 0.0f;
+
     for (const ResolvedHitEvent& ev : hits) {
-        if (auto* attRig = world.TryGet<HitboxRig2D>(ev.attacker)) {
-            attRig->MarkHit(ev.defender);
-        }
-        if (auto* attFsm = world.TryGet<StateMachine2D>(ev.attacker)) {
-            attFsm->PromoteCancelWindowOnHit();
-        }
+        const world::ComponentMask attMask = world.GetComponentMaskByIndex(ev.attacker.index);
+        if ((attMask & kRigBit) != 0) rigPool.DirectAtEntityIndex(ev.attacker.index).MarkHit(ev.defender);
+        if ((attMask & kFsmBit) != 0) fsmPool.DirectAtEntityIndex(ev.attacker.index).PromoteCancelWindowOnHit();
+
+        MotionStack2D* const attMotion = ((attMask & kMotionBit) != 0)
+            ? &motionPool.DirectAtEntityIndex(ev.attacker.index)
+            : nullptr;
 
         const u16 traumaMagQ16 = static_cast<u16>(std::min<u32>(65535u, static_cast<u32>(ev.hitstopTicks) * 5400u));
+        accumCameraTrauma += static_cast<f32>(traumaMagQ16) * (1.0f / 65535.0f);
 
-        // 1. Weapon-vs-Weapon Clash / Parry arbitration & cue emission
+        auto emitHitCues = [&](u64 audioAssetId, u16 audioMag, u16 tag) noexcept {
+            pipeline.EmitCue({assets::AssetId{audioAssetId}, ev.contactX, ev.contactY, ev.attacker,
+                              audioMag, ev.hitstopTicks, SimCueKind::AudioOneShot, 0, tag});
+            pipeline.EmitCue({assets::AssetId{0ULL}, ev.contactX, ev.contactY, ev.attacker,
+                              traumaMagQ16, ev.hitstopTicks, SimCueKind::CameraTraumaPulse, 0, tag});
+        };
+
         if (ev.isClashParry != 0) {
-            if (auto* defRig = world.TryGet<HitboxRig2D>(ev.defender)) {
-                defRig->MarkHit(ev.attacker);
-            }
-            if (auto* defFsm = world.TryGet<StateMachine2D>(ev.defender)) {
-                defFsm->PromoteCancelWindowOnHit();
-            }
+            const world::ComponentMask defMask = world.GetComponentMaskByIndex(ev.defender.index);
+            if ((defMask & kRigBit) != 0) rigPool.DirectAtEntityIndex(ev.defender.index).MarkHit(ev.attacker);
+            if ((defMask & kFsmBit) != 0) fsmPool.DirectAtEntityIndex(ev.defender.index).PromoteCancelWindowOnHit();
+
             const f32 clashSpeed = std::max(6.0f, static_cast<f32>(ev.knockbackSpeed_q2) * 0.25f);
-            if (auto* attMotion = world.TryGet<MotionStack2D>(ev.attacker)) {
+            if (attMotion != nullptr) {
                 attMotion->PushOverride(60u, -static_cast<f32>(attMotion->FacingSign()) * clashSpeed, 0.0f, 10u, 256u);
             }
-
-            pipeline.EmitCue(SimCue{
-                .assetId       = assets::AssetId{1ULL},
-                .worldX        = ev.contactX,
-                .worldY        = ev.contactY,
-                .emitter       = ev.attacker,
-                .magnitude_q16 = 65535u,
-                .durationTicks = ev.hitstopTicks,
-                .kind          = SimCueKind::AudioOneShot,
-                .channel       = 0,
-                .userTag       = 1u,
-            });
-            pipeline.EmitCue(SimCue{
-                .assetId       = assets::AssetId{0ULL},
-                .worldX        = ev.contactX,
-                .worldY        = ev.contactY,
-                .emitter       = ev.attacker,
-                .magnitude_q16 = traumaMagQ16,
-                .durationTicks = ev.hitstopTicks,
-                .kind          = SimCueKind::CameraTraumaPulse,
-                .channel       = 0,
-                .userTag       = 1u,
-            });
+            emitHitCues(1ULL, 65535u, 1u);
             continue;
         }
 
-        // 2. Normal Combat Hit: Emit AudioOneShot & CameraTraumaPulse SimCues + apply CameraController2D kick/trauma
-        pipeline.EmitCue(SimCue{
-            .assetId       = assets::AssetId{2ULL},
-            .worldX        = ev.contactX,
-            .worldY        = ev.contactY,
-            .emitter       = ev.attacker,
-            .magnitude_q16 = static_cast<u16>(std::min<u32>(65535u, static_cast<u32>(ev.damageMultiplier_q8) * 192u)),
-            .durationTicks = ev.hitstopTicks,
-            .kind          = SimCueKind::AudioOneShot,
-            .channel       = 0,
-            .userTag       = ev.socketFlags,
-        });
-        pipeline.EmitCue(SimCue{
-            .assetId       = assets::AssetId{0ULL},
-            .worldX        = ev.contactX,
-            .worldY        = ev.contactY,
-            .emitter       = ev.attacker,
-            .magnitude_q16 = traumaMagQ16,
-            .durationTicks = ev.hitstopTicks,
-            .kind          = SimCueKind::CameraTraumaPulse,
-            .channel       = 0,
-            .userTag       = ev.socketFlags,
-        });
+        const u16 audioMagQ16 = static_cast<u16>(std::min<u32>(65535u, static_cast<u32>(ev.damageMultiplier_q8) * 192u));
+        emitHitCues(2ULL, audioMagQ16, ev.socketFlags);
 
-        // Apply directional hit-kick and trauma directly onto active CameraController2D instances
         const f32 rad = static_cast<f32>(ev.knockbackAngleDeg) * (3.1415926535f / 180.0f);
-        f32 cosA = 1.0f;
-        f32 sinA = 0.0f;
-        world::FastSinCos(rad, cosA, sinA);
+        f32 cosA = 1.0f, sinA = 0.0f;
+        FastSinCos(rad, cosA, sinA);
 
-        auto* attMotion = world.TryGet<MotionStack2D>(ev.attacker);
         const f32 facingSign = attMotion != nullptr ? static_cast<f32>(attMotion->FacingSign()) : 1.0f;
+        accumKickVx += cosA * facingSign * 1.8f;
+        accumKickVy += sinA * 1.8f;
 
-        for (auto [camId, cam] : world.View<CameraController2D>()) {
-            cam.AddTrauma(static_cast<f32>(traumaMagQ16) * (1.0f / 65535.0f));
-            cam.AddDirectionalKick(cosA * facingSign * 1.8f, sinA * 1.8f);
-        }
-
-        // 3. Data-driven Attacker Recoil / Pogo Impulse
         if ((ev.socketFlags & 0x01u) != 0 && ev.knockbackSpeed_q2 > 0 && attMotion != nullptr) {
             const f32 speed = static_cast<f32>(ev.knockbackSpeed_q2) * 0.25f;
-            const f32 recoilVx = (std::abs(cosA) > 1e-4f)
-                ? (-cosA * speed * facingSign)
-                : attMotion->targetWalkVx;
-            const f32 recoilVy = sinA * speed;
-
-            attMotion->PushOverride(50u, recoilVx, recoilVy, 8u, 256u);
+            const f32 recoilVx = (std::abs(cosA) > 1e-4f) ? (-cosA * speed * facingSign) : attMotion->targetWalkVx;
+            attMotion->PushOverride(50u, recoilVx, sinA * speed, 8u, 256u);
             attMotion->groundCoyoteTicks = 0;
+        }
+    }
+
+    if (accumCameraTrauma > 0.0f || accumKickVx != 0.0f || accumKickVy != 0.0f) {
+        for (CameraController2D& cam : world.GetPool<CameraController2D>().Components()) {
+            cam.AddTrauma(accumCameraTrauma);
+            cam.AddDirectionalKick(accumKickVx, accumKickVy);
         }
     }
 

@@ -2,7 +2,6 @@
 
 #include "gameplay/GameplayTypes.h"
 #include "input/ActionBuffer.h"
-#include "renderer/RenderList.h"
 #include "world/World.h"
 
 #include <cmath>
@@ -11,22 +10,36 @@ namespace en::debug {
 
 namespace {
 
-inline constexpr f32 kInvQ8 = 1.0f / 256.0f;
+inline constexpr f32 kInvQ8      = 1.0f / 256.0f;
+inline constexpr u64 kVelBit     = 1ULL << world::Velocity2D::kTypeId;
+inline constexpr u64 kMotorBit   = 1ULL << gameplay::KinematicMotor2D::kTypeId;
+inline constexpr u64 kCarrierBit = 1ULL << gameplay::KinematicCarrier2D::kTypeId;
+inline constexpr u64 kFsmBit     = 1ULL << gameplay::StateMachine2D::kTypeId;
+inline constexpr u64 kRigBit     = 1ULL << gameplay::HitboxRig2D::kTypeId;
+inline constexpr u64 kBcBit      = 1ULL << gameplay::SafeGroundBreadcrumb2D::kTypeId;
+inline constexpr u64 kCamCtrlBit = 1ULL << gameplay::CameraController2D::kTypeId;
 
-[[nodiscard]] constexpr renderer::FRect UnpackWorldBox(f32 wx, f32 wy, const gameplay::CompactAabb2D& box) noexcept {
-    const f32 cx = wx + static_cast<f32>(box.offsetX_q8) * kInvQ8;
-    const f32 cy = wy + static_cast<f32>(box.offsetY_q8) * kInvQ8;
-    const f32 hw = static_cast<f32>(box.halfW_q8) * kInvQ8;
-    const f32 hh = static_cast<f32>(box.halfH_q8) * kInvQ8;
-    return {cx - hw, cy - hh, hw * 2.0f, hh * 2.0f};
+template <typename T>
+[[nodiscard]] constexpr const T* TryGetDirect(const world::World& world, u16 idx, u64 mask) noexcept {
+    return ((mask & (1ULL << T::kTypeId)) != 0ULL)
+        ? &world.GetPool<T>().DirectAtEntityIndex(idx)
+        : nullptr;
 }
 
-[[nodiscard]] constexpr renderer::FRect UnpackQ8ArrayBox(f32 wx, f32 wy, const std::array<i16, 4>& q8) noexcept {
-    const f32 cx = wx + static_cast<f32>(q8[0]) * kInvQ8;
-    const f32 cy = wy + static_cast<f32>(q8[1]) * kInvQ8;
-    const f32 hw = static_cast<f32>(q8[2]) * kInvQ8;
-    const f32 hh = static_cast<f32>(q8[3]) * kInvQ8;
-    return {cx - hw, cy - hh, hw * 2.0f, hh * 2.0f};
+[[nodiscard]] constexpr renderer::FRect UnpackBoxQ8(f32 wx, f32 wy, i16 ox, i16 oy, i16 hw, i16 hh) noexcept {
+    const f32 cx = wx + static_cast<f32>(ox) * kInvQ8;
+    const f32 cy = wy + static_cast<f32>(oy) * kInvQ8;
+    const f32 w  = static_cast<f32>(hw) * (kInvQ8 * 2.0f);
+    const f32 h  = static_cast<f32>(hh) * (kInvQ8 * 2.0f);
+    return {cx - w * 0.5f, cy - h * 0.5f, w, h};
+}
+
+[[nodiscard]] constexpr renderer::FRect UnpackBoxQ8(f32 wx, f32 wy, const gameplay::CompactAabb2D& b) noexcept {
+    return UnpackBoxQ8(wx, wy, b.offsetX_q8, b.offsetY_q8, b.halfW_q8, b.halfH_q8);
+}
+
+[[nodiscard]] constexpr renderer::FRect UnpackBoxQ8(f32 wx, f32 wy, const std::array<i16, 4>& q8) noexcept {
+    return UnpackBoxQ8(wx, wy, q8[0], q8[1], q8[2], q8[3]);
 }
 
 struct ActiveCameraView {
@@ -38,20 +51,20 @@ struct ActiveCameraView {
 };
 
 [[nodiscard]] ActiveCameraView ResolveActiveCamera(const world::World& world,
-                                                   platform::Extent2i viewportSize) noexcept {
+                                                   renderer::ViewportExtent viewportSize) noexcept {
     ActiveCameraView out{};
     out.viewport = {0.0f, 0.0f, static_cast<f32>(viewportSize.w), static_cast<f32>(viewportSize.h)};
     out.zoom     = 1.0f;
 
-    for (const world::EntityId id : world.View<world::CameraRig2D>()) {
-        const auto* rig = world.TryGet<world::CameraRig2D>(id);
-        if (rig != nullptr && rig->active && !rig->screenSpace && rig->viewSlot == 0) {
-            const world::WorldTransform2D& wt = world.GetWorldTransform(id);
+    for (const auto [id, rig] : world.View<world::CameraRig2D>()) {
+        const u16 idx = id.index;
+        if (rig.active && !rig.screenSpace && rig.viewSlot == 0) {
+            const world::WorldTransform2D& wt = world.GetWorldByIndex(idx);
             out.centerX = wt.x;
             out.centerY = wt.y;
-            out.zoom    = rig->zoom > 0.01f ? rig->zoom : 1.0f;
-            if (rig->viewport.w > 0.0f && rig->viewport.h > 0.0f) {
-                out.viewport = rig->viewport;
+            out.zoom    = rig.zoom > 0.01f ? rig.zoom : 1.0f;
+            if (rig.viewport.w > 0.0f && rig.viewport.h > 0.0f) {
+                out.viewport = rig.viewport;
             }
             break;
         }
@@ -72,9 +85,6 @@ void DebugInspector::BindArena(std::span<ActorTickRecord, kHistoryTicks> tickRin
 }
 
 void DebugInspector::Clear() noexcept {
-    for (ActorTickRecord& rec : m_tickRing) {
-        rec = ActorTickRecord{};
-    }
     m_pinnedEntity  = world::kNullEntity;
     m_writeCursor   = 0;
     m_scrubOffset   = 0;
@@ -92,12 +102,11 @@ void DebugInspector::RecordActorTick(const world::World& world,
     world::EntityId target = m_pinnedEntity;
     if (!world.IsAlive(target)) {
         target = world::kNullEntity;
-        for (const world::EntityId id : world.View<gameplay::StateMachine2D, gameplay::KinematicMotor2D>()) {
-            target = id;
-            break;
-        }
-        if (target.index == 0) {
-            for (const world::EntityId id : world.View<gameplay::KinematicMotor2D>()) {
+        for (const auto [id, _] : world.View<gameplay::KinematicMotor2D>()) {
+            if (target.index == 0) {
+                target = id;
+            }
+            if ((world.GetComponentMaskByIndex(id.index) & kFsmBit) != 0ULL) {
                 target = id;
                 break;
             }
@@ -105,37 +114,32 @@ void DebugInspector::RecordActorTick(const world::World& world,
     }
 
     ActorTickRecord rec{};
-    rec.tickIndex     = static_cast<u32>(tickIndex);
-    rec.entityId      = target;
-    rec.inputHeld     = tickInput.held;
-    rec.inputPressed  = tickInput.pressed;
-    rec.inputReleased = tickInput.released;
-    rec.axisX         = tickInput.axis[0];
-    rec.axisY         = tickInput.axis[1];
-
-    u16 bufferedMask = 0;
-    for (u8 a = 0; a < input::kMaxActions; ++a) {
-        if (actionBuffer.Peek(a, 12)) {
-            bufferedMask |= static_cast<u16>(1u << a);
-        }
-    }
-    rec.actionBufferMask = bufferedMask;
+    rec.tickIndex        = static_cast<u32>(tickIndex);
+    rec.entityId         = target;
+    rec.inputHeld        = tickInput.held;
+    rec.inputPressed     = tickInput.pressed;
+    rec.inputReleased    = tickInput.released;
+    rec.actionBufferMask = actionBuffer.PendingPressMask();
+    rec.axisX            = tickInput.axis[0];
+    rec.axisY            = tickInput.axis[1];
 
     if (world.IsAlive(target)) {
-        const world::WorldTransform2D& wt = world.GetWorldTransform(target);
+        const u16 idx  = target.index;
+        const u64 mask = world.GetComponentMaskByIndex(idx);
+        const world::WorldTransform2D& wt = world.GetWorldByIndex(idx);
         rec.worldX = wt.x;
         rec.worldY = wt.y;
 
-        if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(target)) {
+        if (const auto* motor = TryGetDirect<gameplay::KinematicMotor2D>(world, idx, mask)) {
             rec.velX         = motor->vx;
             rec.velY         = motor->vy;
             rec.contactFlags = static_cast<u8>(motor->contacts);
-        } else if (const auto* vel = world.TryGet<world::Velocity2D>(target)) {
+        } else if (const auto* vel = TryGetDirect<world::Velocity2D>(world, idx, mask)) {
             rec.velX = vel->vx;
             rec.velY = vel->vy;
         }
 
-        if (const auto* fsm = world.TryGet<gameplay::StateMachine2D>(target)) {
+        if (const auto* fsm = TryGetDirect<gameplay::StateMachine2D>(world, idx, mask)) {
             rec.cancelMask = fsm->cancelMask;
             rec.stateTicks = fsm->stateTicks;
             rec.stateId    = fsm->stateId;
@@ -143,15 +147,15 @@ void DebugInspector::RecordActorTick(const world::World& world,
             rec.animFrame  = fsm->lastAnimFrame;
         }
 
-        if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(target)) {
-            rec.hurtboxQ8 = {rig->hurtbox.offsetX_q8, rig->hurtbox.offsetY_q8,
-                             rig->hurtbox.halfW_q8, rig->hurtbox.halfH_q8};
-            rec.hitboxQ8  = {rig->primaryHitbox.offsetX_q8, rig->primaryHitbox.offsetY_q8,
-                             rig->primaryHitbox.halfW_q8, rig->primaryHitbox.halfH_q8};
+        if (const auto* rig = TryGetDirect<gameplay::HitboxRig2D>(world, idx, mask)) {
+            rec.hurtboxQ8      = {rig->hurtbox.offsetX_q8, rig->hurtbox.offsetY_q8,
+                                  static_cast<i16>(rig->hurtbox.halfW_q8), static_cast<i16>(rig->hurtbox.halfH_q8)};
+            rec.hitboxQ8       = {rig->primaryHitbox.offsetX_q8, rig->primaryHitbox.offsetY_q8,
+                                  static_cast<i16>(rig->primaryHitbox.halfW_q8), static_cast<i16>(rig->primaryHitbox.halfH_q8)};
             rec.activeSliceIdx = rig->activeSliceIndex;
         }
 
-        if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(target)) {
+        if (const auto* dmg = TryGetDirect<gameplay::DamageReceiver2D>(world, idx, mask)) {
             rec.hp          = dmg->hp;
             rec.iframeTicks = dmg->iframeTicks;
         }
@@ -165,9 +169,8 @@ void DebugInspector::RecordActorTick(const world::World& world,
 }
 
 world::EntityId DebugInspector::PickEntityAtScreenPos(const world::World& world,
-                                                      time::RenderTimeView,
                                                       input::Vec2 mousePos,
-                                                      platform::Extent2i viewportSize) noexcept {
+                                                      renderer::ViewportExtent viewportSize) noexcept {
     const ActiveCameraView cam = ResolveActiveCamera(world, viewportSize);
     const f32 relX   = mousePos.x - (cam.viewport.x + cam.viewport.w * 0.5f);
     const f32 relY   = mousePos.y - (cam.viewport.y + cam.viewport.h * 0.5f);
@@ -177,14 +180,18 @@ world::EntityId DebugInspector::PickEntityAtScreenPos(const world::World& world,
     world::EntityId bestEntity = world::kNullEntity;
     f32 bestArea = 1e30f;
 
-    for (const world::EntityId id : world.View<world::LocalTransform2D>()) {
-        const world::WorldTransform2D& wt = world.GetWorldTransform(id);
+    for (const auto [id, _] : world.View<world::LocalTransform2D>()) {
+        const u16 idx  = id.index;
+        const u64 mask = world.GetComponentMaskByIndex(idx);
+        const world::WorldTransform2D& wt = world.GetWorldByIndex(idx);
         renderer::FRect bounds{wt.x - 8.0f, wt.y - 8.0f, 16.0f, 16.0f};
 
-        if (const auto* rig = world.TryGet<gameplay::HitboxRig2D>(id); rig && rig->hurtbox.halfW_q8 > 0) {
-            bounds = UnpackWorldBox(wt.x, wt.y, rig->hurtbox);
-        } else if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(id); motor && motor->bounds.halfW_q8 > 0) {
-            bounds = UnpackWorldBox(wt.x, wt.y, motor->bounds);
+        if (const auto* rig = TryGetDirect<gameplay::HitboxRig2D>(world, idx, mask);
+            rig != nullptr && rig->hurtbox.halfW_q8 > 0) {
+            bounds = UnpackBoxQ8(wt.x, wt.y, rig->hurtbox);
+        } else if (const auto* motor = TryGetDirect<gameplay::KinematicMotor2D>(world, idx, mask);
+                   motor != nullptr && motor->bounds.halfW_q8 > 0) {
+            bounds = UnpackBoxQ8(wt.x, wt.y, motor->bounds);
         }
 
         if (worldX >= bounds.x && worldX <= bounds.x + bounds.w &&
@@ -232,22 +239,47 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
         }
     }
 
-    // Single fused pass across alive spatial entities for all world-space overlays.
-    if (HasOverlay(flags, OverlayFlags::AllWorld | OverlayFlags::EntityInspector)) {
-        const bool drawTransforms  = HasOverlay(flags, OverlayFlags::SpatialTransforms);
-        const bool drawKinematics  = HasOverlay(flags, OverlayFlags::KinematicBounds);
-        const bool drawVelocities  = HasOverlay(flags, OverlayFlags::VelocityVectors);
-        const bool drawCombat      = HasOverlay(flags, OverlayFlags::CombatHitboxes);
-        const bool drawBreadcrumbs = HasOverlay(flags, OverlayFlags::SafeBreadcrumbs);
-        const bool drawCameraRigs  = HasOverlay(flags, OverlayFlags::CameraRigOverlay);
+    if (HasOverlay(flags, OverlayFlags::AudioEmitters)) {
+        for (const DebugAudioEmitter& em : ctx.audioEmitters) {
+            const renderer::Color col = (em.occlusionFactor < 0.95f)
+                ? renderer::Color::FromRGBA8(0xFF8833CCu)
+                : renderer::Color::FromRGBA8(0x33EEFFCCu);
+            if (em.maxDist > 0.0f) {
+                worldBatcher.PushCircleOutline(em.worldX, em.worldY, em.maxDist, 24, 1.0f, col);
+            }
+            worldBatcher.PushBoxOutline({em.worldX - 2.5f, em.worldY - 2.5f, 5.0f, 5.0f}, 1.0f, col);
+        }
+    }
 
-        for (const world::EntityId id : ctx.world.View<world::LocalTransform2D>()) {
-            const world::WorldTransform2D& wt = ctx.world.GetWorldTransform(id);
+    const bool drawTransforms  = HasOverlay(flags, OverlayFlags::SpatialTransforms);
+    const bool drawKinematics  = HasOverlay(flags, OverlayFlags::KinematicBounds);
+    const bool drawVelocities  = HasOverlay(flags, OverlayFlags::VelocityVectors);
+    const bool drawCombat      = HasOverlay(flags, OverlayFlags::CombatHitboxes);
+    const bool drawBreadcrumbs = HasOverlay(flags, OverlayFlags::SafeBreadcrumbs);
+    const bool drawCameraRigs  = HasOverlay(flags, OverlayFlags::CameraRigOverlay);
+
+    u64 activeCompMask = drawTransforms ? ~0ULL : 0ULL;
+    if (drawKinematics)  activeCompMask |= (kMotorBit | kCarrierBit);
+    if (drawVelocities)  activeCompMask |= (kMotorBit | kVelBit);
+    if (drawCombat)      activeCompMask |= kRigBit;
+    if (drawBreadcrumbs) activeCompMask |= kBcBit;
+    if (drawCameraRigs)  activeCompMask |= kCamCtrlBit;
+
+    if (activeCompMask != 0ULL || HasOverlay(flags, OverlayFlags::EntityInspector)) {
+        for (const auto [id, _] : ctx.world.View<world::LocalTransform2D>()) {
+            const u16 idx       = id.index;
+            const u64 compMask  = ctx.world.GetComponentMaskByIndex(idx);
+            const bool isPinned = (id == m_pinnedEntity);
+            if (((compMask & activeCompMask) == 0ULL) && !isPinned) {
+                continue;
+            }
+
+            const world::WorldTransform2D& wt = ctx.world.GetWorldByIndex(idx);
             const f32 wx = wt.x;
             const f32 wy = wt.y;
 
             const bool inFrustum = (wx >= cullMinX && wx <= cullMaxX && wy >= cullMinY && wy <= cullMaxY);
-            if (!inFrustum && !drawCameraRigs && id.index != m_pinnedEntity.index) {
+            if (!inFrustum && !drawCameraRigs && !isPinned) {
                 continue;
             }
 
@@ -258,22 +290,20 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
                                       1.0f, renderer::Color::FromRGBA8(0x44FF44FFu));
             }
 
-            if (drawKinematics || drawVelocities) {
-                if (const auto* motor = ctx.world.TryGet<gameplay::KinematicMotor2D>(id)) {
-                    if (drawKinematics && inFrustum && motor->bounds.halfW_q8 > 0) {
-                        const renderer::FRect box = UnpackWorldBox(wx, wy, motor->bounds);
-                        const u8 contacts         = static_cast<u8>(motor->contacts);
-                        const renderer::Color col = (contacts & 1u) != 0
+            if (inFrustum && (drawKinematics || drawVelocities)) {
+                if (const auto* motor = TryGetDirect<gameplay::KinematicMotor2D>(ctx.world, idx, compMask)) {
+                    if (drawKinematics && motor->bounds.halfW_q8 > 0) {
+                        const renderer::Color col = (static_cast<u8>(motor->contacts) & 1u) != 0
                             ? renderer::Color::FromRGBA8(0x44FF88FFu)
                             : renderer::Color::FromRGBA8(0x44CCFFFFu);
-                        worldBatcher.PushBoxOutline(box, 1.0f, col);
+                        worldBatcher.PushBoxOutline(UnpackBoxQ8(wx, wy, motor->bounds), 1.0f, col);
                     }
-                    if (drawVelocities && inFrustum && (std::abs(motor->vx) > 0.5f || std::abs(motor->vy) > 0.5f)) {
+                    if (drawVelocities && (std::abs(motor->vx) > 0.5f || std::abs(motor->vy) > 0.5f)) {
                         worldBatcher.PushArrow(wx, wy, wx + motor->vx * 0.1f, wy + motor->vy * 0.1f,
                                                4.0f, 1.0f, renderer::Color::FromRGBA8(0xFFFF44FFu));
                     }
-                } else if (drawVelocities && inFrustum) {
-                    if (const auto* vel = ctx.world.TryGet<world::Velocity2D>(id)) {
+                } else if (drawVelocities) {
+                    if (const auto* vel = TryGetDirect<world::Velocity2D>(ctx.world, idx, compMask)) {
                         if (std::abs(vel->vx) > 0.5f || std::abs(vel->vy) > 0.5f) {
                             worldBatcher.PushArrow(wx, wy, wx + vel->vx * 0.1f, wy + vel->vy * 0.1f,
                                                    4.0f, 1.0f, renderer::Color::FromRGBA8(0xFFCC44FFu));
@@ -281,27 +311,26 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
                     }
                 }
 
-                if (drawKinematics && inFrustum) {
-                    if (const auto* carrier = ctx.world.TryGet<gameplay::KinematicCarrier2D>(id)) {
-                        const renderer::FRect box = UnpackWorldBox(wx, wy, carrier->bounds);
-                        worldBatcher.PushBoxOutline(box, 1.5f, renderer::Color::FromRGBA8(0xFF9922FFu));
+                if (drawKinematics) {
+                    if (const auto* carrier = TryGetDirect<gameplay::KinematicCarrier2D>(ctx.world, idx, compMask)) {
+                        worldBatcher.PushBoxOutline(UnpackBoxQ8(wx, wy, carrier->bounds), 1.5f,
+                                                    renderer::Color::FromRGBA8(0xFF9922FFu));
                     }
                 }
             }
 
             if (drawCombat && inFrustum) {
-                if (const auto* rig = ctx.world.TryGet<gameplay::HitboxRig2D>(id)) {
-                    const auto* dmg      = ctx.world.TryGet<gameplay::DamageReceiver2D>(id);
+                if (const auto* rig = TryGetDirect<gameplay::HitboxRig2D>(ctx.world, idx, compMask)) {
+                    const auto* dmg      = TryGetDirect<gameplay::DamageReceiver2D>(ctx.world, idx, compMask);
                     const bool hasIframe = (dmg != nullptr && dmg->iframeTicks > 0);
                     if (rig->hurtbox.halfW_q8 > 0) {
-                        const renderer::FRect hb  = UnpackWorldBox(wx, wy, rig->hurtbox);
                         const renderer::Color col = hasIframe
                             ? renderer::Color::FromRGBA8(0xFFFFFFFFu)
                             : renderer::Color::FromRGBA8(0x22FF66CCu);
-                        worldBatcher.PushBoxOutline(hb, 1.0f, col);
+                        worldBatcher.PushBoxOutline(UnpackBoxQ8(wx, wy, rig->hurtbox), 1.0f, col);
                     }
                     if (rig->activeSliceIndex != 0xFFu && rig->primaryHitbox.halfW_q8 > 0) {
-                        const renderer::FRect atk = UnpackWorldBox(wx, wy, rig->primaryHitbox);
+                        const renderer::FRect atk = UnpackBoxQ8(wx, wy, rig->primaryHitbox);
                         worldBatcher.PushSolidRect(atk, renderer::Color::FromRGBA8(0xFF224444u));
                         worldBatcher.PushBoxOutline(atk, 1.5f, renderer::Color::FromRGBA8(0xFF2244FFu));
                     }
@@ -309,7 +338,7 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
             }
 
             if (drawBreadcrumbs && inFrustum) {
-                if (const auto* bc = ctx.world.TryGet<gameplay::SafeGroundBreadcrumb2D>(id)) {
+                if (const auto* bc = TryGetDirect<gameplay::SafeGroundBreadcrumb2D>(ctx.world, idx, compMask)) {
                     worldBatcher.PushLine(wx, wy, bc->safeX, bc->safeY, 1.0f,
                                           renderer::Color::FromRGBA8(0x44FFAA88u));
                     worldBatcher.PushBoxOutline({bc->safeX - 3.0f, bc->safeY - 3.0f, 6.0f, 6.0f},
@@ -318,7 +347,7 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
             }
 
             if (drawCameraRigs) {
-                if (const auto* ctrl = ctx.world.TryGet<gameplay::CameraController2D>(id)) {
+                if (const auto* ctrl = TryGetDirect<gameplay::CameraController2D>(ctx.world, idx, compMask)) {
                     const f32 dzW = static_cast<f32>(ctrl->deadzoneHalfW_q4) * (1.0f / 16.0f);
                     const f32 dzH = static_cast<f32>(ctrl->deadzoneHalfH_q4) * (1.0f / 16.0f);
                     worldBatcher.PushBoxOutline({wx - dzW, wy - dzH, dzW * 2.0f, dzH * 2.0f},
@@ -326,7 +355,7 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
                 }
             }
 
-            if (id.index == m_pinnedEntity.index && id.generation == m_pinnedEntity.generation) {
+            if (isPinned) {
                 worldBatcher.PushBoxOutline({wx - 12.0f, wy - 12.0f, 24.0f, 24.0f},
                                             1.5f, renderer::Color::FromRGBA8(0xFFFF00FFu));
             }
@@ -337,24 +366,15 @@ void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
         EmitEntityInspectorCard(ctx.world, ctx.viewportSize, hudBatcher);
     }
     if (HasOverlay(flags, OverlayFlags::FlightScrubber)) {
-        EmitFlightScrubberOverlay(ctx.timeView.tickIndex, ctx.viewportSize, worldBatcher, hudBatcher);
+        EmitFlightScrubberOverlay(ctx.viewportSize, worldBatcher, hudBatcher);
     }
     if (HasOverlay(flags, OverlayFlags::InputViewerHud)) {
         EmitInputViewerOverlay(ctx.frameInput, ctx.viewportSize, hudBatcher);
     }
 }
 
-void DebugInspector::EmitWorldAndInspectorOverlays(OverlayFlags flags,
-                                                   const DebugEmitOverlayContext& ctx,
-                                                   renderer::TextureHandle debugAtlas,
-                                                   renderer::RenderList& outList) const noexcept {
-    DebugBatcher worldBatcher(outList, debugAtlas, kDebugWorldPassId, 0);
-    DebugBatcher hudBatcher(outList, debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
-    EmitWorldAndInspectorOverlays(flags, ctx, worldBatcher, hudBatcher);
-}
-
 void DebugInspector::EmitEntityInspectorCard(const world::World& world,
-                                             platform::Extent2i viewportSize,
+                                             renderer::ViewportExtent viewportSize,
                                              DebugBatcher& hudBatcher) const noexcept {
     const f32 cardW = 248.0f;
     const f32 cardH = 128.0f;
@@ -372,18 +392,21 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
         return;
     }
 
+    const u16 idx  = m_pinnedEntity.index;
+    const u64 mask = world.GetComponentMaskByIndex(idx);
+
     DebugTextLine line{};
-    line.Str("ENTITY #").I64(m_pinnedEntity.index).Str(" (Gen ").I64(m_pinnedEntity.generation).Char(')');
+    line.Str("ENTITY #").I64(idx).Str(" (Gen ").I64(m_pinnedEntity.generation).Char(')');
     hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xFFFF66FFu));
     ty += 12.0f;
 
-    const world::WorldTransform2D& wt = world.GetWorldTransform(m_pinnedEntity);
+    const world::WorldTransform2D& wt = world.GetWorldByIndex(idx);
     line.Clear();
     line.Str("Pos: (").F32(wt.x).Str(", ").F32(wt.y).Char(')');
     hudBatcher.PushText(tx, ty, line.View(), renderer::Color::FromRGBA8(0xE0E8F0FFu));
     ty += 11.0f;
 
-    if (const auto* motor = world.TryGet<gameplay::KinematicMotor2D>(m_pinnedEntity)) {
+    if (const auto* motor = TryGetDirect<gameplay::KinematicMotor2D>(world, idx, mask)) {
         line.Clear();
         line.Str("Vel: (").F32(motor->vx).Str(", ").F32(motor->vy).Str(") C:0x")
             .U64Hex(static_cast<u8>(motor->contacts), 2);
@@ -391,7 +414,7 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
         ty += 11.0f;
     }
 
-    if (const auto* fsm = world.TryGet<gameplay::StateMachine2D>(m_pinnedEntity)) {
+    if (const auto* fsm = TryGetDirect<gameplay::StateMachine2D>(world, idx, mask)) {
         line.Clear();
         line.Str("FSM: St=").I64(fsm->stateId)
             .Str(" Clip=").I64(fsm->animClipId)
@@ -406,7 +429,7 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
         ty += 11.0f;
     }
 
-    if (const auto* dmg = world.TryGet<gameplay::DamageReceiver2D>(m_pinnedEntity)) {
+    if (const auto* dmg = TryGetDirect<gameplay::DamageReceiver2D>(world, idx, mask)) {
         line.Clear();
         line.Str("HP: ").I64(dmg->hp).Char('/').I64(dmg->maxHp)
             .Str("  IFrames: ").I64(dmg->iframeTicks);
@@ -414,8 +437,7 @@ void DebugInspector::EmitEntityInspectorCard(const world::World& world,
     }
 }
 
-void DebugInspector::EmitFlightScrubberOverlay(u64,
-                                               platform::Extent2i viewportSize,
+void DebugInspector::EmitFlightScrubberOverlay(renderer::ViewportExtent viewportSize,
                                                DebugBatcher& worldBatcher,
                                                DebugBatcher& hudBatcher) const noexcept {
     if (m_recordedCount == 0 || m_tickRing.empty()) {
@@ -428,12 +450,12 @@ void DebugInspector::EmitFlightScrubberOverlay(u64,
 
     if (rec.entityId.index != 0) {
         if (rec.hurtboxQ8[2] > 0) {
-            const renderer::FRect hb = UnpackQ8ArrayBox(rec.worldX, rec.worldY, rec.hurtboxQ8);
-            worldBatcher.PushBoxOutline(hb, 1.5f, renderer::Color::FromRGBA8(0x00FFFFCCu));
+            worldBatcher.PushBoxOutline(UnpackBoxQ8(rec.worldX, rec.worldY, rec.hurtboxQ8),
+                                        1.5f, renderer::Color::FromRGBA8(0x00FFFFCCu));
         }
         if (rec.activeSliceIdx != 0xFFu && rec.hitboxQ8[2] > 0) {
-            const renderer::FRect atk = UnpackQ8ArrayBox(rec.worldX, rec.worldY, rec.hitboxQ8);
-            worldBatcher.PushBoxOutline(atk, 1.5f, renderer::Color::FromRGBA8(0xFF00FFCCu));
+            worldBatcher.PushBoxOutline(UnpackBoxQ8(rec.worldX, rec.worldY, rec.hitboxQ8),
+                                        1.5f, renderer::Color::FromRGBA8(0xFF00FFCCu));
         }
     }
 
@@ -467,7 +489,7 @@ void DebugInspector::EmitFlightScrubberOverlay(u64,
 }
 
 void DebugInspector::EmitInputViewerOverlay(const input::FrameInput& frameInput,
-                                            platform::Extent2i viewportSize,
+                                            renderer::ViewportExtent viewportSize,
                                             DebugBatcher& hudBatcher) const noexcept {
     const f32 x = 12.0f;
     const f32 y = static_cast<f32>(viewportSize.h) - 52.0f;
@@ -496,7 +518,8 @@ u64 DebugInspector::ComputeAuditHash() const noexcept {
     u64 h = MixAuditHash(0xA7C0159EC701ull, m_recordedCount);
     h = MixAuditHash(h, (static_cast<u64>(m_pinnedEntity.generation) << 16) | m_pinnedEntity.index);
     for (u8 i = 0; i < m_recordedCount; ++i) {
-        const ActorTickRecord& r = m_tickRing[i];
+        const u8 slot = static_cast<u8>((m_writeCursor + kHistoryTicks - 1u - i) & (kHistoryTicks - 1u));
+        const ActorTickRecord& r = m_tickRing[slot];
         h = MixAuditHash(h, (static_cast<u64>(r.tickIndex) << 32) |
                             (static_cast<u64>(r.stateId) << 16) | r.inputHeld);
     }

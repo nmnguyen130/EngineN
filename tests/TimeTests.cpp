@@ -29,7 +29,7 @@ static_assert(15_ticks == 15, "Tick literal failed.");
 static_assert(sizeof(BakedTickState) == 64 && alignof(BakedTickState) == 64);
 static_assert(sizeof(BakedRenderState) == 32 && alignof(BakedRenderState) == 32);
 static_assert(sizeof(RenderTimeView) == 64 && alignof(RenderTimeView) == 64);
-static_assert(sizeof(ChannelModulator::ChannelModSlot) == 16 && alignof(ChannelModulator::ChannelModSlot) == 16);
+static_assert(sizeof(TimeModulator::TimeModSlot) == 16 && alignof(TimeModulator::TimeModSlot) == 16);
 static_assert(sizeof(TimePipelineConfig) == 24);
 static_assert(MakeChannelMask(TimeChannel::World, TimeChannel::Player, TimeChannel::Ui) == 0b01000011u);
 
@@ -158,7 +158,7 @@ void TestSpiralOfDeathAndCatchupClamp() {
 }
 
 void TestHitstopPrecedenceAndRampFreezeInteraction() {
-    ChannelModulator mod{};
+    TimeModulator mod{};
 
     // Duration-dominant merge rule; on equal duration, lower intensity (harder freeze) wins
     mod.RequestHitstop(TimeChannel::Player, 4, 0.5f);

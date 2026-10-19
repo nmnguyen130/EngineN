@@ -11,8 +11,8 @@ namespace en::debug {
 
 // Stateless world/spatial overlay extractor, mouse entity picker, and 64-tick flight recorder.
 // Non-owning view over the 4 KB ActorTickRecord ring in DebugSystem's arena.
-// Invariant: Never mutates World or SpatialIndex2D state during inspection; executes a single fused pass over entities.
-class DebugInspector {
+// Invariant: Never mutates World or SpatialIndex2D state during inspection; resolves components via 1-hop bitmasks.
+class alignas(32) DebugInspector {
 public:
     static constexpr usize kHistoryTicks = 64;
 
@@ -25,9 +25,15 @@ public:
                          const input::ActionBuffer& actionBuffer) noexcept;
 
     world::EntityId PickEntityAtScreenPos(const world::World& world,
-                                          time::RenderTimeView timeView,
                                           input::Vec2 mousePos,
-                                          platform::Extent2i viewportSize) noexcept;
+                                          renderer::ViewportExtent viewportSize) noexcept;
+
+    world::EntityId PickEntityAtScreenPos(const world::World& world,
+                                          const time::RenderTimeView&,
+                                          input::Vec2 mousePos,
+                                          renderer::ViewportExtent viewportSize) noexcept {
+        return PickEntityAtScreenPos(world, mousePos, viewportSize);
+    }
 
     constexpr void SetPinnedEntity(world::EntityId id) noexcept { m_pinnedEntity = id; }
     [[nodiscard]] constexpr world::EntityId PinnedEntity() const noexcept { return m_pinnedEntity; }
@@ -48,22 +54,25 @@ public:
     void EmitWorldAndInspectorOverlays(OverlayFlags flags,
                                        const DebugEmitOverlayContext& ctx,
                                        renderer::TextureHandle debugAtlas,
-                                       renderer::RenderList& outList) const noexcept;
+                                       renderer::RenderList& outList) const noexcept {
+        DebugBatcher worldBatcher(outList, debugAtlas, kDebugWorldPassId, 0);
+        DebugBatcher hudBatcher(outList, debugAtlas, kDebugHudPassId, kDebugHudViewSlot);
+        EmitWorldAndInspectorOverlays(flags, ctx, worldBatcher, hudBatcher);
+    }
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
     void EmitEntityInspectorCard(const world::World& world,
-                                 platform::Extent2i viewportSize,
+                                 renderer::ViewportExtent viewportSize,
                                  DebugBatcher& hudBatcher) const noexcept;
 
-    void EmitFlightScrubberOverlay(u64 currentTickIndex,
-                                   platform::Extent2i viewportSize,
+    void EmitFlightScrubberOverlay(renderer::ViewportExtent viewportSize,
                                    DebugBatcher& worldBatcher,
                                    DebugBatcher& hudBatcher) const noexcept;
 
     void EmitInputViewerOverlay(const input::FrameInput& frameInput,
-                                platform::Extent2i viewportSize,
+                                renderer::ViewportExtent viewportSize,
                                 DebugBatcher& hudBatcher) const noexcept;
 
     std::span<ActorTickRecord> m_tickRing{};
@@ -72,5 +81,6 @@ private:
     u8 m_scrubOffset{0};
     u8 m_recordedCount{0};
 };
+static_assert(sizeof(DebugInspector) == 32);
 
 } // namespace en::debug

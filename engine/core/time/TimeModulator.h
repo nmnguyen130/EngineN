@@ -11,10 +11,10 @@ namespace en::time {
 // Evaluates per-channel time scales, hitstop freezes, and smoothstep slow-motion ramps.
 // Owned by TimePipeline; hot BakedTickState sits at offset 0 (Cache Line 0) for O(1) simulation reads.
 // Invariant: m_bakedTick and m_frozenMask are always synchronized with channel state in [0.0f, 8.0f].
-class alignas(64) ChannelModulator {
+class alignas(64) TimeModulator {
 public:
     // Compact 16-byte per-channel modulation slot (4 channels per 64B cache line, zero padding).
-    struct alignas(16) ChannelModSlot {
+    struct alignas(16) TimeModSlot {
         f32 hitstopIntensity = 0.0f;
         f32 rampTargetScale  = 1.0f;
         u16 hitstopTicks     = 0;
@@ -22,9 +22,9 @@ public:
         u16 rampBlendTicks   = 0;
         u16 rampElapsedTicks = 0;
     };
-    static_assert(sizeof(ChannelModSlot) == 16);
+    static_assert(sizeof(TimeModSlot) == 16);
 
-    constexpr ChannelModulator() noexcept = default;
+    constexpr TimeModulator() noexcept = default;
 
     constexpr void Reset() noexcept {
         m_bakedTick = {};
@@ -231,7 +231,7 @@ private:
         }
     }
 
-    [[nodiscard]] static constexpr f32 EvaluateRamp(const ChannelModSlot& s) noexcept {
+    [[nodiscard]] static constexpr f32 EvaluateRamp(const TimeModSlot& s) noexcept {
         if (s.rampHoldTicks > 0) {
             return s.rampTargetScale;
         }
@@ -243,7 +243,7 @@ private:
         return 1.0f;
     }
 
-    [[nodiscard]] static constexpr bool AdvanceRamp(ChannelModSlot& s) noexcept {
+    [[nodiscard]] static constexpr bool AdvanceRamp(TimeModSlot& s) noexcept {
         if (s.rampHoldTicks > 0) {
             --s.rampHoldTicks;
             return (s.rampHoldTicks > 0) || (s.rampBlendTicks > 0);
@@ -270,7 +270,7 @@ private:
     };
 
     // Contiguous 16B modulation slots (128B total, zero internal padding).
-    std::array<ChannelModSlot, kMaxTimeChannels> m_slots{};
+    std::array<TimeModSlot, kMaxTimeChannels> m_slots{};
 
     u8 m_frozenMask        = 0;
     u8 m_activeHitstopMask = 0;
@@ -278,12 +278,12 @@ private:
 };
 
 // Scoped view passed by value to simulation systems during a fixed 120Hz tick.
-// Non-owning view into ChannelModulator; valid only when operator bool() returns true.
+// Non-owning view into TimeModulator; valid only when operator bool() returns true.
 class SimStepView {
 public:
     constexpr SimStepView() noexcept = default;
 
-    constexpr SimStepView(u64 tickIndex, u32 subStepIndex, ChannelModulator& modulator) noexcept
+    constexpr SimStepView(u64 tickIndex, u32 subStepIndex, TimeModulator& modulator) noexcept
         : m_modulator(&modulator)
         , m_tickIndex(tickIndex)
         , m_subStepIndex(subStepIndex) {}
@@ -329,9 +329,9 @@ public:
     }
 
 private:
-    ChannelModulator* m_modulator    = nullptr;
-    u64               m_tickIndex    = 0;
-    u32               m_subStepIndex = 0;
+    TimeModulator* m_modulator    = nullptr;
+    u64            m_tickIndex    = 0;
+    u32            m_subStepIndex = 0;
 };
 
 } // namespace en::time
