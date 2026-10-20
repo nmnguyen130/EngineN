@@ -1,123 +1,96 @@
 #pragma once
 
+#include "core/Memory.h"
 #include "renderer/RendererTypes.h"
 
-#include <array>
-#include <span>
+namespace en {
 
-namespace en::renderer {
-
-// Pure C++23 2D command recorder, view-space frustum culler, 6-byte radix sorter, and vertex expander.
-// Owned by Renderer or instantiated standalone in headless unit tests; main-thread use only.
-// Invariant: Zero heap allocation after construction; hot control state resides in Cache Line 0.
+// Pure C++23 command buffer, frustum culler, active-byte radix sorter, and procedural geometry builder.
+// Move-only RAII owner of a single 64B-aligned arena slab; 100% deterministic in headless CI.
+// Invariant: Compile() orders m_keys monotonically and coalesces state-identical runs into DrawBatches.
 class alignas(64) RenderList {
 public:
-    // Sized to the 16-bit GPU index limit (16384 quads = 65536 vertices, ~1.26 MB total L2/L3 footprint).
-    static constexpr u32 kMaxQuads   = 16384;
+    static constexpr u32 kMaxQuads = 16384;
     static constexpr u32 kMaxBatches = 1024;
-    static constexpr u32 kMaxViews   = 16;
-    static constexpr u32 kMaxPasses  = 16;
-    static constexpr u32 kChunkQuads = 2048;
+    static constexpr u32 kMaxPasses = 16;
+    static constexpr u32 kMaxViews = 16;
 
-    // Pre-transformed view-space quad occupying one 64-byte cache line with zero implicit padding.
-    // Stores pre-summed corner offset vectors (d0 = hx + hy, d1 = hx - hy) for 1-op vertex expansion.
-    struct alignas(64) PreparedQuad {
-        f32 cx{0.0f};
-        f32 cy{0.0f};
-        f32 d0X{0.0f};
-        f32 d0Y{0.0f};
-        f32 d1X{0.0f};
-        f32 d1Y{0.0f};
-        f32 u0{0.0f};
-        f32 v0{0.0f};
-        f32 u1{1.0f};
-        f32 v1{1.0f};
-        Color color{};
-        u16 textureGen{1};
-        u16 reserved0{0};
-        u32 reserved1{0};
-    };
-    static_assert(sizeof(PreparedQuad) == 64 && alignof(PreparedQuad) == 64);
+    RenderList() noexcept = default;
+    ~RenderList() noexcept { Shutdown(); }
 
-    void Reset(ViewportExtent size) noexcept;
+    RenderList(const RenderList&) = delete;
+    RenderList& operator=(const RenderList&) = delete;
+
+    [[nodiscard]] bool Init(usize arenaBytes = 2 * 1024 * 1024) noexcept;
+    void Shutdown() noexcept;
+
+    void Reset(ViewportExtent viewportSize = {1280, 720}) noexcept;
 
     constexpr void SetPass(u8 passId, const RenderPassDesc& desc) noexcept {
-        const u8 idx  = passId & 0x0Fu;
-        const u16 bit = static_cast<u16>(1u << idx);
-        m_passes[idx] = desc;
-        m_enabledPassMask = desc.enabled
-            ? static_cast<u16>(m_enabledPassMask | bit)
-            : static_cast<u16>(m_enabledPassMask & ~bit);
-        m_clearPassMask = (desc.enabled && desc.clear)
-            ? static_cast<u16>(m_clearPassMask | bit)
-            : static_cast<u16>(m_clearPassMask & ~bit);
+        if (passId < kMaxPasses) m_passes[passId] = desc;
     }
+    static constexpr u32 kMaxMaterials = 32;
+    static constexpr u32 kMaxOccluders = 32;
 
     constexpr void SetView(u8 viewSlot, const Camera2D& cam) noexcept {
-        m_views[viewSlot & 0x0Fu] = cam;
+        if (viewSlot < kMaxViews) m_views[viewSlot] = cam;
     }
+    constexpr void SetMaterial(u8 materialId, const ShaderParamBlock& block) noexcept {
+        if (materialId < kMaxMaterials) m_materials[materialId] = block;
+    }
+    [[nodiscard]] constexpr const ShaderParamBlock& Material(u8 materialId) const noexcept {
+        return m_materials[materialId % kMaxMaterials];
+    }
+
+    void ClearOccluders2D() noexcept { m_occluderCount = 0; }
+    bool AddOccluder2D(Rect worldOccluder) noexcept {
+        if (m_occluderCount >= kMaxOccluders) return false;
+        m_occluders[m_occluderCount++] = worldOccluder;
+        return true;
+    }
+    [[nodiscard]] bool IsOccluded2D(Rect worldBounds) const noexcept;
 
     void PushQuad(const QuadCmd& cmd) noexcept;
-
-    void PushRect(
-        FRect rect,
-        Color color,
-        u8 passId = 0,
-        u8 layer = 0,
-        u16 depth = 32768,
-        u8 viewSlot = 0) noexcept {
-        PushQuad(QuadCmd{
-            .x        = rect.x + rect.w * 0.5f,
-            .y        = rect.y + rect.h * 0.5f,
-            .w        = rect.w,
-            .h        = rect.h,
-            .color    = color,
-            .texture  = kWhiteTexture,
-            .depth    = depth,
-            .passId   = passId,
-            .layer    = layer,
-            .viewSlot = viewSlot
-        });
-    }
-
-    void PushLine(
-        f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, Color color,
-        u8 passId = 0, u8 layer = 0, u16 depth = 32768, u8 viewSlot = 0) noexcept;
+    void PushRect(Rect rect, Color color, u8 passId = 0, u8 layer = 10, u16 depth = 32768, u8 viewSlot = 0, BlendMode blend = BlendMode::Alpha) noexcept;
+    void PushLine(Vec2 a, Vec2 b, f32 thickness, Color color, u8 passId = 0, u8 layer = 10, u16 depth = 32768, u8 viewSlot = 0) noexcept;
+    void PushCircleOutline(Vec2 center, f32 radius, u32 segments, f32 thickness, Color color, u8 passId = 0, u8 layer = 10, u8 viewSlot = 0) noexcept;
+    void PushSlashArc(Vec2 center, f32 radius, f32 startAngleRad, f32 sweepAngleRad, f32 thickness, Color color, u8 passId = 0, u8 layer = 15, u8 viewSlot = 0) noexcept;
+    void PushBeam(Vec2 start, Vec2 end, f32 width, Color coreColor, Color glowColor, u8 passId = 0, u8 layer = 15, u8 viewSlot = 0) noexcept;
+    void PushRing(Vec2 center, f32 innerRadius, f32 outerRadius, Color color, u8 passId = 0, u8 layer = 14, u8 viewSlot = 0) noexcept;
+    void PushNineSlice(const NineSliceDesc& desc, u8 passId = 0, u8 layer = 20, u8 viewSlot = 0) noexcept;
+    void PushProgressBar(Rect rect, f32 ratio, Color fillColor, Color backColor, Color borderColor, u8 passId = 0, u8 layer = 25, u8 viewSlot = 0) noexcept;
+    void PushText(Vec2 pos, std::string_view text, Color color, f32 scale = 1.0f, u8 passId = 0, u8 layer = 30, u8 viewSlot = 0, GpuTextureHandle fontTex = kWhiteGpuTexture) noexcept;
 
     void Compile() noexcept;
     void ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D> outVertices) const noexcept;
 
-    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
-    [[nodiscard]] static std::span<const u16> SharedQuadIndices(u32 quadCount) noexcept;
-
-    [[nodiscard]] constexpr std::span<const DrawBatch> Batches() const noexcept {
-        return {m_batches.data(), m_stats.drawBatches};
-    }
-    [[nodiscard]] constexpr std::span<const u64> SortedKeys() const noexcept {
-        return {m_keys.data(), m_stats.submittedQuads};
-    }
-    [[nodiscard]] constexpr u16 ClearPassMask() const noexcept { return m_clearPassMask; }
-    [[nodiscard]] constexpr const RenderPassDesc& Pass(u8 id) const noexcept { return m_passes[id & 0x0Fu]; }
-    [[nodiscard]] constexpr const Camera2D& View(u8 slot) const noexcept { return m_views[slot & 0x0Fu]; }
+    [[nodiscard]] constexpr ViewportExtent Viewport() const noexcept { return m_viewport; }
     [[nodiscard]] constexpr const RenderStats& Stats() const noexcept { return m_stats; }
+    [[nodiscard]] constexpr std::span<const DrawBatch> Batches() const noexcept {
+        return m_batches.subspan(0, m_stats.drawBatches);
+    }
+    [[nodiscard]] constexpr const Camera2D& View(u8 slot) const noexcept { return m_views[slot & 0x0FU]; }
+    [[nodiscard]] constexpr const RenderPassDesc& Pass(u8 passId) const noexcept { return m_passes[passId & 0x0FU]; }
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
-    // Cache Line 0 (offset 0..63): Hot per-quad recording counters, key variance tracker, and pass bitmasks.
     u64 m_prevKey{0};
     u64 m_varyingBits{0};
     RenderStats m_stats{};
-    u16 m_enabledPassMask{0x0001u};
-    u16 m_clearPassMask{0x0001u};
+    ViewportExtent m_viewport{1280, 720};
     bool m_isMonotonic{true};
     bool m_compiled{false};
 
-    alignas(64) std::array<Camera2D, kMaxViews> m_views{};
+    std::span<u64> m_keys{};
+    std::span<u64> m_scratchKeys{};
+    std::span<PreparedQuad> m_quads{};
+    std::span<DrawBatch> m_batches{};
     std::array<RenderPassDesc, kMaxPasses> m_passes{};
-
-    alignas(64) std::array<u64, kMaxQuads> m_keys{};
-    alignas(64) std::array<u64, kMaxQuads> m_scratchKeys{};
-    alignas(64) std::array<DrawBatch, kMaxBatches> m_batches{};
-    alignas(64) std::array<PreparedQuad, kMaxQuads> m_quads{};
+    std::array<Camera2D, kMaxViews> m_views{};
+    std::array<ShaderParamBlock, kMaxMaterials> m_materials{};
+    std::array<Rect, kMaxOccluders> m_occluders{};
+    u32 m_occluderCount{0};
+    AlignedArena m_arena{};
 };
 
-} // namespace en::renderer
+} // namespace en

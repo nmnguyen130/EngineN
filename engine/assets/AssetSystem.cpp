@@ -1,655 +1,252 @@
 #include "assets/AssetSystem.h"
+#include "renderer/Renderer2D.h"
+#include "core/Serialization.h"
+#include <filesystem>
+#include <fstream>
 
-#include "renderer/Renderer.h"
-
-#include <SDL3/SDL_asyncio.h>
-#include <SDL3/SDL_iostream.h>
-
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <utility>
-
-namespace en::assets {
-
-AssetSystem::~AssetSystem() noexcept {
-    Shutdown();
-}
-
-AssetSystem::AssetSystem(AssetSystem&& other) noexcept {
-    *this = std::move(other);
-}
-
-AssetSystem& AssetSystem::operator=(AssetSystem&& other) noexcept {
-    if (this != &other) {
-        Shutdown();
-        m_ioQueue            = std::exchange(other.m_ioQueue, nullptr);
-        m_mounts             = std::exchange(other.m_mounts, nullptr);
-        m_jobs               = std::exchange(other.m_jobs, nullptr);
-        m_stagingRing        = std::exchange(other.m_stagingRing, nullptr);
-        m_tocEntriesPool     = std::exchange(other.m_tocEntriesPool, nullptr);
-        m_vfsHash            = std::exchange(other.m_vfsHash, nullptr);
-        m_vfsHashMask        = std::exchange(other.m_vfsHashMask, 0);
-        m_ringWrite          = std::exchange(other.m_ringWrite, 0);
-        m_ringUsed           = std::exchange(other.m_ringUsed, 0);
-        m_activeJobHead      = std::exchange(other.m_activeJobHead, kInvalidJob);
-        m_activeJobTail      = std::exchange(other.m_activeJobTail, kInvalidJob);
-        m_freeJobHead        = std::exchange(other.m_freeJobHead, kInvalidJob);
-        m_highWaterJob       = std::exchange(other.m_highWaterJob, 0);
-        m_activeJobCount     = std::exchange(other.m_activeJobCount, 0);
-        m_stagingJobCount    = std::exchange(other.m_stagingJobCount, 0);
-        m_headlessTexCounter = std::exchange(other.m_headlessTexCounter, 1);
-        m_mountCount         = std::exchange(other.m_mountCount, 0);
-        m_frameCounter       = std::exchange(other.m_frameCounter, 0);
-        m_tocEntriesUsed     = std::exchange(other.m_tocEntriesUsed, 0);
-        m_cfg                = other.m_cfg;
-        m_arena              = std::move(other.m_arena);
-        m_bank               = std::move(other.m_bank);
-    }
-    return *this;
-}
+namespace en {
 
 Result<void, AssetErrc> AssetSystem::Init(const AssetSystemConfig& cfg) noexcept {
     Shutdown();
-    m_cfg = cfg;
-    if (m_cfg.maxTotalTocEntries == 0) {
-        m_cfg.maxTotalTocEntries = 4096u;
-    }
-
-    if (auto res = m_bank.Init(m_cfg.bank); !res) {
-        return res;
-    }
-
-    m_ioQueue = SDL_CreateAsyncIOQueue();
-    if (!m_ioQueue) {
+    if (auto r = m_bank.Init(cfg.bank); !r) return r;
+    if (!m_vfsArena.Init(cfg.vfsArenaBytes)) {
         m_bank.Shutdown();
-        return Err(AssetErrc::IoFailure);
+        return Err(AssetErrc::OutOfMemory);
     }
-
-    const u32 vfsHashCap = NextPow2(m_cfg.maxTotalTocEntries * 2u);
-    m_vfsHashMask = vfsHashCap - 1u;
-
-    const std::size_t totalBytes =
-        64u +
-        Align64(static_cast<std::size_t>(m_cfg.maxMounts) * sizeof(PakMount)) +
-        Align64(static_cast<std::size_t>(m_cfg.maxInFlightJobs) * sizeof(PendingJob)) +
-        Align64(static_cast<std::size_t>(m_cfg.maxTotalTocEntries) * sizeof(PakEntry)) +
-        Align64(static_cast<std::size_t>(vfsHashCap) * sizeof(VfsTocSlot)) +
-        Align64(m_cfg.stagingRingBytes);
-
-    m_arena = std::make_unique_for_overwrite<u64[]>((totalBytes + 7u) >> 3u);
-    const auto rawAddr = reinterpret_cast<std::uintptr_t>(m_arena.get());
-    u8* cursor = reinterpret_cast<u8*>((rawAddr + 63u) & ~static_cast<std::uintptr_t>(63u));
-
-    m_mounts         = CarveAligned64<PakMount>(cursor, m_cfg.maxMounts);
-    m_jobs           = CarveAligned64<PendingJob>(cursor, m_cfg.maxInFlightJobs);
-    m_tocEntriesPool = CarveAligned64<PakEntry>(cursor, m_cfg.maxTotalTocEntries);
-    m_vfsHash        = CarveAligned64<VfsTocSlot>(cursor, vfsHashCap);
-    m_stagingRing    = CarveAligned64<u8>(cursor, m_cfg.stagingRingBytes);
-
-    std::fill_n(m_vfsHash, vfsHashCap, VfsTocSlot{});
+    if (!m_vfsTable.Init(m_vfsArena, cfg.maxVfsEntries * 2U)) {
+        Shutdown();
+        return Err(AssetErrc::OutOfMemory);
+    }
+    m_mountCount = 0;
+    m_initialized = true;
     return {};
 }
 
 void AssetSystem::Shutdown() noexcept {
-    if (m_mounts) {
-        for (u8 i = 0; i < m_mountCount; ++i) {
-            if (m_mounts[i].asyncFile) {
-                SDL_CloseAsyncIO(m_mounts[i].asyncFile, false, m_ioQueue, nullptr);
-            }
-        }
-    }
-    if (m_ioQueue) {
-        SDL_DestroyAsyncIOQueue(m_ioQueue);
-        m_ioQueue = nullptr;
-    }
-    m_arena.reset();
-    m_mounts = nullptr;
-    m_jobs = nullptr;
-    m_stagingRing = nullptr;
-    m_tocEntriesPool = nullptr;
-    m_vfsHash = nullptr;
+    m_vfsArena.Shutdown();
     m_bank.Shutdown();
-
-    m_vfsHashMask = 0;
-    m_ringWrite = 0;
-    m_ringUsed = 0;
-    m_activeJobHead = kInvalidJob;
-    m_activeJobTail = kInvalidJob;
-    m_freeJobHead = kInvalidJob;
-    m_highWaterJob = 0;
-    m_activeJobCount = 0;
-    m_stagingJobCount = 0;
     m_mountCount = 0;
-    m_tocEntriesUsed = 0;
+    m_initialized = false;
 }
 
-void AssetSystem::RegisterVfsEntries(u8 mountIdx, u8 priority, u32 firstEntry, u32 entryCount) noexcept {
-    for (u32 i = 0; i < entryCount; ++i) {
-        const u32 globalIdx = firstEntry + i;
-        const u64 key = m_tocEntriesPool[globalIdx].assetId;
-        if (key == 0) {
-            continue;
-        }
-        u32 idx = FibonacciHash(key, m_vfsHashMask);
-        VfsTocSlot incoming{key, globalIdx, 1, mountIdx, priority};
-        for (;;) {
-            VfsTocSlot& cur = m_vfsHash[idx];
-            if (cur.key == 0) {
-                cur = incoming;
-                break;
-            }
-            if (cur.key == key) {
-                if (incoming.priority > cur.priority) {
-                    cur.entryIndex = incoming.entryIndex;
-                    cur.mountIndex = incoming.mountIndex;
-                    cur.priority   = incoming.priority;
-                }
-                break;
-            }
-            if (incoming.psl > cur.psl) {
-                std::swap(incoming, cur);
-            }
-            ++incoming.psl;
-            idx = (idx + 1u) & m_vfsHashMask;
+Result<void, AssetErrc> AssetSystem::MountPackMemory(std::span<const u8> pakBytes, i32 priority) noexcept {
+    if (!m_initialized) return Err(AssetErrc::InvalidConfig);
+    if (pakBytes.size() < sizeof(EnPakHeader)) return Err(AssetErrc::CorruptedPackHeader);
+
+    EnPakHeader hdr{};
+    std::memcpy(&hdr, pakBytes.data(), sizeof(EnPakHeader));
+    if (hdr.magic != kEnPakMagic) return Err(AssetErrc::CorruptedPackHeader);
+
+    const usize tocBytes = static_cast<usize>(hdr.entryCount) * sizeof(EnPakEntry);
+    if (sizeof(EnPakHeader) + tocBytes > pakBytes.size()) {
+        return Err(AssetErrc::CorruptedPackHeader);
+    }
+
+    std::span<u8> ownedPak = m_vfsArena.Carve<u8>(pakBytes.size());
+    if (ownedPak.empty()) return Err(AssetErrc::OutOfMemory);
+    std::memcpy(ownedPak.data(), pakBytes.data(), pakBytes.size());
+
+    const auto* entries = reinterpret_cast<const EnPakEntry*>(ownedPak.data() + sizeof(EnPakHeader));
+    if (hdr.headerCrc32 != 0U) {
+        const u32 actualTocCrc = ComputeTocCrc32(std::span<const EnPakEntry>(entries, hdr.entryCount));
+        if (actualTocCrc != hdr.headerCrc32) {
+            return Err(AssetErrc::CorruptedPackHeader);
         }
     }
-}
-
-Result<void, AssetErrc> AssetSystem::MountPackMemory(
-    std::span<const u8> mappedPak,
-    u8 priority) noexcept {
-    if (m_mountCount >= m_cfg.maxMounts) {
-        return Err(AssetErrc::PoolExhausted);
+    for (u32 i = 0; i < hdr.entryCount; ++i) {
+        const EnPakEntry& e = entries[i];
+        if (static_cast<usize>(e.offset) + e.compressedSize > ownedPak.size()) {
+            return Err(AssetErrc::CorruptedPayload);
+        }
+        if (const VfsTocSlot* existing = m_vfsTable.Find(e.assetId)) {
+            if (existing->priority > priority) continue;
+        }
+        (void)m_vfsTable.InsertOrAssign(e.assetId, VfsTocSlot{e, ownedPak.data(), priority});
     }
-    if (mappedPak.size() < sizeof(PakHeader)) {
-        return Err(AssetErrc::CorruptedHeader);
-    }
-
-    PakHeader hdr{};
-    std::memcpy(&hdr, mappedPak.data(), sizeof(PakHeader));
-    if (hdr.magic != kPakMagic || hdr.version != kPakVersion) {
-        return Err(AssetErrc::CorruptedHeader);
-    }
-
-    const std::size_t tocBytes = static_cast<std::size_t>(hdr.entryCount) * sizeof(PakEntry);
-    if (hdr.tocOffset > mappedPak.size() || tocBytes > mappedPak.size() - hdr.tocOffset) {
-        return Err(AssetErrc::CorruptedHeader);
-    }
-    if (hdr.entryCount > m_cfg.maxTotalTocEntries - m_tocEntriesUsed) {
-        return Err(AssetErrc::PoolExhausted);
-    }
-
-    const u8 mountIdx = m_mountCount++;
-    m_mounts[mountIdx] = PakMount{nullptr, mappedPak.data(), mappedPak.size(), 0};
-
-    if (hdr.entryCount > 0) {
-        const u32 firstEntry = m_tocEntriesUsed;
-        std::memcpy(&m_tocEntriesPool[firstEntry], mappedPak.data() + hdr.tocOffset, tocBytes);
-        m_tocEntriesUsed += hdr.entryCount;
-        RegisterVfsEntries(mountIdx, priority, firstEntry, hdr.entryCount);
-    }
+    ++m_mountCount;
     return {};
 }
 
-Result<void, AssetErrc> AssetSystem::MountPackFile(
-    std::string_view filePath,
-    u8 priority) noexcept {
-    if (m_mountCount >= m_cfg.maxMounts) {
-        return Err(AssetErrc::PoolExhausted);
-    }
-    if (filePath.empty() || filePath.size() >= 1024u) {
-        return Err(AssetErrc::InvalidMount);
-    }
-
-    char pathBuf[1024];
-    std::memcpy(pathBuf, filePath.data(), filePath.size());
-    pathBuf[filePath.size()] = '\0';
-
-    SDL_IOStream* syncIo = SDL_IOFromFile(pathBuf, "rb");
-    if (!syncIo) {
-        return Err(AssetErrc::IoFailure);
-    }
-
-    PakHeader hdr{};
-    if (SDL_ReadIO(syncIo, &hdr, sizeof(PakHeader)) != sizeof(PakHeader) ||
-        hdr.magic != kPakMagic || hdr.version != kPakVersion) {
-        SDL_CloseIO(syncIo);
-        return Err(AssetErrc::CorruptedHeader);
-    }
-    if (hdr.entryCount > m_cfg.maxTotalTocEntries - m_tocEntriesUsed) {
-        SDL_CloseIO(syncIo);
-        return Err(AssetErrc::PoolExhausted);
-    }
-
-    const u32 firstEntry = m_tocEntriesUsed;
-    const std::size_t tocBytes = static_cast<std::size_t>(hdr.entryCount) * sizeof(PakEntry);
-    if (hdr.entryCount > 0 &&
-        (SDL_SeekIO(syncIo, static_cast<Sint64>(hdr.tocOffset), SDL_IO_SEEK_SET) < 0 ||
-         SDL_ReadIO(syncIo, &m_tocEntriesPool[firstEntry], tocBytes) != tocBytes)) {
-        SDL_CloseIO(syncIo);
-        return Err(AssetErrc::CorruptedHeader);
-    }
-    SDL_CloseIO(syncIo);
-
-    SDL_AsyncIO* asyncFile = SDL_AsyncIOFromFile(pathBuf, "r");
-    if (!asyncFile) {
-        return Err(AssetErrc::IoFailure);
-    }
-
-    const u8 mountIdx = m_mountCount++;
-    m_mounts[mountIdx] = PakMount{asyncFile, nullptr, 0, 0};
-    m_tocEntriesUsed += hdr.entryCount;
-    RegisterVfsEntries(mountIdx, priority, firstEntry, hdr.entryCount);
-    return {};
-}
-
-bool AssetSystem::LocateEntry(AssetId id, u8& outMountIdx, PakEntry& outEntry) const noexcept {
-    if (!id.IsValid() || m_mountCount == 0) {
+bool AssetSystem::LoadSlotImmediate(u16 masterSlot, AssetId id, TextureHandle optionalBackingTex) noexcept {
+    const VfsTocSlot* vfs = m_vfsTable.Find(id.value);
+    if (!vfs || !vfs->baseMemory) {
+        m_bank.MarkFailed(masterSlot);
         return false;
     }
+    const EnPakEntry& e = vfs->entry;
+    std::span<const u8> rawPayload(vfs->baseMemory + e.offset, e.compressedSize);
+    std::span<const u8> decoded = rawPayload;
 
-    u32 idx = FibonacciHash(id.value, m_vfsHashMask);
-    u16 psl = 1;
-    for (;;) {
-        const VfsTocSlot& slot = m_vfsHash[idx];
-        if (slot.key == 0 || psl > slot.psl) {
+    if (e.compressed != 0) {
+        std::span<u8> decompBuf = m_bank.AllocatePayloadSlice(e.uncompressedSize);
+        if (decompBuf.empty()) {
+            m_bank.MarkFailed(masterSlot);
             return false;
         }
-        if (slot.key == id.value) {
-            outMountIdx = slot.mountIndex;
-            outEntry    = m_tocEntriesPool[slot.entryIndex];
+        if (e.compressed == 2) {
+            std::span<u8> cipherScratch = m_vfsArena.Carve<u8>(rawPayload.size());
+            if (cipherScratch.empty()) {
+                m_bank.MarkFailed(masterSlot);
+                return false;
+            }
+            std::memcpy(cipherScratch.data(), rawPayload.data(), rawPayload.size());
+            XorCipherPayload(cipherScratch, e.assetId);
+            auto res = AssetBank::DecompressLz4(cipherScratch, decompBuf);
+            if (!res || *res != e.uncompressedSize) {
+                m_bank.MarkFailed(masterSlot);
+                return false;
+            }
+        } else {
+            auto res = AssetBank::DecompressLz4(rawPayload, decompBuf);
+            if (!res || *res != e.uncompressedSize) {
+                m_bank.MarkFailed(masterSlot);
+                return false;
+            }
+        }
+        decoded = decompBuf;
+    }
+
+    switch (e.kind) {
+        case AssetKind::Texture:
+            (void)m_bank.CommitTexture(masterSlot, e.widthOrRate, e.heightOrChannels, decoded);
+            return true;
+        case AssetKind::Atlas: {
+            const usize count = decoded.size() / sizeof(CookedAtlasSpriteEntry);
+            std::span<const CookedAtlasSpriteEntry> sprites(
+                reinterpret_cast<const CookedAtlasSpriteEntry*>(decoded.data()), count);
+            (void)m_bank.CommitAtlas(masterSlot, optionalBackingTex, sprites);
             return true;
         }
-        ++psl;
-        idx = (idx + 1u) & m_vfsHashMask;
+        case AssetKind::Blob:
+            (void)m_bank.CommitBlob(masterSlot, decoded, e.schemaOrMeta);
+            return true;
+        case AssetKind::Audio: {
+            const usize sampleCount = decoded.size() / sizeof(f32);
+            std::span<const f32> pcm(reinterpret_cast<const f32*>(decoded.data()), sampleCount);
+            (void)m_bank.CommitAudio(
+                masterSlot, pcm, e.widthOrRate > 0 ? e.widthOrRate : 48000U,
+                static_cast<u8>(e.heightOrChannels > 0 ? e.heightOrChannels : 2U));
+            return true;
+        }
+        default:
+            m_bank.MarkFailed(masterSlot);
+            return false;
     }
 }
 
-bool AssetSystem::AllocateStaging(u32 size, u32& outOffset, u32& outReserve) noexcept {
-    if (size == 0) {
-        outOffset = 0;
-        outReserve = 0;
-        return true;
+u16 AssetSystem::Pin(ScopeId scope, AssetId id, AssetKind kind, AssetResidency residency) noexcept {
+    bool newlyCreated = false;
+    const u16 slot = m_bank.AcquireSlot(id, kind, scope, residency, newlyCreated);
+    if (slot != 0 && m_bank.GetSlotMeta(slot).state == AssetState::Loading) {
+        LoadSlotImmediate(slot, id);
     }
-    const u32 alignedSize = (size + 15u) & ~15u;
-    if (alignedSize > m_cfg.stagingRingBytes - m_ringUsed) {
-        return false;
-    }
-    if (m_stagingJobCount == 0) {
-        m_ringUsed = 0;
-        m_ringWrite = 0;
-    }
+    return slot;
+}
 
-    u32 ringRead = m_ringWrite;
-    for (u16 curr = m_activeJobHead; curr != kInvalidJob; curr = m_jobs[curr].nextJob) {
-        if (m_jobs[curr].stagingReserve > 0) {
-            ringRead = m_jobs[curr].stagingOffset;
-            break;
-        }
-    }
+TextureHandle AssetSystem::PinTexture(ScopeId scope, AssetId id, AssetResidency residency) noexcept {
+    const u16 slot = Pin(scope, id, AssetKind::Texture, residency);
+    if (slot == 0) return {};
+    const SlotMeta& m = m_bank.GetSlotMeta(slot);
+    return m.state == AssetState::Ready ? TextureHandle{m.payloadSlot, m.generation} : TextureHandle{};
+}
 
-    if (m_stagingJobCount == 0 || m_ringWrite > ringRead) {
-        const u32 tailSpace = m_cfg.stagingRingBytes - m_ringWrite;
-        if (tailSpace >= alignedSize) {
-            outOffset = m_ringWrite;
-            outReserve = alignedSize;
-            m_ringWrite = (m_ringWrite + alignedSize == m_cfg.stagingRingBytes) ? 0u : (m_ringWrite + alignedSize);
-            m_ringUsed += alignedSize;
-            ++m_stagingJobCount;
+AtlasHandle AssetSystem::PinAtlas(
+    ScopeId scope, AssetId id, TextureHandle backingTex, AssetResidency residency) noexcept {
+    bool newlyCreated = false;
+    const u16 slot = m_bank.AcquireSlot(id, AssetKind::Atlas, scope, residency, newlyCreated);
+    if (slot != 0 && m_bank.GetSlotMeta(slot).state == AssetState::Loading) {
+        LoadSlotImmediate(slot, id, backingTex);
+    }
+    const SlotMeta& m = m_bank.GetSlotMeta(slot);
+    return (slot != 0 && m.state == AssetState::Ready) ? AtlasHandle{m.payloadSlot, m.generation} : AtlasHandle{};
+}
+
+BlobHandle AssetSystem::PinBlob(ScopeId scope, AssetId id, AssetResidency residency) noexcept {
+    const u16 slot = Pin(scope, id, AssetKind::Blob, residency);
+    if (slot == 0) return {};
+    const SlotMeta& m = m_bank.GetSlotMeta(slot);
+    return m.state == AssetState::Ready ? BlobHandle{m.payloadSlot, m.generation} : BlobHandle{};
+}
+
+AudioHandle AssetSystem::PinAudio(ScopeId scope, AssetId id, AssetResidency residency) noexcept {
+    const u16 slot = Pin(scope, id, AssetKind::Audio, residency);
+    if (slot == 0) return {};
+    const SlotMeta& m = m_bank.GetSlotMeta(slot);
+    return m.state == AssetState::Ready ? AudioHandle{m.payloadSlot, m.generation} : AudioHandle{};
+}
+
+
+void AssetSystem::XorCipherPayload(std::span<u8> data, u64 keySeed) noexcept {
+    u64 state = (keySeed != 0) ? keySeed : 0xA5A5F0F09E3779B9ULL;
+    for (usize i = 0; i < data.size(); ++i) {
+        if ((i & 7U) == 0U) state = Mix64(state);
+        data[i] ^= static_cast<u8>((state >> ((i & 7U) * 8U)) & 0xFFU);
+    }
+}
+
+u32 AssetSystem::ComputeTocCrc32(std::span<const EnPakEntry> entries) noexcept {
+    return ComputeCrc32(std::span<const u8>(
+        reinterpret_cast<const u8*>(entries.data()), entries.size() * sizeof(EnPakEntry)));
+}
+
+bool AssetSystem::WatchAssetFile(AssetId id, std::string_view diskPath) noexcept {
+    if (!id.IsValid() || diskPath.empty()) return false;
+    for (HotWatchEntry& w : m_hotWatches) {
+        if (!w.active || w.id == id) {
+            w.id = id;
+            w.path.Assign(diskPath);
+            std::error_code ec{};
+            const auto ftime = std::filesystem::last_write_time(w.path.CStr(), ec);
+            w.lastModTick = ec ? 0ULL : static_cast<u64>(ftime.time_since_epoch().count());
+            w.active = true;
             return true;
         }
-        if (alignedSize <= ringRead && tailSpace + alignedSize <= m_cfg.stagingRingBytes - m_ringUsed) {
-            outOffset = 0;
-            outReserve = tailSpace + alignedSize;
-            m_ringWrite = alignedSize;
-            m_ringUsed += outReserve;
-            ++m_stagingJobCount;
-            return true;
-        }
-        return false;
-    }
-
-    if (ringRead - m_ringWrite >= alignedSize) {
-        outOffset = m_ringWrite;
-        outReserve = alignedSize;
-        m_ringWrite += alignedSize;
-        m_ringUsed += alignedSize;
-        ++m_stagingJobCount;
-        return true;
     }
     return false;
 }
 
-void AssetSystem::ReleaseJob(u16 jobIdx) noexcept {
-    PendingJob& job = m_jobs[jobIdx];
-    if (job.stagingReserve > 0) {
-        m_ringUsed -= job.stagingReserve;
-        if (--m_stagingJobCount == 0) {
-            m_ringUsed = 0;
-            m_ringWrite = 0;
-        }
-        job.stagingReserve = 0;
-    }
-
-    if (job.prevJob != kInvalidJob) {
-        m_jobs[job.prevJob].nextJob = job.nextJob;
-    } else {
-        m_activeJobHead = job.nextJob;
-    }
-    if (job.nextJob != kInvalidJob) {
-        m_jobs[job.nextJob].prevJob = job.prevJob;
-    } else {
-        m_activeJobTail = job.prevJob;
-    }
-
-    job.flags = 0;
-    job.prevJob = kInvalidJob;
-    job.nextJob = m_freeJobHead;
-    m_freeJobHead = jobIdx;
-    --m_activeJobCount;
-}
-
-Result<u16, AssetErrc> AssetSystem::EnqueueLoad(
-    AssetId id,
-    AssetKind expectedKind,
-    ScopeId scope,
-    Residency residency) noexcept {
-    u8 mountIdx = 0;
-    PakEntry entry{};
-    if (!LocateEntry(id, mountIdx, entry) || entry.kind != expectedKind) {
-        return Err(AssetErrc::NotFound);
-    }
-
-    bool needsLoad = false;
-    auto slotRes = m_bank.AcquireSlot(id, expectedKind, scope, residency, needsLoad);
-    if (!slotRes) {
-        return slotRes;
-    }
-    const u16 slot = *slotRes;
-    if (!needsLoad) {
-        return slot;
-    }
-
-    const PakMount& mount = m_mounts[mountIdx];
-
-    if (mount.mappedBase && entry.codec == AssetCodec::Raw &&
-        (expectedKind == AssetKind::Blob || expectedKind == AssetKind::Audio)) {
-        if (entry.offset > mount.mappedSize || entry.rawSize > mount.mappedSize - entry.offset) {
-            m_bank.MarkFailed(slot);
-            return Err(AssetErrc::CorruptedPayload);
-        }
-        const std::span<const u8> slice{mount.mappedBase + entry.offset, entry.rawSize};
-        if (expectedKind == AssetKind::Blob) {
-            (void)m_bank.CommitBlob(slot, slice, entry.metaA, true);
-        } else {
-            (void)m_bank.CommitAudio(slot, slice, static_cast<u16>(entry.metaA), static_cast<u8>(entry.metaB), true);
-        }
-        return slot;
-    }
-
-    if (m_freeJobHead == kInvalidJob && m_highWaterJob >= m_cfg.maxInFlightJobs) {
-        m_bank.MarkFailed(slot);
-        return Err(AssetErrc::PoolExhausted);
-    }
-
-    const bool isArenaDest = (expectedKind == AssetKind::Blob || expectedKind == AssetKind::Audio);
-    u32 requiredStaging = 0;
-    if (mount.mappedBase) {
-        if (entry.codec == AssetCodec::Lz4 && !isArenaDest) {
-            requiredStaging = entry.rawSize;
-        }
-    } else {
-        requiredStaging = (entry.codec == AssetCodec::Lz4 && !isArenaDest)
-                              ? (entry.storedSize + entry.rawSize)
-                              : ((entry.codec == AssetCodec::Lz4) ? entry.storedSize : entry.rawSize);
-    }
-
-    u32 stagingOffset = 0;
-    u32 stagingReserve = 0;
-    if (!AllocateStaging(requiredStaging, stagingOffset, stagingReserve)) {
-        m_bank.MarkFailed(slot);
-        return Err(AssetErrc::StagingOverflow);
-    }
-
-    const u16 jobIdx = (m_freeJobHead != kInvalidJob)
-                           ? std::exchange(m_freeJobHead, m_jobs[m_freeJobHead].nextJob)
-                           : m_highWaterJob++;
-
-    PendingJob& job = m_jobs[jobIdx];
-    job.entry = entry;
-    job.stagingOffset = stagingOffset;
-    job.stagingReserve = stagingReserve;
-    job.slot = slot;
-    job.mountIndex = mountIdx;
-    job.prevJob = m_activeJobTail;
-    job.nextJob = kInvalidJob;
-
-    if (m_activeJobTail != kInvalidJob) {
-        m_jobs[m_activeJobTail].nextJob = jobIdx;
-    } else {
-        m_activeJobHead = jobIdx;
-    }
-    m_activeJobTail = jobIdx;
-    ++m_activeJobCount;
-
-    if (mount.mappedBase) {
-        const bool validRange = (entry.offset <= mount.mappedSize &&
-                                 entry.storedSize <= mount.mappedSize - entry.offset);
-        job.flags = kJobComplete | (validRange ? kJobSuccess : 0u);
-    } else {
-        job.flags = 0;
-        if (!SDL_ReadAsyncIO(
-                mount.asyncFile,
-                &m_stagingRing[job.stagingOffset],
-                entry.offset,
-                entry.storedSize,
-                m_ioQueue,
-                &job)) {
-            ReleaseJob(jobIdx);
-            m_bank.MarkFailed(slot);
-            return Err(AssetErrc::IoFailure);
-        }
-    }
-
-    return slot;
-}
-
-void AssetSystem::FinalizeJob(PendingJob& job, renderer::Renderer* renderer) noexcept {
-    const PakMount& mount = m_mounts[job.mountIndex];
-    const PakEntry& entry = job.entry;
-
-    const u8* storedPtr = mount.mappedBase
-                              ? (mount.mappedBase + entry.offset)
-                              : &m_stagingRing[job.stagingOffset];
-
-    const bool isArenaDest = (entry.kind == AssetKind::Blob || entry.kind == AssetKind::Audio);
-    const u32 prevArenaHead = m_bank.BlobArenaHead();
-    std::span<const u8> decodedSpan{};
-
-    if (entry.codec == AssetCodec::Raw) {
-        decodedSpan = std::span<const u8>{storedPtr, entry.rawSize};
-    } else if (entry.codec == AssetCodec::Lz4) {
-        u8* dstPtr = nullptr;
-        if (isArenaDest) {
-            auto sliceRes = m_bank.AllocateArenaSlice(entry.rawSize);
-            if (!sliceRes) {
-                m_bank.MarkFailed(job.slot);
-                return;
-            }
-            dstPtr = sliceRes->data();
-        } else {
-            dstPtr = mount.mappedBase
-                         ? &m_stagingRing[job.stagingOffset]
-                         : &m_stagingRing[job.stagingOffset + entry.storedSize];
-        }
-
-        auto decRes = AssetBank::DecompressLz4(
-            std::span<const u8>{storedPtr, entry.storedSize},
-            std::span<u8>{dstPtr, entry.rawSize});
-        if (!decRes || *decRes != entry.rawSize) {
-            if (isArenaDest) {
-                m_bank.RollbackArenaSlice(prevArenaHead);
-            }
-            m_bank.MarkFailed(job.slot);
-            return;
-        }
-        decodedSpan = std::span<const u8>{dstPtr, entry.rawSize};
-    } else {
-        m_bank.MarkFailed(job.slot);
-        return;
-    }
-
-    switch (entry.kind) {
-        case AssetKind::Texture: {
-            const u16 w = static_cast<u16>(entry.metaA & 0xFFFFu);
-            const u16 h = static_cast<u16>(entry.metaA >> 16);
-            renderer::TextureHandle gpuHandle{m_headlessTexCounter++, 1};
-
-            if (renderer) {
-                renderer::TextureDesc desc{
-                    .width  = w,
-                    .height = h,
-                    .format = static_cast<renderer::TextureFormat>(entry.metaB & 0xFFu),
-                    .filter = static_cast<renderer::TextureFilter>((entry.metaB >> 8) & 0xFFu),
-                    .pixels = decodedSpan,
-                    .pitch  = static_cast<u32>(w) * 4u
-                };
-
-                auto texRes = renderer->CreateTexture(desc);
-                if (!texRes) {
-                    m_bank.MarkFailed(job.slot);
-                    return;
-                }
-                gpuHandle = *texRes;
-            }
-            (void)m_bank.CommitTexture(job.slot, gpuHandle, w, h, entry.rawSize);
-            break;
-        }
-        case AssetKind::Atlas: {
-            if (decodedSpan.size() >= sizeof(CookedAtlasHeader)) {
-                CookedAtlasHeader hdr{};
-                std::memcpy(&hdr, decodedSpan.data(), sizeof(CookedAtlasHeader));
-                u16 texSlot = 0;
-                if (hdr.backingTextureId != 0) {
-                    if (auto texRes = EnqueueLoad(
-                            AssetId{hdr.backingTextureId},
-                            AssetKind::Texture,
-                            kInvalidScope,
-                            Residency::Presentation)) {
-                        texSlot = *texRes;
+u32 AssetSystem::PumpHotReload() noexcept {
+    u32 reloaded = 0;
+    for (HotWatchEntry& w : m_hotWatches) {
+        if (!w.active) continue;
+        std::error_code ec{};
+        const auto ftime = std::filesystem::last_write_time(w.path.CStr(), ec);
+        if (ec) continue;
+        const u64 modTick = static_cast<u64>(ftime.time_since_epoch().count());
+        if (modTick != w.lastModTick) {
+            w.lastModTick = modTick;
+            const auto fsize = std::filesystem::file_size(w.path.CStr(), ec);
+            if (!ec && fsize > 0 && fsize <= 64 * 1024) {
+                std::span<u8> scratch = m_vfsArena.Carve<u8>(static_cast<usize>(fsize));
+                if (!scratch.empty()) {
+                    std::ifstream ifs(w.path.CStr(), std::ios::binary);
+                    if (ifs.is_open()) {
+                        ifs.read(reinterpret_cast<char*>(scratch.data()), static_cast<std::streamsize>(fsize));
+                        if (m_bank.HotReloadBlob(w.id, scratch)) {
+                            ++reloaded;
+                        }
                     }
                 }
-                (void)m_bank.CommitAtlas(job.slot, texSlot, decodedSpan);
-            } else {
-                m_bank.MarkFailed(job.slot);
             }
-            break;
         }
-        case AssetKind::Blob: {
-            const bool isInPlace = (mount.mappedBase != nullptr && entry.codec == AssetCodec::Raw) ||
-                                   (entry.codec == AssetCodec::Lz4);
-            (void)m_bank.CommitBlob(job.slot, decodedSpan, entry.metaA, isInPlace);
-            break;
-        }
-        case AssetKind::Audio: {
-            const bool isInPlace = (mount.mappedBase != nullptr && entry.codec == AssetCodec::Raw) ||
-                                   (entry.codec == AssetCodec::Lz4);
-            (void)m_bank.CommitAudio(
-                job.slot,
-                decodedSpan,
-                static_cast<u16>(entry.metaA),
-                static_cast<u8>(entry.metaB),
-                isInPlace);
-            break;
-        }
-        default:
-            m_bank.MarkFailed(job.slot);
-            break;
     }
+    return reloaded;
 }
 
-void AssetSystem::PumpInternal(renderer::Renderer* renderer, const PumpBudget& budget) noexcept {
-    m_bank.AdvanceFrame(++m_frameCounter);
-
-    if (m_activeJobCount > 0) {
-        SDL_AsyncIOOutcome outcome{};
-        while (SDL_GetAsyncIOResult(m_ioQueue, &outcome)) {
-            if (auto* job = static_cast<PendingJob*>(outcome.userdata)) {
-                job->flags |= kJobComplete;
-                if (outcome.result == SDL_ASYNCIO_COMPLETE &&
-                    outcome.bytes_transferred == job->entry.storedSize) {
-                    job->flags |= kJobSuccess;
-                }
-            }
-        }
-
-        u32 uploadsDone = 0;
-        u32 bytesUploaded = 0;
-
-        u16 curr = m_activeJobHead;
-        while (curr != kInvalidJob) {
-            PendingJob& job = m_jobs[curr];
-            if ((job.flags & kJobComplete) == 0) {
-                curr = job.nextJob;
-                continue;
-            }
-
-            const bool isTex = (job.entry.kind == AssetKind::Texture);
-            if (isTex && (job.flags & kJobSuccess) != 0 &&
-                (uploadsDone >= budget.maxGpuUploads ||
-                 (uploadsDone > 0 && bytesUploaded + job.entry.rawSize > budget.maxUploadBytes))) {
-                curr = job.nextJob;
-                continue;
-            }
-
-            if ((job.flags & kJobSuccess) != 0) {
-                FinalizeJob(job, renderer);
-                if (isTex) {
-                    ++uploadsDone;
-                    bytesUploaded += job.entry.rawSize;
-                }
-            } else {
-                m_bank.MarkFailed(job.slot);
-            }
-
-            const u16 next = job.nextJob;
-            ReleaseJob(curr);
-            curr = next;
-        }
-    }
-
-    if (m_bank.IsOverVramBudget()) {
-        renderer::TextureHandle evicted[16];
-        const u32 evictedCount = m_bank.EvictUnpinned(evicted);
-        if (renderer) {
-            for (u32 i = 0; i < evictedCount; ++i) {
-                renderer->DestroyTexture(evicted[i]);
+void AssetSystem::Pump(Renderer2D* optionalRenderer, u32 maxJobs) noexcept {
+    (void)PumpHotReload();
+    if (!optionalRenderer) return;
+    u32 uploaded = 0;
+    for (u16 t = 1; t < m_bank.HighWaterTex() && uploaded < maxJobs; ++t) {
+        const TextureRecord& rec = m_bank.GetTextureBySlot(t);
+        if (rec.gpu == kWhiteGpuTexture && !rec.pixels.empty() && rec.width > 0 && rec.height > 0) {
+            const GpuTextureHandle gpu = optionalRenderer->CreateTexture(rec.width, rec.height, rec.pixels);
+            if (gpu.IsValid() && gpu != kWhiteGpuTexture) {
+                m_bank.BindGpuTexture(t, gpu);
+                ++uploaded;
             }
         }
     }
 }
 
-Result<void, AssetErrc> AssetSystem::WaitSimReady(
-    ScopeId scope,
-    renderer::Renderer* optionalRenderer) noexcept {
-    if (!m_bank.IsScopeSimReady(scope)) {
-        PumpInternal(optionalRenderer, PumpBudget{64, 256 * 1024 * 1024});
-    }
-    while (!m_bank.IsScopeSimReady(scope) && m_activeJobCount > 0) {
-        SDL_AsyncIOOutcome outcome{};
-        if (SDL_WaitAsyncIOResult(m_ioQueue, &outcome, 10)) {
-            if (auto* job = static_cast<PendingJob*>(outcome.userdata)) {
-                job->flags |= kJobComplete;
-                if (outcome.result == SDL_ASYNCIO_COMPLETE &&
-                    outcome.bytes_transferred == job->entry.storedSize) {
-                    job->flags |= kJobSuccess;
-                }
-            }
-        }
-        PumpInternal(optionalRenderer, PumpBudget{64, 256 * 1024 * 1024});
-    }
-    return {};
-}
-
-} // namespace en::assets
+} // namespace en

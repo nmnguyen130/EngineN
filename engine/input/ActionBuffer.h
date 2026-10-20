@@ -2,107 +2,163 @@
 
 #include "input/InputTypes.h"
 
-#include <array>
-#include <bit>
+namespace en {
 
-namespace en::input {
-
-// Deterministic tick-counted intent buffer for jump/dash forgiveness and hitstop freeze retention.
-// Self-contained 36-byte value type; pairs with SimStepView::IsFrozen(ch).
-// Invariant: Ages are defined for set bits in pending and never exceed kMaxBufferTicks.
-class ActionBuffer {
+// Deterministic tick-counted input forgiveness buffer for responsive combat and platforming.
+class alignas(4) ActionBuffer {
 public:
     static constexpr u8 kMaxBufferTicks = 60;
 
-    constexpr void Feed(const TickInput& in, bool channelFrozen = false) noexcept {
-        StepChannel(m_press, in.pressed, channelFrozen);
-        StepChannel(m_release, in.released, channelFrozen);
-    }
-
     constexpr void Clear() noexcept {
-        m_press   = {};
-        m_release = {};
+        m_pendingPressMask = 0;
+        m_pendingReleaseMask = 0;
+        m_pressAge.fill(0);
+        m_releaseAge.fill(0);
     }
 
-    [[nodiscard]] constexpr u16 PendingPressMask() const noexcept { return m_press.pending; }
-    [[nodiscard]] constexpr u16 PendingReleaseMask() const noexcept { return m_release.pending; }
+    constexpr void Feed(const TickInput& in, bool channelFrozen = false) noexcept {
+        if (!channelFrozen) {
+            u16 pMask = m_pendingPressMask;
+            while (pMask != 0) {
+                const u8 idx = static_cast<u8>(std::countr_zero(pMask));
+                pMask &= static_cast<u16>(pMask - 1U);
+                if (++m_pressAge[idx] > kMaxBufferTicks) {
+                    m_pendingPressMask &= static_cast<u16>(~(1U << idx));
+                }
+            }
+            u16 rMask = m_pendingReleaseMask;
+            while (rMask != 0) {
+                const u8 idx = static_cast<u8>(std::countr_zero(rMask));
+                rMask &= static_cast<u16>(rMask - 1U);
+                if (++m_releaseAge[idx] > kMaxBufferTicks) {
+                    m_pendingReleaseMask &= static_cast<u16>(~(1U << idx));
+                }
+            }
+        }
 
-    [[nodiscard]] constexpr bool Peek(InputId auto a, u8 windowTicks) const noexcept {
-        return Check(m_press, ToInputIndex(a), windowTicks);
+        u16 newPress = in.pressed;
+        while (newPress != 0) {
+            const u8 idx = static_cast<u8>(std::countr_zero(newPress));
+            newPress &= static_cast<u16>(newPress - 1U);
+            m_pressAge[idx] = 0;
+            m_pendingPressMask |= static_cast<u16>(1U << idx);
+        }
+
+        u16 newRel = in.released;
+        while (newRel != 0) {
+            const u8 idx = static_cast<u8>(std::countr_zero(newRel));
+            newRel &= static_cast<u16>(newRel - 1U);
+            m_releaseAge[idx] = 0;
+            m_pendingReleaseMask |= static_cast<u16>(1U << idx);
+        }
     }
 
-    [[nodiscard]] constexpr bool PeekRelease(InputId auto a, u8 windowTicks) const noexcept {
-        return Check(m_release, ToInputIndex(a), windowTicks);
+    [[nodiscard]] constexpr u16 PendingPressMask() const noexcept { return m_pendingPressMask; }
+    [[nodiscard]] constexpr u16 PendingReleaseMask() const noexcept { return m_pendingReleaseMask; }
+
+    [[nodiscard]] constexpr bool Peek(InputId auto a, u8 windowTicks = 12) const noexcept {
+        const u8 idx = ToInputIndex(a);
+        return ((m_pendingPressMask & (1U << idx)) != 0) && (m_pressAge[idx] <= windowTicks);
     }
 
-    [[nodiscard]] constexpr bool Consume(InputId auto a, u8 windowTicks) noexcept {
-        return Take(m_press, ToInputIndex(a), windowTicks);
+    [[nodiscard]] constexpr bool Consume(InputId auto a, u8 windowTicks = 12) noexcept {
+        const u8 idx = ToInputIndex(a);
+        if (!Peek(idx, windowTicks)) return false;
+        m_pendingPressMask &= static_cast<u16>(~(1U << idx));
+        return true;
     }
 
-    [[nodiscard]] constexpr bool ConsumeRelease(InputId auto a, u8 windowTicks) noexcept {
-        return Take(m_release, ToInputIndex(a), windowTicks);
+    [[nodiscard]] constexpr bool PeekRelease(InputId auto a, u8 windowTicks = 12) const noexcept {
+        const u8 idx = ToInputIndex(a);
+        return ((m_pendingReleaseMask & (1U << idx)) != 0) && (m_releaseAge[idx] <= windowTicks);
+    }
+
+    [[nodiscard]] constexpr bool ConsumeRelease(InputId auto a, u8 windowTicks = 12) noexcept {
+        const u8 idx = ToInputIndex(a);
+        if (!PeekRelease(idx, windowTicks)) return false;
+        m_pendingReleaseMask &= static_cast<u16>(~(1U << idx));
+        return true;
     }
 
     [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
-        u64 h = 14695981039346656037ull;
-        auto mix = [&](u64 v) constexpr noexcept {
-            h ^= v;
-            h *= 1099511628211ull;
-        };
-        mix(static_cast<u64>(m_press.pending) | (static_cast<u64>(m_release.pending) << 16));
-        for (u32 m = m_press.pending; m != 0; m &= m - 1) {
-            mix(m_press.age[std::countr_zero(m)]);
-        }
-        for (u32 m = m_release.pending; m != 0; m &= m - 1) {
-            mix(m_release.age[std::countr_zero(m)]);
+        u64 h = Mix64(static_cast<u64>(m_pendingPressMask) | (static_cast<u64>(m_pendingReleaseMask) << 16U));
+        u16 mask = m_pendingPressMask;
+        while (mask != 0) {
+            const u8 idx = static_cast<u8>(std::countr_zero(mask));
+            mask &= static_cast<u16>(mask - 1U);
+            h = HashCombine64(h, (static_cast<u64>(idx) << 8U) | m_pressAge[idx]);
         }
         return h;
     }
 
 private:
-    struct Channel {
-        u16 pending = 0;
-        std::array<u8, kMaxActions> age{};
-    };
+    u16 m_pendingPressMask{0};
+    u16 m_pendingReleaseMask{0};
+    std::array<u8, kMaxActions> m_pressAge{};
+    std::array<u8, kMaxActions> m_releaseAge{};
+};
+static_assert(sizeof(ActionBuffer) == 36);
 
-    static constexpr void StepChannel(Channel& ch, u16 edges, bool frozen) noexcept {
-        if ((ch.pending | edges) == 0) {
-            return;
-        }
+// Detects Double-Tap dashes and Hold-to-Charge attacks across 120 Hz simulation ticks.
+class GestureDetector {
+public:
+    constexpr void Clear() noexcept {
+        m_lastTapAge.fill(255);
+        m_holdTicks.fill(0);
+        m_releasedChargeTicks.fill(0);
+        m_doubleTapMask = 0;
+    }
 
-        for (u32 m = edges; m != 0; m &= m - 1) {
-            ch.age[std::countr_zero(m)] = 0;
-        }
-        ch.pending |= edges;
-
-        if (frozen) {
-            return;
-        }
-
-        for (u32 m = static_cast<u32>(ch.pending & ~edges); m != 0; m &= m - 1) {
-            const int i = std::countr_zero(m);
-            if (++ch.age[i] > kMaxBufferTicks) {
-                ch.pending &= static_cast<u16>(~(1u << i));
+    constexpr void Feed(const TickInput& in, u8 doubleTapMaxGapTicks = 18) noexcept {
+        m_doubleTapMask = 0;
+        for (u8 i = 0; i < kMaxActions; ++i) {
+            if (m_lastTapAge[i] < 255) ++m_lastTapAge[i];
+            const u16 bit = static_cast<u16>(1U << i);
+            if ((in.pressed & bit) != 0) {
+                if (m_lastTapAge[i] <= doubleTapMaxGapTicks) {
+                    m_doubleTapMask |= bit;
+                    m_lastTapAge[i] = 255;
+                } else {
+                    m_lastTapAge[i] = 0;
+                }
+            }
+            if ((in.held & bit) != 0) {
+                if (m_holdTicks[i] < 0xFFFFU) ++m_holdTicks[i];
+            } else {
+                if ((in.released & bit) != 0) {
+                    m_releasedChargeTicks[i] = m_holdTicks[i];
+                } else {
+                    m_releasedChargeTicks[i] = 0;
+                }
+                m_holdTicks[i] = 0;
             }
         }
     }
 
-    [[nodiscard]] static constexpr bool Check(const Channel& ch, u8 i, u8 window) noexcept {
-        return i < kMaxActions && ((ch.pending >> i) & 1u) != 0 && ch.age[i] <= window;
+    [[nodiscard]] constexpr bool WasDoubleTapped(InputId auto a) const noexcept {
+        return (m_doubleTapMask & (1U << ToInputIndex(a))) != 0;
     }
 
-    [[nodiscard]] static constexpr bool Take(Channel& ch, u8 i, u8 window) noexcept {
-        if (!Check(ch, i, window)) {
-            return false;
+    [[nodiscard]] constexpr f32 HoldChargeRatio(InputId auto a, u16 fullChargeTicks = 30) const noexcept {
+        if (fullChargeTicks == 0) return 1.0f;
+        const u16 held = m_holdTicks[ToInputIndex(a)];
+        return std::clamp(static_cast<f32>(held) / static_cast<f32>(fullChargeTicks), 0.0f, 1.0f);
+    }
+
+    [[nodiscard]] constexpr bool ConsumeChargedRelease(InputId auto a, u16 minChargeTicks = 20) noexcept {
+        const u8 idx = ToInputIndex(a);
+        if (m_releasedChargeTicks[idx] >= minChargeTicks) {
+            m_releasedChargeTicks[idx] = 0;
+            return true;
         }
-        ch.pending &= static_cast<u16>(~(1u << i));
-        return true;
+        return false;
     }
 
-    Channel m_press{};
-    Channel m_release{};
+private:
+    std::array<u8, kMaxActions> m_lastTapAge{};
+    std::array<u16, kMaxActions> m_holdTicks{};
+    std::array<u16, kMaxActions> m_releasedChargeTicks{};
+    u16 m_doubleTapMask{0};
 };
 
-static_assert(sizeof(ActionBuffer) == 36);
-
-} // namespace en::input
+} // namespace en

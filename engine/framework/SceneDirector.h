@@ -2,195 +2,98 @@
 
 #include "framework/FrameworkTypes.h"
 
-#include <array>
+namespace en {
 
-namespace en::framework {
+// Versioned binary checkpoint & world-flag serializer with CRC32 integrity verification.
+class SaveGameManager final {
+public:
+    [[nodiscard]] static Result<usize, FrameworkErrc> SerializeSaveSlot(
+        const SaveSlotHeader& meta,
+        const GameplayPipeline& gameplay,
+        std::span<u8> outBuffer) noexcept;
 
-enum class TransitionPhase : u8 {
-    Idle = 0,
-    WaitingManifestBlob,
-    StreamingSceneAssets
+    [[nodiscard]] static Result<SaveSlotHeader, FrameworkErrc> DeserializeSaveSlot(
+        std::span<const u8> inBuffer,
+        GameplayPipeline& outGameplay) noexcept;
 };
 
-enum class StateCmdKind : u8 {
-    Push = 0,
-    Pop,
-    Switch,
-    ClearAndPush
-};
-
-// Pure C++23 Layer-1 Structure-of-Arrays (SoA) state stack and non-blocking scene transition coordinator.
-// Ownership: Owns persistent/active/staging ScopeIds inside AssetSystem; zero OS or heap resources.
-// Invariant: Cache Line 0 holds all hot 120 Hz/240 Hz dispatch masks, scopes, and state metadata (sizeof == 832).
+// Structure-of-Arrays (SoA) state stack machine and non-blocking '.escn' scene transition coordinator.
+// Value type; packs all hot 120 Hz/240 Hz dispatch masks in Cache Line 0.
+// Invariant: RebakeStackMasks() computes active sim/render/pause/input masks in a single top-down pass.
 class alignas(64) SceneDirector {
 public:
-    SceneDirector() noexcept = default;
+    [[nodiscard]] Result<void, FrameworkErrc> Init(AssetSystem& assets) noexcept;
+    void Shutdown(AssetSystem& assets, AudioEngine& audio, SceneLoadContext* optionalLoadCtx = nullptr) noexcept;
 
-    [[nodiscard]] Result<void, FrameworkErrc> Init(assets::AssetSystem& assets) noexcept;
-    void Shutdown(
-        assets::AssetSystem& assets,
-        audio::AudioSystem& audio,
-        SceneLoadContext* optionalLoadCtx = nullptr) noexcept;
-
-    [[nodiscard]] constexpr Result<void, FrameworkErrc> PushState(const StateLayerDesc& desc) noexcept {
-        return EnqueueStateCmd(StateCmdKind::Push, desc);
-    }
-    [[nodiscard]] constexpr Result<void, FrameworkErrc> PopState() noexcept {
-        return EnqueueStateCmd(StateCmdKind::Pop);
-    }
-    [[nodiscard]] constexpr Result<void, FrameworkErrc> SwitchState(const StateLayerDesc& desc) noexcept {
-        return EnqueueStateCmd(StateCmdKind::Switch, desc);
-    }
-    [[nodiscard]] constexpr Result<void, FrameworkErrc> ClearAndPushState(const StateLayerDesc& desc) noexcept {
-        return EnqueueStateCmd(StateCmdKind::ClearAndPush, desc);
-    }
+    [[nodiscard]] Result<void, FrameworkErrc> PushState(const StateLayerDesc& desc) noexcept;
+    [[nodiscard]] Result<void, FrameworkErrc> PopState() noexcept;
+    [[nodiscard]] Result<void, FrameworkErrc> SwitchState(const StateLayerDesc& desc) noexcept;
+    [[nodiscard]] Result<void, FrameworkErrc> ClearAndPushState(const StateLayerDesc& desc) noexcept;
 
     [[nodiscard]] Result<void, FrameworkErrc> RequestSceneTransition(
-        const SceneTransitionDesc& desc,
-        assets::AssetSystem& assets) noexcept;
+        const SceneTransitionDesc& desc, AssetSystem& assets) noexcept;
+    [[nodiscard]] Result<bool, FrameworkErrc> CommitSafeFramePoint(SceneLoadContext& loadCtx) noexcept;
 
-    // Safe Frame Mutation Point (invoked before TimeManager::BeginFrame).
-    // Advances non-blocking scene streaming, activates ready scenes, and commits queued state commands.
-    [[nodiscard]] Result<bool, FrameworkErrc> CommitSafeFramePoint(
-        SceneLoadContext& loadCtx) noexcept;
-
-    // O(popcount) branchless intrinsic dispatch using std::countr_zero over pre-baked bitmasks.
     void DispatchSimTick(SimContext& simCtx) const noexcept;
     void DispatchRenderExtract(RenderContext& renderCtx) const noexcept;
 
     [[nodiscard]] constexpr bool HasPendingWork() const noexcept {
-        return m_phase != TransitionPhase::Idle || m_cmdCount != 0;
+        return m_pendingCmdCount > 0 || m_hasPendingScene;
     }
-    [[nodiscard]] constexpr TransitionPhase Phase() const noexcept { return m_phase; }
-    [[nodiscard]] constexpr assets::ScopeId ActiveSceneScope() const noexcept { return m_activeScope; }
-    [[nodiscard]] constexpr assets::ScopeId PersistentScope() const noexcept { return m_persistentScope; }
-    [[nodiscard]] constexpr assets::AssetId ActiveSceneId() const noexcept { return m_activeSceneId; }
+    [[nodiscard]] constexpr ScopeId ActiveSceneScope() const noexcept { return m_activeScope; }
+    [[nodiscard]] constexpr ScopeId PersistentScope() const noexcept { return m_persistentScope; }
+    [[nodiscard]] constexpr AssetId ActiveSceneId() const noexcept { return m_activeSceneId; }
     [[nodiscard]] constexpr u8 StateDepth() const noexcept { return m_stackDepth; }
     [[nodiscard]] constexpr u8 ActiveSimMask() const noexcept { return m_activeSimMask; }
     [[nodiscard]] constexpr u8 ActiveRenderMask() const noexcept { return m_activeRenderMask; }
     [[nodiscard]] constexpr u16 TopInputMask() const noexcept { return m_topInputMask; }
     [[nodiscard]] constexpr bool IsClockPausedByState() const noexcept { return m_pausedClockMask != 0; }
 
-    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept;
-
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
     [[nodiscard]] static constexpr u64 CombineAuditHashes(
-        u64 tickIndex,
-        u64 worldHash,
-        u64 gameplayHash,
-        u64 assetHash,
-        u64 audioHash,
-        u64 renderHash,
-        u64 directorHash) noexcept;
-
-private:
-    [[nodiscard]] constexpr Result<void, FrameworkErrc> EnqueueStateCmd(
-        StateCmdKind kind,
-        StateLayerDesc desc = {}) noexcept {
-        if (m_cmdCount >= kMaxPendingStateCmds) {
-            return Err(FrameworkErrc::StateStackOverflow);
-        }
-        desc.cmdKind = static_cast<u8>(kind);
-        m_cmdQueue[m_cmdCount++] = desc;
-        return {};
+        u64 tickIndex, u64 worldHash, u64 gameplayHash, u64 assetHash,
+        u64 audioHash, u64 renderHash, u64 directorHash) noexcept {
+        u64 h = Mix64(tickIndex ^ worldHash);
+        h = HashCombine64(h, gameplayHash);
+        h = HashCombine64(h, assetHash);
+        h = HashCombine64(h, audioHash);
+        h = HashCombine64(h, renderHash);
+        return HashCombine64(h, directorHash);
     }
 
-    constexpr void RebakeStackMasks() noexcept;
-    [[nodiscard]] Result<void, FrameworkErrc> PinScenePayloads(
-        const u8* rawEntries,
-        u16 entryCount,
-        assets::AssetSystem& assets) noexcept;
-    [[nodiscard]] Result<bool, FrameworkErrc> StepSceneTransition(SceneLoadContext& loadCtx) noexcept;
-    [[nodiscard]] Result<void, FrameworkErrc> ActivatePendingScene(SceneLoadContext& loadCtx) noexcept;
-    void AbortStagingScope(assets::AssetSystem& assets) noexcept;
+private:
+    enum class CmdKind : u8 { Push = 0, Pop = 1, Switch = 2, ClearAndPush = 3 };
+    struct PendingCmd {
+        StateLayerDesc desc{};
+        CmdKind kind{CmdKind::Push};
+    };
 
-    // Cache Line 0 (offset 0..63, 64B exact): Hot Bitmasks, Scopes, Layer Flags, State IDs, Input Masks, Active Scene
+    void RebakeStackMasks() noexcept;
+
     u8 m_activeSimMask{0};
     u8 m_activeRenderMask{0};
     u8 m_pausedClockMask{0};
     u8 m_stackDepth{0};
-    u8 m_cmdCount{0};
-    TransitionPhase m_phase{TransitionPhase::Idle};
-    assets::ScopeId m_persistentScope{assets::kInvalidScope};
-    assets::ScopeId m_activeScope{assets::kInvalidScope};
-    assets::ScopeId m_stagingScope{assets::kInvalidScope};
-    u8 m_reserved0{0};
-    u16 m_topInputMask{0xFFFF};
-    assets::BlobHandle m_stagedManifestBlob{};
+    u8 m_pendingCmdCount{0};
+    ScopeId m_persistentScope{0};
+    ScopeId m_activeScope{kInvalidScope};
+    ScopeId m_stagingScope{kInvalidScope};
+    u16 m_topInputMask{0xFFFFU};
+    bool m_hasPendingScene{false};
+
     std::array<StateLayerFlags, kMaxStateStackDepth> m_layerFlags{};
     std::array<StateId, kMaxStateStackDepth> m_stateIds{};
     std::array<u16, kMaxStateStackDepth> m_inputMasks{};
-    assets::AssetId m_activeSceneId{};
+    AssetId m_activeSceneId{};
 
-    // Cache Lines 1..3 (offset 64..255, 192B exact): Hot 120 Hz / 240 Hz SoA Dispatch Tables
-    std::array<StateSimTickFn, kMaxStateStackDepth> m_simFns{};
-    std::array<StateRenderFn, kMaxStateStackDepth> m_renderFns{};
+    std::array<void (*)(SimContext&) noexcept, kMaxStateStackDepth> m_simFns{};
+    std::array<void (*)(RenderContext&) noexcept, kMaxStateStackDepth> m_renderFns{};
+    std::array<void (*)(SceneLoadContext&, void*) noexcept, kMaxStateStackDepth> m_exitFns{};
     std::array<void*, kMaxStateStackDepth> m_userStates{};
 
-    // Cache Line 4 (offset 256..319, 64B exact): Cold Exit Callbacks
-    std::array<StateLifecycleFn, kMaxStateStackDepth> m_exitFns{};
-
-    // Cache Line 5 (offset 320..383, 64B exact): Pending Scene Transition Descriptor
+    std::array<PendingCmd, 8> m_pendingCmds{};
     SceneTransitionDesc m_pendingScene{};
-
-    // Cache Lines 6..12 (offset 384..831, 448B): Pending State Queue & Staged Scene Handles
-    std::array<StateLayerDesc, kMaxPendingStateCmds> m_cmdQueue{};
-    assets::BlobHandle m_stagedCollisionBlob{};
-    assets::BlobHandle m_stagedPrefabBlob{};
-    assets::BlobHandle m_stagedCueBankBlob{};
-    SceneDeactivateFn m_activeSceneDeactivateFn{nullptr};
+    void (*m_activeSceneDeactivateFn)(SceneLoadContext&) noexcept {nullptr};
 };
-static_assert(sizeof(SceneDirector) == 832);
-static_assert(alignof(SceneDirector) == 64);
 
-constexpr u64 SceneDirector::ComputeAuditHash() const noexcept {
-    auto mix = [](u64 x) constexpr noexcept -> u64 {
-        x += 0x9e3779b97f4a7c15ULL;
-        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-        return x ^ (x >> 31);
-    };
-
-    u64 h = mix(m_activeSceneId.value);
-    h ^= mix(
-        (static_cast<u64>(m_stackDepth) << 40) |
-        (static_cast<u64>(m_activeSimMask) << 32) |
-        (static_cast<u64>(m_activeRenderMask) << 24) |
-        (static_cast<u64>(m_pausedClockMask) << 16) |
-        static_cast<u64>(m_topInputMask));
-
-    for (u8 i = 0; i < m_stackDepth; ++i) {
-        h ^= mix((static_cast<u64>(m_stateIds[i]) << 8) | static_cast<u64>(m_layerFlags[i]));
-    }
-    return h;
-}
-
-constexpr u64 SceneDirector::CombineAuditHashes(
-    u64 tickIndex,
-    u64 worldHash,
-    u64 gameplayHash,
-    u64 assetHash,
-    u64 audioHash,
-    u64 renderHash,
-    u64 directorHash) noexcept {
-    auto mix = [](u64 x) constexpr noexcept -> u64 {
-        x += 0x9e3779b97f4a7c15ULL;
-        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-        return x ^ (x >> 31);
-    };
-    auto fold = [&mix](u64 seed, u64 val) constexpr noexcept -> u64 {
-        return seed ^ (mix(val) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
-    };
-
-    u64 seed = 0x517cc1b727220a95ULL;
-    seed = fold(seed, tickIndex);
-    seed = fold(seed, worldHash);
-    seed = fold(seed, gameplayHash);
-    seed = fold(seed, assetHash);
-    seed = fold(seed, audioHash);
-    seed = fold(seed, renderHash);
-    seed = fold(seed, directorHash);
-    return seed;
-}
-
-} // namespace en::framework
+} // namespace en

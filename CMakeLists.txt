@@ -1,121 +1,69 @@
-cmake_minimum_required(VERSION 3.28)
-project(EngineN LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.24)
+project(EngineN_2026_Clean VERSION 3.0.0 LANGUAGES CXX)
 
-# Set output directory for the final executable
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-include(FetchContent)
-FetchContent_Declare(
-    SDL3
-    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-    GIT_TAG main
-    GIT_SHALLOW TRUE
-    SYSTEM
-)
-FetchContent_MakeAvailable(SDL3)
+if(MSVC)
+    add_compile_options(/W4 /WX /permissive- /GR- /EHs-c-)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror -Wstringop-overflow=2 -fno-exceptions -fno-rtti -O2)
+endif()
 
-# Engine Library
-add_library(engine STATIC
-    # Core
-    engine/core/Log.cpp
-    engine/core/time/SdlClock.cpp
-
-    # Platform
-    engine/platform/Platform.cpp
-    engine/platform/Window.cpp
-
-    # Renderer
-    engine/renderer/RenderList.cpp
-    engine/renderer/Renderer.cpp
-
-    # Assets
-    engine/assets/AssetBank.cpp
-    engine/assets/AssetSystem.cpp
-
-    # World
-    engine/world/TransformSolver.cpp
-    engine/world/World.cpp
-    engine/world/WorldExtractor.cpp
-
-    # Gameplay
-    engine/gameplay/GameplayPipeline.cpp
-    engine/gameplay/KinematicSolver2D.cpp
-    engine/gameplay/SpatialIndex2D.cpp
-    engine/gameplay/StateAndCombatSolver.cpp
-
-    # Audio
-    engine/audio/AudioMixer.cpp
-    engine/audio/AudioSystem.cpp
-
-    # Debug
-    engine/debug/DebugBatcher.cpp
-    engine/debug/DebugInspector.cpp
-    engine/debug/DebugProfilerAndConsole.cpp
-    engine/debug/DebugSystem.cpp
-
-    # Framework
-    engine/framework/Application.cpp
-    engine/framework/SceneDirector.cpp
+file(GLOB_RECURSE ENGINEN_SOURCES
+    "engine/core/*.cpp"
+    "engine/time/*.cpp"
+    "engine/platform/*.cpp"
+    "engine/input/*.cpp"
+    "engine/assets/*.cpp"
+    "engine/world/*.cpp"
+    "engine/physics/*.cpp"
+    "engine/gameplay/*.cpp"
+    "engine/renderer/*.cpp"
+    "engine/audio/*.cpp"
+    "engine/debug/*.cpp"
+    "engine/framework/*.cpp"
 )
 
-target_compile_features(engine PUBLIC cxx_std_23)
-set_target_properties(engine PROPERTIES CXX_EXTENSIONS OFF)
+add_library(enginen STATIC ${ENGINEN_SOURCES})
+target_include_directories(enginen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/engine)
 
-target_compile_options(engine PUBLIC
-    $<$<CXX_COMPILER_ID:MSVC>:/utf-8 /W4 /permissive->
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+find_package(SDL3 QUIET CONFIG)
+if(SDL3_FOUND)
+    message(STATUS "EngineN: Linking against native production SDL3::SDL3")
+    target_link_libraries(enginen PUBLIC SDL3::SDL3)
+else()
+    message(STATUS "EngineN: Using built-in Win32/POSIX Window+GDI backend (engine/platform/sdl3_shim)")
+    target_include_directories(enginen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/engine/platform/sdl3_shim)
+    if(WIN32)
+        target_link_libraries(enginen PUBLIC user32 gdi32)
+    endif()
+endif()
+if(WIN32)
+    target_link_libraries(enginen PUBLIC user32 gdi32)
+endif()
+
+file(GLOB_RECURSE VEIL_GAME_SOURCES
+    "game/core/*.cpp"
+    "game/systems/*.cpp"
+    "game/runtime/*.cpp"
+    "game/main.cpp"
 )
 
-target_include_directories(engine PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/engine
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+add_executable(veil_game ${VEIL_GAME_SOURCES})
+target_include_directories(veil_game PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(veil_game PRIVATE enginen)
+
+file(GLOB_RECURSE SUBSYSTEM_TEST_SOURCES
+    "tests/*.cpp"
+    "tests/subsystems/*.cpp"
 )
 
-target_link_libraries(engine PUBLIC SDL3::SDL3)
+add_executable(enginen_tests ${SUBSYSTEM_TEST_SOURCES})
+target_include_directories(enginen_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(enginen_tests PRIVATE enginen)
 
-# Unit Tests
 enable_testing()
-
-function(add_engine_test TEST_NAME)
-    add_executable(${TEST_NAME} tests/${TEST_NAME}.cpp)
-    target_link_libraries(${TEST_NAME} PRIVATE engine)
-    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
-endfunction()
-
-add_engine_test(TimeTests)
-add_engine_test(PlatformTests)
-add_engine_test(InputTests)
-add_engine_test(RendererTests)
-add_engine_test(AssetsTests)
-add_engine_test(WorldTests)
-add_engine_test(GameplayTests)
-add_engine_test(AudioTests)
-add_engine_test(FrameworkTests)
-
-# Veil of the Silent - Native EngineN Client Game
-add_executable(veil_game
-    game/main.cpp
-    game/app/GameApp.cpp
-    game/app/GameplayPolicies.cpp
-    game/app/VeilStateLayers.cpp
-    game/movement/TraversalSystem.cpp
-    game/combat/CombatSystem.cpp
-    game/ai/BossSystem.cpp
-    game/world/WorldSystem.cpp
-    game/tests/VeilTests.cpp
-)
-
-target_link_libraries(veil_game PRIVATE engine)
-
-target_compile_options(veil_game PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/WX>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>
-)
-
-target_link_options(veil_game PRIVATE
-    $<$<CXX_COMPILER_ID:MSVC>:/STACK:16777216>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wl,--stack,16777216>
-)
-
-add_test(NAME VeilGameTests COMMAND veil_game --test)
+add_test(NAME SubsystemSuite COMMAND enginen_tests)
+add_test(NAME VeilGameIntegration COMMAND veil_game --test)

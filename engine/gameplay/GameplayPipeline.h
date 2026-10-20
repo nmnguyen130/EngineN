@@ -1,141 +1,108 @@
 #pragma once
 
-#include "gameplay/GameplayTypes.h"
-#include "gameplay/KinematicSolver2D.h"
-#include "gameplay/SpatialIndex2D.h"
-#include "gameplay/StateAndCombatSolver.h"
+#include "gameplay/AiAndNavigation.h"
+#include "gameplay/CombatAndStateSolver.h"
+#include "gameplay/ParticleAndCamera.h"
+#include "physics/KinematicSolver2D.h"
 
-#include <array>
-#include <bit>
-#include <span>
-
-namespace en::gameplay {
+namespace en {
 
 struct GameplayPipelineConfig {
-    usize arenaBytes{512u * 1024u};
-    u16 maxMotors{512};
-    u16 maxCarriers{64};
-    u16 maxHitboxRigs{512};
-    u16 maxStateMachines{256};
-    u16 maxDamageReceivers{512};
-    u16 maxBreadcrumbs{16};
-    u16 maxCameras{4};
-    f32 pixelsPerMeter{64.0f};
-    KinematicStepConfig kinematicConfig{};
+    usize arenaBytes{2 * 1024 * 1024};
+    u16 maxMapWidth{256};
+    u16 maxMapHeight{128};
+    u32 maxParticles{2048};
+    KinematicStepConfig kinematics{};
 };
 
-// Top-level 120 Hz gameplay mechanism orchestrator, camera director, and persistent world-flag container.
-// Move-only RAII owner of a single 64B-aligned pre-allocated arena slab; zero dynamic allocation during Tick().
-// Cache Line 0 (offset 0..63): Hot policy pointers, kinematic config, scale, and scratch buffer pointers.
-// Cache Line 1 (offset 64..127): 64B SpatialIndex2D accelerator.
-// Invariant: Never calls AudioSystem, Renderer, or DebugSystem directly; communicates strictly via DrainCues() and World ECS.
-class alignas(64) GameplayPipeline final {
+// Authoritative 120 Hz gameplay, physics, combat, particle, camera, and world-flag coordinator.
+class alignas(64) GameplayPipeline {
 public:
-    static constexpr u32 kMaxWorldFlags   = 4096;
-    static constexpr u32 kMaxCuesPerFrame = 256;
-    static constexpr u32 kMaxHitsPerTick  = 256;
+    static constexpr usize kMaxCues = 128;
+    static constexpr usize kMaxHitScratch = 128;
 
-    GameplayPipeline() = default;
-    ~GameplayPipeline() noexcept;
+    GameplayPipeline() noexcept = default;
+    ~GameplayPipeline() noexcept { Shutdown(); }
 
     GameplayPipeline(const GameplayPipeline&) = delete;
     GameplayPipeline& operator=(const GameplayPipeline&) = delete;
-    GameplayPipeline(GameplayPipeline&& other) noexcept;
-    GameplayPipeline& operator=(GameplayPipeline&& other) noexcept;
 
-    [[nodiscard]] Result<void, GameplayErrc> Init(
-        world::World& world,
+    [[nodiscard]] Result<void, WorldErrc> Init(
+        World& world,
         const GameplayPolicyTable& policies = {},
         const GameplayPipelineConfig& cfg = {}) noexcept;
-
     void Shutdown() noexcept;
 
-    constexpr void SetPolicyTable(const GameplayPolicyTable& policies) noexcept {
-        m_policies = policies;
-    }
-
-    [[nodiscard]] Result<void, GameplayErrc> SetActiveRoomCollision(
-        const assets::AssetBank& bank,
-        assets::BlobHandle collisionMapBlob) noexcept;
-
-    void ClearActiveRoomCollision() noexcept {
-        m_spatial.ClearCollisionMap();
-    }
+    constexpr void SetPolicyTable(const GameplayPolicyTable& policies) noexcept { m_policies = policies; }
+    [[nodiscard]] Result<void, WorldErrc> SetActiveRoomCollision(
+        const AssetBank& bank, BlobHandle collisionMapBlob) noexcept;
 
     void Tick(
-        world::World& world,
-        const assets::AssetBank& assetBank,
-        time::SimStepView step,
-        const input::TickInput& tickInput,
-        input::ActionBuffer& actionBuffer) noexcept;
+        World& world,
+        const AssetBank& assetBank,
+        const SimStepView& step,
+        const TickInput& tickInput,
+        ActionBuffer& actionBuffer) noexcept;
 
     constexpr void EmitCue(const SimCue& cue) noexcept {
-        if (m_cueBuffer != nullptr && m_cueCount < kMaxCuesPerFrame) {
-            m_cueBuffer[m_cueCount++] = cue;
-        }
+        if (m_cueCount < kMaxCues) m_cueBuffer[m_cueCount++] = cue;
     }
-
-    [[nodiscard]] constexpr std::span<const SimCue> DrainCues() noexcept {
-        const std::span<const SimCue> ready{m_cueBuffer, m_cueCount};
+    [[nodiscard]] std::span<const SimCue> DrainCues() noexcept {
+        const u32 count = m_cueCount;
         m_cueCount = 0;
-        return ready;
+        return m_cueBuffer.subspan(0, count);
     }
 
     constexpr void SetWorldFlag(u16 flagId, bool value = true) noexcept {
-        if (flagId < kMaxWorldFlags) {
-            const u32 word = static_cast<u32>(flagId) >> 6u;
-            const u64 bit  = 1ULL << (flagId & 63u);
-            if (value) {
-                m_worldFlags[word]    |= bit;
-                m_activeFlagWordsMask |= (1ULL << word);
-            } else {
-                m_worldFlags[word] &= ~bit;
-                if (m_worldFlags[word] == 0ULL) {
-                    m_activeFlagWordsMask &= ~(1ULL << word);
-                }
-            }
+        if (flagId >= 4096U) return;
+        const u16 w = flagId >> 6U;
+        const u64 bit = (1ULL << (flagId & 63U));
+        if (value) {
+            m_worldFlags[w] |= bit;
+            m_activeFlagWordsMask |= (1ULL << w);
+        } else {
+            m_worldFlags[w] &= ~bit;
+            if (m_worldFlags[w] == 0ULL) m_activeFlagWordsMask &= ~(1ULL << w);
         }
     }
 
     [[nodiscard]] constexpr bool TestWorldFlag(u16 flagId) const noexcept {
-        if (flagId >= kMaxWorldFlags) return false;
-        return (m_worldFlags[static_cast<u32>(flagId) >> 6u] & (1ULL << (flagId & 63u))) != 0ULL;
+        if (flagId >= 4096U) return false;
+        return (m_worldFlags[flagId >> 6U] & (1ULL << (flagId & 63U))) != 0ULL;
     }
 
     constexpr void ClearWorldFlags() noexcept {
-        for (u64 m = m_activeFlagWordsMask; m != 0ULL; m &= (m - 1ULL)) {
-            m_worldFlags[std::countr_zero(m)] = 0ULL;
+        u64 m = m_activeFlagWordsMask;
+        while (m != 0ULL) {
+            const u8 w = static_cast<u8>(std::countr_zero(m));
+            m &= (m - 1ULL);
+            m_worldFlags[w] = 0ULL;
         }
         m_activeFlagWordsMask = 0ULL;
     }
 
+    [[nodiscard]] constexpr SpatialIndex2D& Spatial() noexcept { return m_spatial; }
     [[nodiscard]] constexpr const SpatialIndex2D& Spatial() const noexcept { return m_spatial; }
-    [[nodiscard]] u64 ComputeAuditHash(const world::World& world) const noexcept;
+    [[nodiscard]] constexpr ParticlePool2D& Particles() noexcept { return m_particles; }
+    [[nodiscard]] constexpr const ParticlePool2D& Particles() const noexcept { return m_particles; }
+    [[nodiscard]] constexpr KinematicStepConfig& KinematicConfig() noexcept { return m_kinematicCfg; }
+    [[nodiscard]] constexpr std::span<const u64, 64> RawWorldFlags() const noexcept { return m_worldFlags; }
+    void LoadRawWorldFlags(std::span<const u64, 64> words) noexcept;
+
+    [[nodiscard]] u64 ComputeAuditHash(const World& world) const noexcept;
 
 private:
-    void StepCameraControllers(
-        world::World& world,
-        time::SimStepView step) noexcept;
-
-    // Cache Line 0 (64B exact): Hot 120 Hz dispatch state & scratch pointers
     GameplayPolicyTable m_policies{};
     KinematicStepConfig m_kinematicCfg{};
-    f32 m_invPixelsPerMeter{1.0f / 64.0f};
-    ResolvedHitEvent* m_hitScratch{nullptr};
-    SimCue* m_cueBuffer{nullptr};
-
-    // Cache Line 1 (64B exact): Spatial accelerator
-    SpatialIndex2D m_spatial{};
-
-    // Cache Line 2 (64B): Arena ownership, cue count, and sparse world-flag summary bitmask
-    u8* m_arena{nullptr};
-    usize m_arenaBytes{0};
+    std::span<ResolvedHitEvent> m_hitScratch{};
+    std::span<SimCue> m_cueBuffer{};
     u64 m_activeFlagWordsMask{0};
     u32 m_cueCount{0};
 
-    // Cache Lines 3..10 (512B): 4096-bit world flag storage
+    SpatialIndex2D m_spatial{};
+    ParticlePool2D m_particles{};
+    AlignedArena m_arena{};
     alignas(64) std::array<u64, 64> m_worldFlags{};
 };
-static_assert(sizeof(GameplayPipeline) == 704);
 
-} // namespace en::gameplay
+} // namespace en
