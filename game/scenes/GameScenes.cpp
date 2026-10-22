@@ -27,8 +27,8 @@ namespace {
     const EntityId id = *idRes;
 
     en::Sprite2D spr{};
-    spr.width = 1.0f;
-    spr.height = 1.4f;
+    spr.width = (kind == InteractableKind::RoomExitPortal) ? 1.2f : 1.0f;
+    spr.height = (kind == InteractableKind::RoomExitPortal) ? 2.2f : 1.4f;
     spr.layer = 9U;
     spr.tint = tint;
     (void)world.Emplace<en::Sprite2D>(id, spr);
@@ -205,6 +205,18 @@ en::Result<void, en::FrameworkErrc> GameScenes::RequestRoomTransition(
     u8 targetRoomId,
     en::SceneTransitionMode mode) noexcept {
     const u8 clampedRoom = static_cast<u8>(targetRoomId % kRoomCount);
+    const u8 prevRoom = app.ActiveRoomId();
+
+    if (mode == en::SceneTransitionMode::FullReset) {
+        app.SetTransitionSpawnX(-4.0f);
+    } else if (clampedRoom > prevRoom) {
+        app.SetTransitionSpawnX(-7.5f); // Entered from left portal
+    } else if (clampedRoom < prevRoom) {
+        app.SetTransitionSpawnX(17.5f); // Entered from right portal
+    } else {
+        app.SetTransitionSpawnX(app.Metroidvania().LastCheckpointPos().x);
+    }
+
     app.SetPendingRoomId(clampedRoom);
 
     constexpr std::array<std::string_view, kRoomCount> kSceneNames{{
@@ -230,42 +242,108 @@ en::Result<void, en::FrameworkErrc> GameScenes::RequestRoomTransition(
     return app.EngineApp().Director().RequestSceneTransition(desc, app.EngineApp().Assets());
 }
 
+void GameScenes::SpawnRoomEnemiesIfNeeded(
+    VeilGameApp& app,
+    en::World& world,
+    u8 roomId) noexcept {
+    // Track which enemy slots are already alive in the room
+    u8 existingSlots = 0U;
+    for (auto [id, ai, recv] : world.View<EnemyAiComp, en::DamageReceiver2D>()) {
+        if (ai.roomId == roomId && !recv.HasFlag(en::ReceiverFlags::Dead) && recv.hp > 0) {
+            existingSlots |= ai.spawnSlotBit;
+        }
+    }
+
+    if (roomId == 0U) {
+        if ((existingSlots & 0x01U) == 0U && !app.Metroidvania().IsEnemyCleared(0U, 0x01U)) {
+            (void)EnemyAiSystem::SpawnDissonantHusk(world, app.AssetHandles(), Vec2{4.0f, 1.0f}, 0U, 0x01U);
+        }
+        if ((existingSlots & 0x02U) == 0U && !app.Metroidvania().IsEnemyCleared(0U, 0x02U)) {
+            (void)EnemyAiSystem::SpawnDissonantHusk(world, app.AssetHandles(), Vec2{6.5f, 1.0f}, 0U, 0x02U);
+        }
+    } else if (roomId == 1U) {
+        if ((existingSlots & 0x01U) == 0U && !app.Metroidvania().IsEnemyCleared(1U, 0x01U)) {
+            (void)EnemyAiSystem::SpawnChoirEnforcer(world, app.AssetHandles(), Vec2{5.0f, 1.0f}, 1U, 0x01U);
+        }
+        if ((existingSlots & 0x02U) == 0U && !app.Metroidvania().IsEnemyCleared(1U, 0x02U)) {
+            (void)EnemyAiSystem::SpawnDissonantHusk(world, app.AssetHandles(), Vec2{11.5f, 1.0f}, 1U, 0x02U);
+        }
+    } else if (roomId == 2U) {
+        if ((existingSlots & 0x01U) == 0U && !app.Metroidvania().IsEnemyCleared(2U, 0x01U)) {
+            (void)EnemyAiSystem::SpawnDissonantHusk(world, app.AssetHandles(), Vec2{3.5f, 1.0f}, 2U, 0x01U);
+        }
+        if ((existingSlots & 0x02U) == 0U && !app.Metroidvania().IsEnemyCleared(2U, 0x02U)) {
+            (void)EnemyAiSystem::SpawnChoirEnforcer(world, app.AssetHandles(), Vec2{15.0f, 1.0f}, 2U, 0x02U);
+        }
+    }
+}
+
 en::Result<void, en::FrameworkErrc> GameScenes::PopulateRoom(
     VeilGameApp& app,
     en::SceneLoadContext& ctx,
     u8 roomId) noexcept {
     app.SetActiveRoomId(roomId);
     app.Metroidvania().DiscoverRoom(roomId);
+    app.SetPortalCooldownTicks(35U);
 
-    // 1. Build 32x8 static tilemap floor + one-way ledges for the active room
-    std::array<en::TileMaterialFlags, 32U * 8U> tiles{};
-    for (u32 x = 0U; x < 32U; ++x) {
-        tiles[x] = en::TileMaterialFlags::Solid; // y = 0 floor row
+    // 1. Build enclosed 36x12 tilemap (world X in [-12, +24], world Y in [-1, +11]):
+    //    - Solid floor (ty = 0), solid ceiling (ty = 11), solid left/right boundary walls (tx = 0..1, tx = 34..35)
+    //    - Stepped OneWay platforms at ty = 3 (world Y = 2.0) and ty = 6 (world Y = 5.0)
+    constexpr u32 kMapW = 36U;
+    constexpr u32 kMapH = 12U;
+    std::array<en::TileMaterialFlags, kMapW * kMapH> tiles{};
+    for (u32 x = 0U; x < kMapW; ++x) {
+        tiles[0U * kMapW + x] = en::TileMaterialFlags::Solid;              // Ground floor (y = -1..0)
+        tiles[(kMapH - 1U) * kMapW + x] = en::TileMaterialFlags::Solid;    // Ceiling (y = 10..11)
     }
-    for (u32 x = 8U; x < 16U; ++x) {
-        tiles[3U * 32U + x] = en::TileMaterialFlags::OneWay; // elevated one-way platform
+    for (u32 y = 0U; y < kMapH; ++y) {
+        tiles[y * kMapW + 0U] = en::TileMaterialFlags::Solid;              // Left outer wall
+        tiles[y * kMapW + 1U] = en::TileMaterialFlags::Solid;
+        tiles[y * kMapW + (kMapW - 2U)] = en::TileMaterialFlags::Solid;    // Right outer wall
+        tiles[y * kMapW + (kMapW - 1U)] = en::TileMaterialFlags::Solid;
     }
-    (void)ctx.physics->BuildTileMap(32U, 8U, 1.0f, -10.0f, -1.0f, tiles);
+    // Lower OneWay platforms (world X = -4..+2 and +8..+15, world Y = 2.0)
+    for (u32 x = 8U; x < 15U; ++x) {
+        tiles[3U * kMapW + x] = en::TileMaterialFlags::OneWay;
+    }
+    for (u32 x = 20U; x < 27U; ++x) {
+        tiles[3U * kMapW + x] = en::TileMaterialFlags::OneWay;
+    }
+    // Upper OneWay platform (world X = +1..+9, world Y = 5.0)
+    for (u32 x = 13U; x < 21U; ++x) {
+        tiles[6U * kMapW + x] = en::TileMaterialFlags::OneWay;
+    }
+    (void)ctx.physics->BuildTileMap(kMapW, kMapH, 1.0f, -12.0f, -1.0f, tiles);
 
-    // 2. Spawn or preserve Kaelen & Camera rig across RoomSwap / FullReset
+    // 2. Spawn or reposition Kaelen & Camera rig across RoomSwap / FullReset
+    const f32 spawnX = app.TransitionSpawnX();
     if (!ctx.world->IsAlive(app.PlayerEntity())) {
-        auto heroRes = PlayerController::SpawnKaelen(*ctx.world, app.AssetHandles(), Vec2{0.0f, 1.0f}, roomId);
+        auto heroRes = PlayerController::SpawnKaelen(*ctx.world, app.AssetHandles(), Vec2{spawnX, 1.0f}, roomId);
         if (!heroRes.has_value()) return en::Err(en::FrameworkErrc::ClientBootFailed);
         app.SetPlayerEntity(*heroRes);
     } else {
         if (auto* ps = ctx.world->TryGet<PlayerStateComp>(app.PlayerEntity())) {
             ps->activeRoomId = roomId;
+            ps->airDashCharges = ps->maxAirDashCharges;
+        }
+        if (auto* motor = ctx.world->TryGet<en::CharacterMotor2D>(app.PlayerEntity())) {
+            motor->vx = 0.0f;
+            motor->vy = 0.0f;
+        }
+        if (auto* anchor = ctx.world->TryGet<en::SafeAnchor2D>(app.PlayerEntity())) {
+            anchor->safeX = spawnX;
+            anchor->safeY = 1.0f;
         }
         en::LocalTransform2D local = ctx.world->GetLocalTransform(app.PlayerEntity());
-        local.x = 0.0f;
+        local.x = spawnX;
         local.y = 1.0f;
         ctx.world->Teleport(app.PlayerEntity(), local);
     }
 
     if (!ctx.world->IsAlive(app.CameraEntity())) {
         en::EntitySpawnDesc camSp{};
-        camSp.local.x = 0.0f;
-        camSp.local.y = 2.0f;
+        camSp.local.x = spawnX;
+        camSp.local.y = 3.0f;
         camSp.timeChannel = en::TimeChannel::Camera;
         const EntityId camId = ctx.world->Spawn(camSp).value_or(kNullEntity);
         app.SetCameraEntity(camId);
@@ -277,60 +355,92 @@ en::Result<void, en::FrameworkErrc> GameScenes::PopulateRoom(
 
         en::CameraController2D ctrl{};
         ctrl.primaryTarget = app.PlayerEntity();
-        ctrl.activeRoomBounds = en::Rect{-10.0f, -2.0f, 32.0f, 14.0f};
+        ctrl.activeRoomBounds = en::Rect{-12.0f, -1.0f, 36.0f, 12.0f};
+        ctrl.flags = en::CameraCtrlFlags::EnableLookahead | en::CameraCtrlFlags::ConfineToRoom | en::CameraCtrlFlags::SnapNextStep;
         (void)ctx.world->Emplace<en::CameraController2D>(camId, ctrl);
+    } else {
+        if (auto* ctrl = ctx.world->TryGet<en::CameraController2D>(app.CameraEntity())) {
+            ctrl->primaryTarget = app.PlayerEntity();
+            ctrl->secondaryTarget = kNullEntity;
+            ctrl->secondaryWeight_q8 = 0U;
+            ctrl->activeRoomBounds = en::Rect{-12.0f, -1.0f, 36.0f, 12.0f};
+            ctrl->flags |= en::CameraCtrlFlags::ConfineToRoom | en::CameraCtrlFlags::SnapNextStep;
+        }
     }
 
-    // 3. Populate room-specific props, checkpoints, enemies, gates, and Boss
+    // 3. Populate room-specific props, checkpoints, portals, enemies, gates, and Boss
     app.SetBossEntity(kNullEntity);
 
-    // Every room has a Tuning Resonator checkpoint at x = -2.0f
+    // Every room has a Tuning Resonator checkpoint at x = -6.0f
     (void)SpawnInteractableProp(
-        *ctx.world, Vec2{-2.0f, 1.0f}, InteractableKind::TuningResonator, roomId, 0U, 0U, true,
+        *ctx.world, Vec2{-6.0f, 1.0f}, InteractableKind::TuningResonator, roomId, 0U, 0U, true,
         Color{0.30f, 0.90f, 1.0f, 1.0f});
 
-    if (roomId == 0U) {
-        // Room 0: Ash-Sump Slums — Dissonant Husks, Ventus Echo Altar, Frequency Gate to Sanctum
-        (void)EnemyAiSystem::SpawnDissonantHusk(*ctx.world, app.AssetHandles(), Vec2{4.0f, 1.0f});
-        (void)EnemyAiSystem::SpawnDissonantHusk(*ctx.world, app.AssetHandles(), Vec2{5.5f, 1.0f});
+    // Left & Right Room Exit Portals so players can walk between rooms 0 <-> 1 <-> 2 <-> 3
+    if (roomId > 0U) {
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{8.0f, 1.0f}, InteractableKind::EchoAltar,
+            *ctx.world, Vec2{-9.2f, 1.1f}, InteractableKind::RoomExitPortal,
+            static_cast<u8>(roomId - 1U), 0U, 0U, true, Color{0.35f, 0.85f, 1.0f, 1.0f});
+    }
+    if (roomId + 1U < kRoomCount) {
+        (void)SpawnInteractableProp(
+            *ctx.world, Vec2{20.5f, 1.1f}, InteractableKind::RoomExitPortal,
+            static_cast<u8>(roomId + 1U), 0U, 0U, true, Color{0.35f, 0.85f, 1.0f, 1.0f});
+    }
+
+    // Spawn Lost Wick Husk prop if active in this room
+    if (app.Metroidvania().ActiveHusk().IsActive() && app.Metroidvania().ActiveHusk().roomId == roomId) {
+        (void)SpawnInteractableProp(
+            *ctx.world,
+            Vec2{app.Metroidvania().ActiveHusk().worldX, app.Metroidvania().ActiveHusk().worldY},
+            InteractableKind::LostWickHusk,
+            roomId, 0U, 0U, false, Color{1.0f, 0.82f, 0.25f, 1.0f});
+    }
+
+    // Spawn non-cleared room enemies
+    SpawnRoomEnemiesIfNeeded(app, *ctx.world, roomId);
+
+    if (roomId == 0U) {
+        // Room 0: Ash-Sump Slums — Ventus Echo Altar, Frequency Gate to Sanctum
+        (void)SpawnInteractableProp(
+            *ctx.world, Vec2{9.5f, 1.0f}, InteractableKind::EchoAltar,
             static_cast<u8>(EchoId::Ventus), 0U, 0U, true, GetEchoDef(EchoId::Ventus).primaryColor);
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{14.0f, 1.0f}, InteractableKind::FrequencyGate,
+            *ctx.world, Vec2{14.5f, 1.0f}, InteractableKind::FrequencyGate,
             1U, static_cast<u16>(WorldFlagId::UnlockedGrappleHook),
             static_cast<u16>(WorldFlagId::GateSanctumOpened), true, Color{0.95f, 0.75f, 0.25f, 1.0f});
     } else if (roomId == 1U) {
-        // Room 1: Resonator Sanctum — Heavy Choir Enforcer (BreakableGuard), Lore Tablet, Memory Tuning Fork 1
-        (void)EnemyAiSystem::SpawnChoirEnforcer(*ctx.world, app.AssetHandles(), Vec2{5.0f, 1.0f});
+        // Room 1: Resonator Sanctum — Lore Tablet, Memory Tuning Fork 1
         (void)SpawnInteractableProp(
             *ctx.world, Vec2{9.0f, 1.0f}, InteractableKind::LoreTablet,
             1U, 0U, static_cast<u16>(WorldFlagId::LoreTablet01Read), false, Color{0.85f, 0.85f, 0.95f, 1.0f});
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{12.0f, 1.0f}, InteractableKind::MemoryTuningFork,
+            *ctx.world, Vec2{14.0f, 1.0f}, InteractableKind::MemoryTuningFork,
             0U, 0U, static_cast<u16>(WorldFlagId::MemoryTuningQuest01Done), false, Color{0.95f, 0.55f, 0.85f, 1.0f});
     } else if (roomId == 2U) {
-        // Room 2: Echo Vault — Elemental Cataclysm Destructible Wall, Echo Altars, Memory Tuning Fork 2
+        // Room 2: Echo Vault — Elemental Cataclysm Destructible Wall, Echo Altar, Memory Tuning Fork 2
         (void)SpawnDestructibleWall(
-            *ctx.world, Vec2{6.0f, 1.3f}, 30, static_cast<u16>(WorldFlagId::GateSpireOpened));
+            *ctx.world, Vec2{6.5f, 1.3f}, 30, static_cast<u16>(WorldFlagId::GateSpireOpened));
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{10.0f, 1.0f}, InteractableKind::EchoAltar,
+            *ctx.world, Vec2{10.5f, 1.0f}, InteractableKind::EchoAltar,
             static_cast<u8>(EchoId::Aqua), 0U, 0U, false, GetEchoDef(EchoId::Aqua).primaryColor);
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{13.0f, 1.0f}, InteractableKind::MemoryTuningFork,
+            *ctx.world, Vec2{13.5f, 1.0f}, InteractableKind::MemoryTuningFork,
             1U, 0U, static_cast<u16>(WorldFlagId::MemoryTuningQuest02Done), false, Color{0.95f, 0.55f, 0.85f, 1.0f});
     } else if (roomId == 3U) {
         // Room 3: Spire of Unison Boss Arena — High Conductor 3-Phase Boss & Spire Decision Core
-        auto bossRes = EnemyAiSystem::SpawnHighConductorBoss(*ctx.world, app.AssetHandles(), Vec2{6.0f, 1.35f});
-        if (bossRes.has_value()) {
-            app.SetBossEntity(*bossRes);
-            if (auto* camCtrl = ctx.world->TryGet<en::CameraController2D>(app.CameraEntity())) {
-                camCtrl->secondaryTarget = *bossRes;
-                camCtrl->secondaryWeight_q8 = 96U;
+        if (!ctx.gameplay->TestWorldFlag(static_cast<u16>(WorldFlagId::HighConductorDefeated))) {
+            auto bossRes = EnemyAiSystem::SpawnHighConductorBoss(*ctx.world, app.AssetHandles(), Vec2{6.0f, 1.35f});
+            if (bossRes.has_value()) {
+                app.SetBossEntity(*bossRes);
+                if (auto* camCtrl = ctx.world->TryGet<en::CameraController2D>(app.CameraEntity())) {
+                    camCtrl->secondaryTarget = *bossRes;
+                    camCtrl->secondaryWeight_q8 = 96U;
+                }
             }
         }
         (void)SpawnInteractableProp(
-            *ctx.world, Vec2{12.0f, 1.0f}, InteractableKind::SpireDecisionCore,
+            *ctx.world, Vec2{13.0f, 1.0f}, InteractableKind::SpireDecisionCore,
             0U, static_cast<u16>(WorldFlagId::HighConductorDefeated), 0U, true, Color{1.0f, 0.95f, 0.60f, 1.0f});
     }
 

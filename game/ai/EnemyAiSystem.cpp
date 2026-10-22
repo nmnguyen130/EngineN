@@ -1,6 +1,7 @@
 #include "game/ai/EnemyAiSystem.h"
 #include "framework/FrameworkTypes.h"
 #include "game/combat/CombatSystem.h"
+#include "game/world/MetroidvaniaSystem.h"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,9 @@ namespace {
     TargetCategory category,
     u8 ruleFlags,
     u8 archetypeId,
-    u16 shardReward) noexcept {
+    u16 shardReward,
+    u8 roomId,
+    u8 spawnSlotBit) noexcept {
     en::EntitySpawnDesc sp{};
     sp.local.x = pos.x;
     sp.local.y = pos.y;
@@ -44,20 +47,13 @@ namespace {
     anim.ticksPerFrame = 8U;
     (void)world.Emplace<en::SpriteAnimator2D>(id, anim);
 
-    en::Collider2D col{};
-    col.localBounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, halfExtents.x, halfExtents.y);
-    col.shape = en::ShapeKind2D::CapsuleY;
-    col.filter.categoryBits = 0x0004U;
-    col.filter.maskBits = 0xFFFFU;
-    (void)world.Emplace<en::Collider2D>(id, col);
-
     en::CharacterMotor2D motor{};
     motor.bounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, halfExtents.x, halfExtents.y);
-    motor.solidMask = 0x0001U;
+    motor.solidMask = 0x0001U; // Collides with static tilemap/walls only, never blocks player movement
     (void)world.Emplace<en::CharacterMotor2D>(id, motor);
 
     en::MotionStack2D motion{};
-    motion.pushboxGroup = 1U;
+    motion.pushboxGroup = 2U;  // Enemies separate from other enemies (group 2), while player is group 0
     (void)world.Emplace<en::MotionStack2D>(id, motion);
 
     en::StateMachine2D fsm{};
@@ -67,8 +63,8 @@ namespace {
     en::HitboxRig2D rig{};
     rig.hurtbox = en::CompactAabb2D::FromMeters(0.0f, 0.0f, halfExtents.x, halfExtents.y);
     rig.hitbox = en::CompactAabb2D::FromMeters(0.9f, 0.0f, 0.7f, 0.5f);
-    rig.hitLayerMask = 0x01U; // Hits hurtLayer 0 (Kaelen)
-    rig.SetHurtLayer(1U);     // Enemy hurtLayer 1
+    rig.hitLayerMask = 0x01U;
+    rig.SetHurtLayer(1U);
     (void)world.Emplace<en::HitboxRig2D>(id, rig);
 
     en::DamageReceiver2D recv{};
@@ -76,7 +72,7 @@ namespace {
     recv.maxHp = hp;
     recv.poise = 100U;
     recv.maxPoise = 100U;
-    recv.autoIframeTicks = 0U; // Enemies do not gain hidden auto-iframes between player combo swings
+    recv.autoIframeTicks = 0U;
     recv.SetTeamId(2U);
     (void)world.Emplace<en::DamageReceiver2D>(id, recv);
 
@@ -92,6 +88,8 @@ namespace {
     ai.patrolOriginX = pos.x;
     ai.archetypeId = archetypeId;
     ai.shardReward = shardReward;
+    ai.roomId = roomId;
+    ai.spawnSlotBit = spawnSlotBit;
     (void)world.Emplace<EnemyAiComp>(id, ai);
 
     WeaponAttackComp atk{};
@@ -112,25 +110,31 @@ namespace {
 en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnDissonantHusk(
     en::World& world,
     const GameAssetHandles& assets,
-    Vec2 pos) noexcept {
+    Vec2 pos,
+    u8 roomId,
+    u8 spawnSlotBit) noexcept {
     return SpawnEnemyCommon(
         world,
         assets.enemyRigBlob,
         assets.characterAtlas,
         pos,
         Vec2{0.4f, 0.75f},
-        Color{0.75f, 0.35f, 0.45f, 1.0f},
+        Color{0.82f, 0.32f, 0.42f, 1.0f},
         kStandardEnemyBaseHp,
         TargetCategory::Standard,
         BreakAndCcComp::kFlagInterruptibleWindup,
         0U,
-        20U);
+        20U,
+        roomId,
+        spawnSlotBit);
 }
 
 en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnChoirEnforcer(
     en::World& world,
     const GameAssetHandles& assets,
-    Vec2 pos) noexcept {
+    Vec2 pos,
+    u8 roomId,
+    u8 spawnSlotBit) noexcept {
     const u8 flags = BreakAndCcComp::kFlagDisplacementResistant |
                      BreakAndCcComp::kFlagBreakableGuard |
                      BreakAndCcComp::kFlagGuardActive |
@@ -140,13 +144,15 @@ en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnChoirEnforcer(
         assets.enemyRigBlob,
         assets.characterAtlas,
         pos,
-        Vec2{0.6f, 1.0f},
-        Color{0.85f, 0.70f, 0.25f, 1.0f},
+        Vec2{0.58f, 0.98f},
+        Color{0.90f, 0.72f, 0.25f, 1.0f},
         kHeavyEliteEnemyBaseHp,
         TargetCategory::HeavyElite,
         flags,
         1U,
-        65U);
+        65U,
+        roomId,
+        spawnSlotBit);
 }
 
 en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnHighConductorBoss(
@@ -162,12 +168,14 @@ en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnHighConductorBoss(
         assets.characterAtlas,
         pos,
         Vec2{0.85f, 1.35f},
-        Color{0.95f, 0.85f, 0.40f, 1.0f},
+        Color{0.96f, 0.85f, 0.38f, 1.0f},
         kBossPhaseBaseHp,
         TargetCategory::Boss,
         flags,
         2U,
-        500U);
+        500U,
+        3U,
+        0x80U);
 }
 
 en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnHarmonicProjectile(
@@ -224,7 +232,8 @@ en::Result<EntityId, en::WorldErrc> EnemyAiSystem::SpawnHarmonicProjectile(
 void EnemyAiSystem::StepEnemiesAndProjectiles(
     EntityId playerId,
     en::World& world,
-    en::GameplayPipeline& pipeline) noexcept {
+    en::GameplayPipeline& pipeline,
+    MetroidvaniaSystem* optionalMetroidvania) noexcept {
     const bool playerValid = world.IsAlive(playerId);
     Vec2 playerPos{0.0f, 0.0f};
     if (playerValid) {
@@ -232,18 +241,10 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
         playerPos = {pxf.x, pxf.y};
     }
 
-    // 1. Step Enemy AI state machines & Boss phase transitions
     for (auto [id, ai, recv, brk, motion, atk] :
          world.View<EnemyAiComp, en::DamageReceiver2D, BreakAndCcComp, en::MotionStack2D, WeaponAttackComp>()) {
         if (recv.HasFlag(en::ReceiverFlags::Dead) || recv.hp <= 0) {
-            if (ai.shardReward > 0U && playerValid) {
-                if (auto* ps = world.TryGet<PlayerStateComp>(playerId)) {
-                    ps->carriedTuningShards += ai.shardReward;
-                }
-                ai.shardReward = 0U;
-            }
             if (brk.category == TargetCategory::Boss && ai.bossPhase < 3U) {
-                // Advance High Conductor to next phase (1200 HP per phase per GDD v0.2 Section 4.2)
                 ++ai.bossPhase;
                 recv.hp = kBossPhaseBaseHp;
                 recv.maxHp = kBossPhaseBaseHp;
@@ -255,14 +256,28 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
                     true);
                 continue;
             }
+
+            if (ai.shardReward > 0U && playerValid) {
+                if (auto* ps = world.TryGet<PlayerStateComp>(playerId)) {
+                    ps->carriedTuningShards += ai.shardReward;
+                }
+                ai.shardReward = 0U;
+            }
+
             if (brk.category == TargetCategory::Boss) {
                 pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::HighConductorDefeated), true);
+            } else if (optionalMetroidvania != nullptr && ai.spawnSlotBit != 0U) {
+                optionalMetroidvania->MarkEnemyCleared(ai.roomId, ai.spawnSlotBit);
+            }
+
+            // Despawn dead enemy immediately when killed in live room gameplay
+            if (optionalMetroidvania != nullptr && ai.spawnSlotBit != 0U) {
+                (void)world.DeferDestroy(id);
             }
             motion.targetWalkVx = 0.0f;
             continue;
         }
 
-        // Re-enable BreakableGuard on Choir Enforcer once GuardBroken lockout expires
         if (brk.HasRuleFlag(BreakAndCcComp::kFlagBreakableGuard) &&
             brk.guardBrokenTicks == 0U &&
             !brk.IsActionLocked()) {
@@ -272,6 +287,7 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
         const f32 speedMult = brk.MoveSpeedMultiplier();
         if (speedMult <= 0.0f) {
             motion.targetWalkVx = 0.0f;
+            ai.actionTimerTicks = 0U;
             continue;
         }
 
@@ -283,8 +299,9 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
             const i8 dirSign = (dx < 0.0f) ? -1 : 1;
             motion.SetFacingSign(dirSign);
             if (absDx > ai.attackRange) {
-                const f32 baseWalk = (brk.category == TargetCategory::Boss) ? 3.8f : 2.6f;
+                const f32 baseWalk = (brk.category == TargetCategory::Boss) ? 3.6f : 2.5f;
                 motion.targetWalkVx = static_cast<f32>(dirSign) * baseWalk * speedMult;
+                ai.actionTimerTicks = 0U;
             } else {
                 motion.targetWalkVx = 0.0f;
                 if (ai.cooldownTicks > 0U) {
@@ -293,7 +310,6 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
                     ++ai.actionTimerTicks;
                     brk.flags |= BreakAndCcComp::kFlagInterruptibleWindup;
 
-                    // Alternate Gold Harmonic Wave (Parryable with CounterEchoId) and Crimson Overload Wave (Unblockable)
                     if (brk.category == TargetCategory::Boss || brk.category == TargetCategory::HeavyElite) {
                         const bool useCrimson = ((ai.patternIndex & 1U) != 0U);
                         ai.activeTelegraph = useCrimson
@@ -307,12 +323,12 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
                     atk.telegraph = ai.activeTelegraph;
                     atk.counterEchoId = ai.counterEcho;
 
-                    const u16 windupTarget = static_cast<u16>(24.0f / std::max(0.25f, speedMult));
+                    const u16 windupTarget = static_cast<u16>(30.0f / std::max(0.25f, speedMult));
                     if (ai.actionTimerTicks >= windupTarget) {
                         ai.actionTimerTicks = 0U;
-                        ai.cooldownTicks = (brk.category == TargetCategory::Boss) ? 45U : 60U;
+                        ai.cooldownTicks = (brk.category == TargetCategory::Boss) ? 48U : 65U;
                         ++ai.patternIndex;
-                        if (absDx <= ai.attackRange + 0.4f) {
+                        if (absDx <= ai.attackRange + 0.45f) {
                             (void)CombatSystem::ResolveEnemyAttackAgainstPlayer(
                                 id,
                                 playerId,
@@ -327,11 +343,15 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
                 }
             }
         } else {
-            motion.targetWalkVx = 0.0f;
+            // Gentle patrol around origin when player is out of aggro range
+            const f32 offsetFromOrigin = exf.x - ai.patrolOriginX;
+            if (std::abs(offsetFromOrigin) > ai.patrolRange) {
+                motion.SetFacingSign(offsetFromOrigin > 0.0f ? -1 : 1);
+            }
+            motion.targetWalkVx = static_cast<f32>(motion.FacingSign()) * 1.2f * speedMult;
         }
     }
 
-    // 2. Step Harmonic Projectiles overlap against Kaelen
     if (playerValid) {
         for (auto [projId, proj] : world.View<ProjectileComp>()) {
             if (proj.active == 0U) continue;

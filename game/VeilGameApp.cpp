@@ -5,6 +5,8 @@
 #include "game/scenes/GameScenes.h"
 #include "game/ui/HudAndMenuSystem.h"
 
+#include <cmath>
+
 namespace vots {
 
 en::Result<void, en::FrameworkErrc> VeilGameApp::OnRegisterComponentsHook(
@@ -91,8 +93,12 @@ void VeilGameApp::Shutdown() noexcept {
     m_bossEntity = kNullEntity;
 }
 
-void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView&) noexcept {
+void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) noexcept {
     if (!ctx.world || !ctx.gameplay || !ctx.physics || !ctx.tickInput || !ctx.actionBuffer) return;
+
+    if (m_portalCooldownTicks > 0U) {
+        --m_portalCooldownTicks;
+    }
 
     // 1. Step mark expirations (420t), Chrono-Overdrive delayed strikes, Break State/Recovery, and CC timers
     CombatSystem::StepCombatTimersAndDelayedStrikes(*ctx.world, *ctx.gameplay);
@@ -119,21 +125,54 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView&) noexcep
         *ctx.actionBuffer,
         m_nextAttackInstanceId);
 
-    // 4. Step Enemies, Boss Phases, and Projectiles
-    EnemyAiSystem::StepEnemiesAndProjectiles(m_playerEntity, *ctx.world, *ctx.gameplay);
+    // 4. Step Enemies, Boss Phases, and Projectiles (despawns dead enemies and records cleared slots)
+    EnemyAiSystem::StepEnemiesAndProjectiles(m_playerEntity, *ctx.world, *ctx.gameplay, &m_metroidvania);
 
-    // 5. Check Kaelen death -> spawn / update single Lost Wick Husk & respawn at Tuning Resonator
+    // 5. Step ambient projectile velocities, sprite frame animations, and transient lifetimes
+    ctx.world->StepAmbientVelocities(step);
+    ctx.world->StepAnimationsAndLifetimes(step);
+
+    // 6. Check Kaelen death -> spawn / update single Lost Wick Husk, reset room enemies, and snap camera
     if (ctx.world->IsAlive(m_playerEntity)) {
         if (const auto* recv = ctx.world->TryGet<en::DamageReceiver2D>(m_playerEntity)) {
             if (recv->HasFlag(en::ReceiverFlags::Dead) || recv->hp <= 0) {
                 const en::WorldTransform2D& xf = ctx.world->GetWorldByIndex(m_playerEntity.index);
                 m_metroidvania.HandlePlayerDeathAndSpawnHusk(
                     m_playerEntity, Vec2{xf.x, xf.y}, m_activeRoomId, *ctx.world);
+
+                if (auto* camCtrl = ctx.world->TryGet<en::CameraController2D>(m_cameraEntity)) {
+                    camCtrl->primaryTarget = m_playerEntity;
+                    camCtrl->flags |= en::CameraCtrlFlags::SnapNextStep;
+                }
+
+                if (m_metroidvania.LastCheckpointRoom() != m_activeRoomId &&
+                    !ctx.director->HasPendingWork()) {
+                    (void)GameScenes::RequestRoomTransition(
+                        *this, m_metroidvania.LastCheckpointRoom(), en::SceneTransitionMode::RoomSwap);
+                } else {
+                    GameScenes::SpawnRoomEnemiesIfNeeded(*this, *ctx.world, m_activeRoomId);
+                }
             }
         }
     }
 
-    // 6. Check modal UI triggers (Pause, Map, PlaceMapPin, World Interactables)
+    // 7. Automatic Room Exit Portal proximity transition when walking into Left/Right portals
+    if (m_portalCooldownTicks == 0U &&
+        !ctx.director->HasPendingWork() &&
+        ctx.world->IsAlive(m_playerEntity)) {
+        const en::WorldTransform2D& pxf = ctx.world->GetWorldByIndex(m_playerEntity.index);
+        for (auto [propId, inter] : ctx.world->View<InteractableComp>()) {
+            if (inter.kind != InteractableKind::RoomExitPortal) continue;
+            const en::WorldTransform2D& ixf = ctx.world->GetWorldByIndex(propId.index);
+            if (std::abs(ixf.x - pxf.x) <= 0.75f && std::abs(ixf.y - pxf.y) <= 1.4f) {
+                m_portalCooldownTicks = 40U;
+                (void)GameScenes::RequestRoomTransition(*this, inter.paramByte, en::SceneTransitionMode::RoomSwap);
+                break;
+            }
+        }
+    }
+
+    // 8. Check modal UI triggers (Pause, Map, PlaceMapPin, World Interactables)
     if (ctx.actionBuffer->Consume(static_cast<u8>(GameAction::Pause), 6U)) {
         (void)ctx.director->PushState(GameScenes::MakePauseModalLayerDesc(this));
     } else if (ctx.actionBuffer->Consume(static_cast<u8>(GameAction::ToggleMap), 6U)) {
@@ -156,9 +195,12 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView&) noexcep
                     case InteractableKind::TuningResonator:
                         m_metroidvania.ActivateTuningResonator(
                             m_playerEntity, m_activeRoomId, Vec2{ixf.x, ixf.y}, *ctx.world, *ctx.gameplay);
+                        GameScenes::SpawnRoomEnemiesIfNeeded(*this, *ctx.world, m_activeRoomId);
                         break;
                     case InteractableKind::LostWickHusk:
-                        (void)m_metroidvania.RecoverLostWickHusk(m_playerEntity, *ctx.world, *ctx.gameplay);
+                        if (m_metroidvania.RecoverLostWickHusk(m_playerEntity, *ctx.world, *ctx.gameplay)) {
+                            (void)ctx.world->DeferDestroy(propId);
+                        }
                         break;
                     case InteractableKind::EchoAltar:
                         m_metroidvania.UnlockEchoAtAltar(
@@ -194,6 +236,7 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView&) noexcep
                         }
                         break;
                     case InteractableKind::RoomExitPortal:
+                        m_portalCooldownTicks = 40U;
                         (void)GameScenes::RequestRoomTransition(*this, inter.paramByte, en::SceneTransitionMode::RoomSwap);
                         break;
                 }
@@ -208,7 +251,7 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView&) noexcep
 void VeilGameApp::OnRenderExtract(en::RenderContext& ctx) noexcept {
     if (!ctx.renderList || !ctx.world) return;
     HudAndMenuSystem::EmitGameplayHudAndWorldIndicators(
-        m_playerEntity, *ctx.world, m_metroidvania, *ctx.renderList);
+        m_playerEntity, *ctx.world, &m_app.Physics(), m_metroidvania, m_activeRoomId, *ctx.renderList);
 }
 
 } // namespace vots

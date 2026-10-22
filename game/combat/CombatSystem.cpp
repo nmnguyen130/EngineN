@@ -220,6 +220,9 @@ void CombatSystem::StepCombatTimersAndDelayedStrikes(
         if (mark.reactionVfxTicks > 0U) {
             --mark.reactionVfxTicks;
         }
+        if (mark.hitFlashTicks > 0U) {
+            --mark.hitFlashTicks;
+        }
         if (mark.chronoDelayTicks > 0U) {
             if (--mark.chronoDelayTicks == 0U) {
                 const i16 delayedDmg = mark.chronoPendingDamage;
@@ -230,6 +233,7 @@ void CombatSystem::StepCombatTimersAndDelayedStrikes(
                     if (recv != nullptr && !recv->HasFlag(en::ReceiverFlags::Dead) && recv->hp > 0) {
                         // Chrono-Overdrive delayed hit: deals 10 HP Damage (scaled by active modifiers), 0 Break, no mark, no Harmony.
                         ApplyDirectHpDamage(*recv, breakComp, delayedDmg);
+                        mark.hitFlashTicks = 8U;
                     }
                 }
             }
@@ -312,8 +316,11 @@ CombatResolutionReport CombatSystem::ResolvePlayerWeaponHit(
         markComp->lastAppliedAttackInstance == attack.instanceId) {
         return report;
     }
-    if (markComp != nullptr && attack.instanceId != 0U) {
-        markComp->lastAppliedAttackInstance = attack.instanceId;
+    if (markComp != nullptr) {
+        if (attack.instanceId != 0U) {
+            markComp->lastAppliedAttackInstance = attack.instanceId;
+        }
+        markComp->hitFlashTicks = 10U;
     }
 
     const EchoId hitEcho = attack.capturedEchoId;
@@ -340,7 +347,7 @@ CombatResolutionReport CombatSystem::ResolvePlayerWeaponHit(
     }
 
     // 1. Resolve primary hit base HP Damage + Reaction bonus HP Damage.
-    // Note: Melt-Shock applies Fracture for subsequent attacks ("các đòn sau"), so apply primary hit damage before setting Fracture,
+    // Note: Melt-Shock applies Fracture for subsequent attacks, so apply primary hit damage before setting Fracture,
     // while Break State (1.25x) and any pre-existing Fracture (1.15x) apply to this hit + reaction bonus.
     const i32 rawTotalPrimaryHp = static_cast<i32>(attack.baseHpDamage) +
                                   (reactionSpec != nullptr ? static_cast<i32>(reactionSpec->bonusHpDamage) : 0);
@@ -538,7 +545,7 @@ CombatResolutionReport CombatSystem::ResolvePlayerWeaponHit(
         }
     }
 
-    // 3. Apply primary HP Damage after reaction secondary query so primary killing blow still fires its reaction!
+    // 3. Apply primary HP Damage after reaction secondary query so primary killing blow still fires its reaction.
     recv->hp -= modifiedPrimaryHp;
     if (recv->hp <= 0) {
         recv->hp = 0;

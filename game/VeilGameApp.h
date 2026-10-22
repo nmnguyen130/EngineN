@@ -57,6 +57,11 @@ public:
     [[nodiscard]] constexpr u8 PendingRoomId() const noexcept { return m_pendingRoomId; }
     constexpr void SetPendingRoomId(u8 roomId) noexcept { m_pendingRoomId = roomId; }
 
+    [[nodiscard]] constexpr f32 TransitionSpawnX() const noexcept { return m_transitionSpawnX; }
+    constexpr void SetTransitionSpawnX(f32 x) noexcept { m_transitionSpawnX = x; }
+
+    constexpr void SetPortalCooldownTicks(u8 ticks) noexcept { m_portalCooldownTicks = ticks; }
+
     [[nodiscard]] u32& NextAttackInstanceId() noexcept { return m_nextAttackInstanceId; }
 
 private:
@@ -82,10 +87,12 @@ private:
     EntityId m_playerEntity{kNullEntity};
     EntityId m_cameraEntity{kNullEntity};
     EntityId m_bossEntity{kNullEntity};
+    f32 m_transitionSpawnX{-4.0f};
     u32 m_nextAttackInstanceId{1U};
     u32 m_cuesConsumedCount{0U};
     u8 m_activeRoomId{0U};
     u8 m_pendingRoomId{0U};
+    u8 m_portalCooldownTicks{0U};
 };
 
 } // namespace vots

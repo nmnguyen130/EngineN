@@ -384,6 +384,14 @@ void Application::ExtractAndCompileRenderFrame() noexcept {
     m_rt->debug.EmitOverlays(dbgCtx, m_rt->renderList);
     m_rt->renderList.Compile();
 
+    u32 activeMotorContacts = 0U;
+    if ((m_rt->world.RegisteredPoolsMask() & MakeComponentMask<CharacterMotor2D>()) != 0ULL) {
+        const auto motors = m_rt->world.GetPool<CharacterMotor2D>().Components();
+        for (const CharacterMotor2D& m : motors) {
+            if (m.contacts != ContactFlags::None) ++activeMotorContacts;
+        }
+    }
+
     const RenderStats& rStats = m_rt->renderList.Stats();
     SubsystemTelemetryDesc tele{};
     tele.channelScales = m_rt->time.EffectiveScales().data();
@@ -391,7 +399,8 @@ void Application::ExtractAndCompileRenderFrame() noexcept {
     tele.submittedQuads = static_cast<u16>(std::min<u32>(65535U, rStats.submittedQuads));
     tele.culledQuads = static_cast<u16>(std::min<u32>(65535U, rStats.culledQuads));
     tele.drawBatches = static_cast<u16>(std::min<u32>(65535U, rStats.drawBatches));
-    tele.activeContacts = static_cast<u16>(std::min<usize>(65535U, m_rt->physics.ActiveManifolds().size()));
+    tele.activeContacts = static_cast<u16>(
+        std::min<usize>(65535U, m_rt->physics.ActiveManifolds().size() + activeMotorContacts));
     tele.catchupTicks = m_rt->time.Telemetry().ticksLastFrame;
     tele.audioActiveVoices = m_rt->audio.Telemetry().activeVoiceCount;
     tele.audioVirtualVoices = m_rt->audio.Telemetry().virtualVoiceCount;
@@ -428,6 +437,10 @@ Result<void, FrameworkError> Application::StepFrame(u64 rawDeltaNs) noexcept {
     dbgBeginCtx.isPaused = m_rt->time.IsPaused() ? 1U : 0U;
 
     const DebugLoopDirectives dir = m_rt->debug.BeginFrame(dbgBeginCtx);
+    m_rt->debug.Profiler().RecordScopeUs(
+        ProfileScopeId::FrameTotal,
+        static_cast<u32>(std::min<u64>(65535ULL, rawDeltaNs / 1000ULL)));
+
     if (dir.TogglePause()) {
         m_rt->time.SetPaused(!m_rt->time.IsPaused());
     }

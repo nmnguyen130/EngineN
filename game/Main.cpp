@@ -8,10 +8,15 @@
 #include <cstring>
 
 int main(int argc, char** argv) {
-    bool headless = true;
+    bool headless = false;
+#if defined(EN_SDL3_SHIM_ACTIVE)
+    headless = true;
+#endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--windowed") == 0) {
             headless = false;
+        } else if (std::strcmp(argv[i], "--headless") == 0) {
+            headless = true;
         }
     }
 
@@ -69,8 +74,10 @@ int main(int argc, char** argv) {
         const en::u64 deltaNs = (nowNs > prevNs) ? (nowNs - prevNs) : en::kFixedDtNs;
         prevNs = nowNs;
 
-        (void)plat.Pump(win, game.EngineApp().Input());
-        (void)game.EngineApp().Input().EndFrame();
+        const en::WindowFlags winFlags = plat.Pump(win, game.EngineApp().Input());
+        if (en::HasFlag(winFlags, en::WindowFlags::CloseRequested)) {
+            break;
+        }
 
         if (!game.StepFrame(deltaNs).has_value()) {
             break;

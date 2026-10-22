@@ -17,7 +17,7 @@ enum class GameStateLayerId : u8 {
     EndingModal    = 6,
 };
 
-// Manages the 4 interconnected Vaelen rooms, tilemaps, interactive props, CameraController2D confiners, and StateLayerDesc stack.
+// Manages the 4 interconnected Vaelen rooms, enclosed tilemaps, portals, interactive props, CameraController2D confiners, and StateLayerDesc stack.
 class GameScenes {
 public:
     [[nodiscard]] static en::StateLayerDesc MakeGameplayLayerDesc(VeilGameApp* app) noexcept;
@@ -34,6 +34,11 @@ public:
     [[nodiscard]] static en::Result<void, en::FrameworkErrc> PopulateRoom(
         VeilGameApp& app,
         en::SceneLoadContext& ctx,
+        u8 roomId) noexcept;
+
+    static void SpawnRoomEnemiesIfNeeded(
+        VeilGameApp& app,
+        en::World& world,
         u8 roomId) noexcept;
 };
 

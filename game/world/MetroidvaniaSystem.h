@@ -5,6 +5,7 @@
 #include "gameplay/GameplayPipeline.h"
 #include "world/World.h"
 
+#include <array>
 #include <string_view>
 
 namespace vots {
@@ -17,12 +18,12 @@ struct FrequencyGateDiagnostic {
     bool isUnlocked{false};
 };
 
-// Manages Tuning Resonators, the single Lost Wick Husk, Acoustic Fog of War, Map Pins, Frequency Gates, and Ending resolution.
+// Manages Tuning Resonators, the single Lost Wick Husk, enemy respawn masks, Fog of War, Map Pins, Frequency Gates, and Endings.
 // Value type owned by VeilGameApp; synchronizes directly with SaveData and GameplayPipeline world flags.
-// Invariant: at most one LostWickHuskRecord is active at any time, and Max HP penalty never stacks beyond 25%.
+// Invariant: at most one LostWickHuskRecord is active at any time, and cleared enemies only respawn on Resonator rest or player death.
 class MetroidvaniaSystem {
 public:
-    // Activates a Tuning Resonator checkpoint: heals HP to max, sets Harmony to 100, updates respawn point, and snapshots SaveData.
+    // Activates a Tuning Resonator checkpoint: heals HP to max, sets Harmony to 100, resets cleared enemies, and updates respawn point.
     void ActivateTuningResonator(
         EntityId playerId,
         u8 roomId,
@@ -39,7 +40,7 @@ public:
         en::World& world) noexcept;
 
     // Handles Kaelen's death per GDD v0.2 Section 5.2: respawns at Resonator, sets Harmony to 0, applies non-stacking 25% Max HP penalty,
-    // and accumulates carried Tuning Shards into the single Lost Wick Husk (keeping its original position if already active).
+    // resets cleared room enemies, and accumulates carried Tuning Shards into the single Lost Wick Husk.
     void HandlePlayerDeathAndSpawnHusk(
         EntityId playerId,
         Vec2 deathPos,
@@ -63,6 +64,20 @@ public:
     void CompleteMemoryTuningFork(
         u8 forkIndex,
         en::GameplayPipeline& pipeline) noexcept;
+
+    constexpr void MarkEnemyCleared(u8 roomId, u8 slotBit) noexcept {
+        if (roomId < kRoomCount) {
+            m_clearedEnemiesMask[roomId] |= slotBit;
+        }
+    }
+
+    [[nodiscard]] constexpr bool IsEnemyCleared(u8 roomId, u8 slotBit) const noexcept {
+        return roomId < kRoomCount && ((m_clearedEnemiesMask[roomId] & slotBit) != 0U);
+    }
+
+    constexpr void ResetClearedEnemies() noexcept {
+        m_clearedEnemiesMask.fill(0U);
+    }
 
     // Marks a room discovered in the Acoustic Fog of War bitmask.
     constexpr void DiscoverRoom(u8 roomId) noexcept {
@@ -123,8 +138,9 @@ public:
 private:
     LostWickHuskRecord m_husk{};
     std::array<MapPinRecord, kMaxMapPins> m_mapPins{};
-    f32 m_checkpointX{0.0f};
-    f32 m_checkpointY{0.0f};
+    std::array<u8, kRoomCount> m_clearedEnemiesMask{};
+    f32 m_checkpointX{-6.0f};
+    f32 m_checkpointY{1.0f};
     u8 m_checkpointRoomId{0U};
     u8 m_discoveredRoomsMask{0x01U};
     u8 m_equippedSigilMask{0U};

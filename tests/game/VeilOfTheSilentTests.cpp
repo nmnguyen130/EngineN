@@ -363,9 +363,9 @@ void TestBossBreakRecoveryMultiplicativeDamageAndParryWindow(TestSuite& suite) n
     EXPECT_EQ(suite, bossBrk->breakMeter, 0U);
     EXPECT_EQ(suite, bossBrk->phaseTicks, 150U);
 
-    // Verify Fracture (1.15x) * Boss Break State (1.25x) = 1.4375x multiplicative HP Damage (100 * 1.4375 = 144 rounded)
+    // Verify Fracture (1.15x) * Boss Break State (1.25x) = 1.4375x multiplicative HP Damage (160 * 1.4375 = 230 exact)
     bossBrk->fractureTicks = 720U;
-    EXPECT_EQ(suite, CombatSystem::ComputeModifiedHpDamage(160, bossBrk), 230); // 160 * 1.4375 == 230 exact
+    EXPECT_EQ(suite, CombatSystem::ComputeModifiedHpDamage(160, bossBrk), 230);
 
     // Break is ignored while in Break State
     EXPECT_TRUE(suite, !CombatSystem::ApplyBreakDamage(boss, 50U, world, *bossBrk));
@@ -546,6 +546,94 @@ void TestFullGameReplayDeterminismAndRoomTransitions(TestSuite& suite) noexcept 
     EXPECT_EQ(suite, dRec.combinedHash, dPlay.combinedHash);
 }
 
+// 7. Verify Camera yUp Orientation, Tilemap & Slash Arc VFX Rendering, Enemy Despawn/Respawn Lifecycle, Pass-Through, and Portal Transitions
+void TestVisualTilemapSlashVfxEnemyRespawnAndPassThrough(TestSuite& suite) noexcept {
+    VeilGameApp app{};
+    EXPECT_TRUE(suite, app.Init(true).has_value());
+    (void)app.StepHeadlessTicks(4U, 1U);
+
+    en::World& world = app.EngineApp().GetWorld();
+    const EntityId pid = app.PlayerEntity();
+    EXPECT_TRUE(suite, world.IsAlive(pid));
+
+    // 1. Verify Camera2D yUp == true on world view 0 so jumping (+Y in physics) renders upward on screen
+    const en::Camera2D& cam0 = app.EngineApp().GetRenderList().View(0U);
+    EXPECT_TRUE(suite, cam0.yUp);
+
+    // 2. Verify tilemap platforms and backdrop emit > 200 quads and starting an attack emits SlashArc + Beam quads
+    const u32 baseQuadCount = app.EngineApp().GetRenderList().Stats().submittedQuads;
+    EXPECT_TRUE(suite, baseQuadCount > 200U);
+
+    PlayerController::StartWeaponAttack(
+        pid, WeaponMoveKind::Light1, world, app.EngineApp().Gameplay(), app.NextAttackInstanceId());
+    // Step 7 ticks so WeaponAttackComp advances past Startup (6 ticks) into Active phase
+    (void)app.StepHeadlessTicks(7U, 1U);
+    const u32 activeSlashQuadCount = app.EngineApp().GetRenderList().Stats().submittedQuads;
+    EXPECT_TRUE(suite, activeSlashQuadCount > baseQuadCount + 8U);
+
+    // 3. Verify player pushboxGroup == 0U and no Collider2D so player can walk/dash through enemies without blocking
+    EXPECT_EQ(suite, world.TryGet<en::MotionStack2D>(pid)->pushboxGroup, 0U);
+    EXPECT_TRUE(suite, !world.Has<en::Collider2D>(pid));
+
+    // 4. Verify killing Room 0 enemy despawns it, keeps it cleared across RoomSwap, and only respawns on Resonator activation
+    u32 room0EnemiesInitial = 0U;
+    EntityId firstEnemy = kNullEntity;
+    for (auto [eid, ai, recv] : world.View<EnemyAiComp, en::DamageReceiver2D>()) {
+        if (ai.roomId == 0U) {
+            ++room0EnemiesInitial;
+            if (ai.spawnSlotBit == 0x01U) firstEnemy = eid;
+        }
+    }
+    EXPECT_EQ(suite, room0EnemiesInitial, 2U);
+    EXPECT_TRUE(suite, world.IsAlive(firstEnemy));
+
+    // Kill firstEnemy -> next tick despawns it and sets cleared mask for slot 0x01
+    world.TryGet<en::DamageReceiver2D>(firstEnemy)->hp = 0;
+    (void)app.StepHeadlessTicks(1U, 1U);
+    EXPECT_TRUE(suite, !world.IsAlive(firstEnemy));
+    EXPECT_TRUE(suite, app.Metroidvania().IsEnemyCleared(0U, 0x01U));
+
+    // Transition to Room 1 and back to Room 0 -> slot 0x01 stays dead (only 1 enemy in Room 0)
+    EXPECT_TRUE(suite, GameScenes::RequestRoomTransition(app, 1U, en::SceneTransitionMode::RoomSwap).has_value());
+    (void)app.StepHeadlessTicks(4U, 1U);
+    EXPECT_EQ(suite, app.ActiveRoomId(), 1U);
+
+    EXPECT_TRUE(suite, GameScenes::RequestRoomTransition(app, 0U, en::SceneTransitionMode::RoomSwap).has_value());
+    (void)app.StepHeadlessTicks(4U, 1U);
+    EXPECT_EQ(suite, app.ActiveRoomId(), 0U);
+
+    u32 room0EnemiesAfterSwap = 0U;
+    for (auto [eid, ai, recv] : world.View<EnemyAiComp, en::DamageReceiver2D>()) {
+        if (ai.roomId == 0U && recv.hp > 0) ++room0EnemiesAfterSwap;
+    }
+    EXPECT_EQ(suite, room0EnemiesAfterSwap, 1U);
+
+    // Rest at Tuning Resonator -> clears enemy mask and respawns all Room 0 enemies (back to 2)
+    app.Metroidvania().ActivateTuningResonator(pid, 0U, Vec2{-6.0f, 1.0f}, world, app.EngineApp().Gameplay());
+    GameScenes::SpawnRoomEnemiesIfNeeded(app, world, 0U);
+    u32 room0EnemiesAfterResonator = 0U;
+    for (auto [eid, ai, recv] : world.View<EnemyAiComp, en::DamageReceiver2D>()) {
+        if (ai.roomId == 0U && recv.hp > 0) ++room0EnemiesAfterResonator;
+    }
+    EXPECT_EQ(suite, room0EnemiesAfterResonator, 2U);
+
+    // 5. Verify walking into Right Room Exit Portal at (20.5, 1.1) automatically transitions to Room 1
+    app.SetPortalCooldownTicks(0U);
+    en::LocalTransform2D pxf = world.GetLocalTransform(pid);
+    pxf.x = 20.5f;
+    pxf.y = 1.0f;
+    world.Teleport(pid, pxf);
+    (void)app.StepHeadlessTicks(4U, 1U);
+    EXPECT_EQ(suite, app.ActiveRoomId(), 1U);
+
+    // 6. Verify DebugProfiler ValidFrames() and FrameTotal scope are actively recorded
+    EXPECT_TRUE(suite, app.EngineApp().Debug().Profiler().ValidFrames() > 0U);
+    EXPECT_TRUE(suite, app.EngineApp().Debug().Profiler().Latest().aliveEntities > 0U);
+    EXPECT_TRUE(suite, app.EngineApp().Debug().Profiler().Latest().scopeUs[0] > 0U);
+
+    app.Shutdown();
+}
+
 } // namespace vots::tests
 
 int main() {
@@ -558,6 +646,7 @@ int main() {
     TestBossBreakRecoveryMultiplicativeDamageAndParryWindow(suite);
     TestHarmonySacredChordsLostWickHuskSaveAndEndings(suite);
     TestFullGameReplayDeterminismAndRoomTransitions(suite);
+    TestVisualTilemapSlashVfxEnemyRespawnAndPassThrough(suite);
 
     std::printf("Veil of the Silent (GDD v0.2) Verification Suite: %u passed, %u failed\n",
                 suite.passed, suite.failed);

@@ -7,29 +7,31 @@
 
 namespace vots {
 
+class MetroidvaniaSystem;
+
 // Spawns and steps GDD v0.2 enemies (Dissonant Husk, Choir Enforcer, High Conductor Boss) and projectiles.
-// Stateless system operating over World component pools; marks room mobs with kRoomTransientCategoryBit.
+// Stateless system operating over World component pools; despawns dead enemies and records per-room clear masks.
 class EnemyAiSystem {
 public:
-    // Spawns a Standard enemy (100 HP, 100 Break, susceptible to Stagger/Stun/Micro-stagger/Knockback/Pull).
     [[nodiscard]] static en::Result<EntityId, en::WorldErrc> SpawnDissonantHusk(
         en::World& world,
         const GameAssetHandles& assets,
-        Vec2 pos) noexcept;
+        Vec2 pos,
+        u8 roomId = 0U,
+        u8 spawnSlotBit = 0U) noexcept;
 
-    // Spawns a Heavy/Elite enemy (300 HP, 100 Break, BreakableGuard + DisplacementResistant, Gold/Crimson telegraphs).
     [[nodiscard]] static en::Result<EntityId, en::WorldErrc> SpawnChoirEnforcer(
         en::World& world,
         const GameAssetHandles& assets,
-        Vec2 pos) noexcept;
+        Vec2 pos,
+        u8 roomId = 0U,
+        u8 spawnSlotBit = 0U) noexcept;
 
-    // Spawns the High Conductor Boss (1200 HP per phase, 100 Break, 3 phases, CounterEchoId Gold waves & Crimson waves).
     [[nodiscard]] static en::Result<EntityId, en::WorldErrc> SpawnHighConductorBoss(
         en::World& world,
         const GameAssetHandles& assets,
         Vec2 pos) noexcept;
 
-    // Spawns an enemy or boss projectile (normal clearable or protected Boss projectile).
     [[nodiscard]] static en::Result<EntityId, en::WorldErrc> SpawnHarmonicProjectile(
         en::World& world,
         EntityId owner,
@@ -43,7 +45,8 @@ public:
     static void StepEnemiesAndProjectiles(
         EntityId playerId,
         en::World& world,
-        en::GameplayPipeline& pipeline) noexcept;
+        en::GameplayPipeline& pipeline,
+        MetroidvaniaSystem* optionalMetroidvania = nullptr) noexcept;
 };
 
 } // namespace vots

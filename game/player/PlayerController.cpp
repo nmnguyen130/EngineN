@@ -26,7 +26,7 @@ void PlayerController::ConfigureDefaultInputMap(en::InputMap& map) noexcept {
     moveY.altNegSource = InputSource::Key(81U); // Down
     moveY.altPosSource = InputSource::Key(82U); // Up
     moveY.gamepadAxis = 1U;
-    moveY.socd = SocdPolicy::Neutral;
+    moveX.socd = SocdPolicy::Neutral;
     map.BindAxis(1U, moveY);
 
     map.Bind(static_cast<u8>(GameAction::Jump),          {InputSource::Key(44U),  InputSource::Pad(0U)});
@@ -61,8 +61,8 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     const EntityId id = *idRes;
 
     en::Sprite2D spr{};
-    spr.width = 0.9f;
-    spr.height = 1.6f;
+    spr.width = 0.85f;
+    spr.height = 1.55f;
     spr.layer = 12U;
     spr.tint = GetEchoDef(EchoId::Ignis).primaryColor;
     spr.sprite = en::SpriteHandle{0U, 1U};
@@ -75,21 +75,14 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     anim.ticksPerFrame = 8U;
     (void)world.Emplace<en::SpriteAnimator2D>(id, anim);
 
-    en::Collider2D col{};
-    col.localBounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.38f, 0.78f);
-    col.shape = en::ShapeKind2D::CapsuleY;
-    col.filter.categoryBits = 0x0002U;
-    col.filter.maskBits = 0xFFFFU;
-    (void)world.Emplace<en::Collider2D>(id, col);
-
     en::CharacterMotor2D motor{};
-    motor.bounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.38f, 0.78f);
-    motor.solidMask = 0x0001U;
+    motor.bounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.36f, 0.76f);
+    motor.solidMask = 0x0001U; // Collides only with world geometry (0x0001), passes freely through enemies!
     (void)world.Emplace<en::CharacterMotor2D>(id, motor);
 
     en::MotionStack2D motion{};
     motion.groundCoyoteTicks = 8U;
-    motion.pushboxGroup = 1U;
+    motion.pushboxGroup = 0U; // Zero pushbox group so Kaelen can dash and move freely through enemies
     (void)world.Emplace<en::MotionStack2D>(id, motion);
 
     en::StateMachine2D fsm{};
@@ -98,10 +91,10 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     (void)world.Emplace<en::StateMachine2D>(id, fsm);
 
     en::HitboxRig2D rig{};
-    rig.hurtbox = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.38f, 0.78f);
+    rig.hurtbox = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.36f, 0.76f);
     rig.hitbox = en::CompactAabb2D::FromMeters(0.8f, 0.0f, 0.7f, 0.45f);
-    rig.hitLayerMask = 0x02U; // Hits hurtLayer 1 (enemies)
-    rig.SetHurtLayer(0U);     // Player hurtLayer 0
+    rig.hitLayerMask = 0x02U;
+    rig.SetHurtLayer(0U);
     (void)world.Emplace<en::HitboxRig2D>(id, rig);
 
     en::DamageReceiver2D recv{};
@@ -125,7 +118,7 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
 
     en::Tag2D tag{};
     tag.name = en::StringId::Hash("Kaelen");
-    tag.categoryMask = 0x0001U; // Persistent hero (not room-transient)
+    tag.categoryMask = 0x0001U;
     (void)world.Emplace<en::Tag2D>(id, tag);
 
     PlayerStateComp ps{};
@@ -148,7 +141,6 @@ void PlayerController::SwitchActiveEchoSlot(
     ps->deck.activeSlot = static_cast<u8>(targetSlot % kTriadDeckSize);
     const EchoIdentityDef& def = GetEchoDef(ps->deck.ActiveEcho());
 
-    // Switching Echo updates visual palette immediately without altering in-flight WeaponAttackComp::capturedEchoId.
     if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
         spr->tint = def.primaryColor;
     }
@@ -176,7 +168,7 @@ void PlayerController::StartWeaponAttack(
     atk->baseHpDamage = spec.hpDamage;
     atk->baseBreakDamage = spec.breakDamage;
     atk->moveKind = move;
-    atk->capturedEchoId = ps->deck.ActiveEcho(); // Captured at attack start!
+    atk->capturedEchoId = ps->deck.ActiveEcho();
     atk->hitboxTriggered = 0U;
     rig->EndSwing();
 
@@ -229,17 +221,16 @@ bool PlayerController::TryStartDash(
         return false;
     }
 
-    const bool grounded = motor->IsGrounded();
-    if (!grounded) {
+    if (!motor->IsGrounded()) {
         if (ps->airDashCharges == 0U) {
-            return false; // GDD v0.2 Section 4.6: only 1 Air-Dash per airborne sequence
+            return false;
         }
         --ps->airDashCharges;
         motion->flags |= en::MotionFlags::AirborneDash;
     }
 
     const f32 dashDir = static_cast<f32>(motion->FacingSign());
-    (void)motion->RequestVelocityOverride(dashDir * 12.5f, 0.0f, 12U, 2U);
+    (void)motion->RequestVelocityOverride(dashDir * 13.0f, 0.0f, 12U, 2U);
     ps->dashCooldownTicks = 22U;
 
     if (auto* fsm = world.TryGet<en::StateMachine2D>(playerId)) {
@@ -267,12 +258,27 @@ void PlayerController::StepPlayer(
     auto* rig = world.TryGet<en::HitboxRig2D>(playerId);
     if (!ps || !motion || !motor || !recv || !atk || !rig) return;
 
-    // 1. Restore Air-Dash charge when Kaelen is on valid ground (GDD v0.2 Section 4.6).
+    // Out-of-bounds safety recovery via SafeAnchor2D
+    en::LocalTransform2D loc = world.GetLocalTransform(playerId);
+    if (loc.y < -3.0f || loc.y > 14.0f || loc.x < -15.0f || loc.x > 24.0f) {
+        if (const auto* anchor = world.TryGet<en::SafeAnchor2D>(playerId)) {
+            loc.x = anchor->safeX;
+            loc.y = std::max(1.0f, anchor->safeY);
+        } else {
+            loc.x = 0.0f;
+            loc.y = 1.0f;
+        }
+        motor->vx = 0.0f;
+        motor->vy = 0.0f;
+        motion->currentWalkVx = 0.0f;
+        motion->impulseVx = 0.0f;
+        world.Teleport(playerId, loc);
+    }
+
     if (motor->IsGrounded()) {
         ps->airDashCharges = ps->maxAirDashCharges;
     }
 
-    // 2. Step Parry window and cooldowns.
     if (ps->parryWindowTicks > 0U) {
         if (--ps->parryWindowTicks == 0U) {
             recv->RemoveFlags(en::ReceiverFlags::Parrying);
@@ -280,16 +286,14 @@ void PlayerController::StepPlayer(
     }
     if (ps->parryCooldownTicks > 0U) --ps->parryCooldownTicks;
     if (ps->dashCooldownTicks > 0U) --ps->dashCooldownTicks;
-    if (ps->healFlashTicks > 0U) --ps->healFlashTicks;
+    if (ps->burstVfxTicks > 0U) --ps->burstVfxTicks;
 
-    // 3. Echo switching (allowed mid-animation without canceling attack or changing capturedEchoId).
     if (actions.Consume(static_cast<u8>(GameAction::CycleEchoNext), 6U)) {
         SwitchActiveEchoSlot(playerId, static_cast<u8>((ps->deck.activeSlot + 1U) % kTriadDeckSize), world);
     } else if (actions.Consume(static_cast<u8>(GameAction::CycleEchoPrev), 6U)) {
         SwitchActiveEchoSlot(playerId, static_cast<u8>((ps->deck.activeSlot + kTriadDeckSize - 1U) % kTriadDeckSize), world);
     }
 
-    // 4. Advance active weapon attack timeline (activating hitbox at exact startup tick).
     if (atk->moveKind != WeaponMoveKind::None) {
         const WeaponMoveSpec& spec = GetWeaponMoveSpec(atk->moveKind);
         ++atk->elapsedTicks;
@@ -310,12 +314,11 @@ void PlayerController::StepPlayer(
         }
     }
 
-    // 5. Horizontal walk input & facing update.
     const f32 moveX = input.Axis(0U);
     const f32 moveY = input.Axis(1U);
     const bool inHeavyWindup = (atk->moveKind == WeaponMoveKind::Heavy &&
                                 atk->elapsedTicks < kHeavyAttackStartupTicks);
-    motion->targetWalkVx = inHeavyWindup ? (moveX * 2.0f) : (moveX * 6.5f);
+    motion->targetWalkVx = inHeavyWindup ? (moveX * 2.0f) : (moveX * 6.8f);
     if (atk->moveKind == WeaponMoveKind::None && std::abs(moveX) > 0.1f) {
         motion->SetFacingSign(moveX < 0.0f ? -1 : 1);
         if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
@@ -323,7 +326,6 @@ void PlayerController::StepPlayer(
         }
     }
 
-    // 6. Jump, variable jump height, and one-way platform drop-through.
     if (input.Held(static_cast<u8>(GameAction::Jump))) {
         motion->flags |= en::MotionFlags::JumpHeld;
     } else {
@@ -335,20 +337,23 @@ void PlayerController::StepPlayer(
         motion->oneWayDropTicks = 10U;
         (void)actions.Consume(static_cast<u8>(GameAction::Jump), 8U);
     } else if (actions.Peek(static_cast<u8>(GameAction::Jump), 8U)) {
-        if (motion->TryExecuteJump(10.5f, 7.5f)) {
+        if (motion->TryExecuteJump(11.2f, 7.5f)) {
             (void)actions.Consume(static_cast<u8>(GameAction::Jump), 8U);
         }
     }
 
-    // 7. Dash, Parry, Unison Burst, Sacred Chord, and Attack chain inputs.
     if (actions.Consume(static_cast<u8>(GameAction::Parry), 6U)) {
         (void)StartParryStance(playerId, world);
     } else if (actions.Consume(static_cast<u8>(GameAction::Dash), 6U)) {
         (void)TryStartDash(playerId, world);
     } else if (actions.Consume(static_cast<u8>(GameAction::SacredChord), 6U)) {
-        (void)CombatSystem::TryActivateSacredChord(playerId, world, pipeline);
+        if (CombatSystem::TryActivateSacredChord(playerId, world, pipeline)) {
+            ps->burstVfxTicks = 28U;
+        }
     } else if (actions.Consume(static_cast<u8>(GameAction::UnisonBurst), 6U)) {
-        (void)CombatSystem::TryActivateUnisonBurst(playerId, world, pipeline);
+        if (CombatSystem::TryActivateUnisonBurst(playerId, world, pipeline)) {
+            ps->burstVfxTicks = 20U;
+        }
     } else if (actions.Consume(static_cast<u8>(GameAction::AttackHeavy), 8U)) {
         if (atk->moveKind == WeaponMoveKind::None) {
             StartWeaponAttack(playerId, WeaponMoveKind::Heavy, world, pipeline, ioNextAttackInstanceId);

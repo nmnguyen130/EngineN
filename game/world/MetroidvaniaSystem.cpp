@@ -16,6 +16,7 @@ void MetroidvaniaSystem::ActivateTuningResonator(
     m_checkpointY = resonatorPos.y;
     m_checkpointRoomId = roomId;
     DiscoverRoom(roomId);
+    ResetClearedEnemies(); // Non-Boss enemies respawn when resting/saving at a Tuning Resonator
 
     const u16 flagId = static_cast<u16>(WorldFlagId::ResonatorAshSumpActive) + std::min<u8>(roomId, 3U);
     pipeline.SetWorldFlag(flagId, true);
@@ -26,7 +27,7 @@ void MetroidvaniaSystem::ActivateTuningResonator(
     if (ps != nullptr) {
         ps->harmony = kMaxHarmonyGauge; // GDD v0.2 Section 5.1: sets Harmony to 100
         ps->lastResonatorRoomId = roomId;
-        ps->healFlashTicks = 30U;
+        ps->burstVfxTicks = 20U;
     }
     if (recv != nullptr) {
         const i32 baseMax = (ps != nullptr) ? ps->baseMaxHp : kPlayerBaseMaxHp;
@@ -87,10 +88,17 @@ void MetroidvaniaSystem::HandlePlayerDeathAndSpawnHusk(
         m_husk.bankedTuningShards += ps->carriedTuningShards;
     }
 
+    ResetClearedEnemies();
+
     ps->carriedTuningShards = 0U;
     ps->harmony = 0U; // Harmony resets to 0 on death
     ps->huskPenaltyActive = 1U;
     ps->activeRoomId = m_checkpointRoomId;
+    ps->airDashCharges = ps->maxAirDashCharges;
+    ps->parryWindowTicks = 0U;
+    ps->parryCooldownTicks = 0U;
+    ps->dashCooldownTicks = 0U;
+    ps->burstVfxTicks = 0U;
 
     // Non-stacking 25% Max HP penalty
     const i32 penalizedMaxHp = static_cast<i32>(
@@ -98,7 +106,28 @@ void MetroidvaniaSystem::HandlePlayerDeathAndSpawnHusk(
     recv->maxHp = penalizedMaxHp;
     recv->hp = penalizedMaxHp;
     recv->RemoveFlags(en::ReceiverFlags::Dead);
-    recv->iframeTicks = 0U;
+    recv->RemoveFlags(en::ReceiverFlags::Parrying);
+    recv->iframeTicks = 60U;
+
+    if (auto* motor = world.TryGet<en::CharacterMotor2D>(playerId)) {
+        motor->vx = 0.0f;
+        motor->vy = 0.0f;
+    }
+    if (auto* motion = world.TryGet<en::MotionStack2D>(playerId)) {
+        motion->currentWalkVx = 0.0f;
+        motion->targetWalkVx = 0.0f;
+        motion->impulseVx = 0.0f;
+        motion->pendingLaunchVy = 0.0f;
+        motion->overrideTicks = 0U;
+    }
+    if (auto* rig = world.TryGet<en::HitboxRig2D>(playerId)) {
+        rig->EndSwing();
+    }
+    if (auto* atk = world.TryGet<WeaponAttackComp>(playerId)) {
+        atk->moveKind = WeaponMoveKind::None;
+        atk->elapsedTicks = 0U;
+        atk->hitboxTriggered = 0U;
+    }
 
     en::LocalTransform2D respawnXf = world.GetLocalTransform(playerId);
     respawnXf.x = m_checkpointX;
@@ -119,6 +148,7 @@ bool MetroidvaniaSystem::RecoverLostWickHusk(
     ps->carriedTuningShards += m_husk.bankedTuningShards;
     ps->huskPenaltyActive = 0U;
     ps->harmony = kMaxHarmonyGauge; // Restores Harmony to 100
+    ps->burstVfxTicks = 24U;
 
     // Restore Max HP cap; clamp current HP to restored Max HP without overhealing (GDD v0.2 Section 5.2).
     recv->maxHp = ps->baseMaxHp;
@@ -291,7 +321,7 @@ SaveData MetroidvaniaSystem::ExportSaveData(
         if (const auto* ps = world.TryGet<PlayerStateComp>(playerId)) {
             out.unlockedEchoMask = ps->unlockedEchoMask;
             out.carriedTuningShards = ps->carriedTuningShards;
-            out. playerBaseMaxHp = ps->baseMaxHp;
+            out.playerBaseMaxHp = ps->baseMaxHp;
             out.triadDeck = ps->deck;
             out.harmonyGauge = ps->harmony;
         }
@@ -317,6 +347,7 @@ void MetroidvaniaSystem::ImportSaveData(
     m_pinCount = std::min<u8>(data.pinCount, static_cast<u8>(kMaxMapPins));
     m_husk = data.husk;
     m_mapPins = data.mapPins;
+    ResetClearedEnemies();
 
     for (u16 b = 0U; b < 16U; ++b) {
         pipeline.SetWorldFlag(b, (data.worldFlagsWord0 & (1U << b)) != 0U);

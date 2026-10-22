@@ -7,26 +7,26 @@ namespace vots {
 
 // Tracks Kaelen's Triad Deck, Harmony gauge, air-dash charge, Parry window, and carried Tuning Shards.
 // Registered in World at kTypeId = 24; strictly 32 bytes (2 per cache line, 0B padding).
-// Invariant: harmony in [0..100], airDashCharges <= maxAirDashCharges, and capturedEchoId is fixed on attack/parry start.
+// Invariant: harmony in [0..100], airDashCharges <= maxAirDashCharges, and capturedParryEcho is fixed on Parry start.
 struct alignas(32) PlayerStateComp {
     static constexpr u8 kTypeId = 24U;
 
     u32 carriedTuningShards{0U};
     i32 baseMaxHp{kPlayerBaseMaxHp};
     TriadDeck deck{};
-    u16 unlockedEchoMask{0x000FU};     // Ignis, Terra, Fulgur, Glacies unlocked at baseline
-    u16 parryWindowTicks{0U};          // Counts down from 10 ticks on Parry input
+    u16 unlockedEchoMask{0x000FU};
+    u16 parryWindowTicks{0U};
     u16 parryCooldownTicks{0U};
     u16 dashCooldownTicks{0U};
-    u16 healFlashTicks{0U};
-    u8 harmony{0U};                    // Clamped [0..100]
-    u8 airDashCharges{1U};             // Restored to 1 on valid ground contact; never restored by reactions
+    u16 burstVfxTicks{0U};
+    u8 harmony{0U};
+    u8 airDashCharges{1U};
     u8 maxAirDashCharges{1U};
     EchoId capturedParryEcho{EchoId::Ignis};
     u8 activeRoomId{0U};
     u8 lastResonatorRoomId{0U};
-    u8 huskPenaltyActive{0U};          // 1 when Lost Wick Husk is unrecovered (-25% Max HP cap)
-    u8 lanternRelinquished{0U};        // 1 after Ending C (Symphony of the Off-Beat)
+    u8 huskPenaltyActive{0U};
+    u8 lanternRelinquished{0U};
 };
 static_assert(sizeof(PlayerStateComp) == 32);
 static_assert(en::Component<PlayerStateComp>);
@@ -64,7 +64,7 @@ struct alignas(16) ResonanceMarkComp {
     EchoId activeMark{EchoId::None};
     WaveReactionId lastReactionTriggered{WaveReactionId::None};
     u16 reactionVfxTicks{0U};
-    u16 reserved{0U};
+    u16 hitFlashTicks{0U};
 
     [[nodiscard]] constexpr bool HasActiveMark() const noexcept {
         return remainingTicks > 0U && IsValidEcho(activeMark);
@@ -103,8 +103,8 @@ struct alignas(32) BreakAndCcComp {
     BreakPhase breakPhase{BreakPhase::Normal};
     TargetCategory category{TargetCategory::Standard};
     ActionLockKind lockKind{ActionLockKind::None};
-    u8 slowPercent{0U}; // e.g., 40 means 40% slow (0.60x speed)
-    u8 flags{0U};       // bit 0: DisplacementResistant, bit 1: BreakableGuard, bit 2: GuardActive, bit 3:InterruptibleWindup
+    u8 slowPercent{0U};
+    u8 flags{0U};
 
     static constexpr u8 kFlagDisplacementResistant = 1U << 0U;
     static constexpr u8 kFlagBreakableGuard        = 1U << 1U;
@@ -141,13 +141,14 @@ struct alignas(32) EnemyAiComp {
     u16 actionTimerTicks{0U};
     u16 cooldownTicks{60U};
     u16 shardReward{25U};
-    u8 archetypeId{0U};      // 0: DissonantHusk, 1: ChoirEnforcer, 2: HighConductorBoss
-    u8 bossPhase{1U};        // 1..3 for High Conductor
+    u8 archetypeId{0U};
+    u8 bossPhase{1U};
     u8 patternIndex{0U};
     AttackTelegraphKind activeTelegraph{AttackTelegraphKind::Standard};
     EchoId counterEcho{EchoId::None};
     u8 windupInterrupted{0U};
-    u16 statePhaseTicks{0U};
+    u8 roomId{0U};
+    u8 spawnSlotBit{0U};
 };
 static_assert(sizeof(EnemyAiComp) == 32);
 static_assert(en::Component<EnemyAiComp>);
@@ -161,11 +162,11 @@ struct alignas(16) ProjectileComp {
     i16 damage{12};
     u8 breakDamage{6U};
     u8 teamId{2U};
-    u8 protectedFromClear{0U}; // 1 = Boss signature / environmental trap (cannot be cleared by Pyro-Cyclone)
+    u8 protectedFromClear{0U};
     AttackTelegraphKind telegraph{AttackTelegraphKind::GoldHarmonicWave};
     EchoId counterEcho{EchoId::None};
     u8 active{1U};
-    u32 reserved{0U};
+    u32 flightTicks{0U};
 };
 static_assert(sizeof(ProjectileComp) == 16);
 static_assert(en::Component<ProjectileComp>);
@@ -190,8 +191,8 @@ struct alignas(16) InteractableComp {
     u16 requiredWorldFlag{0U};
     u16 grantedWorldFlag{0U};
     InteractableKind kind{InteractableKind::TuningResonator};
-    u8 paramByte{0U};         // EchoId for EchoAltar, targetRoomId for RoomExitPortal, etc.
-    u8 isMainRouteGate{1U};   // Communicates main route vs optional gate per GDD v0.2 Section 5.4
+    u8 paramByte{0U};
+    u8 isMainRouteGate{1U};
     u8 activated{0U};
     u32 shardPayload{0U};
 };
@@ -207,7 +208,7 @@ struct alignas(16) DestructibleTerrainComp {
     u16 unlockedWorldFlagOnBreak{0U};
     u8 requiresSacredChord{1U};
     u8 broken{0U};
-    u64 reserved{0ULL};
+    u64 hitFlashTicks{0ULL};
 };
 static_assert(sizeof(DestructibleTerrainComp) == 16);
 static_assert(en::Component<DestructibleTerrainComp>);

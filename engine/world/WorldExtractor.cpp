@@ -30,6 +30,7 @@ void WorldExtractor::Extract(
             cam.zoom = rig.zoom;
             cam.pixelsPerMeter = (rig.pixelsPerMeter > 0.0f) ? rig.pixelsPerMeter : defaultPixelsPerMeter;
             cam.screenSpace = rig.screenSpace;
+            cam.yUp = !rig.screenSpace;
             if (rig.trauma > 0.0f) {
                 cam.ApplyTraumaShake(rig.trauma, static_cast<f32>(timeView.tickIndex) * 0.05f, 0.5f);
             }
@@ -41,6 +42,7 @@ void WorldExtractor::Extract(
     if (!foundCamera) {
         Camera2D defaultCam{};
         defaultCam.pixelsPerMeter = defaultPixelsPerMeter;
+        defaultCam.yUp = true;
         outRenderList.SetView(0U, defaultCam);
     }
 
