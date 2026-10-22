@@ -280,7 +280,7 @@ void AudioSystem::ComputeSpatialVoiceParams(
 
     const f32 dx = tr.worldX - listenerX;
     const f32 dy = tr.worldY - listenerY;
-    const f32 dist = std::hypot(dx, dy);
+    const f32 dist = std::sqrt(dx * dx + dy * dy);
     const f32 atten = EvaluateAttenuation(def.Attenuation(), dist, def.minDist, def.maxDist);
 
     // Near-field spatial spread: smoothly collapses stereo pan to center inside minDist to prevent speaker flip

@@ -342,7 +342,7 @@ u16 DynamicsSolver2D::GatherManifolds(
             const f32 hAH = colA.localBounds.HalfH() * std::abs(xfA.scaleY);
 
             const f32 specMargin = bodyA.IsBullet()
-                ? (std::hypot(bodyA.vx * dt, bodyA.vy * dt) + 0.05f)
+                ? (std::sqrt(bodyA.vx * bodyA.vx + bodyA.vy * bodyA.vy) * dt + 0.05f)
                 : 0.0f;
 
             const i32 minTX = std::max<i32>(0, static_cast<i32>(std::floor(((centerA.x - hAW - specMargin) - origX) * invTile)));
@@ -451,19 +451,27 @@ u16 DynamicsSolver2D::GatherManifolds(
                 }
                 if (alreadyTested) continue;
 
-                const WorldTransform2D& xf1 = world.GetWorldByIndex(firstId.index);
-                const WorldTransform2D& xf2 = world.GetWorldByIndex(secondId.index);
-
                 f32 specMargin = 0.0f;
                 if (!firstCol.IsSensor() && !secondCol.IsSensor()) {
-                    const f32 dt = step.Dt(TimeChannel::World);
                     if (firstBody && firstBody->IsBullet()) {
-                        specMargin = std::max(specMargin, std::hypot(firstBody->vx * dt, firstBody->vy * dt));
+                        const f32 dt1 = step.Dt(static_cast<TimeChannel>(world.GetTimeChannelByIndex(firstId.index)));
+                        specMargin = std::max(specMargin, std::sqrt(firstBody->vx * firstBody->vx + firstBody->vy * firstBody->vy) * dt1);
                     }
                     if (secondBody && secondBody->IsBullet()) {
-                        specMargin = std::max(specMargin, std::hypot(secondBody->vx * dt, secondBody->vy * dt));
+                        const f32 dt2 = step.Dt(static_cast<TimeChannel>(world.GetTimeChannelByIndex(secondId.index)));
+                        specMargin = std::max(specMargin, std::sqrt(secondBody->vx * secondBody->vx + secondBody->vy * secondBody->vy) * dt2);
                     }
                 }
+
+                if (boxA.BoundMaxX() + specMargin < boxB.BoundMinX() ||
+                    boxA.BoundMinX() - specMargin > boxB.BoundMaxX() ||
+                    boxA.BoundMaxY() + specMargin < boxB.BoundMinY() ||
+                    boxA.BoundMinY() - specMargin > boxB.BoundMaxY()) {
+                    continue;
+                }
+
+                const WorldTransform2D& xf1 = world.GetWorldByIndex(firstId.index);
+                const WorldTransform2D& xf2 = world.GetWorldByIndex(secondId.index);
 
                 ContactManifold2D m{};
                 if (!Narrowphase2D::CollideShapes(

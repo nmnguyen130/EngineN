@@ -68,8 +68,9 @@ void StateAndCombatSolver2D::StepStateMachinesAndDirectives(
             continue;
         }
 
+        CookedStateEntry activeStateStorage{};
         const CookedStateEntry* activeStateEntry = nullptr;
-        const CookedFrameDirective* directiveTable = nullptr;
+        const u8* directiveBytes = nullptr;
         u16 totalDirectives = 0U;
 
         if (fsm.rigBlob.IsValid()) {
@@ -84,11 +85,12 @@ void StateAndCombatSolver2D::StepStateMachinesAndDirectives(
                     hdr.version == CookedGameplayRigHeader::kVersion &&
                     bytes.size() >= sizeof(CookedGameplayRigHeader) + statesBytes + dirsBytes &&
                     fsm.stateId < hdr.stateCount) {
-                    const auto* states = reinterpret_cast<const CookedStateEntry*>(
-                        bytes.data() + sizeof(CookedGameplayRigHeader));
-                    directiveTable = reinterpret_cast<const CookedFrameDirective*>(
-                        bytes.data() + sizeof(CookedGameplayRigHeader) + statesBytes);
-                    activeStateEntry = &states[fsm.stateId];
+                    std::memcpy(
+                        &activeStateStorage,
+                        bytes.data() + sizeof(CookedGameplayRigHeader) + static_cast<usize>(fsm.stateId) * sizeof(CookedStateEntry),
+                        sizeof(CookedStateEntry));
+                    activeStateEntry = &activeStateStorage;
+                    directiveBytes = bytes.data() + sizeof(CookedGameplayRigHeader) + statesBytes;
                     totalDirectives = hdr.directiveCount;
                 }
             }
@@ -120,14 +122,18 @@ void StateAndCombatSolver2D::StepStateMachinesAndDirectives(
         }
 
         // Fire frame-accurate timeline directives once per frame advance
-        if (activeStateEntry && directiveTable && currentFrame != fsm.lastAnimFrame) {
+        if (activeStateEntry && directiveBytes && currentFrame != fsm.lastAnimFrame) {
             fsm.lastAnimFrame = currentFrame;
             const u16 startDir = activeStateEntry->firstDirective;
             const u16 endDir = static_cast<u16>(
                 std::min<u32>(totalDirectives, static_cast<u32>(startDir) + activeStateEntry->directiveCount));
 
             for (u16 d = startDir; d < endDir; ++d) {
-                const CookedFrameDirective dir = directiveTable[d];
+                CookedFrameDirective dir{};
+                std::memcpy(
+                    &dir,
+                    directiveBytes + static_cast<usize>(d) * sizeof(CookedFrameDirective),
+                    sizeof(CookedFrameDirective));
                 if (dir.triggerFrame != currentFrame) continue;
 
                 const WorldTransform2D& xf = world.GetWorldByIndex(id.index);

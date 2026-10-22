@@ -70,7 +70,7 @@ std::atomic<LogLevel> g_minLogLevel{LogLevel::Info};
 LogSinkFn g_logSink{nullptr};
 void* g_logSinkCtx{nullptr};
 std::array<LogRecord, Logger::kHistoryCapacity> g_logRing{};
-u64 g_logSequence{0};
+std::atomic<u64> g_logSequence{0};
 
 std::atomic<AssertHandlerFn> g_assertHandler{nullptr};
 std::atomic<void*> g_assertUserCtx{nullptr};
@@ -108,7 +108,7 @@ void Logger::SetSink(LogSinkFn sinkFn, void* userCtx) noexcept {
 void Logger::Clear() noexcept {
     std::lock_guard lock(g_logMutex);
     g_logRing.fill(LogRecord{});
-    g_logSequence = 0ULL;
+    g_logSequence.store(0ULL, std::memory_order_release);
 }
 
 void Logger::Log(
@@ -132,8 +132,10 @@ void Logger::Log(
     void* sinkCtxCopy = nullptr;
     {
         std::lock_guard lock(g_logMutex);
-        rec.sequence = ++g_logSequence;
-        g_logRing[(rec.sequence - 1ULL) & (kHistoryCapacity - 1ULL)] = rec;
+        const u64 seq = g_logSequence.load(std::memory_order_relaxed) + 1ULL;
+        rec.sequence = seq;
+        g_logRing[(seq - 1ULL) & (kHistoryCapacity - 1ULL)] = rec;
+        g_logSequence.store(seq, std::memory_order_release);
         sinkCopy = g_logSink;
         sinkCtxCopy = g_logSinkCtx;
     }
@@ -146,7 +148,7 @@ void Logger::Log(
 u32 Logger::RecentRecords(std::span<LogRecord> outRecords) noexcept {
     if (outRecords.empty()) return 0U;
     std::lock_guard lock(g_logMutex);
-    const u64 total = g_logSequence;
+    const u64 total = g_logSequence.load(std::memory_order_relaxed);
     const u64 available = std::min<u64>(total, kHistoryCapacity);
     const u32 count = static_cast<u32>(std::min<u64>(available, outRecords.size()));
     const u64 startSeq = total - count + 1ULL;
@@ -157,8 +159,7 @@ u32 Logger::RecentRecords(std::span<LogRecord> outRecords) noexcept {
 }
 
 u64 Logger::TotalLoggedCount() noexcept {
-    std::lock_guard lock(g_logMutex);
-    return g_logSequence;
+    return g_logSequence.load(std::memory_order_acquire);
 }
 
 void SetAssertHandler(AssertHandlerFn handler, void* userCtx) noexcept {
@@ -257,12 +258,15 @@ usize CrashHandler::FormatCrashReport(const char* reason, std::span<char> outTex
         w.Append("\n");
     }
 
-    std::array<LogRecord, 8> recentLogs{};
-    const u32 logCount = Logger::RecentRecords(recentLogs);
+    // Lock-free snapshot of recent log history so crash signals inside Logger::Log never deadlock on g_logMutex
+    const u64 total = g_logSequence.load(std::memory_order_acquire);
+    const u64 available = std::min<u64>(total, Logger::kHistoryCapacity);
+    const u32 logCount = static_cast<u32>(std::min<u64>(available, 8ULL));
     if (logCount > 0U) {
+        const u64 startSeq = total - logCount + 1ULL;
         w.Append("Recent Log History:\n");
         for (u32 i = 0U; i < logCount; ++i) {
-            const LogRecord& r = recentLogs[i];
+            const LogRecord r = g_logRing[(startSeq + i - 1ULL) & (Logger::kHistoryCapacity - 1ULL)];
             w.Append("  [");
             w.Append(LevelToString(r.level));
             w.Append("] ");

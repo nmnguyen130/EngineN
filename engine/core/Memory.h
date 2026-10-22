@@ -150,7 +150,6 @@ public:
 private:
     AlignedArena& m_arena;
     u32 m_marker{0};
-    u32 m_pad{0};
 };
 static_assert(sizeof(ArenaTempScope) == 16);
 
@@ -246,6 +245,15 @@ public:
             std::memcpy(outBytes.data(), m_data + m_offset, outBytes.size());
             m_offset += static_cast<u32>(outBytes.size());
         }
+        return true;
+    }
+
+    [[nodiscard]] constexpr bool Skip(u32 byteCount) noexcept {
+        if (!m_ok || byteCount > (m_size - m_offset)) {
+            m_ok = false;
+            return false;
+        }
+        m_offset += byteCount;
         return true;
     }
 

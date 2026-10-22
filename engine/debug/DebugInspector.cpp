@@ -135,10 +135,11 @@ EntityId DebugInspector::PickEntityAtWorldPos(
             if (hasColliderPool && (mask & MakeComponentMask<Collider2D>()) != 0ULL) {
                 const Collider2D& col = world.GetPool<Collider2D>().DirectAtEntityIndex(eIdx);
                 if (col.shape != ShapeKind2D::Segment) {
-                    const f32 cx = wt.x + col.localBounds.OffsetX();
-                    const f32 cy = wt.y + col.localBounds.OffsetY();
-                    const f32 hw = col.localBounds.HalfW();
-                    const f32 hh = (col.shape == ShapeKind2D::Circle) ? hw : col.localBounds.HalfH();
+                    const Vec2 c = wt.TransformPoint({col.localBounds.OffsetX(), col.localBounds.OffsetY()});
+                    const f32 cx = c.x;
+                    const f32 cy = c.y;
+                    const f32 hw = col.localBounds.HalfW() * std::abs(wt.scaleX);
+                    const f32 hh = (col.shape == ShapeKind2D::Circle) ? hw : (col.localBounds.HalfH() * std::abs(wt.scaleY));
                     if (worldPos.x >= cx - hw && worldPos.x <= cx + hw &&
                         worldPos.y >= cy - hh && worldPos.y <= cy + hh) {
                         const f32 dSq = (worldPos.x - cx) * (worldPos.x - cx) + (worldPos.y - cy) * (worldPos.y - cy);
@@ -247,10 +248,11 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
                     }
                 }
 
-                const f32 cx = wt.x + col.localBounds.OffsetX();
-                const f32 cy = wt.y + col.localBounds.OffsetY();
-                const f32 hw = col.localBounds.HalfW();
-                const f32 hh = col.localBounds.HalfH();
+                const Vec2 center = wt.TransformPoint({col.localBounds.OffsetX(), col.localBounds.OffsetY()});
+                const f32 cx = center.x;
+                const f32 cy = center.y;
+                const f32 hw = col.localBounds.HalfW() * std::abs(wt.scaleX);
+                const f32 hh = col.localBounds.HalfH() * std::abs(wt.scaleY);
 
                 switch (col.shape) {
                     case ShapeKind2D::Aabb:
@@ -266,9 +268,9 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
                         worldBatcher.PushObbOutline({cx, cy}, {hw, hh}, wt.cosRot, wt.sinRot, 0.04f, wireCol);
                         break;
                     case ShapeKind2D::Segment: {
-                        const Vec2 p0 = col.localBounds.SegmentP0();
-                        const Vec2 p1 = col.localBounds.SegmentP1();
-                        worldBatcher.PushLine(wt.x + p0.x, wt.y + p0.y, wt.x + p1.x, wt.y + p1.y, 0.05f, wireCol);
+                        const Vec2 p0 = wt.TransformPoint(col.localBounds.SegmentP0());
+                        const Vec2 p1 = wt.TransformPoint(col.localBounds.SegmentP1());
+                        worldBatcher.PushLine(p0.x, p0.y, p1.x, p1.y, 0.05f, wireCol);
                         break;
                     }
                 }
@@ -301,7 +303,7 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
                     const EntityId e = rbPool.Entities()[i];
                     const WorldTransform2D& wt = world.GetWorldByIndex(e.index);
                     const RigidBody2D& rb = rbPool.ComponentAtDense(i);
-                    if (std::hypot(rb.vx, rb.vy) > 0.05f) {
+                    if ((rb.vx * rb.vx + rb.vy * rb.vy) > (0.05f * 0.05f)) {
                         worldBatcher.PushArrow(
                             wt.x, wt.y, wt.x + rb.vx * 0.15f, wt.y + rb.vy * 0.15f,
                             0.18f, 0.04f, Color{1.0f, 0.55f, 0.1f, 0.9f});
@@ -314,7 +316,7 @@ void DebugInspector::EmitWorldAndInspectorOverlays(
                     const EntityId e = motorPool.Entities()[i];
                     const WorldTransform2D& wt = world.GetWorldByIndex(e.index);
                     const CharacterMotor2D& m = motorPool.ComponentAtDense(i);
-                    if (std::hypot(m.vx, m.vy) > 0.05f) {
+                    if ((m.vx * m.vx + m.vy * m.vy) > (0.05f * 0.05f)) {
                         worldBatcher.PushArrow(
                             wt.x, wt.y, wt.x + m.vx * 0.15f, wt.y + m.vy * 0.15f,
                             0.18f, 0.04f, Color{0.2f, 0.9f, 1.0f, 0.9f});

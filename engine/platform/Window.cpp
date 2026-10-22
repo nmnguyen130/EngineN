@@ -6,6 +6,21 @@
 
 namespace en {
 
+namespace {
+
+SDL_Cursor* g_systemCursors[7]{};
+
+void DestroyCachedCursors() noexcept {
+    for (SDL_Cursor*& cur : g_systemCursors) {
+        if (cur != nullptr) {
+            SDL_DestroyCursor(cur);
+            cur = nullptr;
+        }
+    }
+}
+
+} // namespace
+
 Result<void, PlatformErrc> Window::Create(const WindowConfig& cfg, bool headless) noexcept {
     Destroy();
     if (!cfg.size.IsValid()) return Err(PlatformErrc::InvalidState);
@@ -60,6 +75,7 @@ void Window::Destroy() noexcept {
         if (m_state.relativeMouse) {
             (void)SDL_SetWindowRelativeMouseMode(m_window, false);
         }
+        DestroyCachedCursors();
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
     }
@@ -149,17 +165,19 @@ void Window::SetCursorVisible(bool visible) noexcept {
     if (IsCursorVisible() == visible) return;
     if (visible) m_optionBits |= kBitCursorVisible;
     else m_optionBits &= static_cast<u8>(~kBitCursorVisible);
-    if (visible) (void)SDL_ShowCursor();
-    else (void)SDL_HideCursor();
+    if (m_window) {
+        if (visible) (void)SDL_ShowCursor();
+        else (void)SDL_HideCursor();
+    }
 }
 
 void Window::SetCursorShape(CursorShape shape) noexcept {
     if (m_cursorShape == shape) return;
     m_cursorShape = shape;
-    static SDL_Cursor* s_cursors[7]{};
+    if (!m_window) return;
     const u8 idx = static_cast<u8>(shape);
     if (idx < 7U) {
-        if (!s_cursors[idx]) {
+        if (!g_systemCursors[idx]) {
             constexpr SDL_SystemCursor kMap[7] = {
                 SDL_SYSTEM_CURSOR_DEFAULT,
                 SDL_SYSTEM_CURSOR_TEXT,
@@ -169,10 +187,10 @@ void Window::SetCursorShape(CursorShape shape) noexcept {
                 SDL_SYSTEM_CURSOR_NS_RESIZE,
                 SDL_SYSTEM_CURSOR_NOT_ALLOWED,
             };
-            s_cursors[idx] = SDL_CreateSystemCursor(kMap[idx]);
+            g_systemCursors[idx] = SDL_CreateSystemCursor(kMap[idx]);
         }
-        if (s_cursors[idx]) {
-            (void)SDL_SetCursor(s_cursors[idx]);
+        if (g_systemCursors[idx]) {
+            (void)SDL_SetCursor(g_systemCursors[idx]);
         }
     }
 }

@@ -408,8 +408,11 @@ Result<void, WorldErrc> World::DeferSetParent(
 }
 
 Result<void, WorldErrc> World::FlushCommands() noexcept {
+    const usize endOffset = m_cmdWriteOffset;
+    m_cmdWriteOffset = 0U;
+    m_pendingCmdCount = 0U;
     usize offset = 0U;
-    while (offset + 12U <= m_cmdWriteOffset) {
+    while (offset + 12U <= endOffset) {
         const u8* src = m_cmdTape + offset;
         const auto kind = static_cast<CmdKind>(src[0]);
         const u8 tidOrFlag = src[1];
@@ -441,8 +444,6 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
                 break;
         }
     }
-    m_cmdWriteOffset = 0U;
-    m_pendingCmdCount = 0U;
     return {};
 }
 
@@ -481,70 +482,77 @@ void World::StepAmbientVelocities(const SimStepView& step) noexcept {
     }
 }
 
+void World::StepSpriteAnimationsOnly(const SimStepView& step) noexcept {
+    if ((m_registeredPoolsMask & (1ULL << SpriteAnimator2D::kTypeId)) == 0ULL) return;
+    auto& animPool = GetPool<SpriteAnimator2D>();
+    const auto entities = animPool.Entities();
+    auto anims = animPool.Components();
+    for (usize i = 0U; i < entities.size(); ++i) {
+        SpriteAnimator2D& anim = anims[i];
+        if (!anim.playing || anim.frameCount <= 1U) continue;
+        const auto ch = static_cast<TimeChannel>(m_timeChannels[entities[i].index]);
+        if (step.IsFrozen(ch)) continue;
+        const u16 threshold = std::max<u16>(1U, anim.ticksPerFrame);
+        if (++anim.tickAccum >= threshold) {
+            anim.tickAccum = 0U;
+            if (anim.currentFrame + 1U < anim.frameCount) {
+                ++anim.currentFrame;
+            } else if (anim.loop) {
+                anim.currentFrame = 0U;
+            } else {
+                anim.playing = false;
+            }
+        }
+    }
+}
+
+void World::StepLifetimes(const SimStepView& step) noexcept {
+    if ((m_registeredPoolsMask & (1ULL << Lifetime2D::kTypeId)) == 0ULL) return;
+    auto& lifePool = GetPool<Lifetime2D>();
+    auto& spritePool = GetPool<Sprite2D>();
+    const auto entities = lifePool.Entities();
+    auto lives = lifePool.Components();
+    for (usize i = 0U; i < entities.size(); ++i) {
+        Lifetime2D& life = lives[i];
+        if (!life.active) continue;
+        const EntityId id = entities[i];
+        const auto ch = static_cast<TimeChannel>(m_timeChannels[id.index]);
+        if (step.IsFrozen(ch)) continue;
+        if (life.remainingTicks > 0U) --life.remainingTicks;
+        if (life.fadeSpriteAlpha && life.initialTicks > 0U) {
+            life.alphaScale = static_cast<f32>(life.remainingTicks) / static_cast<f32>(life.initialTicks);
+            if ((m_componentMasks[id.index] & (1ULL << Sprite2D::kTypeId)) != 0ULL) {
+                spritePool.DirectAtEntityIndex(id.index).tint.a = life.alphaScale;
+            }
+        }
+        if (life.remainingTicks == 0U) {
+            (void)DeferDestroy(id);
+        }
+    }
+}
+
+void World::StepPointLights(const SimStepView& step) noexcept {
+    if ((m_registeredPoolsMask & (1ULL << PointLight2D::kTypeId)) == 0ULL) return;
+    auto& lightPool = GetPool<PointLight2D>();
+    const auto entities = lightPool.Entities();
+    auto lights = lightPool.Components();
+    for (usize i = 0U; i < entities.size(); ++i) {
+        PointLight2D& light = lights[i];
+        const auto ch = static_cast<TimeChannel>(m_timeChannels[entities[i].index]);
+        if (!step.IsFrozen(ch) && light.pulseSpeed != 0.0f) {
+            light.pulsePhase += light.pulseSpeed * step.Dt(ch);
+        }
+    }
+}
+
 void World::StepAnimations(const SimStepView& step) noexcept {
     StepAnimationsAndLifetimes(step);
 }
 
 void World::StepAnimationsAndLifetimes(const SimStepView& step) noexcept {
-    if ((m_registeredPoolsMask & (1ULL << SpriteAnimator2D::kTypeId)) != 0ULL) {
-        auto& animPool = GetPool<SpriteAnimator2D>();
-        const auto entities = animPool.Entities();
-        auto anims = animPool.Components();
-        for (usize i = 0U; i < entities.size(); ++i) {
-            SpriteAnimator2D& anim = anims[i];
-            if (!anim.playing || anim.frameCount <= 1U) continue;
-            const auto ch = static_cast<TimeChannel>(m_timeChannels[entities[i].index]);
-            if (step.IsFrozen(ch)) continue;
-            const u16 threshold = std::max<u16>(1U, anim.ticksPerFrame);
-            if (++anim.tickAccum >= threshold) {
-                anim.tickAccum = 0U;
-                if (anim.currentFrame + 1U < anim.frameCount) {
-                    ++anim.currentFrame;
-                } else if (anim.loop) {
-                    anim.currentFrame = 0U;
-                } else {
-                    anim.playing = false;
-                }
-            }
-        }
-    }
-
-    if ((m_registeredPoolsMask & (1ULL << Lifetime2D::kTypeId)) != 0ULL) {
-        auto& lifePool = GetPool<Lifetime2D>();
-        auto& spritePool = GetPool<Sprite2D>();
-        const auto entities = lifePool.Entities();
-        auto lives = lifePool.Components();
-        for (usize i = 0U; i < entities.size(); ++i) {
-            Lifetime2D& life = lives[i];
-            if (!life.active) continue;
-            const EntityId id = entities[i];
-            const auto ch = static_cast<TimeChannel>(m_timeChannels[id.index]);
-            if (step.IsFrozen(ch)) continue;
-            if (life.remainingTicks > 0U) --life.remainingTicks;
-            if (life.fadeSpriteAlpha && life.initialTicks > 0U) {
-                life.alphaScale = static_cast<f32>(life.remainingTicks) / static_cast<f32>(life.initialTicks);
-                if ((m_componentMasks[id.index] & (1ULL << Sprite2D::kTypeId)) != 0ULL) {
-                    spritePool.DirectAtEntityIndex(id.index).tint.a = life.alphaScale;
-                }
-            }
-            if (life.remainingTicks == 0U) {
-                (void)DeferDestroy(id);
-            }
-        }
-    }
-
-    if ((m_registeredPoolsMask & (1ULL << PointLight2D::kTypeId)) != 0ULL) {
-        auto& lightPool = GetPool<PointLight2D>();
-        const auto entities = lightPool.Entities();
-        auto lights = lightPool.Components();
-        for (usize i = 0U; i < entities.size(); ++i) {
-            PointLight2D& light = lights[i];
-            const auto ch = static_cast<TimeChannel>(m_timeChannels[entities[i].index]);
-            if (!step.IsFrozen(ch) && light.pulseSpeed != 0.0f) {
-                light.pulsePhase += light.pulseSpeed * step.Dt(ch);
-            }
-        }
-    }
+    StepSpriteAnimationsOnly(step);
+    StepLifetimes(step);
+    StepPointLights(step);
 }
 
 void World::EndTick(const SimStepView& /*step*/) noexcept {
@@ -591,16 +599,12 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
         for (u8 c = 0U; c < rec.componentCount; ++c) {
             u8 tid = 0U;
             u16 compSize = 0U;
-            if (!reader.Read(tid) || !reader.Read(compSize) || reader.Remaining() < compSize) {
+            if (!reader.Read(tid) || !reader.Read(compSize)) {
                 return Err(WorldErrc::CorruptedPrefab);
             }
             const void* rawPtr = blob.data + reader.Offset();
-            // Advance reader directly without copying into a temporary stack buffer
-            std::string_view skipped{};
-            (void)skipped;
-            for (u16 b = 0U; b < compSize; ++b) {
-                u8 dummy = 0U;
-                (void)reader.Read(dummy);
+            if (!reader.Skip(compSize)) {
+                return Err(WorldErrc::CorruptedPrefab);
             }
             (void)EmplaceRawByTypeId(*entRes, tid, rawPtr);
         }

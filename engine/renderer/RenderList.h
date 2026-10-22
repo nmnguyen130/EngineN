@@ -225,6 +225,19 @@ public:
         u8 layer = 15,
         u8 viewSlot = 0) noexcept;
 
+    void PushTaperedArc(
+        Vec2 center,
+        f32 radius,
+        f32 startAngleRad,
+        f32 sweepAngleRad,
+        f32 thickness,
+        Color color,
+        u8 passId = 0,
+        u8 layer = 15,
+        u8 viewSlot = 0) noexcept {
+        PushSlashArc(center, radius, startAngleRad, sweepAngleRad, thickness, color, passId, layer, viewSlot);
+    }
+
     void PushBeam(
         Vec2 start,
         Vec2 end,

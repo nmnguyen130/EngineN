@@ -56,7 +56,7 @@ void DebugBatcher::PushLine(f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, Color
     if (!m_list) return;
     const f32 dx = x1 - x0;
     const f32 dy = y1 - y0;
-    const f32 len = std::hypot(dx, dy);
+    const f32 len = std::sqrt(dx * dx + dy * dy);
     if (len <= 1e-5f) return;
 
     const f32 invLen = 1.0f / len;
@@ -87,7 +87,7 @@ void DebugBatcher::PushArrow(
     PushLine(x0, y0, x1, y1, thickness, color);
     const f32 dx = x1 - x0;
     const f32 dy = y1 - y0;
-    const f32 len = std::hypot(dx, dy);
+    const f32 len = std::sqrt(dx * dx + dy * dy);
     if (len <= 1e-5f || headSize <= 1e-4f) return;
 
     const f32 ux = dx / len;
@@ -115,7 +115,7 @@ void DebugBatcher::PushCircleOutline(
     f32 prevY = cy;
     for (u32 i = 1U; i <= segs; ++i) {
         f32 s = 0.0f, c = 1.0f;
-        FastSinCos(static_cast<f32>(i) * stepRad, s, c);
+        FastSinCos(static_cast<f32>(i) * stepRad, c, s);
         const f32 nextX = cx + c * radius;
         const f32 nextY = cy + s * radius;
         PushLine(prevX, prevY, nextX, nextY, thickness, color);

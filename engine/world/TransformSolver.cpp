@@ -4,6 +4,7 @@ namespace en {
 
 bool TransformSolver::Init(AlignedArena& arena, u16 maxEntities) noexcept {
     if (maxEntities == 0U) return false;
+    const u32 marker = arena.SaveMarker();
     const usize wordCount = (static_cast<usize>(maxEntities) + 63U) >> 6U;
 
     auto localSpan = arena.Carve<LocalTransform2D>(maxEntities);
@@ -18,6 +19,7 @@ bool TransformSolver::Init(AlignedArena& arena, u16 maxEntities) noexcept {
     if (localSpan.empty() || worldSpan.empty() || prevSpan.empty() ||
         parentSpan.empty() || childSpan.empty() || siblingSpan.empty() ||
         dirtySpan.empty() || movedSpan.empty()) {
+        arena.RollbackToMarker(marker);
         return false;
     }
 

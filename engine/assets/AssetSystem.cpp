@@ -68,18 +68,19 @@ Result<void, AssetErrc> AssetSystem::MountPackMemory(
         basePtr = ownedPak.data();
     }
 
-    const auto* entries = reinterpret_cast<const EnPakEntry*>(basePtr + sizeof(EnPakHeader));
+    const u8* tocBytesPtr = basePtr + sizeof(EnPakHeader);
     if (hdr.headerCrc32 != 0U) {
-        const u32 actualTocCrc = ComputeTocCrc32(std::span<const EnPakEntry>(entries, hdr.entryCount));
+        const u32 actualTocCrc = ComputeCrc32(std::span<const u8>(tocBytesPtr, tocBytes));
         if (actualTocCrc != hdr.headerCrc32) {
             if (copyToArena) m_vfsArena.RollbackToMarker(marker);
             return Err(AssetErrc::CorruptedPackHeader);
         }
     }
 
-    // Validate all entry payload bounds before mutating the VFS table
+    // Validate all entry payload bounds before mutating the VFS table (alignment-safe for zero-copy external buffers)
     for (u32 i = 0U; i < hdr.entryCount; ++i) {
-        const EnPakEntry& e = entries[i];
+        EnPakEntry e{};
+        std::memcpy(&e, tocBytesPtr + static_cast<usize>(i) * sizeof(EnPakEntry), sizeof(EnPakEntry));
         if (e.assetId == 0ULL ||
             static_cast<usize>(e.offset) > pakBytes.size() ||
             static_cast<usize>(e.compressedSize) > (pakBytes.size() - static_cast<usize>(e.offset))) {
@@ -89,7 +90,8 @@ Result<void, AssetErrc> AssetSystem::MountPackMemory(
     }
 
     for (u32 i = 0U; i < hdr.entryCount; ++i) {
-        const EnPakEntry& e = entries[i];
+        EnPakEntry e{};
+        std::memcpy(&e, tocBytesPtr + static_cast<usize>(i) * sizeof(EnPakEntry), sizeof(EnPakEntry));
         if (const VfsTocSlot* existing = m_vfsTable.Find(e.assetId)) {
             if (existing->priority > priority) continue;
         }
@@ -300,8 +302,19 @@ bool AssetSystem::LoadSlotImmediate(
         }
         case AssetKind::Atlas: {
             const usize count = decoded.size() / sizeof(CookedAtlasSpriteEntry);
-            std::span<const CookedAtlasSpriteEntry> sprites(
-                reinterpret_cast<const CookedAtlasSpriteEntry*>(decoded.data()), count);
+            const CookedAtlasSpriteEntry* spritePtr = nullptr;
+            if ((reinterpret_cast<usize>(decoded.data()) & (alignof(CookedAtlasSpriteEntry) - 1U)) == 0U) {
+                spritePtr = reinterpret_cast<const CookedAtlasSpriteEntry*>(decoded.data());
+            } else if (count > 0U) {
+                auto alignedScratch = m_vfsArena.Carve<CookedAtlasSpriteEntry>(count);
+                if (alignedScratch.empty()) {
+                    m_bank.MarkFailed(masterSlot);
+                    return false;
+                }
+                std::memcpy(alignedScratch.data(), decoded.data(), count * sizeof(CookedAtlasSpriteEntry));
+                spritePtr = alignedScratch.data();
+            }
+            std::span<const CookedAtlasSpriteEntry> sprites(spritePtr, count);
             const auto h = m_bank.CommitAtlas(masterSlot, optionalBackingTex, sprites);
             if (isCompressed && !decompBuf.empty()) {
                 // Atlas entries were copied into m_sprites; reclaim temporary decompression slice immediately!
@@ -316,7 +329,19 @@ bool AssetSystem::LoadSlotImmediate(
         }
         case AssetKind::Audio: {
             const usize sampleCount = decoded.size() / sizeof(f32);
-            std::span<const f32> pcm(reinterpret_cast<const f32*>(decoded.data()), sampleCount);
+            const f32* pcmPtr = nullptr;
+            if ((reinterpret_cast<usize>(decoded.data()) & (alignof(f32) - 1U)) == 0U) {
+                pcmPtr = reinterpret_cast<const f32*>(decoded.data());
+            } else if (sampleCount > 0U) {
+                auto alignedPcm = m_vfsArena.Carve<f32>(sampleCount);
+                if (alignedPcm.empty()) {
+                    m_bank.MarkFailed(masterSlot);
+                    return false;
+                }
+                std::memcpy(alignedPcm.data(), decoded.data(), sampleCount * sizeof(f32));
+                pcmPtr = alignedPcm.data();
+            }
+            std::span<const f32> pcm(pcmPtr, sampleCount);
             const auto h = m_bank.CommitAudio(
                 masterSlot,
                 pcm,

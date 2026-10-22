@@ -151,18 +151,12 @@ Result<void, FrameworkError> Application::Init(
             FrameworkErrc::AudioInitFailed, SubSystemStage::Audio, static_cast<u16>(r.error())});
     }
 
-    // 3. Initialize World and register built-in 2D component pools
+    // 3. Initialize World (automatically registers built-in 2D component pools)
     if (auto r = m_rt->world.Init(cfg.world); !r) {
         Shutdown();
         return Err(FrameworkError{
             FrameworkErrc::WorldInitFailed, SubSystemStage::World, static_cast<u16>(r.error())});
     }
-
-    (void)m_rt->world.RegisterComponentPool<Tag2D>();
-    (void)m_rt->world.RegisterComponentPool<Lifetime2D>();
-    (void)m_rt->world.RegisterComponentPool<Sprite2D>();
-    (void)m_rt->world.RegisterComponentPool<SpriteAnimator2D>();
-    (void)m_rt->world.RegisterComponentPool<CameraRig2D>();
 
     if (hooks.onRegisterComponents) {
         if (auto r = hooks.onRegisterComponents(m_rt->world, m_userAppState); !r) {
@@ -327,7 +321,7 @@ void Application::RouteSimCuesAndSyncAudio(SimContext& simCtx, const SimStepView
         if (!phys) return false;
         const f32 dx = ex - lx;
         const f32 dy = ey - ly;
-        const f32 dist = std::hypot(dx, dy);
+        const f32 dist = std::sqrt(dx * dx + dy * dy);
         if (dist <= 1e-3f) return false;
         const RayHit2D hit = phys->Raycast(lx, ly, dx / dist, dy / dist, dist, 0x0001U);
         return hit.Hit();
@@ -375,20 +369,6 @@ void Application::ExtractAndCompileRenderFrame() noexcept {
 
     m_rt->activeEmitterCount = m_rt->audio.ExtractActiveEmitters(m_rt->audioEmitterScratch);
 
-    SubsystemTelemetryDesc tele{};
-    tele.channelScales = m_rt->time.EffectiveScales().data();
-    tele.aliveEntities = static_cast<u16>(std::min<u32>(65535U, m_rt->world.AliveCount()));
-    tele.submittedQuads = static_cast<u16>(std::min<u32>(65535U, m_rt->renderList.Stats().submittedQuads));
-    tele.activeContacts = static_cast<u16>(std::min<usize>(65535U, m_rt->physics.ActiveManifolds().size()));
-    tele.catchupTicks = m_rt->time.Telemetry().ticksLastFrame;
-    tele.audioActiveVoices = m_rt->audio.Telemetry().activeVoiceCount;
-    tele.audioVirtualVoices = m_rt->audio.Telemetry().virtualVoiceCount;
-    tele.audioStolenVoices = m_rt->audio.Telemetry().stolenVoiceCount;
-    tele.frozenChannelMask = static_cast<u8>(
-        m_rt->time.FrozenMask() | (m_statePausedClock != 0U ? 0x7EU : 0U));
-    tele.audioMusicStems = static_cast<u8>(m_rt->audio.Telemetry().activeMusicStems);
-    m_rt->debug.Profiler().RecordSubsystemTelemetry(tele);
-
     DebugFrameContext dbgCtx{};
     dbgCtx.world = &m_rt->world;
     dbgCtx.physics = &m_rt->physics;
@@ -402,8 +382,26 @@ void Application::ExtractAndCompileRenderFrame() noexcept {
     dbgCtx.isPaused = (m_rt->time.IsPaused() || m_statePausedClock != 0U) ? 1U : 0U;
 
     m_rt->debug.EmitOverlays(dbgCtx, m_rt->renderList);
-    m_rt->debug.Profiler().EndFrame();
     m_rt->renderList.Compile();
+
+    const RenderStats& rStats = m_rt->renderList.Stats();
+    SubsystemTelemetryDesc tele{};
+    tele.channelScales = m_rt->time.EffectiveScales().data();
+    tele.aliveEntities = static_cast<u16>(std::min<u32>(65535U, m_rt->world.AliveCount()));
+    tele.submittedQuads = static_cast<u16>(std::min<u32>(65535U, rStats.submittedQuads));
+    tele.culledQuads = static_cast<u16>(std::min<u32>(65535U, rStats.culledQuads));
+    tele.drawBatches = static_cast<u16>(std::min<u32>(65535U, rStats.drawBatches));
+    tele.activeContacts = static_cast<u16>(std::min<usize>(65535U, m_rt->physics.ActiveManifolds().size()));
+    tele.catchupTicks = m_rt->time.Telemetry().ticksLastFrame;
+    tele.audioActiveVoices = m_rt->audio.Telemetry().activeVoiceCount;
+    tele.audioVirtualVoices = m_rt->audio.Telemetry().virtualVoiceCount;
+    tele.audioStolenVoices = m_rt->audio.Telemetry().stolenVoiceCount;
+    tele.frozenChannelMask = static_cast<u8>(
+        m_rt->time.FrozenMask() | (m_statePausedClock != 0U ? 0x7EU : 0U));
+    tele.radixPasses = rStats.radixPassesRun;
+    tele.audioMusicStems = static_cast<u8>(m_rt->audio.Telemetry().activeMusicStems);
+    m_rt->debug.Profiler().RecordSubsystemTelemetry(tele);
+    m_rt->debug.Profiler().EndFrame();
 }
 
 Result<void, FrameworkError> Application::StepFrame(u64 rawDeltaNs) noexcept {

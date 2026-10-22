@@ -611,7 +611,10 @@ AtlasHandle AssetBank::CommitAtlas(
         return {};
     }
 
-    const TextureRecord& texRec = GetTexture(texHandle);
+    const bool validTex =
+        (texHandle.index < m_highWaterTex) && (m_texGens[texHandle.index] == texHandle.generation);
+    const u16 resolvedTexSlot = validTex ? texHandle.index : 0U;
+    const TextureRecord& texRec = m_textures[resolvedTexSlot];
     const u16 firstSprite = m_highWaterSprite;
     for (const CookedAtlasSpriteEntry& e : entries) {
         const u16 spIdx = m_highWaterSprite++;
@@ -631,7 +634,7 @@ AtlasHandle AssetBank::CommitAtlas(
     AtlasRecord& rec = m_atlases[atlasIdx];
     rec.firstSprite = firstSprite;
     rec.spriteCount = static_cast<u16>(entries.size());
-    rec.textureSlot = texHandle.index;
+    rec.textureSlot = resolvedTexSlot;
     rec.generation = meta.generation;
 
     CompleteSlot(meta, AssetState::Ready);
@@ -657,7 +660,10 @@ AtlasHandle AssetBank::CommitGridAtlas(
         return {};
     }
 
-    const TextureRecord& texRec = GetTextureBySlot(texHandle.index);
+    const bool validTex =
+        (texHandle.index < m_highWaterTex) && (m_texGens[texHandle.index] == texHandle.generation);
+    const u16 resolvedTexSlot = validTex ? texHandle.index : 0U;
+    const TextureRecord& texRec = m_textures[resolvedTexSlot];
     const f32 invCols = 1.0f / static_cast<f32>(cols);
     const f32 invRows = 1.0f / static_cast<f32>(rows);
     const f32 cellW = static_cast<f32>(texRec.width > 0U ? texRec.width : cols) * invCols;
@@ -686,7 +692,7 @@ AtlasHandle AssetBank::CommitGridAtlas(
     AtlasRecord& rec = m_atlases[atlasIdx];
     rec.firstSprite = firstSprite;
     rec.spriteCount = static_cast<u16>(totalFrames);
-    rec.textureSlot = texHandle.index;
+    rec.textureSlot = resolvedTexSlot;
     rec.generation = meta.generation;
 
     CompleteSlot(meta, AssetState::Ready);
@@ -827,9 +833,11 @@ void AssetBank::EvictSlotInternal(
                 if (tex.gpu == kWhiteTexture && tex.pixels != nullptr && m_pendingGpuTexCount > 0U) {
                     --m_pendingGpuTexCount;
                 }
-                if (tex.gpu.IsValid() && tex.gpu != kWhiteTexture &&
-                    ioGpuDestroyCount < outDestroyedGpuTextures.size()) {
-                    outDestroyedGpuTextures[ioGpuDestroyCount++] = tex.gpu;
+                if (tex.gpu.IsValid() && tex.gpu != kWhiteTexture) {
+                    PropagateAtlasGpuTexture(payloadIdx, kWhiteTexture);
+                    if (ioGpuDestroyCount < outDestroyedGpuTextures.size()) {
+                        outDestroyedGpuTextures[ioGpuDestroyCount++] = tex.gpu;
+                    }
                 }
                 if (tex.pixels != nullptr && tex.pixels != kFallbackWhitePixel && bytes > 0U) {
                     FreePayloadSlice(tex.pixels, bytes);

@@ -177,23 +177,41 @@ Result<bool, FrameworkErrc> SceneDirector::ActivatePendingScene(SceneLoadContext
         if (manifestBlob.IsValid()) {
             const BlobRecord& rec = assetBank.GetBlob(manifestBlob);
             if (rec.data != nullptr && rec.size >= sizeof(CookedSceneManifestHeader)) {
-                const auto* hdr = reinterpret_cast<const CookedSceneManifestHeader*>(rec.data);
+                CookedSceneManifestHeader hdr{};
+                std::memcpy(&hdr, rec.data, sizeof(CookedSceneManifestHeader));
                 const usize expectedBytes = sizeof(CookedSceneManifestHeader) +
-                                            static_cast<usize>(hdr->assetEntryCount) * sizeof(CookedSceneAssetEntry);
-                if (hdr->magic != CookedSceneManifestHeader::kMagic ||
-                    hdr->version != CookedSceneManifestHeader::kVersion ||
+                                            static_cast<usize>(hdr.assetEntryCount) * sizeof(CookedSceneAssetEntry);
+                if (hdr.magic != CookedSceneManifestHeader::kMagic ||
+                    hdr.version != CookedSceneManifestHeader::kVersion ||
                     rec.size < expectedBytes) {
                     return Err(FrameworkErrc::CorruptedSceneManifest);
                 }
-                const auto* entries = reinterpret_cast<const CookedSceneAssetEntry*>(
-                    rec.data + sizeof(CookedSceneManifestHeader));
-                const std::span<const CookedSceneAssetEntry> entrySpan{entries, hdr->assetEntryCount};
-                if (hdr->checksum != 0U && ComputeSceneManifestChecksum(entrySpan) != hdr->checksum) {
-                    return Err(FrameworkErrc::CorruptedSceneManifest);
+                const u8* entriesBytes = rec.data + sizeof(CookedSceneManifestHeader);
+                if (hdr.checksum != 0U) {
+                    u32 h = 2166136261U;
+                    for (u32 i = 0U; i < hdr.assetEntryCount; ++i) {
+                        CookedSceneAssetEntry e{};
+                        std::memcpy(&e, entriesBytes + static_cast<usize>(i) * sizeof(CookedSceneAssetEntry), sizeof(CookedSceneAssetEntry));
+                        const u64 idVal = e.id.value;
+                        for (u32 b = 0U; b < 8U; ++b) {
+                            h ^= static_cast<u32>((idVal >> (b * 8U)) & 0xFFU);
+                            h *= 16777619U;
+                        }
+                        h ^= static_cast<u32>(e.kind);
+                        h *= 16777619U;
+                        h ^= static_cast<u32>(e.residency);
+                        h *= 16777619U;
+                    }
+                    const u32 actualChecksum = (h == 0U) ? 1U : h;
+                    if (actualChecksum != hdr.checksum) {
+                        return Err(FrameworkErrc::CorruptedSceneManifest);
+                    }
                 }
-                manifestMusicTrackId = hdr->musicTrackId;
+                manifestMusicTrackId = hdr.musicTrackId;
                 bool needsLoad = false;
-                for (const CookedSceneAssetEntry& e : entrySpan) {
+                for (u32 i = 0U; i < hdr.assetEntryCount; ++i) {
+                    CookedSceneAssetEntry e{};
+                    std::memcpy(&e, entriesBytes + static_cast<usize>(i) * sizeof(CookedSceneAssetEntry), sizeof(CookedSceneAssetEntry));
                     if (e.id.IsValid()) {
                         (void)assetBank.AcquireSlot(e.id, e.kind, m_stagingScope, e.residency, needsLoad);
                     }

@@ -45,6 +45,7 @@ enum class CancelCategory : u8 {
     Skill   = 1U << 6U,
     Any     = 0xFFU,
 };
+consteval bool enable_bitmask_operators(CancelCategory) noexcept { return true; }
 
 enum class MotionFlags : u8 {
     None          = 0,
@@ -55,6 +56,7 @@ enum class MotionFlags : u8 {
     WallSliding   = 1U << 4U,
     JumpCutApplied = 1U << 5U,
 };
+consteval bool enable_bitmask_operators(MotionFlags) noexcept { return true; }
 
 enum class HitboxFlags : u8 {
     None           = 0,
@@ -64,6 +66,7 @@ enum class HitboxFlags : u8 {
     Unblockable    = 1U << 3U,
     FlipWithFacing = 1U << 4U,
 };
+consteval bool enable_bitmask_operators(HitboxFlags) noexcept { return true; }
 
 enum class ReceiverFlags : u8 {
     None         = 0,
@@ -72,6 +75,7 @@ enum class ReceiverFlags : u8 {
     Parrying     = 1U << 2U,
     Dead         = 1U << 3U,
 };
+consteval bool enable_bitmask_operators(ReceiverFlags) noexcept { return true; }
 
 enum class HitOutcome : u8 {
     None          = 0,
@@ -88,6 +92,7 @@ enum class CameraCtrlFlags : u8 {
     ConfineToRoom   = 1U << 2U,
     SnapNextStep    = 1U << 3U,
 };
+consteval bool enable_bitmask_operators(CameraCtrlFlags) noexcept { return true; }
 
 enum class FrameDirectiveOp : u8 {
     None             = 0,

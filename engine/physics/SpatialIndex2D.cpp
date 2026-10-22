@@ -7,11 +7,13 @@ namespace en {
 
 bool SpatialIndex2D::Init(AlignedArena& arena, u16 maxProxies, f32 cellSizeMeters) noexcept {
     if (maxProxies == 0U || cellSizeMeters <= 0.05f) return false;
+    const u32 marker = arena.SaveMarker();
     auto boxesSpan = arena.Carve<SpatialBox2D>(static_cast<usize>(maxProxies) * 2U);
     auto offsetsSpan = arena.Carve<u32>(kGridCells + 1U);
     auto refsSpan = arena.Carve<u16>(static_cast<usize>(maxProxies) * 8U);
 
     if (boxesSpan.empty() || offsetsSpan.empty() || refsSpan.empty()) {
+        arena.RollbackToMarker(marker);
         return false;
     }
 
@@ -90,9 +92,11 @@ Result<void, PhysicsErrc> SpatialIndex2D::BuildTileMapFromGrid(
 
     const u16 chunkCols = static_cast<u16>((widthTiles + 7U) >> 3U);
     const u16 chunkRows = static_cast<u16>((heightTiles + 7U) >> 3U);
+    const u32 marker = arena.SaveMarker();
     auto bitplaneSpan = arena.Carve<u64>(static_cast<usize>(chunkCols) * chunkRows);
     auto flagSpan = arena.Carve<u8>(static_cast<usize>(widthTiles) * heightTiles);
     if (bitplaneSpan.empty() || flagSpan.empty()) {
+        arena.RollbackToMarker(marker);
         return Err(PhysicsErrc::OutOfMemory);
     }
 
@@ -326,6 +330,10 @@ RayHit2D SpatialIndex2D::Raycast(
 
     const auto testBox = [&](const SpatialBox2D& b) noexcept {
         if (b.entity == ignoreEntity || (b.categoryBits & categoryMask) == 0U) return;
+        if (b.BoundMaxX() < rayMinX || b.BoundMinX() > rayMaxX ||
+            b.BoundMaxY() < rayMinY || b.BoundMinY() > rayMaxY) {
+            return;
+        }
         RayHit2D h{};
         if (b.shape == ShapeKind2D::Circle) {
             const f32 cx = 0.5f * (b.minX + b.maxX);
@@ -432,8 +440,15 @@ SweepHit2D SpatialIndex2D::SweepAabb(
             const u32 end = m_cellOffsets[cell + 1U];
             for (u32 r = begin; r < end; ++r) {
                 const SpatialBox2D& b = m_boxes[m_cellBoxIndices[r]];
-                if (b.entity == ignoreEntity || HasPhysicsFlag(b.flags, ColliderFlags2D::IsSensor)) continue;
+                if (b.entity == ignoreEntity || b.entity == best.hitEntity ||
+                    HasPhysicsFlag(b.flags, ColliderFlags2D::IsSensor)) {
+                    continue;
+                }
                 if ((b.categoryBits & solidMask) == 0U) continue;
+                if (b.BoundMaxX() < sweepMinX || b.BoundMinX() > sweepMaxX ||
+                    b.BoundMaxY() < sweepMinY || b.BoundMinY() > sweepMaxY) {
+                    continue;
+                }
 
                 const bool isOneWay = HasPhysicsFlag(b.flags, ColliderFlags2D::IsOneWay);
                 if (isOneWay && ignoreOneWay) continue;
@@ -521,18 +536,41 @@ u32 SpatialIndex2D::QueryCircle(
     EntityId ignoreEntity) const noexcept {
     u32 count = 0U;
     const f32 rSq = radius * radius;
-    for (u16 i = 0U; i < m_boxCount; ++i) {
-        const SpatialBox2D& b = m_boxes[i];
-        if (b.entity == ignoreEntity || (b.categoryBits & categoryMask) == 0U) continue;
+    const i32 minCX = static_cast<i32>(std::floor((centerX - radius) * m_invCellSize));
+    const i32 maxCX = static_cast<i32>(std::floor((centerX + radius) * m_invCellSize));
+    const i32 minCY = static_cast<i32>(std::floor((centerY - radius) * m_invCellSize));
+    const i32 maxCY = static_cast<i32>(std::floor((centerY + radius) * m_invCellSize));
+
+    const auto checkAndAppend = [&](const SpatialBox2D& b) noexcept {
+        if (b.entity == ignoreEntity || (b.categoryBits & categoryMask) == 0U) return;
         const f32 closestX = std::clamp(centerX, b.BoundMinX(), b.BoundMaxX());
         const f32 closestY = std::clamp(centerY, b.BoundMinY(), b.BoundMaxY());
         const f32 dx = centerX - closestX;
         const f32 dy = centerY - closestY;
-        if (dx * dx + dy * dy <= rSq) {
-            if (count < outEntities.size()) {
-                outEntities[count] = b.entity;
+        if (dx * dx + dy * dy > rSq) return;
+        for (u32 k = 0U; k < std::min<u32>(count, static_cast<u32>(outEntities.size())); ++k) {
+            if (outEntities[k] == b.entity) return;
+        }
+        if (count < outEntities.size()) {
+            outEntities[count] = b.entity;
+        }
+        ++count;
+    };
+
+    if ((maxCX - minCX) <= 6 && (maxCY - minCY) <= 6) {
+        for (i32 cy = minCY; cy <= maxCY; ++cy) {
+            for (i32 cx = minCX; cx <= maxCX; ++cx) {
+                const u32 cell = HashCellCoords(cx, cy);
+                const u32 begin = m_cellOffsets[cell];
+                const u32 end = m_cellOffsets[cell + 1U];
+                for (u32 r = begin; r < end; ++r) {
+                    checkAndAppend(m_boxes[m_cellBoxIndices[r]]);
+                }
             }
-            ++count;
+        }
+    } else {
+        for (u16 i = 0U; i < m_boxCount; ++i) {
+            checkAndAppend(m_boxes[i]);
         }
     }
     return count;

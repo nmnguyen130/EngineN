@@ -40,6 +40,10 @@ enum class AudioBusId : u8 {
     Ambience  = 5,
     Ui        = 6,
     Voice     = 7,
+    // Domain-neutral SFX bus aliases for non-combat genres
+    Sfx0      = SfxPlayer,
+    Sfx1      = SfxCombat,
+    Sfx2      = SfxWorld,
 };
 
 enum class FilterMode : u8 {
@@ -74,25 +78,10 @@ enum class VoiceFlags : u8 {
     ReverbSend        = 1U << 7U,
 };
 
-[[nodiscard]] constexpr VoiceFlags operator|(VoiceFlags a, VoiceFlags b) noexcept {
-    return static_cast<VoiceFlags>(static_cast<u8>(a) | static_cast<u8>(b));
-}
-[[nodiscard]] constexpr VoiceFlags operator&(VoiceFlags a, VoiceFlags b) noexcept {
-    return static_cast<VoiceFlags>(static_cast<u8>(a) & static_cast<u8>(b));
-}
-[[nodiscard]] constexpr VoiceFlags operator~(VoiceFlags a) noexcept {
-    return static_cast<VoiceFlags>(~static_cast<u8>(a));
-}
-constexpr VoiceFlags& operator|=(VoiceFlags& a, VoiceFlags b) noexcept {
-    a = a | b;
-    return a;
-}
-constexpr VoiceFlags& operator&=(VoiceFlags& a, VoiceFlags b) noexcept {
-    a = a & b;
-    return a;
-}
+consteval bool enable_bitmask_operators(VoiceFlags) noexcept { return true; }
+
 [[nodiscard]] constexpr bool HasVoiceFlag(VoiceFlags flags, VoiceFlags test) noexcept {
-    return (static_cast<u8>(flags) & static_cast<u8>(test)) != 0U;
+    return HasFlag(flags, test);
 }
 
 enum class AudioCmdType : u8 {

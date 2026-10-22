@@ -108,10 +108,14 @@ class alignas(32) ComponentPool : public RawComponentPool {
 public:
     [[nodiscard]] bool Init(AlignedArena& arena, u16 maxEntities, u16 capacity) noexcept {
         if (maxEntities == 0U || capacity == 0U) return false;
+        const u32 marker = arena.SaveMarker();
         auto sparseSpan = arena.Carve<u16>(maxEntities);
         auto entitySpan = arena.Carve<EntityId>(capacity);
         auto compSpan = arena.Carve<T>(capacity);
-        if (sparseSpan.empty() || entitySpan.empty() || compSpan.empty()) return false;
+        if (sparseSpan.empty() || entitySpan.empty() || compSpan.empty()) {
+            arena.RollbackToMarker(marker);
+            return false;
+        }
 
         m_sparse = sparseSpan.data();
         m_denseEntities = entitySpan.data();

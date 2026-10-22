@@ -267,6 +267,9 @@ public:
 
     void BeginTick(const SimStepView& step) noexcept;
     void StepAmbientVelocities(const SimStepView& step) noexcept;
+    void StepSpriteAnimationsOnly(const SimStepView& step) noexcept;
+    void StepLifetimes(const SimStepView& step) noexcept;
+    void StepPointLights(const SimStepView& step) noexcept;
     void StepAnimations(const SimStepView& step) noexcept;
     void StepAnimationsAndLifetimes(const SimStepView& step) noexcept;
     void EndTick(const SimStepView& step = {}) noexcept;

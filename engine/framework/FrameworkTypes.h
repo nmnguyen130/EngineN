@@ -95,14 +95,10 @@ enum class StateLayerFlags : u8 {
     PauseSimClock      = 1U << 3U, // Freezes World/Gameplay/Physics ticks while keeping UI & top modal state ticking
 };
 
-[[nodiscard]] constexpr StateLayerFlags operator|(StateLayerFlags a, StateLayerFlags b) noexcept {
-    return static_cast<StateLayerFlags>(static_cast<u8>(a) | static_cast<u8>(b));
-}
-[[nodiscard]] constexpr StateLayerFlags operator&(StateLayerFlags a, StateLayerFlags b) noexcept {
-    return static_cast<StateLayerFlags>(static_cast<u8>(a) & static_cast<u8>(b));
-}
+consteval bool enable_bitmask_operators(StateLayerFlags) noexcept { return true; }
+
 [[nodiscard]] constexpr bool HasStateFlag(StateLayerFlags flags, StateLayerFlags test) noexcept {
-    return (static_cast<u8>(flags) & static_cast<u8>(test)) != 0U;
+    return HasFlag(flags, test);
 }
 
 enum class StateCmdKind : u8 {

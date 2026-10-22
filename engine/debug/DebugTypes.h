@@ -78,32 +78,10 @@ enum class OverlayFlags : u32 {
     AllHud             = 0x0000FC00U,
 };
 
-[[nodiscard]] constexpr OverlayFlags operator|(OverlayFlags a, OverlayFlags b) noexcept {
-    return static_cast<OverlayFlags>(static_cast<u32>(a) | static_cast<u32>(b));
-}
-[[nodiscard]] constexpr OverlayFlags operator&(OverlayFlags a, OverlayFlags b) noexcept {
-    return static_cast<OverlayFlags>(static_cast<u32>(a) & static_cast<u32>(b));
-}
-[[nodiscard]] constexpr OverlayFlags operator^(OverlayFlags a, OverlayFlags b) noexcept {
-    return static_cast<OverlayFlags>(static_cast<u32>(a) ^ static_cast<u32>(b));
-}
-[[nodiscard]] constexpr OverlayFlags operator~(OverlayFlags a) noexcept {
-    return static_cast<OverlayFlags>(~static_cast<u32>(a));
-}
-constexpr OverlayFlags& operator|=(OverlayFlags& a, OverlayFlags b) noexcept {
-    a = a | b;
-    return a;
-}
-constexpr OverlayFlags& operator&=(OverlayFlags& a, OverlayFlags b) noexcept {
-    a = a & b;
-    return a;
-}
-constexpr OverlayFlags& operator^=(OverlayFlags& a, OverlayFlags b) noexcept {
-    a = a ^ b;
-    return a;
-}
+consteval bool enable_bitmask_operators(OverlayFlags) noexcept { return true; }
+
 [[nodiscard]] constexpr bool HasOverlay(OverlayFlags mask, OverlayFlags test) noexcept {
-    return (static_cast<u32>(mask) & static_cast<u32>(test)) != 0U;
+    return HasFlag(mask, test);
 }
 
 enum class ProfileScopeId : u8 {

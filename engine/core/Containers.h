@@ -20,10 +20,12 @@ public:
 
     [[nodiscard]] bool Init(AlignedArena& arena, u16 capacity) noexcept {
         if (capacity == 0U || capacity == kNullSlot) return false;
+        const u32 marker = arena.SaveMarker();
         auto values = arena.Carve<T>(capacity);
         auto slots = arena.Carve<SparseSlot>(capacity);
         auto denseToSparse = arena.Carve<u16>(capacity);
         if (values.empty() || slots.empty() || denseToSparse.empty()) {
+            arena.RollbackToMarker(marker);
             m_values = nullptr;
             m_slots = nullptr;
             m_denseToSparse = nullptr;
@@ -130,7 +132,6 @@ private:
     u16 m_capacity{0};
     u16 m_activeCount{0};
     u16 m_freeHead{kNullSlot};
-    u16 m_pad{0};
 };
 static_assert(sizeof(SlotMap<u32>) == 32);
 

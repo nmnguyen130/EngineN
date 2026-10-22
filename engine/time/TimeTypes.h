@@ -21,14 +21,27 @@ inline constexpr u32 kMaxTimeChannels = 8U;
 inline constexpr u8 kGameplayChannelsMask = 0x3FU;
 
 enum class TimeChannel : u8 {
-    World = 0,
-    Player = 1,
-    Enemy = 2,
+    World      = 0,
+    Player     = 1,
+    Enemy      = 2,
     Projectile = 3,
-    Vfx = 4,
-    Camera = 5,
-    Ui = 6,
-    Custom = 7,
+    Vfx        = 4,
+    Camera     = 5,
+    Ui         = 6,
+    Custom     = 7,
+
+    // Generic domain-neutral aliases for non-combat / general simulation clients
+    Sim0       = 1,
+    Sim1       = 2,
+    Sim2       = 3,
+    Channel0   = 0,
+    Channel1   = 1,
+    Channel2   = 2,
+    Channel3   = 3,
+    Channel4   = 4,
+    Channel5   = 5,
+    Channel6   = 6,
+    Channel7   = 7,
 };
 
 inline namespace literals {

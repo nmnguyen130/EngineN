@@ -9,49 +9,9 @@
 
 namespace en {
 
-template <typename E>
-concept PhysicsBitmaskEnum = std::is_enum_v<E> && requires {
-    typename std::underlying_type_t<E>;
-};
-
-template <PhysicsBitmaskEnum E>
-[[nodiscard]] constexpr E operator|(E a, E b) noexcept {
-    return static_cast<E>(static_cast<std::underlying_type_t<E>>(a) |
-                          static_cast<std::underlying_type_t<E>>(b));
-}
-
-template <PhysicsBitmaskEnum E>
-[[nodiscard]] constexpr E operator&(E a, E b) noexcept {
-    return static_cast<E>(static_cast<std::underlying_type_t<E>>(a) &
-                          static_cast<std::underlying_type_t<E>>(b));
-}
-
-template <PhysicsBitmaskEnum E>
-[[nodiscard]] constexpr E operator^(E a, E b) noexcept {
-    return static_cast<E>(static_cast<std::underlying_type_t<E>>(a) ^
-                          static_cast<std::underlying_type_t<E>>(b));
-}
-
-template <PhysicsBitmaskEnum E>
-[[nodiscard]] constexpr E operator~(E a) noexcept {
-    return static_cast<E>(~static_cast<std::underlying_type_t<E>>(a));
-}
-
-template <PhysicsBitmaskEnum E>
-constexpr E& operator|=(E& a, E b) noexcept {
-    a = a | b;
-    return a;
-}
-
-template <PhysicsBitmaskEnum E>
-constexpr E& operator&=(E& a, E b) noexcept {
-    a = a & b;
-    return a;
-}
-
-template <PhysicsBitmaskEnum E>
+template <BitmaskEnum E>
 [[nodiscard]] constexpr bool HasPhysicsFlag(E flags, E test) noexcept {
-    return static_cast<std::underlying_type_t<E>>(flags & test) != 0;
+    return HasFlag(flags, test);
 }
 
 enum class PhysicsErrc : u8 {
@@ -83,6 +43,7 @@ enum class ColliderFlags2D : u8 {
     IsSensor = 1U << 0U,
     IsOneWay = 1U << 1U,
 };
+consteval bool enable_bitmask_operators(ColliderFlags2D) noexcept { return true; }
 
 enum class ContactFlags : u8 {
     None      = 0,
@@ -95,6 +56,7 @@ enum class ContactFlags : u8 {
     Submerged = 1U << 6U,
     Crushed   = 1U << 7U,
 };
+consteval bool enable_bitmask_operators(ContactFlags) noexcept { return true; }
 
 enum class BodyFlags2D : u8 {
     None          = 0,
@@ -106,12 +68,14 @@ enum class BodyFlags2D : u8 {
     UseGravity    = 1U << 5U,
     Enabled       = 1U << 6U,
 };
+consteval bool enable_bitmask_operators(BodyFlags2D) noexcept { return true; }
 
 enum class TileMaterialFlags : u8 {
     Empty  = 0,
     Solid  = 1U << 0U,
     OneWay = 1U << 1U,
 };
+consteval bool enable_bitmask_operators(TileMaterialFlags) noexcept { return true; }
 
 enum class ContactEventKind : u8 {
     BeginTouch  = 0,
