@@ -148,7 +148,7 @@ public:
             [[nodiscard]] constexpr auto operator*() const noexcept {
                 const EntityId id = *cur;
                 return std::tie(
-                    id,
+                    *cur,
                     world->template GetPool<FirstC>().DirectAtEntityIndex(id.index),
                     world->template GetPool<RestCs>().DirectAtEntityIndex(id.index)...);
             }

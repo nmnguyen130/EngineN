@@ -22,7 +22,7 @@
     ├── AssetHandle              ✅ DONE
     ├── AssetManager             ✅ DONE
     ├── Texture loading          ✅ DONE
-    └── Future: audio/font/shader
+    └── Audio/font/atlas/blob    ✅ DONE
 
 05. Scene / World
     ├── Entity                   ✅ DONE
@@ -52,11 +52,12 @@
     ├── Debug draw               ✅ DONE
     ├── Profiler                 ✅ DONE
     ├── Console                  ✅ DONE
-    └── ImGui later              ⏳ PLANNED
+    └── WatchPlots / Inspector   ✅ DONE
 
-10. Production
-    ├── Serialization
-    ├── Config
-    ├── Save/Load
-    ├── Packaging
-    └── Build/release pipeline
+10. Production & Veil of the Silent (GDD v0.2)
+    ├── Serialization            ✅ DONE
+    ├── Config                   ✅ DONE
+    ├── Save/Load                ✅ DONE
+    ├── Packaging                ✅ DONE
+    ├── Build/release pipeline   ✅ DONE
+    └── Veil of the Silent v0.2  ✅ DONE
