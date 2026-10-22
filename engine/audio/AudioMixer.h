@@ -1,96 +1,90 @@
 #pragma once
 
 #include "audio/AudioTypes.h"
-#include "core/Memory.h"
 
 namespace en {
 
-// Pure C++23 64-voice SoA polyphonic mixer with Hermite4 resampler, Cytomic SVF, reverb, and compressor.
-// Non-owning view over arena memory; deterministic across headless and hardware playback.
-// Invariant: MixBlock outputs finite [-1, 1] soft-clipped stereo samples with zero allocations.
-class alignas(64) AudioDspAndMixer {
+// 64-byte (1 cache line exact, zero padding) pure C++23 polyphonic SoA synthesizer, virtual-voice tracker, and 8-bus DSP mixer.
+// Non-owning view over a single contiguous MixerArenaState block; zero heap allocations and zero OS/SDL headers.
+// Invariant: sizeof(AudioMixer) == 64, out-of-earshot looping voices advance phase in O(1), and output samples are bounded within [-1.0, +1.0].
+class alignas(64) AudioMixer {
 public:
-    struct VoiceSlot {
-        const f32* pcm{nullptr};
-        u32 frameCount{0};
-        f64 playhead{0.0};
-        f32 pitchStep{1.0f};
-        f32 curGainL{0.0f};
-        f32 curGainR{0.0f};
-        f32 svfIc1EqL{0.0f};
-        f32 svfIc2EqL{0.0f};
-        f32 cutoffRatio{0.45f};
-        u32 emitterId{kNullAudioEmitter};
-        Vec2 worldPos{};
-        f32 maxDist{18.0f};
-        f32 baseGain{0.8f};
-        AudioBusId bus{AudioBusId::SfxCombat};
-        TimeChannel channel{TimeChannel::World};
-        VoiceFlags flags{VoiceFlags::None};
-        ScopeId scopeId{0};
-        u16 generation{1};
-        bool active{false};
-    };
+    [[nodiscard]] static constexpr usize RequiredArenaBytes() noexcept { return 65536U; }
 
-    [[nodiscard]] bool Init(AlignedArena& arena) noexcept;
+    [[nodiscard]] Result<void, AudioErrc> Init(std::span<u8> arenaSlice) noexcept;
     void Reset() noexcept;
 
-    [[nodiscard]] VoiceHandle SpawnVoice(
-        const SoundCueDef& def,
-        const AudioRecord& clip,
-        Vec2 worldPos,
-        u32 emitterId,
-        ScopeId scope) noexcept;
+    void ApplyCommand(const AudioCommand& cmd) noexcept;
 
-    void StopVoice(VoiceHandle h) noexcept;
     void MixBlock(
         const AudioFrameSnapshot& snapshot,
-        std::span<f32, kAudioMixBlockFrames * 2> outStereo) noexcept;
+        std::span<f32, kMixBlockFrames * 2U> outInterleavedStereo) noexcept;
 
-    constexpr void SetReverbConfig(const ReverbConfig& cfg) noexcept { m_reverbCfg = cfg; }
-    constexpr void SetCompressorConfig(const CompressorConfig& cfg) noexcept { m_compCfg = cfg; }
-
-    [[nodiscard]] constexpr std::span<VoiceSlot> Voices() noexcept { return m_voices; }
-    [[nodiscard]] constexpr std::span<const VoiceSlot> Voices() const noexcept { return m_voices; }
     [[nodiscard]] constexpr const AudioTelemetrySnapshot& Telemetry() const noexcept { return m_telemetry; }
+    [[nodiscard]] constexpr u64 ActiveVoiceMask() const noexcept { return m_activeVoicesMask; }
+    [[nodiscard]] constexpr u64 VirtualVoiceMask() const noexcept { return m_virtualVoicesMask; }
+    [[nodiscard]] u32 ActiveAssetScopesMask() const noexcept;
+
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
-    [[nodiscard]] static constexpr f32 SampleHermite4(
-        f32 xm1, f32 x0, f32 x1, f32 x2, f32 frac) noexcept {
-        const f32 c = (x1 - xm1) * 0.5f;
-        const f32 v = x0 - x1;
-        const f32 w = c + v;
-        const f32 a = w + v + (x2 - x0) * 0.5f;
-        const f32 bNeg = w + a;
-        return (((a * frac) - bNeg) * frac + c) * frac + x0;
+    // 4-point 3rd-order Catmull-Rom Hermite cubic interpolation kernel.
+    [[nodiscard]] static constexpr f32 InterpolateHermite4(
+        f32 xm1,
+        f32 x0,
+        f32 x1,
+        f32 x2,
+        f32 frac) noexcept {
+        const f32 c0 = x0;
+        const f32 c1 = 0.5f * (x1 - xm1);
+        const f32 c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+        const f32 c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+        return ((c3 * frac + c2) * frac + c1) * frac + c0;
     }
 
-    [[nodiscard]] static f32 ComputeDopplerPitch(Vec2 listenerPos, Vec2 listenerVel, Vec2 emitterPos, Vec2 emitterVel, f32 speedOfSound = 343.0f) noexcept {
-        const Vec2 toEmitter = emitterPos - listenerPos;
-        const f32 distSq = toEmitter.LengthSq();
-        if (distSq < 1e-4f || speedOfSound <= 1.0f) return 1.0f;
-        const f32 invDist = 1.0f / std::sqrt(distSq);
-        const Vec2 dir = toEmitter * invDist;
-        const f32 vL = std::clamp(listenerVel.Dot(dir), -speedOfSound * 0.5f, speedOfSound * 0.5f);
-        const f32 vS = std::clamp(emitterVel.Dot(dir), -speedOfSound * 0.5f, speedOfSound * 0.5f);
-        return std::clamp((speedOfSound + vL) / (speedOfSound + vS), 0.5f, 2.0f);
+    // Single-sample Cytomic linear trapezoidal zero-delay feedback state variable filter step.
+    [[nodiscard]] static constexpr f32 StepCytomicSvf(
+        f32 input,
+        f32& ic1,
+        f32& ic2,
+        f32 a1,
+        f32 a2,
+        f32 a3,
+        FilterMode mode = FilterMode::LowPass) noexcept {
+        const f32 v3 = input - ic2;
+        const f32 v1 = a1 * ic1 + a2 * v3;
+        const f32 v2 = ic2 + a2 * ic1 + a3 * v3;
+        ic1 = 2.0f * v1 - ic1;
+        ic2 = 2.0f * v2 - ic2;
+        if (mode == FilterMode::LowPass) return v2;
+        if (mode == FilterMode::BandPass) return v1;
+        if (mode == FilterMode::HighPass) return input - 1.41421356f * v1 - v2;
+        return input;
     }
 
-    [[nodiscard]] static constexpr f32 PadeSoftClip(f32 x) noexcept {
-        const f32 c = std::clamp(x, -3.0f, 3.0f);
-        const f32 c2 = c * c;
-        return c * (27.0f + c2) / (27.0f + 9.0f * c2);
+    // Rational Padé [3/2] hyperbolic tangent soft-clipping limiter bounded strictly to [-1.0, +1.0].
+    [[nodiscard]] static constexpr f32 SoftClipTanhPade(f32 x) noexcept {
+        if (x <= -3.0f) return -1.0f;
+        if (x >=  3.0f) return  1.0f;
+        const f32 x2 = x * x;
+        return x * (27.0f + x2) / (27.0f + 9.0f * x2);
     }
 
 private:
-    std::span<VoiceSlot> m_voices{};
-    std::span<f32> m_reverbCombL{};
-    std::span<f32> m_reverbCombR{};
-    u32 m_reverbCursor{0};
-    f32 m_compEnvelope{0.0f};
-    ReverbConfig m_reverbCfg{};
-    CompressorConfig m_compCfg{};
-    AudioTelemetrySnapshot m_telemetry{};
+    struct MixerArenaState;
+
+    void EnsureBusInitialized(u8 busIdx) noexcept;
+    void EnsureReverbSendInitialized() noexcept;
+    void AccumulateStolenVoiceTail(u8 slot) noexcept;
+    void AccumulateMusicDeckTail() noexcept;
+
+    MixerArenaState* m_state{nullptr};          // 8B
+    u64 m_activeVoicesMask{0ULL};               // 8B
+    u64 m_virtualVoicesMask{0ULL};              // 8B
+    u32 m_activeScopesCache{0U};                // 4B
+    u16 m_dirtyBusMask{0U};                     // 2B
+    u16 m_pendingStealBusMask{0U};              // 2B
+    AudioTelemetrySnapshot m_telemetry{};       // 32B
 };
+static_assert(sizeof(AudioMixer) == 64);
 
 } // namespace en

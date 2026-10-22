@@ -1,173 +1,152 @@
 #pragma once
 
-#include "assets/AssetTypes.h"
+#include "core/Memory.h"
 #include "physics/PhysicsTypes.h"
 #include "world/World.h"
 
 namespace en {
 
-enum class SpatialRebuildMode : u8 {
-    All = 0,
-    KinematicsOnly = 1,
-    CombatOnly = 2,
-};
-
-struct alignas(8) GridBox {
+// 24-byte (zero padding) spatial grid proxy record for cache-coherent broadphase and ray/sweep queries.
+// For Aabb/Circle/CapsuleY/Obb: (minX, minY, maxX, maxY) is the world AABB.
+// For Segment: (minX, minY) is world endpoint p0 and (maxX, maxY) is world endpoint p1.
+struct alignas(8) SpatialBox2D {
     f32 minX{0.0f};
     f32 minY{0.0f};
     f32 maxX{0.0f};
     f32 maxY{0.0f};
     EntityId entity{kNullEntity};
-    u16 layerMask{1};
-    u16 flags{0};
+    u16 categoryBits{0x0001U};
+    ShapeKind2D shape{ShapeKind2D::Aabb};
+    ColliderFlags2D flags{ColliderFlags2D::None};
 
-    [[nodiscard]] constexpr Rect ToRect() const noexcept {
-        return {minX, minY, maxX - minX, maxY - minY};
-    }
+    [[nodiscard]] constexpr f32 BoundMinX() const noexcept { return (shape == ShapeKind2D::Segment) ? std::min(minX, maxX) : minX; }
+    [[nodiscard]] constexpr f32 BoundMinY() const noexcept { return (shape == ShapeKind2D::Segment) ? std::min(minY, maxY) : minY; }
+    [[nodiscard]] constexpr f32 BoundMaxX() const noexcept { return (shape == ShapeKind2D::Segment) ? std::max(minX, maxX) : maxX; }
+    [[nodiscard]] constexpr f32 BoundMaxY() const noexcept { return (shape == ShapeKind2D::Segment) ? std::max(minY, maxY) : maxY; }
 };
-static_assert(sizeof(GridBox) == 24);
+static_assert(sizeof(SpatialBox2D) == 24);
 
-// Chunked 8x8 bitmask tilemap and dynamic spatial accelerator.
+// 64-byte (1 cache line exact, zero padding) hybrid 2-level hierarchical tile bitplane and 3-pass counting-sort uniform grid.
+// Non-owning view over PhysicsSystem's AlignedArena; zero heap allocations and zero stack buffers during RebuildDynamicGrid.
+// Invariant: m_cellOffsets[kGridCells] equals the total number of scattered cell references in the active build.
 class alignas(64) SpatialIndex2D {
 public:
-    static constexpr u32 kGridDim = 32;
-    static constexpr u32 kGridCells = kGridDim * kGridDim;
-    static constexpr u32 kMaxBoxes = 1024;
+    static constexpr u32 kGridDim = 32U;
+    static constexpr u32 kGridCells = kGridDim * kGridDim; // 1024 cells
 
-    [[nodiscard]] bool Init(AlignedArena& arena, u16 maxMapWidth = 256, u16 maxMapHeight = 128) noexcept;
-    void ClearTilemap() noexcept;
+    [[nodiscard]] bool Init(AlignedArena& arena, u16 maxProxies, f32 cellSizeMeters = 2.0f) noexcept;
+    void Clear() noexcept;
 
-    [[nodiscard]] Result<void, WorldErrc> BindCollisionMapBlob(const BlobRecord& blob) noexcept;
-    void SetupProceduralGrid(u16 width, u16 height, f32 tileSize = 1.0f, Vec2 origin = {0.0f, 0.0f}) noexcept;
+    [[nodiscard]] Result<void, PhysicsErrc> BindCollisionMap(std::span<const u8> blobBytes) noexcept;
+    [[nodiscard]] Result<void, PhysicsErrc> BuildTileMapFromGrid(
+        AlignedArena& arena,
+        u16 widthTiles,
+        u16 heightTiles,
+        f32 tileSizeMeters,
+        f32 originX,
+        f32 originY,
+        std::span<const TileMaterialFlags> tiles) noexcept;
 
-    void SetTile(i32 tx, i32 ty, TileType type) noexcept;
-    [[nodiscard]] TileType GetTile(i32 tx, i32 ty) const noexcept;
-    [[nodiscard]] u8 ComputeAutoTileMask4(i32 tx, i32 ty, TileType matchType = TileType::Solid) const noexcept;
-    [[nodiscard]] bool IsChunkSolidEmpty(i32 cx, i32 cy) const noexcept;
+    void RebuildDynamicGrid(const World& world, f32 dt = 0.0f) noexcept;
 
-    void RebuildDynamicGrid(const World& world, SpatialRebuildMode mode = SpatialRebuildMode::All) noexcept;
-
-    [[nodiscard]] SlabImpact2D SweepAabb(
-        EntityId ignoreEntity,
-        Vec2 center,
-        Vec2 halfExtents,
-        Vec2 delta,
-        u16 solidMask = 1,
-        bool ignoreOneWay = false) const noexcept;
+    [[nodiscard]] TileMaterialFlags SampleTileAtWorld(f32 worldX, f32 worldY) const noexcept;
+    [[nodiscard]] TileMaterialFlags SampleTileCoord(i32 tx, i32 ty) const noexcept;
 
     [[nodiscard]] RayHit2D Raycast(
-        Vec2 origin,
-        Vec2 direction,
+        f32 originX,
+        f32 originY,
+        f32 dirX,
+        f32 dirY,
         f32 maxDist,
-        u16 layerMask = 0xFFFFU,
+        u16 categoryMask = 0xFFFFU,
         EntityId ignoreEntity = kNullEntity) const noexcept;
 
-    [[nodiscard]] RayHit2D Linecast(
-        Vec2 start,
-        Vec2 end,
-        u16 layerMask = 0xFFFFU,
-        EntityId ignoreEntity = kNullEntity) const noexcept {
-        const Vec2 delta = end - start;
-        const f32 dist = delta.Length();
-        if (dist <= 1e-6f) return RayHit2D{};
-        return Raycast(start, delta / dist, dist, layerMask, ignoreEntity);
-    }
+    [[nodiscard]] SweepHit2D SweepAabb(
+        EntityId ignoreEntity,
+        f32 centerX,
+        f32 centerY,
+        f32 halfW,
+        f32 halfH,
+        f32 deltaX,
+        f32 deltaY,
+        u16 solidMask = 0xFFFFU,
+        bool ignoreOneWay = false) const noexcept;
 
-    [[nodiscard]] bool HasLineOfSight(
-        Vec2 start,
-        Vec2 end,
-        u16 solidMask = 1U,
-        EntityId ignoreEntity = kNullEntity) const noexcept {
-        return !Linecast(start, end, solidMask, ignoreEntity).hit;
-    }
-
-    [[nodiscard]] RayHit2D CircleCast(
-        Vec2 origin,
+    [[nodiscard]] SweepHit2D CastCircle(
+        EntityId ignoreEntity,
+        f32 centerX,
+        f32 centerY,
         f32 radius,
-        Vec2 direction,
-        f32 maxDist,
-        u16 layerMask = 0xFFFFU,
-        EntityId ignoreEntity = kNullEntity) const noexcept;
+        f32 deltaX,
+        f32 deltaY,
+        u16 solidMask = 0xFFFFU,
+        bool ignoreOneWay = false) const noexcept {
+        return SweepAabb(ignoreEntity, centerX, centerY, radius, radius, deltaX, deltaY, solidMask, ignoreOneWay);
+    }
 
-    [[nodiscard]] u32 OverlapAabb(
-        const Rect& area,
-        u16 layerMask,
+    [[nodiscard]] u32 QueryAabb(
+        f32 minX,
+        f32 minY,
+        f32 maxX,
+        f32 maxY,
+        u16 categoryMask,
         std::span<EntityId> outEntities,
         EntityId ignoreEntity = kNullEntity) const noexcept;
 
-    [[nodiscard]] u32 OverlapCircle(
-        Circle circle,
-        u16 layerMask,
+    [[nodiscard]] u32 QueryCircle(
+        f32 centerX,
+        f32 centerY,
+        f32 radius,
+        u16 categoryMask,
         std::span<EntityId> outEntities,
         EntityId ignoreEntity = kNullEntity) const noexcept;
 
-    [[nodiscard]] ContactFlags SampleEnvironmentFlags(const Rect& worldBox) const noexcept;
-    [[nodiscard]] f32 SampleSlopeSurfaceY(i32 tx, i32 ty, f32 worldX, Vec2& outNormal) const noexcept;
+    [[nodiscard]] constexpr std::span<const SpatialBox2D> ActiveBoxes() const noexcept {
+        return {m_boxes, m_boxCount};
+    }
 
-    [[nodiscard]] constexpr u16 MapWidth() const noexcept { return m_width; }
-    [[nodiscard]] constexpr u16 MapHeight() const noexcept { return m_height; }
-    [[nodiscard]] constexpr f32 TileSize() const noexcept { return m_tileSize; }
-    [[nodiscard]] constexpr Vec2 Origin() const noexcept { return m_origin; }
-    [[nodiscard]] constexpr std::span<const GridBox> ActiveBoxes() const noexcept {
-        return m_boxes.subspan(0, m_boxCount);
+    [[nodiscard]] constexpr std::span<const u32> CellOffsets() const noexcept {
+        return {m_cellOffsets, kGridCells + 1U};
+    }
+
+    [[nodiscard]] constexpr std::span<const u16> CellBoxIndices() const noexcept {
+        return {m_cellBoxIndices, TotalCellRefs()};
+    }
+
+    [[nodiscard]] constexpr u32 TotalCellRefs() const noexcept {
+        return m_cellOffsets ? m_cellOffsets[kGridCells] : 0U;
+    }
+
+    [[nodiscard]] constexpr f32 TileSizeMeters() const noexcept { return m_tileSize; }
+    [[nodiscard]] constexpr f32 InvCellSize() const noexcept { return m_invCellSize; }
+    [[nodiscard]] constexpr f32 OriginX() const noexcept { return m_originX; }
+    [[nodiscard]] constexpr f32 OriginY() const noexcept { return m_originY; }
+    [[nodiscard]] constexpr u16 WidthTiles() const noexcept { return m_widthTiles; }
+    [[nodiscard]] constexpr u16 HeightTiles() const noexcept { return m_heightTiles; }
+    [[nodiscard]] constexpr u16 ChunkCols() const noexcept { return static_cast<u16>((m_widthTiles + 7U) >> 3U); }
+    [[nodiscard]] constexpr u16 ChunkRows() const noexcept { return static_cast<u16>((m_heightTiles + 7U) >> 3U); }
+
+    [[nodiscard]] static constexpr u32 HashCellCoords(i32 cx, i32 cy) noexcept {
+        const u32 ux = static_cast<u32>(cx) * 73856093U;
+        const u32 uy = static_cast<u32>(cy) * 19349663U;
+        return (ux ^ uy) & (kGridCells - 1U);
     }
 
 private:
-    std::span<TileType> m_tiles{};
-    std::span<u64> m_solidChunks{};
-    std::span<GridBox> m_boxes{};
-    u16 m_maxWidth{0};
-    u16 m_maxHeight{0};
-    u16 m_width{0};
-    u16 m_height{0};
-    u16 m_chunksX{0};
-    u16 m_chunksY{0};
-    u32 m_boxCount{0};
-    f32 m_tileSize{1.0f};
-    f32 m_invTileSize{1.0f};
-    Vec2 m_origin{0.0f, 0.0f};
+    SpatialBox2D* m_boxes{nullptr};       // 8B (first half: active, second half: staging)
+    u32* m_cellOffsets{nullptr};          // 8B (kGridCells + 1 entries)
+    u16* m_cellBoxIndices{nullptr};       // 8B (scattered proxy indices)
+    const u64* m_chunkBitplanes{nullptr}; // 8B (1 u64 per 8x8 tile chunk)
+    const u8* m_tileFlags{nullptr};       // 8B (widthTiles * heightTiles bytes)
+    f32 m_originX{0.0f};                  // 4B
+    f32 m_originY{0.0f};                  // 4B
+    f32 m_tileSize{1.0f};                 // 4B
+    f32 m_invCellSize{0.5f};              // 4B
+    u16 m_widthTiles{0U};                 // 2B
+    u16 m_heightTiles{0U};                // 2B
+    u16 m_boxCount{0U};                   // 2B
+    u16 m_maxBoxes{0U};                   // 2B
 };
-
-enum class TriggerEventKind : u8 {
-    OnEnter = 0,
-    OnStay = 1,
-    OnExit = 2,
-};
-
-struct alignas(4) TriggerContactEvent {
-    EntityId triggerEntity{kNullEntity};
-    EntityId actorEntity{kNullEntity};
-    u16 triggerTag{0};
-    TriggerEventKind kind{TriggerEventKind::OnEnter};
-    u8 flags{0};
-};
-static_assert(sizeof(TriggerContactEvent) == 12);
-
-// Tracks overlapping TriggerVolume2D pairs across ticks and emits OnEnter, OnStay, and OnExit events.
-class ContactListener2D {
-public:
-    static constexpr usize kMaxActivePairs = 64;
-    struct PairRecord {
-        u64 pairKey{0};
-        EntityId triggerEntity{kNullEntity};
-        EntityId actorEntity{kNullEntity};
-        u16 triggerTag{0};
-        bool presentCurrTick{false};
-        u8 flags{0};
-    };
-
-    constexpr void Clear() noexcept { m_pairCount = 0; }
-
-    [[nodiscard]] u32 StepAndCollectTriggerEvents(
-        const World& world,
-        const SpatialIndex2D& spatial,
-        std::span<TriggerContactEvent> outEvents) noexcept;
-
-    [[nodiscard]] constexpr usize ActivePairCount() const noexcept { return m_pairCount; }
-
-private:
-    std::array<PairRecord, kMaxActivePairs> m_pairs{};
-    usize m_pairCount{0};
-};
+static_assert(sizeof(SpatialIndex2D) == 64);
 
 } // namespace en

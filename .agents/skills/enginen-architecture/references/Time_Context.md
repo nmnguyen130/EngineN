@@ -1,85 +1,36 @@
-# EngineN — Core Time Subsystem Context (`core/time/`)
+# EngineN — Phase 2: Time Subsystem Context (`time/`)
 
 ## 1. Architecture & Invariants
-- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), strictly zero heap allocation, minimal 4-file footprint (`TimeTypes.h`, `TimePipeline.h`, `SdlClock.h/.cpp`) + `tests/TimeTests.cpp`, two-layer pure C++23 separation (`namespace en::time`).
+- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), zero heap allocation, 4-file two-layer footprint (`TimeTypes.h`, `TimePipeline.h`, `SdlClock.h`, `SdlClock.cpp`) + `tests/TimeTests.cpp` (`namespace en`).
 - **Two-Layer Zero-Virtual Seam:**
-  - **Layer 1 (`TimeTypes.h`, `TimePipeline.h`):** 100% `constexpr` C++23 rational accumulator, O(1) bitmask-driven 8-channel modulator (`ChannelModulator`), `SimStepView`, `RenderTimeView`, `ManualClock`, and 64-bit SplitMix deterministic state audit (`ChannelModulator::ComputeAuditHash()`, `TimePipeline::ComputeAuditHash()`). Zero OS or `<SDL3/SDL_*.h>` dependencies.
-  - **Layer 2 (`SdlClock.h/.cpp`):** Thin SDL3 wall-clock adapter (`SdlClock::NowNs()` + `using TimeManager = TimePipeline<SdlClock>;`). `<SDL3/SDL_timer.h>` is strictly confined to `SdlClock.cpp`.
-- **Deterministic Baseline & Rational Accumulator:**
-  - `kSimHz = 120` (`kFixedDtNs = 8,333,333`, `kFixedDtSec = 1.0f / 120.0f`, `kInvNsPerSecond = 1e-9`).
-  - Accumulates in exact integer rational units (`ns * kSimHz`, where `kNsPerSecond == 10^9 units == 1 exact tick`) for zero floating-point drift. Exact multiples of `kFixedDtNs` scale losslessly to `N * kNsPerSecond`.
-  - **O(1) Power-of-Two VSync Harmonic Snapping (`SnapToRefreshHarmonicUnits`):** Branchlessly snaps frame deltas within `±vsyncSnapMarginNs` (`150µs`) to power-of-two multiples `{1, 2, 4, 8, 16}` of a quarter-tick (`250M` units), supporting `480Hz`, `240Hz`, `120Hz`, `60Hz`, and `30Hz` with zero loop iterations and zero integer division truncation.
-  - **Spiral-of-Death Protection:** Clamps frame delta (`maxFrameDeltaNs = 250ms`) and substeps (`maxCatchupTicks = 8`, sanitized `>= 1`).
-- **L1 Cache Line Layout & 16-Byte Compact Modulation Slots (`ChannelModulator`):**
-  - **Cache Line 0 (`offset 0..63`, `alignas(64)`):** `BakedTickState m_bakedTick` sits at offset `0` of both `ChannelModulator` and `TimePipeline`, placing `scaledDt[8]` and `effectiveScale[8]` in the first 64B L1 cache line.
-  - **Cache Line 1 (`offset 64..95`, `32B`):** `m_baseScales[8]`.
-  - **Compact `ChannelModSlot` (`sizeof == 16`, `alignas(16)`, zero padding):** Combines `hitstopIntensity` (`f32`), `rampTargetScale` (`f32`), `hitstopTicks` (`u16`), `rampHoldTicks` (`u16`), `rampBlendTicks` (`u16`), and `rampElapsedTicks` (`u16`) into a single 16B SIMD-aligned record (4 channels per 64B cache line, 128B total for all 8 channels).
-  - **Zero-Loop Idle Fast Path & Single-Channel Immediate Rebake:** `SetBaseScale`, `RequestHitstop`, `RequestMaskHitstop`, `RequestTimeRamp`, and `ClearChannelEffects` immediately rebake only the modified channel (`BakeChannel(idx)`). `AdvanceTick()` exits immediately when `(m_activeHitstopMask | m_activeRampMask) == 0` and iterates exclusively over set bits via `std::countr_zero(mask)`.
-- **Multi-Frame Pause Stepping & Gameplay Freeze:**
-  - **Multi-Tick Pause Stepping (`RequestStep(u32 ticks = 1)`):** Injects `std::min(ticks, maxCatchupTicks) * kNsPerSecond` directly into `m_accUnits` while paused so debuggers and frame-steppers can advance `1_ticks` (`8.33ms`), `1_f60` (`2 ticks = 16.67ms`), or `N` ticks in a single paused step.
-  - **Multi-Frame Gameplay Freeze (`RequestGameplayFreeze(u32 ticks, f32 intensity = 0.0f)`):** Freezes all gameplay channels (`kGameplayChannelsMask = 0x3Fu`, `World..Camera`) across `ticks` while keeping `TimeChannel::Ui` (bit 6) and `Custom` (bit 7) active.
-- **Zero-Loop Cross-Subsystem Communication Contract:**
-  - `TimePipeline::FrozenMask()` (`u8`, automatically OR-ed with `kGameplayChannelsMask = 0x3Fu` when paused) and `TimePipeline::EffectiveScales()` (`std::span<const f32, 8>`) persist across 0-tick high-refresh frames (`240Hz`/`480Hz`).
+  - **Layer 1 (`TimeTypes.h`, `TimePipeline.h`):** 100% `constexpr` C++23 simulation clock, 1440 Hz LCM harmonic snapper, VRR micro-jitter EWMA filter, 8-channel modulator, `SimStepView`, `RenderTimeView`, and 64-bit SplitMix `ComputeAuditHash()`. Zero OS, `<chrono>`, `<thread>`, or `<SDL3/...>` includes. Verified at compile time via `static_assert`.
+  - **Layer 2 (`SdlClock.h`, `SdlClock.cpp`):** Thin SDL3 hardware timer and sleep adapter (`SdlClock::NowNs()`, `SdlClock::SleepNs()`, `SdlClock::YieldThread()`) + `FramePacer::EndFrameAndPace()`. `<SDL3/SDL_timer.h>` (`SDL_GetTicksNS`, `SDL_DelayNS`) is strictly confined to `SdlClock.cpp`, sharing the exact monotonic nanosecond timeline of SDL3 input events (`SDL_Event::common.timestamp`).
+- **1440 Hz LCM Harmonic Rational Accumulator & VRR Smoothing:**
+  - `kSimHz = 120`, `kHarmonicSubdivisions = 12`, `kHarmonicHz = 1440` (`kTickUnits = 12 * 10^9` units per 120 Hz tick).
+  - Because `LCM(30, 40, 48, 60, 72, 80, 90, 120, 144, 160, 180, 240, 360, 480) = 1440`, every standard refresh rate maps to an exact integer multiple `k = 1440 / Hz` of `kNsPerSecond` units with zero integer division truncation.
+  - **O(1) Bitmask Harmonic Snapping:** Snaps frame deltas within `±150µs` (`kVsyncSnapMarginNs`) via 64-bit `kValidHarmonicMask` lookup with zero loops.
+  - **VRR Micro-Jitter Filter (`FilterVrrDeltaUnits`):** Smooths unsnapped variable-refresh deltas within `±20%` via a 3:1 integer EWMA while passing larger frame-rate transitions immediately.
+  - **Spiral-of-Death Protection:** Clamps frame delta (`kMaxFrameDeltaNs = 250ms`) and substeps (`maxCatchupTicks = 8`).
+- **256-Byte L1 Cache Layout (`TimePipeline`, 4 Cache Lines Exact, Zero Padding):**
+  - **Cache Line 0 (`offset 0..63`, `64B`):** `BakedTickState m_bakedTick` (`scaledDt[8]`, `effectiveScale[8]`).
+  - **Cache Lines 1 & 2 (`offset 64..191`, `128B`):** `std::array<ChannelModSlot, 8> m_slots` (`16B` per channel: `baseScale`, `rampTargetScale`, `hitstopTicks`, `rampHoldTicks`, `rampBlendTicks`, `rampElapsedTicks`).
+  - **Cache Line 3 (`offset 192..255`, `64B`):** `m_accUnits` (`8B`), `m_lastWallNs` (`8B`), `TimeTelemetry m_telemetry` (`24B`), `m_smoothedDeltaNs` (`8B`), `m_masterScale` (`4B`), `m_realDtSec` (`4B`), `m_stepAllowanceTicks` (`2B`), `m_plannedSubsteps` (`2B`), `m_activeHitstopMask` (`1B`), `m_activeRampMask` (`1B`), `m_frozenMask` (`1B`), `m_paused` (`1B`).
+- **Hierarchical Channel Modulation & True Pause vs Gameplay Freeze:**
+  - Channel `0` (`TimeChannel::World`) cascades to Gameplay Channels `1..5` (`Player`, `Enemy`, `Projectile`, `Vfx`, `Camera`). `Ui` (`6`) and `Custom` (`7`) are independent root channels.
+  - Modifying channels `1..7` rebakes only the modified channel in O(1) (`BakeSingleChannel(idx)`); modifying `World` (`0`) rebakes `0..7`.
+  - `RequestTimeRamp` blends out using a C1-continuous Hermite `SmoothStep` curve (`t^2 * (3 - 2t)`).
+  - `SetPaused(true)` halts `m_accUnits` accumulation (preserving active hitstops and time ramps on gameplay channels while updating `realDt` for UI). `RequestStep(ticks)` injects `ticks * kTickUnits` for exact debugger frame-stepping while paused. `RequestGameplayFreeze(ticks)` hitstops `kGameplayChannelsMask` (`0x3FU`) while `Ui` and `Custom` continue ticking at 120 Hz.
 
-## 2. Core Types (`core/time/TimeTypes.h` & `core/time/TimePipeline.h`)
-- **Constants & Literals (`inline namespace literals`):**
-  - `kSimHz = 120`, `kNsPerSecond = 1'000'000'000ULL`, `kFixedDtNs = 8'333'333ULL`, `kFixedDtSec = 1.0f / 120.0f`, `kMaxTimeChannels = 8`, `kGameplayChannelsMask = 0x3Fu`.
-  - `consteval u32 operator""_f60(unsigned long long frames) noexcept` (`6_f60 == 12`) and `consteval u32 operator""_ticks(unsigned long long ticks) noexcept`.
-- **Channels & Concepts:**
-  - `enum class TimeChannel : u8 { World = 0, Player, Enemy, Projectile, Vfx, Camera, Ui, Custom };`
-  - `concept ChannelId<T>`: Accepts `TimeChannel`, any `u8`-backed scoped enum, or unsigned integral. Converted via `constexpr u8 ToChannelIndex(ChannelId auto ch) noexcept` and `constexpr u8 MakeChannelMask(Channels... chs) noexcept`.
-  - `concept ClockSource<T>`: Requires `{ clock.NowNs() } noexcept -> std::same_as<u64>`. Implemented by Layer 1 `ManualClock` and Layer 2 `SdlClock`.
-- **L1 Cache-Aligned Snapshots & Configs (Zero Internal Padding):**
-  - `struct alignas(64) BakedTickState` (`sizeof == 64`): `scaledDt[8]`, `effectiveScale[8]`.
-  - `struct alignas(32) BakedRenderState` (`sizeof == 32`): `alpha[8]`.
-  - `struct alignas(64) RenderTimeView` (`sizeof == 64`): `channelAlpha`, `rawAlpha`, `realDt`, `tickIndex`, `frozenMask`.
-  - `struct alignas(16) ChannelModulator::ChannelModSlot` (`sizeof == 16`): `hitstopIntensity`, `rampTargetScale`, `hitstopTicks`, `rampHoldTicks`, `rampBlendTicks`, `rampElapsedTicks`.
-  - `struct TimePipelineConfig` (`sizeof == 24`): `maxFrameDeltaNs`, `vsyncSnapMarginNs`, `maxCatchupTicks`, `enableVsyncSnap`.
-  - `struct TimeTelemetry` (`sizeof == 40`): `totalSimTicks`, `totalFrames`, `droppedTicks`, `accumulatorNs`, `ticksLastFrame`.
+## 2. Locked Struct Byte Layouts (Zero Internal or Tail Padding)
+- `BakedTickState`: `64 B` (`alignas(64)`) — `scaledDt[8]`, `effectiveScale[8]`.
+- `ChannelModSlot`: `16 B` (`alignas(16)`) — `baseScale`, `rampTargetScale`, `hitstopTicks`, `rampHoldTicks`, `rampBlendTicks`, `rampElapsedTicks`.
+- `RenderTimeView`: `48 B` (`alignas(16)`) — `channelAlpha[8]` (locked to `1.0f` when channel is frozen), `tickIndex`, `rawAlpha`, `realDt`.
+- `TimeTelemetry`: `24 B` (`alignas(8)`) — `totalSimTicks`, `totalFrames`, `droppedTicks`, `ticksLastFrame`, `maxCatchupTicks`.
+- `SimStepView`: `32 B` (`alignas(32)`) — `baked`, `pipeline`, `tickIndex`, `catchupIndex`, `substepTotal`, `frozenMask`, `valid`.
+- `TimePipeline`: `256 B` (`alignas(64)`) — 4 cache lines exact.
+- `FramePacer`: `32 B` (`alignas(8)`) — `m_frameStartNs`, `m_targetFrameNs`, `m_lastSleepNs`, `m_lastSpinNs`, EWMA `m_sleepMarginNs` (`[250µs, 4ms]`), `m_targetFps`.
 
 ## 3. Public Interfaces & Signatures
-### `SimStepView` (`core/time/TimePipeline.h` — Passed by Value to `Tick()` Functions)
-- `explicit operator bool() const noexcept`
-- `f32 Dt(ChannelId auto ch = TimeChannel::World) const noexcept`, `f32 EffectiveScale(ChannelId auto ch = TimeChannel::World) const noexcept`, `bool IsFrozen(ChannelId auto ch = TimeChannel::World) const noexcept`
-- `u8 FrozenMask() const noexcept`, `u64 TickIndex() const noexcept`, `u32 CatchupIndex() const noexcept`
-- `void RequestHitstop(ChannelId auto ch, u32 ticks, f32 intensity = 0.0f) const noexcept`
-- `void RequestMultiHitstop(u32 ticks, f32 intensity, Channels... chs) const noexcept`, `void RequestMaskHitstop(u8 channelMask, u32 ticks, f32 intensity = 0.0f) const noexcept`
-- `void RequestTimeRamp(ChannelId auto ch, f32 targetScale, u32 holdTicks, u32 blendOutTicks) const noexcept`
-- `void SetBaseScale(ChannelId auto ch, f32 scale) const noexcept`
-
-### `RenderTimeView` (`core/time/TimeTypes.h` — 64B Snapshot Passed to `Extract()` / `Update()`)
-- `f32 Alpha(ChannelId auto ch = TimeChannel::World) const noexcept`
-- `bool IsFrozen(ChannelId auto ch = TimeChannel::World) const noexcept`
-
-### `TimePipeline<ClockT>` (`core/time/TimePipeline.h` & `core/time/SdlClock.h`)
-- Frame Lifecycle:
-  - `constexpr void BeginFrame() noexcept` / `constexpr void BeginFrameManual(u64 rawDeltaNs) noexcept`
-  - `[[nodiscard]] constexpr SimStepView PollTick() noexcept`
-  - `[[nodiscard]] constexpr RenderTimeView GetRenderView() const noexcept`
-- Control, Multi-Frame Stepping & Audit:
-  - `constexpr void SetPaused(bool paused) noexcept`, `constexpr void RequestStep(u32 ticks = 1) noexcept`, `constexpr void RequestSingleStep() noexcept`
-  - `constexpr void RequestGameplayFreeze(u32 ticks, f32 intensity = 0.0f) noexcept`, `constexpr void OnWindowRefocus() noexcept`
-  - `[[nodiscard]] constexpr bool IsPaused() const noexcept`, `[[nodiscard]] constexpr u8 FrozenMask() const noexcept`
-  - `[[nodiscard]] constexpr std::span<const f32, 8> EffectiveScales() const noexcept`
-  - `[[nodiscard]] constexpr ChannelModulator& Modulator() noexcept` (`const` & mutable), `[[nodiscard]] constexpr const TimeTelemetry& Telemetry() const noexcept`
-  - `[[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept`
-
-## 4. Canonical Main Loop Usage
-```cpp
-m_time.BeginFrame();
-while (const auto step = m_time.PollTick()) {
-    const auto tickInput = m_input.PollTick(step.TickIndex());
-    m_actionBuffer.Feed(tickInput, step.IsFrozen(en::time::TimeChannel::Player));
-
-    m_world.BeginTick(step);
-    m_gameplay.Tick(m_world, m_assets.Bank(), step, tickInput, m_actionBuffer);
-    m_world.EndTick(step);
-
-    m_debug.EndSimTick(m_world, step, tickInput, m_actionBuffer);
-}
-
-const auto renderTime = m_time.GetRenderView();
-m_audio.ConsumeSimCues(m_gameplay.DrainCues(), m_world, m_assets.Bank());
-m_audio.Update(m_world, m_gameplay.Spatial(), m_assets.Bank(), renderTime, m_time.FrozenMask(), m_time.EffectiveScales());
-m_worldExtractor.Extract(m_world, m_assets.Bank(), renderTime, m_renderer.BeginFrame());
-```
+- **`SimStepView`:** `operator bool()`, `Dt(ch)`, `EffectiveScale(ch)`, `IsFrozen(ch)`, `RequestHitstop(ch, ticks)`, `RequestMaskHitstop(mask, ticks)`, `RequestTimeRamp(ch, targetScale, holdTicks, blendTicks)`.
+- **`TimePipeline`:** `Reset()`, `BeginFrame()`, `BeginFrameManual(rawDeltaNs)`, `PollTick()`, `GetRenderView()`, `SetMasterScale(scale)`, `MasterScale()`, `SetBaseScale(ch, scale)`, `BaseScale(ch)`, `RequestHitstop(ch, ticks)`, `RequestMaskHitstop(mask, ticks)`, `RequestGameplayFreeze(ticks)`, `RequestTimeRamp(ch, targetScale, holdTicks, blendTicks)`, `ClearChannelEffects(ch)`, `SetPaused(paused)`, `IsPaused()`, `RequestStep(ticks)`, `OnWindowRefocus()`, `FrozenMask()`, `EffectiveScales()`, `AccumulatorNs()`, `Telemetry()`, `ComputeAuditHash()`.
+- **`FramePacer` & `SdlClock`:** `SdlClock::NowNs()`, `SdlClock::SleepNs(ns)`, `SdlClock::YieldThread()`, `FramePacer::SetTargetFps(fps)`, `BeginFrame()`, `EndFrameAndPace()`, `TargetFps()`, `TargetFrameNs()`, `LastSleepNs()`, `LastSpinNs()`, `SleepMarginNs()`.

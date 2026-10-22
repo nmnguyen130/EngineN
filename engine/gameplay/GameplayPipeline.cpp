@@ -2,95 +2,192 @@
 
 namespace en {
 
-Result<void, WorldErrc> GameplayPipeline::Init(
-    World& world, const GameplayPolicyTable& policies, const GameplayPipelineConfig& cfg) noexcept {
-    Shutdown();
-    if (!m_arena.Init(cfg.arenaBytes)) return Err(WorldErrc::OutOfMemory);
+GameplayPipeline::GameplayPipeline(GameplayPipeline&& other) noexcept
+    : m_cfg(other.m_cfg),
+      m_policies(other.m_policies),
+      m_cues(other.m_cues),
+      m_hitEvents(other.m_hitEvents),
+      m_arena(std::move(other.m_arena)),
+      m_activeFlagWordsMask(other.m_activeFlagWordsMask),
+      m_tickCount(other.m_tickCount),
+      m_totalCombatHits(other.m_totalCombatHits),
+      m_cueCount(other.m_cueCount),
+      m_hitEventCount(other.m_hitEventCount),
+      m_worldFlags(other.m_worldFlags) {
+    other.m_cues = nullptr;
+    other.m_hitEvents = nullptr;
+    other.m_activeFlagWordsMask = 0ULL;
+    other.m_cueCount = 0U;
+    other.m_hitEventCount = 0U;
+}
 
-    m_hitScratch = m_arena.Carve<ResolvedHitEvent>(kMaxHitScratch);
-    m_cueBuffer = m_arena.Carve<SimCue>(kMaxCues);
-    if (m_hitScratch.empty() || m_cueBuffer.empty() ||
-        !m_spatial.Init(m_arena, cfg.maxMapWidth, cfg.maxMapHeight) ||
-        !m_particles.Init(m_arena, cfg.maxParticles)) {
+GameplayPipeline& GameplayPipeline::operator=(GameplayPipeline&& other) noexcept {
+    if (this != &other) {
         Shutdown();
-        return Err(WorldErrc::OutOfMemory);
+        m_cfg = other.m_cfg;
+        m_policies = other.m_policies;
+        m_cues = other.m_cues;
+        m_hitEvents = other.m_hitEvents;
+        m_arena = std::move(other.m_arena);
+        m_activeFlagWordsMask = other.m_activeFlagWordsMask;
+        m_tickCount = other.m_tickCount;
+        m_totalCombatHits = other.m_totalCombatHits;
+        m_cueCount = other.m_cueCount;
+        m_hitEventCount = other.m_hitEventCount;
+        m_worldFlags = other.m_worldFlags;
+
+        other.m_cues = nullptr;
+        other.m_hitEvents = nullptr;
+        other.m_activeFlagWordsMask = 0ULL;
+        other.m_cueCount = 0U;
+        other.m_hitEventCount = 0U;
+    }
+    return *this;
+}
+
+Result<void, GameplayErrc> GameplayPipeline::Init(
+    World& world,
+    const GameplayPolicyTable& policies,
+    const GameplayConfig& cfg) noexcept {
+    Shutdown();
+    if (cfg.maxCuesPerTick == 0U || cfg.maxHitEventsPerTick == 0U || cfg.arenaBytes < 16384U) {
+        return Err(GameplayErrc::InvalidConfig);
     }
 
-    m_policies = policies;
-    m_kinematicCfg = cfg.kinematics;
-    m_cueCount = 0;
-    ClearWorldFlags();
+    if (!world.RegisterComponentPool<MotionStack2D>().has_value() ||
+        !world.RegisterComponentPool<StateMachine2D>().has_value() ||
+        !world.RegisterComponentPool<HitboxRig2D>().has_value() ||
+        !world.RegisterComponentPool<DamageReceiver2D>().has_value() ||
+        !world.RegisterComponentPool<SafeAnchor2D>(256U).has_value() ||
+        !world.RegisterComponentPool<CameraController2D>(32U).has_value()) {
+        return Err(GameplayErrc::PoolRegistrationFailed);
+    }
 
-    (void)world.RegisterComponentPool<VerletRope2D>(128);
-    (void)world.RegisterComponentPool<DistanceJoint2D>(128);
-    (void)world.RegisterComponentPool<TriggerVolume2D>(256);
-    (void)world.RegisterComponentPool<KinematicMotor2D>();
-    (void)world.RegisterComponentPool<KinematicCarrier2D>(256);
-    (void)world.RegisterComponentPool<MotionStack2D>();
-    (void)world.RegisterComponentPool<StateMachine2D>();
-    (void)world.RegisterComponentPool<HitboxRig2D>();
-    (void)world.RegisterComponentPool<DamageReceiver2D>();
-    (void)world.RegisterComponentPool<SafeGroundBreadcrumb2D>(256);
-    (void)world.RegisterComponentPool<CameraController2D>(32);
+    if (!m_arena.Init(cfg.arenaBytes)) {
+        return Err(GameplayErrc::OutOfMemory);
+    }
+
+    auto cuesSpan = m_arena.Carve<SimCue>(cfg.maxCuesPerTick);
+    auto hitsSpan = m_arena.Carve<CombatHitEvent>(cfg.maxHitEventsPerTick);
+    if (cuesSpan.empty() || hitsSpan.empty()) {
+        Shutdown();
+        return Err(GameplayErrc::OutOfMemory);
+    }
+
+    m_cfg = cfg;
+    m_policies = policies;
+    m_cues = cuesSpan.data();
+    m_hitEvents = hitsSpan.data();
+    m_activeFlagWordsMask = 0ULL;
+    m_tickCount = 0ULL;
+    m_totalCombatHits = 0U;
+    m_cueCount = 0U;
+    m_hitEventCount = 0U;
+    m_worldFlags.fill(0ULL);
     return {};
 }
 
 void GameplayPipeline::Shutdown() noexcept {
     m_arena.Shutdown();
-    m_cueCount = 0;
-    ClearWorldFlags();
+    m_cues = nullptr;
+    m_hitEvents = nullptr;
+    m_activeFlagWordsMask = 0ULL;
+    m_tickCount = 0ULL;
+    m_totalCombatHits = 0U;
+    m_cueCount = 0U;
+    m_hitEventCount = 0U;
+    m_worldFlags.fill(0ULL);
 }
 
-Result<void, WorldErrc> GameplayPipeline::SetActiveRoomCollision(
-    const AssetBank& bank, BlobHandle collisionMapBlob) noexcept {
-    return m_spatial.BindCollisionMapBlob(bank.GetBlob(collisionMapBlob));
+void GameplayPipeline::Clear() noexcept {
+    ClearWorldFlags();
+    m_cueCount = 0U;
+    m_hitEventCount = 0U;
 }
 
 void GameplayPipeline::Tick(
-    World& world, const AssetBank& assetBank, const SimStepView& step,
-    const TickInput& tickInput, ActionBuffer& actionBuffer) noexcept {
-    CombatAndStateSolver::DispatchAnimationFrameDirectives(world, assetBank, step, *this);
+    World& world,
+    PhysicsSystem& physics,
+    const AssetBank& assetBank,
+    const SimStepView& step,
+    const TickInput& input,
+    ActionBuffer& actions) noexcept {
+    if (!m_cues || !step.valid) return;
 
-    m_spatial.RebuildDynamicGrid(world, SpatialRebuildMode::KinematicsOnly);
-    KinematicSolver2D::StepCarriersAndRiders(world, m_spatial, step, m_kinematicCfg);
+    m_hitEventCount = 0U;
 
-    CombatAndStateSolver::StepStateMachinesAndPolicies(
-        world, assetBank, step, tickInput, actionBuffer, m_policies, *this);
+    // Stage 1: Step state machines, timeline frame directives, and client policies
+    StateAndCombatSolver2D::StepStateMachinesAndDirectives(
+        world, assetBank, step, input, actions, m_policies, *this);
 
-    m_spatial.RebuildDynamicGrid(world, SpatialRebuildMode::KinematicsOnly);
-    KinematicSolver2D::StepMotorsAndMotionStacks(world, m_spatial, step, m_kinematicCfg);
-    KinematicSolver2D::StepConstraintsAndVerlet(world, m_spatial, step, m_kinematicCfg);
+    // Stage 2: Blend MotionStack2D velocities/root-motion/impulses into CharacterMotor2D
+    MotionSolver2D::BlendMotionStacksIntoMotors(world, step, m_cfg);
 
-    (void)CombatAndStateSolver::GatherAndResolveCombatHits(
-        world, step, m_hitScratch, m_policies, *this);
+    // Stage 3: Step 2D PhysicsSystem (kinematic platforms, MoveAndSlide characters, Soft-Step TGS rigid bodies & joints)
+    physics.Step(world, step);
 
-    CameraAndBreadcrumbSolver::StepSafeBreadcrumbs(world, m_spatial, step);
-    if (!step.IsFrozen(TimeChannel::Vfx)) {
-        m_particles.Step(step.Dt(TimeChannel::Vfx), m_kinematicCfg.gravity);
-    }
-    CameraAndBreadcrumbSolver::StepCameraControllers(world, step);
-}
+    // Stage 4: Resolve soft character pushbox separation & refresh post-physics coyote timers and 3-ray safe anchors
+    MotionSolver2D::ResolveSoftCharacterPushboxes(world, physics, step, m_cfg);
+    MotionSolver2D::SyncPostPhysicsContactsAndTimers(world, physics, step);
 
-void GameplayPipeline::LoadRawWorldFlags(std::span<const u64, 64> words) noexcept {
-    m_activeFlagWordsMask = 0ULL;
-    for (u8 w = 0; w < 64U; ++w) {
-        m_worldFlags[w] = words[w];
-        if (words[w] != 0ULL) m_activeFlagWordsMask |= (1ULL << w);
-    }
+    // Stage 5: Resolve Bloom-deduplicated hitbox/hurtbox combat overlaps and clash/parry arbitration
+    std::span<CombatHitEvent> hitSpan{m_hitEvents, m_cfg.maxHitEventsPerTick};
+    m_hitEventCount = StateAndCombatSolver2D::ResolveCombatOverlaps(
+        world, step, m_policies, *this, hitSpan);
+    m_totalCombatHits += m_hitEventCount;
+
+    // Stage 6: Step 2nd-order critically damped spring cameras, room confiners, and trauma shake
+    CameraDirector2D::StepCameras(world, step, m_cfg, m_tickCount);
+    ++m_tickCount;
 }
 
 u64 GameplayPipeline::ComputeAuditHash(const World& world) const noexcept {
-    u64 h = Mix64(m_activeFlagWordsMask ^ (static_cast<u64>(m_particles.ActiveCount()) << 32U));
-    u64 m = m_activeFlagWordsMask;
-    while (m != 0ULL) {
-        const u8 w = static_cast<u8>(std::countr_zero(m));
-        m &= (m - 1ULL);
-        h = HashCombine64(h, m_worldFlags[w]);
+    u64 h = 14695981039346656037ULL;
+    const auto mixBytes = [&](const void* data, usize len) noexcept {
+        const auto* bytes = static_cast<const u8*>(data);
+        for (usize i = 0U; i < len; ++i) {
+            h ^= static_cast<u64>(bytes[i]);
+            h *= 1099511628211ULL;
+        }
+    };
+
+    mixBytes(&m_tickCount, sizeof(m_tickCount));
+    mixBytes(&m_totalCombatHits, sizeof(m_totalCombatHits));
+    mixBytes(&m_activeFlagWordsMask, sizeof(m_activeFlagWordsMask));
+
+    u64 flagMask = m_activeFlagWordsMask;
+    while (flagMask != 0ULL) {
+        const u32 w = static_cast<u32>(std::countr_zero(flagMask));
+        flagMask &= (flagMask - 1ULL);
+        mixBytes(&w, sizeof(w));
+        mixBytes(&m_worldFlags[w], sizeof(u64));
     }
-    world.Each<KinematicMotor2D>([&](EntityId id, const KinematicMotor2D& motor) noexcept {
-        h = HashCombine64(h, static_cast<u64>(id.Packed()) |
-                             (static_cast<u64>(motor.contacts) << 32U));
-    });
+
+    const u64 regMask = world.RegisteredPoolsMask();
+    if ((regMask & (1ULL << MotionStack2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<MotionStack2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
+    if ((regMask & (1ULL << StateMachine2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<StateMachine2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
+    if ((regMask & (1ULL << HitboxRig2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<HitboxRig2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
+    if ((regMask & (1ULL << DamageReceiver2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<DamageReceiver2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
+    if ((regMask & (1ULL << SafeAnchor2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<SafeAnchor2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
+    if ((regMask & (1ULL << CameraController2D::kTypeId)) != 0ULL) {
+        const auto& p = world.GetPool<CameraController2D>();
+        mixBytes(p.Components().data(), p.Components().size_bytes());
+    }
     return h;
 }
 

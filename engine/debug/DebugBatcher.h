@@ -1,74 +1,107 @@
 #pragma once
 
-#include "core/Memory.h"
 #include "debug/DebugTypes.h"
-#include "renderer/RenderList.h"
 
 namespace en {
 
-// Immediate-mode debug primitive and zero-allocation text quad emitter.
-// Value type wrapping a RenderList reference.
-// Invariant: Format* helpers never allocate heap memory or write past buffer end.
-class DebugBatcher {
+// 16-byte (4 per 64B cache line, zero padding) immediate-mode 2D primitive and bitmap text quad emitter.
+// Non-owning adapter writing directly into RenderList using kWhiteTexture and kBuiltinFontTexture.
+// Invariant: sizeof(DebugBatcher) == 16, zero heap allocations, and all glyph UVs address the 128x48 built-in 16x6 ASCII font grid.
+class alignas(16) DebugBatcher {
 public:
     constexpr DebugBatcher(
         RenderList& list,
-        u8 passId = 0,
-        u8 viewSlot = 0,
-        GpuTextureHandle debugAtlas = kWhiteGpuTexture) noexcept
-        : m_list(list), m_atlas(debugAtlas), m_passId(passId), m_viewSlot(viewSlot) {}
+        u8 passId = kDebugWorldPassId,
+        u8 viewSlot = kDebugWorldViewSlot,
+        u16 depth = kDebugFixedDepth) noexcept
+        : m_list(&list),
+          m_fontTex(kBuiltinFontTexture),
+          m_depth(depth),
+          m_passId(passId),
+          m_viewSlot(viewSlot) {}
 
     void PushSolidRect(Rect rect, Color color) noexcept;
     void PushBoxOutline(Rect rect, f32 thickness, Color color) noexcept;
-    void PushLine(Vec2 a, Vec2 b, f32 thickness, Color color) noexcept;
-    void PushArrow(Vec2 start, Vec2 end, f32 headSize, f32 thickness, Color color) noexcept;
-    void PushCircleOutline(Vec2 center, f32 radius, u32 segments, f32 thickness, Color color) noexcept;
-    void PushText(Vec2 pos, std::string_view text, Color color, f32 scale = 1.0f) noexcept;
+    void PushObbOutline(Vec2 center, Vec2 halfExtents, f32 cosRot, f32 sinRot, f32 thickness, Color color) noexcept;
+    void PushLine(f32 x0, f32 y0, f32 x1, f32 y1, f32 thickness, Color color) noexcept;
+    void PushArrow(f32 x0, f32 y0, f32 x1, f32 y1, f32 headSize, f32 thickness, Color color) noexcept;
+    void PushCircleOutline(f32 cx, f32 cy, f32 radius, u8 segments, f32 thickness, Color color) noexcept;
+    void PushCapsuleYOutline(f32 cx, f32 cy, f32 halfW, f32 halfH, f32 thickness, Color color) noexcept;
+    void PushCrosshair(f32 cx, f32 cy, f32 halfSize, f32 thickness, Color color) noexcept;
+    void PushText(f32 x, f32 y, std::string_view text, Color color, f32 scale = 1.0f) noexcept;
 
-    static char* FormatI64(char* out, char* end, i64 val) noexcept;
-    static char* FormatU64Hex(char* out, char* end, u64 val, u8 digits = 16) noexcept;
-    static char* FormatF32Fixed2(char* out, char* end, f32 val) noexcept;
+    [[nodiscard]] static char* FormatI64(char* out, char* end, i64 val) noexcept;
+    [[nodiscard]] static char* FormatU64Hex(char* out, char* end, u64 val, u8 digits = 8U) noexcept;
+    [[nodiscard]] static char* FormatF32Fixed2(char* out, char* end, f32 val) noexcept;
+
+    [[nodiscard]] static constexpr u32 PackRgba8(Color c) noexcept {
+        return c.ToRGBA8();
+    }
+    [[nodiscard]] static constexpr Color UnpackRgba8(u32 rgba8) noexcept {
+        constexpr f32 kInv = 1.0f / 255.0f;
+        return {
+            static_cast<f32>((rgba8 >> 24U) & 0xFFU) * kInv,
+            static_cast<f32>((rgba8 >> 16U) & 0xFFU) * kInv,
+            static_cast<f32>((rgba8 >>  8U) & 0xFFU) * kInv,
+            static_cast<f32>((rgba8 >>  0U) & 0xFFU) * kInv,
+        };
+    }
 
 private:
-    RenderList& m_list;
-    GpuTextureHandle m_atlas{kWhiteGpuTexture};
-    u8 m_passId{0};
-    u8 m_viewSlot{0};
+    RenderList* m_list{nullptr};                // 8B
+    TextureHandle m_fontTex{kBuiltinFontTexture}; // 4B
+    u16 m_depth{kDebugFixedDepth};              // 2B
+    u8 m_passId{kDebugWorldPassId};             // 1B
+    u8 m_viewSlot{kDebugWorldViewSlot};         // 1B
 };
+static_assert(sizeof(DebugBatcher) == 16);
 
-// Persistent tick-expiring debug shape pool for multi-frame diagnostic gizmos.
-class alignas(64) DebugShapePool {
+// 288-byte (9 x 32B blocks exact, zero padding) two-level bitmask transient/persistent 2D debug shape pool.
+// Non-owning view over a 2048-slot DebugShapeCmd arena slice; packs allocations into the lowest free bit index.
+// Invariant: sizeof(DebugShapePool) == 288 and expired shapes are reclaimed in O(activeWords) via bit-scanning.
+class alignas(32) DebugShapePool {
 public:
-    enum class ShapeKind : u8 { Line = 0, Box = 1, Arrow = 2, Circle = 3 };
+    constexpr void Init(std::span<DebugShapeCmd, kMaxDebugShapes> storage) noexcept {
+        m_pool = storage.data();
+        Clear();
+    }
 
-    struct alignas(8) ShapeCmd {
-        Vec2 a{};
-        Vec2 b{};
-        Color color{};
-        f32 thickness{0.04f};
-        u32 expireTick{0};
-        ShapeKind kind{ShapeKind::Line};
-        bool active{false};
-        u16 category{0};
-    };
+    constexpr void Clear() noexcept {
+        m_activeWords.fill(0ULL);
+        m_nonEmptyWordMask = 0U;
+        m_nonFullWordMask = 0xFFFFFFFFU;
+        m_currentTick = 0U;
+        m_activeCount = 0U;
+        m_totalSubmitted = 0ULL;
+    }
 
-    [[nodiscard]] bool Init(AlignedArena& arena, u32 maxShapes = 512) noexcept;
-    void Clear() noexcept;
+    constexpr void SetCurrentTick(u32 tickIndex) noexcept { m_currentTick = tickIndex; }
 
-    void AddLine(Vec2 a, Vec2 b, Color color, u32 durationTicks = 1, f32 thickness = 0.04f) noexcept;
-    void AddBox(Rect rect, Color color, u32 durationTicks = 1, f32 thickness = 0.04f) noexcept;
-    void AddArrow(Vec2 start, Vec2 end, Color color, u32 durationTicks = 1, f32 thickness = 0.04f) noexcept;
-    void AddCircle(Vec2 center, f32 radius, Color color, u32 durationTicks = 1, f32 thickness = 0.04f) noexcept;
+    void AddLine(f32 x0, f32 y0, f32 x1, f32 y1, Color color, f32 thickness = 0.05f, u32 durationTicks = 0U) noexcept;
+    void AddBox(Rect rect, Color color, f32 thickness = 0.05f, bool solid = false, u32 durationTicks = 0U) noexcept;
+    void AddArrow(f32 x0, f32 y0, f32 x1, f32 y1, f32 headSize, Color color, f32 thickness = 0.05f, u32 durationTicks = 0U) noexcept;
+    void AddCircle(f32 cx, f32 cy, f32 radius, Color color, u8 segments = 16U, f32 thickness = 0.05f, u32 durationTicks = 0U) noexcept;
+    void AddCapsuleY(f32 cx, f32 cy, f32 halfW, f32 halfH, Color color, f32 thickness = 0.05f, u32 durationTicks = 0U) noexcept;
+    void AddTextWorld(f32 x, f32 y, std::string_view text, Color color, f32 scale = 0.05f, u32 durationTicks = 0U) noexcept;
+    void AddTextScreen(f32 x, f32 y, std::string_view text, Color color, f32 scale = 1.0f, u32 durationTicks = 0U) noexcept;
 
-    void EmitAndExpire(u64 currentTick, DebugBatcher& worldBatcher) noexcept;
+    void EmitAndExpire(u32 currentTickIndex, DebugBatcher& worldBatcher, DebugBatcher& hudBatcher) noexcept;
+
     [[nodiscard]] constexpr u32 ActiveCount() const noexcept { return m_activeCount; }
+    [[nodiscard]] constexpr u64 TotalSubmitted() const noexcept { return m_totalSubmitted; }
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
-    void PushShape(const ShapeCmd& cmd, u32 durationTicks) noexcept;
+    [[nodiscard]] DebugShapeCmd* AllocateSlot(u32 durationTicks) noexcept;
 
-    std::span<ShapeCmd> m_shapes{};
-    u32 m_currentTick{0};
-    u32 m_activeCount{0};
+    std::array<u64, 32> m_activeWords{};        // 256B (32 x 64-bit active slot bitmasks = 2048 slots)
+    DebugShapeCmd* m_pool{nullptr};             // 8B
+    u64 m_totalSubmitted{0ULL};                 // 8B
+    u32 m_nonEmptyWordMask{0U};                 // 4B
+    u32 m_nonFullWordMask{0xFFFFFFFFU};         // 4B
+    u32 m_currentTick{0U};                      // 4B
+    u32 m_activeCount{0U};                      // 4B
 };
+static_assert(sizeof(DebugShapePool) == 288);
 
 } // namespace en

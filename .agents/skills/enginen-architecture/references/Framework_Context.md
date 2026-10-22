@@ -1,72 +1,22 @@
-# EngineN — Game Framework Subsystem Context (`framework/`)
+# Phase 12 v2: `framework` Subsystem — Final Production Specification (Locked)
 
-## 1. Architecture & Invariants
-- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), strictly zero heap allocation after `Application::Init()`, zero virtual dispatch (`AppHooks` & `StateLayerDesc` function-pointer tables), locked 5-file footprint (`FrameworkTypes.h`, `SceneDirector.h/.cpp`, `Application.h/.cpp`) + `tests/FrameworkTests.cpp`, two-layer pure C++23 separation (`namespace en::framework`).
-- **Two-Layer Zero-Virtual Seam & Zero Cross-Subsystem Header Leaks:**
-  - **Layer 1 (`FrameworkTypes.h`, `SceneDirector.h/.cpp`):** Pure C++23 data-oriented Structure-of-Arrays (SoA) state stack machine (`kMaxStateStackDepth = 8`), cooked binary `'ESCN'` scene manifest parser, non-blocking 2-stage scene/room transition pipeline (`WaitingManifestBlob` -> `StreamingSceneAssets`), and `constexpr` 64-bit SplitMix deterministic state audit (`SceneDirector::ComputeAuditHash()`, `SceneDirector::CombineAuditHashes()`). `FrameworkTypes.h` and `SceneDirector.h` include only Layer 1 `*Types.h` headers (`AssetTypes.h`, `TimePipeline.h`, `GameplayTypes.h`, `InputTypes.h`, `ActionBuffer.h`, `Platform.h`, `WorldTypes.h`) and forward-declare Layer 2 subsystem classes — zero `World.h`, `Renderer.h`, `RenderList.h`, `AssetSystem.h`, `AudioSystem.h`, `GameplayPipeline.h`, `DebugSystem.h`, `Window.h`, or `<SDL3/SDL_*.h>` header pollution.
-  - **Layer 2 (`Application.h/.cpp`):** 64B-aligned move-only RAII runtime coordinator owning all concrete subsystem instances (`Platform`, `Window`, `InputPipeline`, `ActionBuffer`, `TimeManager`, `Renderer`, `AssetSystem`, `AudioSystem`, `World`, `GameplayPipeline`, `DebugSystem`, `SceneDirector`) in strict dependency order. Drives the canonical 120 Hz fixed-step simulation loop, routes OS window/focus events, drains gameplay `SimCue` records into consolidated `AudioUpdateDesc` / camera trauma / rumble / prefab spawn actions, integrates `DebugSystem` (`DebugLoopDirectives`, `EndSimTick`, `RecordSubsystemTelemetry`, `EmitOverlays`), and orchestrates interpolated render extraction.
-- **L1 Cache Line 0 Partitioning & Eliminated Memory Bloat:**
-  - **`SceneDirector` (`sizeof == 832`, `alignas(64)`, 13 Cache Lines Exact):**
-    - **Cache Line 0 (`offset 0..63`, `64B` exact):** Packs all hot 120 Hz/240 Hz bitmasks (`m_activeSimMask`, `m_activeRenderMask`, `m_pausedClockMask`), `m_stackDepth`, `m_cmdCount`, `m_phase`, `m_persistentScope`, `m_activeScope`, `m_stagingScope`, `m_topInputMask`, `m_stagedManifestBlob`, `m_layerFlags[8]` (`8B`), `m_stateIds[8]` (`16B`), `m_inputMasks[8]` (`16B`), and `m_activeSceneId` (`8B`) with zero padding.
-    - **Cache Lines 1..3 (`offset 64..255`, `192B` exact):** Hot SoA dispatch tables (`m_simFns[8]`, `m_renderFns[8]`, `m_userStates[8]`).
-    - **Cache Line 4 (`offset 256..319`, `64B` exact):** Cold exit lifecycle table (`m_exitFns[8]`). The write-only dead `m_enterFns[8]` (`64B`) array and `PendingStateCmd` (`15B/cmd` padding) are completely eliminated (`StateLayerDesc::cmdKind` embeds the command tag directly at offset 45).
-  - **`Application` Cache Line 0 (`offset 0..63`, `64B` exact) & `-1.26 MB` Footprint Reduction:**
-    - Packs all hot runtime coordinator state (`m_userAppState`, `m_devToolsTap`, `m_onConsumeSimCue`, `m_onPreShutdown`, `m_lastRenderListAuditHash`, `m_assetPumpBudget`, `m_frameIndex`, `m_initialized`, `m_headless`) into Cache Line 0 (`64B` exact), eliminating the dead runtime `ApplicationConfig m_cfg` copy, `m_cachedCameraEntity`, `m_latchedFrozenMask`, `m_latchedChannelScales[8]`, and the duplicate `1.26 MB` `m_headlessRenderList` (`StepHeadless()` reuses `m_renderer.BeginFrame()` via shared `ExtractRenderFrame()`).
-- **Single-Pass Top-Down Bitmask Rebaking & Re-Entrant State Command Queueing:**
-  - `RebakeStackMasks()` sweeps top-down (`i = m_stackDepth` down to `1`) in a single 15-line pass to compute `m_activeSimMask`, `m_activeRenderMask`, `m_pausedClockMask`, and `m_topInputMask` simultaneously without `std::bit_width` shifts or second loops.
-  - `PushState`, `PopState`, `SwitchState`, and `ClearAndPushState` delegate to a single 6-line `EnqueueStateCmd` helper, and `CommitSafeFramePoint()` supports re-entrant state/scene commands triggered from inside `onEnter` callbacks.
-- **Non-Blocking Scene Streaming, `O(1)` `IsScopeSimReady` & Symmetric Scene Teardown:**
-  - Manifest entries (`CookedSceneAssetEntry`) are pinned via unified `assets.Pin(m_stagingScope, entry.id, entry.kind, entry.residency)` (eliminating 5-way `switch (entry.kind)`), and `StepSceneTransition()` checks `bank.IsScopeSimReady(m_stagingScope)` in `constexpr` $O(1)$ (`m_scopeSimPending[scope] == 0`) via a single shared `ensureSimReady` gate.
-  - `ActivatePendingScene()` pre-validates staged simulation blobs before invoking `m_activeSceneDeactivateFn` or `world.Clear()`, latches `m_activeSceneDeactivateFn = m_pendingScene.onDeactivating` so the active scene's teardown hook is preserved across subsequent transitions and `Shutdown()`, and retires `oldScope` via single-arg `audio.RequestScopeRelease(oldScope)` (drained in `Application::RouteCuesAndSyncAudio` via `m_audio.PollReleasableScopeMask()` -> `m_assets.EndScope()`).
+## 1. Architectural Overview & Strict Two-Layer Separation
+- **Layer 1 (`framework/FrameworkTypes.h`, `framework/SceneDirector.h/.cpp`):** 100% pure C++23 (`-fno-exceptions -fno-rtti`), zero `<SDL3/SDL_*.h>`, `platform/`, or `Renderer.h` dependencies. Coordinates the 8-layer pushdown state stack (`StateLayerDesc`), safe frame-barrier command queue (`CommitSafeFramePoint`), two-tier asset scopes (`m_persistentScope` + `m_activeScope` + `m_stagingScope`), cooked `"ESCN"` v1 binary scene manifests (`CookedSceneManifestHeader` with `ComputeSceneManifestChecksum()` FNV-1a verification), `FullReset` vs `RoomSwap` transitions (destroying transient `Lifetime2D` and `kRoomTransientCategoryBit` actors while preserving persistent entities), automatic music crossfade (`AudioSystem::TransitionMusic`), `ReloadActiveScene()`, and built-in screen-space transition wipes (`FadeToBlack`, `HorizontalCurtain`, `VerticalCurtain`, `DiamondIris`).
+- **Layer 2 (`framework/Application.h/.cpp`):** Top-level 12-subsystem runtime coordinator (`sizeof(Application) == 64`, 1 cache line exact) housing `AppRuntimeState` (including the 1.33 MB `RenderList`) inside a single 64B-aligned `AlignedArena` slab to prevent stack overflow in `main()`. Executes deterministic dependency-ordered initialization, reverse-order RAII shutdown, 120 Hz fixed-step simulation (`StepFrame` / `StepHeadless`), reversible modal `StateLayerFlags::PauseSimClock` (freezing `World`/`Physics`/`Gameplay` and non-UI audio channels while keeping the top modal overlay layer and UI ticking at 120 Hz), `BindReplayStream(InputReplayStream*, ReplayMode)` deterministic recording & playback, `DebugLoopDirectives::RequestStateReset()` handling, per-frame LRU VRAM budget eviction (`EvictLruToVramBudget`), `SimCue` cross-subsystem routing (`AudioOneShot`, `SpawnPrefabEffect`, `CameraTraumaPulse`, `HitstopFreeze`), audio raycast occlusion & scope garbage collection (`PollReleasableScopeMask()`), interpolated render extraction (`ExtractAndCompileRenderFrame`), and 64-byte `FrameAuditDigest` verification.
 
-## 2. Core Types (`framework/FrameworkTypes.h`)
-- **Primitives, Enums & Errors (`Zero Padding`):**
-  - `using StateId = u16;` (`kInvalidStateId = 0xFFFF`, `kMaxStateStackDepth = 8`, `kMaxPendingStateCmds = 8`).
-  - `enum class FrameworkErrc : u8`: `None = 0`, `InvalidConfig`, `PlatformInitFailed`, `WindowCreateFailed`, `RendererInitFailed`, `AssetInitFailed`, `AudioInitFailed`, `WorldInitFailed`, `GameplayInitFailed`, `DebugInitFailed`, `ClientBootFailed`, `StateStackOverflow`, `StateStackUnderflow`, `SceneTransitionBusy`, `ScopeAllocationFailed`, `CorruptedSceneManifest`, `SimAssetWaitFailed`.
-  - `enum class SubSystemStage : u8`: `None = 0`, `Platform`, `Window`, `Renderer`, `Assets`, `Audio`, `World`, `Gameplay`, `Debug`, `SceneDirector`, `ClientApp`.
-  - `struct alignas(4) FrameworkError` (`sizeof == 4`): `code`, `stage`, `subSystemErrc`, `reserved`.
-  - `enum class StateLayerFlags : u8`: `None`, `BlockLowerSimTicks`, `BlockLowerInput`, `BlockLowerRender`, `PauseSimClock`. Queried via `constexpr bool HasStateFlag(StateLayerFlags val, StateLayerFlags mask) noexcept`.
-  - `enum class SceneTransitionMode : u8`: `FullReset = 0` (`World::Clear()`), `RoomSwap = 1` (retains surviving entities).
-  - `enum class SceneWaitPolicy : u8`: `StreamNonBlocking = 0`, `ImmediateBarrier = 1`.
-  - `enum class TransitionPhase : u8`: `Idle = 0`, `WaitingManifestBlob`, `StreamingSceneAssets`.
-- **Non-Owning Execution Contexts (`alignas(64)`, Zero Implicit Padding):**
-  - `struct alignas(64) SimContext` (`sizeof == 128`): `world`, `gameplay`, `assetBank`, `audio`, `platform`, `actionBuffer`, `tickInput` (`const TickInput*`), `userState` (`void*`), `step` (`SimStepView`), `director` (`SceneDirector*`). Hoisted outside the `PollTick()` loop.
-  - `struct alignas(64) RenderContext` (`sizeof == 128`, 0 implicit padding): `world`, `gameplay`, `assetBank`, `renderList`, `frameInput`, `windowState`, `userState` (`void*`), `director` (`SceneDirector*`), `timeView` (`RenderTimeView`).
-  - `struct alignas(64) SceneLoadContext` (`sizeof == 64`, 1 cache line): `world`, `gameplay`, `assets`, `audio`, `renderer` (`Renderer*`), `userAppState` (`void*`), `frameIndex`, `sceneScope`, `persistentScope`, `reserved`, `director` (`SceneDirector*`).
-- **State, Scene & Determinism Descriptors (`Zero Padding`):**
-  - `struct alignas(16) StateLayerDesc` (`sizeof == 48`): `onSimTick`, `onRenderExtract`, `onEnter`, `onExit`, `stateData`, `id`, `inputActionMask`, `flags`, `cmdKind`, `reserved`.
-  - `struct alignas(64) SceneTransitionDesc` (`sizeof == 64`): `sceneId`, `manifestBlobId` (`'ESCN'`), `collisionMapId` (`'ECOL'`), `rootPrefabId` (`'EPFB'`), `cueBankId` (`'EAUD'`), `onActivated`, `onDeactivating`, `musicTrackId`, `musicCrossfadeBlocks`, `mode`, `waitPolicy`.
-  - `struct alignas(16) CookedSceneManifestHeader` (`sizeof == 48`, magic `'ESCN'`) & `struct alignas(16) CookedSceneAssetEntry` (`sizeof == 16`).
-  - `struct alignas(64) FrameAuditDigest` (`sizeof == 64`): `tickIndex`, `worldHash`, `gameplayHash`, `assetBankHash`, `audioHash`, `renderListHash`, `directorHash`, `combinedHash`.
-  - `struct alignas(64) AppHooks`: `userAppState`, `devToolsTap`, `gameplayPolicies`, `OnRegisterComponents`, `OnBoot`, `OnPreShutdown`, `OnConsumeSimCue`.
-  
-## 3. Public Interfaces & Signatures
-### `SceneDirector` (`framework/SceneDirector.h` — `sizeof == 832`, `alignas(64)`, Pure C++23 SoA State Stack & Scene Coordinator)
-- Lifecycle & Queued State Stack Operations:
-  - `[[nodiscard]] Result<void, FrameworkErrc> Init(assets::AssetSystem& assets) noexcept`
-  - `void Shutdown(assets::AssetSystem& assets, audio::AudioSystem& audio, SceneLoadContext* optionalLoadCtx = nullptr) noexcept`
-  - `[[nodiscard]] constexpr Result<void, FrameworkErrc> PushState(const StateLayerDesc& desc) noexcept`
-  - `[[nodiscard]] constexpr Result<void, FrameworkErrc> PopState() noexcept`
-  - `[[nodiscard]] constexpr Result<void, FrameworkErrc> SwitchState(const StateLayerDesc& desc) noexcept`
-  - `[[nodiscard]] constexpr Result<void, FrameworkErrc> ClearAndPushState(const StateLayerDesc& desc) noexcept`
-- Scene Streaming, Frame Barrier & Hot Dispatch:
-  - `[[nodiscard]] Result<void, FrameworkErrc> RequestSceneTransition(const SceneTransitionDesc& desc, assets::AssetSystem& assets) noexcept`
-  - `[[nodiscard]] Result<bool, FrameworkErrc> CommitSafeFramePoint(SceneLoadContext& loadCtx) noexcept`
-  - `void DispatchSimTick(SimContext& simCtx) const noexcept`
-  - `void DispatchRenderExtract(RenderContext& renderCtx) const noexcept`
-- Queries & Determinism Audit (`constexpr` O(1) Cache Line 0):
-  - `HasPendingWork()`, `Phase()`, `ActiveSceneScope()`, `PersistentScope()`, `ActiveSceneId()`, `StateDepth()`, `ActiveSimMask()`, `ActiveRenderMask()`, `TopInputMask()`, `IsClockPausedByState()`
-  - `[[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept`
-  - `[[nodiscard]] static constexpr u64 CombineAuditHashes(u64 tickIndex, u64 worldHash, u64 gameplayHash, u64 assetHash, u64 audioHash, u64 renderHash, u64 directorHash) noexcept`
-
-### `ApplicationConfig` & `Application` (`framework/Application.h` — 64B-Aligned Layer 2 Runtime Coordinator)
-- `struct ApplicationConfig` (Layer 2): `appName`, `orgName`, `bootPakPath`, `headless`, `assetPumpBudget`, `window`, `renderer`, `assets`, `audio`, `world`, `gameplay`, `debug`.
-- Lifecycle & Execution Entry Points:
-  - `[[nodiscard]] Result<void, FrameworkError> Init(const ApplicationConfig& cfg, const AppHooks& hooks = {}) noexcept`
-  - `void Shutdown() noexcept`
-  - `[[nodiscard]] Result<void, FrameworkError> Run() noexcept`
-  - `[[nodiscard]] Result<void, FrameworkError> StepFrame() noexcept`
-  - `[[nodiscard]] Result<FrameAuditDigest, FrameworkError> StepHeadless(u32 tickCount = 1, u32 audioBlocksPerTick = 2) noexcept`
-  - `[[nodiscard]] FrameAuditDigest ComputeFrameAuditDigest() const noexcept`
-- Deduced-`this` Subsystem Accessors:
-  - `Director()`, `World()`, `Gameplay()`, `Assets()`, `Audio()`, `Renderer()`, `Platform()`, `Window()`, `Input()`, `Time()`, `ActionBuffer()`, `Debug()`
+## 2. Exact Struct Byte Budgets (`0` `using` Aliases, `0` Dummy `reserved` Fields, `0B` Compiler Padding)
+| Struct / Class | Size | Alignment | Invariant & Layout Summary |
+| :--- | :--- | :--- | :--- |
+| `FrameworkError` | `4 B` | `alignas(4)` | `FrameworkErrc` (`1B`), `SubSystemStage` (`1B`), `subSystemErrc` (`2B`). |
+| `CookedSceneManifestHeader` | `16 B` | `alignas(16)` | `"ESCN"` (`0x4E435345`), `version = 1`, `assetEntryCount`, `musicTrackId`, `checksum`. |
+| `CookedSceneAssetEntry` | `16 B` | `alignas(16)` | `AssetId` (`8B`), `byteSizeHint` (`4B`), `AssetKind` (`1B`), `AssetResidency` (`1B`), `flags` (`2B`). |
+| `SimContext` | `64 B` | `alignas(64)` | 1 cache line exact: 8 non-owning subsystem pointers (`world`, `physics`, `gameplay`, `assetBank`, `audio`, `actionBuffer`, `tickInput`, `director`). |
+| `RenderContext` | `64 B` | `alignas(64)` | 1 cache line exact: 8 non-owning pointers (`world`, `physics`, `gameplay`, `assetBank`, `renderList`, `frameInput`, `timeView`, `director`). |
+| `SceneLoadContext` | `64 B` | `alignas(64)` | 1 cache line exact: 7 pointers (`world`, `physics`, `gameplay`, `assetBank`, `audio`, `director`, `userAppState`) + `frameIndex` (`4B`), `transitionTicks` (`2B`), `sceneScope` (`1B`), `persistentScope` (`1B`). |
+| `StateLayerDesc` | `48 B` | `alignas(16)` | 3 x 16B exact: `onSimTick`, `onRenderExtract`, `onEnter`, `onExit`, `stateData`, `inputActionMask` (`2B`), `id` (`1B`), `flags` (`1B`), `cmdKind` (`1B`), `layerPriority` (`1B`), `userTag` (`2B`). |
+| `SceneTransitionDesc` | `64 B` | `alignas(64)` | 1 cache line exact: `sceneId`, `manifestBlobId`, `collisionMapId`, `rootPrefabId`, `cueBankId`, `onActivated`, `onDeactivating`, `musicTrackId`, `musicCrossfadeBlocks`, `transitionDurationTicks`, `mode`, `wipe`. |
+| `FrameAuditDigest` | `64 B` | `alignas(64)` | 1 cache line exact: `tickIndex`, `worldHash`, `physicsHash`, `gameplayHash`, `audioHash`, `renderListHash`, `directorHash`, `combinedHash`. |
+| `AppHooks` | `64 B` | `alignas(64)` | 1 cache line exact: `userAppState` (`8B`), `GameplayPolicyTable` (`24B`), `onRegisterComponents` (`8B`), `onBoot` (`8B`), `onPreShutdown` (`8B`), `onConsumeSimCue` (`8B`). |
+| `SceneDirector` | `576 B` | `alignas(64)` | 9 cache lines exact (shrunk from 832B): Cache Line 0 packs hot bitmasks (`m_activeSimMask`, `m_activeRenderMask`, `m_pausedClockMask`, `m_topInputMask`), scopes, wipe state, 8-layer SoA metadata (`m_layerFlags[8]`, `m_stateIds[8]`, `m_inputMasks[8]`), `m_activeSceneId`, and `m_activeSceneDeactivateFn`; Cache Lines 1..4 pack SoA callbacks; Cache Lines 5..7 pack `m_pendingCmds[4]`; Cache Line 8 packs `m_pendingScene`. |
+| `ApplicationConfig` | `96 B` | `alignas(32)` | 3 x 32B blocks exact: `AssetBankConfig` (`32B`), `AudioSystemConfig` (`16B`), `DebugSystemConfig` (`16B`), `ViewportExtent` (`8B`), `WorldConfig` (`12B`), and tuning scalars (`12B`). |
+| `Application` | `64 B` | `alignas(64)` | 1 cache line exact: `AlignedArena` (`16B`), `m_rt` (`8B`), `m_userAppState` (`8B`), `m_lastCombinedAuditHash` (`8B`), `m_frameIndex` (`8B`), `m_totalSimTicks` (`8B`), `m_pixelsPerMeterQ4` (`2B`), `m_initialized` (`1B`), `m_running` (`1B`), `m_headless` (`1B`), `m_debugEnabled` (`1B`), `m_statePausedClock` (`1B`), `m_replayMode` (`1B`). |

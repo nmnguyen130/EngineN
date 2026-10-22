@@ -1,36 +1,74 @@
 #pragma once
 
 #include "debug/DebugBatcher.h"
-#include "gameplay/GameplayPipeline.h"
 
 namespace en {
 
-// Read-only 1-hop entity inspector, screen-to-world picker, and 64-tick combat flight recorder.
-// Non-owning view over arena memory; zero side effects on simulation state.
-// Invariant: m_history ring stores the most recent 64 ticks of the pinned entity.
-class alignas(32) DebugInspector {
+// 16-byte (4 per 64B cache line, zero padding) 1-hop read-only World/Physics/Gameplay/Audio introspector, picker, and flight recorder.
+// Non-owning view over a 64-slot ActorTickRecord ring buffer; zero heap allocations and zero mutation of inspected subsystems.
+// Invariant: sizeof(DebugInspector) == 16, m_scrubOffset < kActorFlightHistoryTicks, and all component reads use 1-hop DirectAtEntityIndex.
+class alignas(16) DebugInspector {
 public:
-    static constexpr usize kFlightHistoryTicks = 64;
+    constexpr void Init(std::span<ActorTickRecord, kActorFlightHistoryTicks> historyStorage) noexcept {
+        m_history = historyStorage.data();
+        Clear();
+    }
 
-    [[nodiscard]] bool Init(AlignedArena& arena) noexcept;
-    void Clear() noexcept;
+    constexpr void Clear() noexcept {
+        if (m_history) {
+            for (u32 i = 0U; i < kActorFlightHistoryTicks; ++i) {
+                m_history[i] = ActorTickRecord{};
+            }
+        }
+        m_pinnedEntity = kNullEntity;
+        m_writeIdx = 0U;
+        m_validCount = 0U;
+        m_scrubOffset = 0U;
+    }
 
     void RecordActorTick(
         const World& world,
-        u64 tickIndex,
-        const TickInput& tickInput,
-        const ActionBuffer& actionBuffer) noexcept;
+        u32 tickIndex,
+        const TickInput* tickInput = nullptr,
+        const ActionBuffer* actionBuffer = nullptr) noexcept;
 
-    [[nodiscard]] EntityId PickEntityAtWorldPos(const World& world, Vec2 worldPos) noexcept;
+    [[nodiscard]] EntityId PickEntityAtWorldPos(
+        const World& world,
+        Vec2 worldPos,
+        f32 pickRadius = 1.0f) noexcept;
 
-    constexpr void SetPinnedEntity(EntityId id) noexcept { m_pinnedEntity = id; }
+    [[nodiscard]] EntityId PickEntityAtScreenPos(
+        const World& world,
+        Vec2 screenPos,
+        ViewportExtent viewportSize,
+        const Camera2D& worldCam = {}) noexcept;
+
+    constexpr void SetPinnedEntity(EntityId entity) noexcept {
+        if (m_pinnedEntity != entity) {
+            m_pinnedEntity = entity;
+            m_writeIdx = 0U;
+            m_validCount = 0U;
+            m_scrubOffset = 0U;
+        }
+    }
+
     [[nodiscard]] constexpr EntityId PinnedEntity() const noexcept { return m_pinnedEntity; }
 
     constexpr void StepScrubOffset(i32 deltaTicks) noexcept {
-        m_scrubOffset = static_cast<u8>(std::clamp(static_cast<i32>(m_scrubOffset) + deltaTicks, 0, 63));
+        if (m_validCount == 0U) {
+            m_scrubOffset = 0U;
+            return;
+        }
+        const i32 maxOff = static_cast<i32>(m_validCount) - 1;
+        const i32 next = std::clamp(static_cast<i32>(m_scrubOffset) + deltaTicks, 0, maxOff);
+        m_scrubOffset = static_cast<u8>(next);
     }
-    constexpr void ResetScrubOffset() noexcept { m_scrubOffset = 0; }
+
+    constexpr void ResetScrubOffset() noexcept { m_scrubOffset = 0U; }
     [[nodiscard]] constexpr u8 ScrubOffset() const noexcept { return m_scrubOffset; }
+    [[nodiscard]] constexpr u8 RecordedTickCount() const noexcept { return m_validCount; }
+
+    [[nodiscard]] const ActorTickRecord* InspectedRecord() const noexcept;
 
     void EmitWorldAndInspectorOverlays(
         OverlayFlags flags,
@@ -41,11 +79,12 @@ public:
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
-    std::span<ActorTickRecord> m_history{};
-    EntityId m_pinnedEntity{kNullEntity};
-    u8 m_writeCursor{0};
-    u8 m_validRecords{0};
-    u8 m_scrubOffset{0};
+    ActorTickRecord* m_history{nullptr};    // 8B
+    EntityId m_pinnedEntity{kNullEntity};   // 4B
+    u16 m_writeIdx{0U};                     // 2B
+    u8 m_validCount{0U};                    // 1B
+    u8 m_scrubOffset{0U};                   // 1B
 };
+static_assert(sizeof(DebugInspector) == 16);
 
 } // namespace en

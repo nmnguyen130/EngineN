@@ -1,84 +1,34 @@
-# EngineN — Audio Subsystem Context (`audio/`)
+# EngineN Phase 10: `audio/` (v2) Subsystem Architecture & Reference
 
-## 1. Architecture & Invariants
-- **Standard:** C++23 (`-fno-exceptions`, `-fno-rtti`), strictly zero heap allocation after `Init()` (single `64 KB` 64-byte aligned arena slab), zero virtual dispatch, locked 5-file footprint (`AudioTypes.h`, `AudioMixer.h/.cpp`, `AudioSystem.h/.cpp`) + `tests/AudioTests.cpp`, two-layer pure C++23 separation (`namespace en::audio`).
-- **Two-Layer Zero-Virtual Seam & Zero Cross-Subsystem Header Pollution:**
-  - **Layer 1 (`AudioTypes.h`, `AudioMixer.h/.cpp`):** Pure C++23 1-cache-line (`sizeof(AudioMixer) == 64`, `alignas(64)`) data-oriented polyphonic mixer (`kSampleRate = 48000`, `kMixBlockFrames = 256`, `kMaxVoices = 64`), L1-resident single-base-pointer `MixerArenaState` (`sizeof == 20352`, `19.8 KB`: `VoicePoolSoA` `3648 B`, 1-cache-line `MusicDeckRuntime` `64 B`, 3-cache-line `BusDspState` `192 B`, and `16 KB` planar bus scratch), 3-stage decoupled SIMD block voice pipe (Pass A branchless interior 4-point Hermite resampling -> Pass B optional full-range Cytomic SVF -> Pass C stereo gain ramp FMA), direct in-place stolen-voice bus tail accumulation (`AccumulateStolenVoiceTail`), lazy dirty-bus clearing (`EnsureBusInitialized`), combat-to-music sidechain ducking, Padé `[3/2]` $\tanh$ master soft-clipper, and 4-stem sample-locked interactive music decks. Depends solely on `"core/Result.h"`, `"core/Types.h"`, `"core/time/TimeTypes.h"`, and `"assets/AssetTypes.h"` — zero `world/`, `gameplay/`, `platform/`, or `<SDL3/SDL_*.h>` dependencies; 100% deterministic in headless CI via `AudioMixer::ComputeAuditHash()`.
-  - **Layer 2 (`AudioSystem.h/.cpp`):** 2-cache-line (`sizeof(AudioSystem) == 128`, `alignas(64)`) move-only RAII coordinator owning the single `64 KB` arena slab (`m_bridge` at offset `0`) and `SDL_AudioStream` hardware binding (`SDL_OpenAudioDeviceStream`), flat 1024-slot Fibonacci Robin Hood `SoundCueDef` index with co-located 8-byte `CueRuntimeMeta`, all-in-one 32-byte `MainVoiceTracker` (`2 per cache line`, zero side arrays), single-pass bitmask voice admission pipeline (tick-0-safe cooldown/energy-summing coalescer, per-cue concurrency cap, entity voice replacement, and single-command `StealOldest`/`StealQuietest` audibility stealing), `m_spatialActiveMask`-filtered 30 Hz staggered raycast occlusion via `AudioOcclusionQueryFn`, and bitmask scope retirement (`RequestScopeRelease` / `PollReleasableScopeMask`) covering both active voices and active music decks. `<SDL3/SDL_audio.h>` is strictly confined to `AudioSystem.cpp`.
-- **Direct In-Place Steal Tail Accumulation (`0 B` Steal Pool Overhead):**
-  - Eliminates the legacy `16.5 KB` `StealSlotState` buffer, `MixStealPoolPlanar()` pass, `m_nextStealPoolIdx`, and duplicate `StopVoice` command before `SpawnVoice`. When `ApplyCommand(SpawnVoice)` overwrites an active voice bit, `AccumulateStolenVoiceTail(slot)` mixes a 256-sample linear fade-out of the old voice directly into its target bus scratch plane (`m_pendingStealBusMask`), halving SPSC command traffic on voice steals and shrinking `MixerArenaState` to `19.8 KB` (fitting 100% inside a 32 KB L1D cache).
-- **Hybrid Lock-Free Thread Synchronization (Triple-Buffer + Discrete SPSC Ring + `freshSpawnMask`):**
-  - **Continuous State (`AudioFrameSnapshot`, `576 B` = 9 cache lines):** Pre-computed on the main thread inside `AudioSystem::Update()` and published via a wait-free 3-slot atomic Triple Buffer (`tripleFlags`). Non-spatial 2D voices compute their targets once at `PlayCue()`, while `Update()` iterates strictly over `m_spatialActiveMask` for distance attenuation, constant-power panning (`m_invPanWidth`), and occlusion filtering.
-  - **Discrete Lifecycle Edges (`AudioCommand`, `32 B` exact):** A 256-slot cache-isolated SPSC ring buffer (`cmdRing`) carries only discrete state transitions (`SpawnVoice`, `StopVoice`, `BindMusicStem`, `CommitMusicDeck`, `PanicReset`). `VoicePoolSoA::freshSpawnMask` latches spawn gains and pitch until `snapshotSeq` advances, preventing first-block volume dips when `SpawnVoice` is drained on the audio thread prior to the next `Update()` snapshot.
+## 1. Zero-Coupling Boundary & Header Hygiene
+- `audio/` includes ONLY `"core/Types.h"`, `"core/Error.h"`, `"core/Memory.h"`, `"core/Math.h"`, `"time/TimeTypes.h"`, and `"assets/AssetTypes.h"` (`AudioSystem.cpp` includes `"assets/AssetBank.h"`).
+- **Zero Cross-Subsystem Header Leaks:** Zero `world/`, `physics/`, `gameplay/`, `platform/`, `renderer/`, or `input/` headers.
+- **Zero Type Aliases & Zero Hidden Padding:** `0` `using` type aliases across `audio/*.h` and `audio/*.cpp`; `0` dummy `reserved` padding fields; `0B` hidden compiler padding verified via `static_assert`.
 
-## 2. Core Types (`audio/AudioTypes.h`)
-- **Primitives, Enums & Bitmasks:**
-  - `enum class AudioErrc : u8`: `InvalidConfig`, `ArenaExhausted`, `DeviceOpenFailed`, `CorruptedBankBlob`, `CueTableFull`, `VoicePoolExhausted`.
-  - `enum class AudioBusId : u8`: `Master = 0`, `Music`, `SfxPlayer`, `SfxCombat`, `SfxWorld`, `Ambience`, `Ui`, `Voice`, `Count` (`kAudioBusCount = 8`).
-  - `enum class FilterMode : u8`: `Bypass = 0`, `LowPass`, `HighPass`, `BandPass`.
-  - `enum class AttenuationCurve : u8`: `None = 0`, `Linear`, `InverseClamped`, `Smoothstep`.
-  - `enum class StealPolicy : u8`: `Reject = 0`, `StealOldest`, `StealQuietest`.
-  - `enum class VoiceFlags : u8`: `None`, `Looping`, `Spatialized2D`, `FollowTimeScale`, `PauseOnHitstop`, `BypassOcclusion`, `OneVoicePerEntity`. Queried via `constexpr bool HasVoiceFlag(VoiceFlags val, VoiceFlags mask) noexcept`.
-- **Identifiers, Bridges & Cooked Binary Formats (`Zero Dummy Padding`):**
-  - `struct alignas(4) VoiceHandle { u16 index{0}; u16 generation{0}; };` (`sizeof == 4`).
-  - `struct alignas(4) SoundCueId { u32 value{0}; };` (`sizeof == 4`, `SoundCueId::FromAssetId(assets::AssetId)`).
-  - `struct alignas(16) AudioTriggerReq` (`sizeof == 16`): `cueId`, `worldX`, `worldY`, `emitterId`.
-  - `struct alignas(16) AudioEmitterView` (`sizeof == 16`): `worldX`, `worldY`, `maxDist`, `occlusionFactor`.
-  - `struct AudioUpdateDesc`: `tickIndex`, `listenerX`, `listenerY`, `channelScales`, `triggers`, `assetBank`, `occlusionQuery`, `occlusionUserCtx`, `frozenChannelMask`, `focusMuteOverride`.
-  - `struct alignas(16) CookedAudioBankHeader` (`sizeof == 16`, magic `'EAUD'`).
-  - `struct alignas(32) SoundCueDef` (`sizeof == 32`, 2 cues per 64B cache line).
-  - `struct alignas(32) MusicTrackDef` (`sizeof == 32`, 2 tracks per 64B cache line).
-  - `struct alignas(32) AudioCommand` (`sizeof == 32`): `type` (`AudioCmdType`), `packedBusAndChannel`, `voiceSlot`, `generation`, `flags`, `assetScopeId`, `payload` (`24 B` union: `Spawn`, `Stop`, `MusicStem`).
-  - `struct alignas(64) AudioFrameSnapshot` (`sizeof == 576`, 9 cache lines).
-  - `struct alignas(32) AudioTelemetrySnapshot` (`sizeof == 32`).
+## 2. Exact Struct Layouts (`audio/AudioTypes.h`)
+- `VoiceHandle` (`4B`): `u16 index{0}`, `u16 generation{0}` (`generation == 0` is invalid).
+- `SoundCueId` (`4B`): `u32 value{0}` with `constexpr SoundCueId::Hash(std::string_view)`.
+- `AudioTriggerReq` (`16B`, `alignas(16)`): `SoundCueId cueId`, `f32 worldX`, `f32 worldY`, `u32 emitterId`.
+- `AudioEmitterView` (`16B`, `alignas(16)`): `f32 worldX`, `f32 worldY`, `f32 maxDist`, `f32 occlusionFactor`.
+- `CookedAudioBankHeader` (`16B`, `alignas(16)`): `u32 magic{0x44554145U}` (`"EAUD"`), `u16 version{1}`, `u16 cueCount`, `u16 musicTrackCount`, `u16 flags`, `u32 checksum`.
+- `SoundCueDef` (`32B`, `alignas(32)`):
+  - `SoundCueId id` (`4B`), `AudioHandle clipVariants[2]` (`8B`), `f32 minDist{2.0f}` (`4B`), `f32 maxDist{24.0f}` (`4B`), `u16 baseGain_q14{16384}` (`2B`), `u16 basePitch_q12{4096}` (`2B`), `u16 loopStartFrame{0}` (`2B`), `u8 priority{128}` (`1B`), `u8 maxConcurrency{4}` (`1B`), `u8 cooldownTicks{2}` (`1B`), `VoiceFlags flags` (`1B`), `u8 packedRouting` (`1B`: `AudioBusId`, `TimeChannel`, `StealPolicy`), `u8 packedCurveAndJitter` (`1B`: `AttenuationCurve`, `GainJitter`, `PitchJitter`).
+- `MusicTrackDef` (`32B`, `alignas(32)`): `u32 trackId`, `AudioHandle stems[4]` (`16B`), `u16 defaultWeights_q14[4]` (`8B`), `u16 loopStartFrame`, `u8 stemCount`, `u8 loop`.
+- `AudioCommand` (`32B`, `alignas(32)`, descending alignment): `const f32* pcmData` (`8B` at offset 0), `u32 frameCount` (`4B`), `u16 loopStartFrame` (`2B`), `u16 sampleRate` (`2B`), `u16 initialGainL_q14` (`2B`), `u16 initialGainR_q14` (`2B`), `u16 initialPitch_q12` (`2B`), `u16 generation` (`2B`), `u16 fadeBlocks` (`2B`), `AudioCmdType type` (`1B`), `AudioBusId bus` (`1B`), `u8 voiceSlot` (`1B`), `VoiceFlags flags` (`1B`), `u8 channels` (`1B`), `u8 assetScope` (`1B`).
+- `AudioFrameSnapshot` (`576B`, `alignas(64)`, 9 cache lines): `targetGainL_q14[64]`, `targetGainR_q14[64]`, `targetPitch_q12[64]`, `voiceCutoffHz[64]`, `busGain_q14[8]`, `busCutoffHz[8]`, `busFilterMode[8]`, `musicStemWeights_q14[4]`, `pausedVoicesMask`, `sidechainDuckStrength_q14`, `reverbWetGain_q14`, `reverbRoomSize_q8`, `reverbDamping_q8`, `masterMuted`, `reverbBusSendMask`.
+- `AudioTelemetrySnapshot` (`32B`, `alignas(32)`): `u64 mixedBlocksCount`, `f32 masterPeakL`, `f32 masterPeakR`, `f32 sidechainEnvelope`, `f32 reverbPeak`, `u16 activeVoiceCount`, `u16 virtualVoiceCount`, `u16 stolenVoiceCount`, `u16 activeMusicStems`.
+- `AudioUpdateDesc` (`64B`, `alignas(64)`): Single-call per-tick orchestration descriptor.
 
-## 3. Public Interfaces & Signatures
-### `AudioMixer` (`audio/AudioMixer.h` — 64B 1-Cache-Line Pure C++23 SoA Mixer & DSP Engine)
-- `[[nodiscard]] static constexpr usize RequiredArenaBytes() noexcept`
-- `[[nodiscard]] Result<void, AudioErrc> Init(std::span<u8> arenaSlice) noexcept`
-- `void Reset() noexcept`
-- `void ApplyCommand(const AudioCommand& cmd) noexcept`
-- `void MixBlock(const AudioFrameSnapshot& snapshot, std::span<f32, kMixBlockFrames * 2> outInterleavedStereo) noexcept`
-- `[[nodiscard]] constexpr const AudioTelemetrySnapshot& Telemetry() const noexcept`
-- `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
+## 3. DSP & Mixer Engine (`audio/AudioMixer.h/.cpp` v2)
+- `sizeof(AudioMixer) == 64` (1 cache line exact) operating over a contiguous 56 KB `MixerArenaState` with zero dead fields (`m_freshSpawnMask`, `m_lastSnapshotSeq`, `m_activeVoiceCount` removed).
+- **True Stereo & Mono 4-Point Catmull-Rom Hermite Resampler (`InterpolateHermite4`):** Natively synthesizes both 1-channel and 2-channel stereo clips using `baseRateStep32_32` (`(sampleRate << 32) / kAudioSampleRate`) scaled by `pitch_q12` without cumulative pitch drift.
+- **Seamless Sample-Accurate Loop Points (`[loopStartFrame .. frameCount)`):** Preserves sub-sample fractional phase across intro-to-sustain loop boundaries for both polyphonic voices and 4-stem music tracks.
+- **Virtual Voice Fast-Path (`m_virtualVoicesMask`):** Looping spatial emitters outside `maxDist` (`gain == 0`) advance `phase32_32` in O(1) (`step * kMixBlockFrames` with loop wrapping) without sample synthesis, and promote seamlessly to real voices when entering `maxDist`.
+- **Unified Cytomic Linear Trapezoidal SVF (`StepCytomicSvf`) & In-Place Stolen-Voice / Music Deck Tail Crossfader:** Zero-delay feedback (`LowPass`, `HighPass`, `BandPass`) shared between voices and buses; click-free 256-sample tail rendering on voice steals, hard stops, and music track transitions.
+- **Integrated Stereo Schroeder / Freeverb Aux Reverb:** 4 parallel lowpass-feedback comb filters + 2 series allpass diffusers per channel (`SetReverbParams(roomSize, damping, wetGain, busSendMask)` + `VoiceFlags::ReverbSend`), bypassed in O(1) when `reverbWetGain_q14 == 0`.
+- **Sidechain Envelope Ducking & Padé `[3/2]` Soft-Clipper:** Automatic `Music` + `Ambience` ducking driven by `SfxCombat + Voice` peak envelope, followed by rational Padé $\tanh$ master limiting.
 
-### `AudioSystem` (`audio/AudioSystem.h` — 128B 2-Cache-Line Move-Only RAII Coordinator & SDL3 Stream Adapter)
-- Lifecycle & Bank Registration:
-  - `[[nodiscard]] Result<void, AudioErrc> Init(const AudioSystemConfig& cfg = {}) noexcept` (`cfg.arenaBytes = 64 * 1024`)
-  - `void Shutdown() noexcept`
-  - `[[nodiscard]] Result<void, AudioErrc> RegisterCueDef(const SoundCueDef& def, assets::ScopeId owningScope = 0) noexcept`
-  - `[[nodiscard]] Result<void, AudioErrc> RegisterMusicTrackDef(const MusicTrackDef& def, assets::ScopeId owningScope = 0) noexcept`
-  - `[[nodiscard]] Result<void, AudioErrc> RegisterCueBank(const assets::BlobRecord& cueBlob, assets::ScopeId owningScope) noexcept`
-  - `void RequestScopeRelease(assets::ScopeId scope) noexcept`, `[[nodiscard]] u32 PollReleasableScopeMask() noexcept`
-  - `void SetFocusMuted(bool muted) noexcept`
-- Playback, Routing & Consolidated Frame Synchronization:
-  - `void SubmitTriggers(std::span<const AudioTriggerReq> triggers, const assets::AssetBank& assetBank) noexcept`
-  - `VoiceHandle PlayCue(SoundCueId cueId, const assets::AssetBank& assetBank, f32 worldX = 0.0f, f32 worldY = 0.0f, u32 emitterId = kNullEmitter) noexcept`
-  - `void StopVoice(VoiceHandle handle, u16 fadeOutBlocks = 1) noexcept`
-  - `void SetBusGain(AudioBusId bus, f32 linearGain) noexcept`, `void SetBusFilter(AudioBusId bus, FilterMode mode, f32 cutoffHz) noexcept`
-  - `void TransitionMusic(u32 trackId, const assets::AssetBank& assetBank, u8 crossfadeBlocks = 94) noexcept`
-  - `void SetMusicStemWeights(std::span<const f32, kMaxMusicStems> weights) noexcept`
-  - `void Update(const AudioUpdateDesc& desc) noexcept`
-  - `void PumpHeadlessBlocks(u32 blockCount, std::span<f32> optionalCaptureOut = {}) noexcept`
-  - `[[nodiscard]] u32 ExtractActiveEmitters(std::span<AudioEmitterView> outEmitters) const noexcept`
-  - `[[nodiscard]] AudioTelemetrySnapshot Telemetry() const noexcept`, `[[nodiscard]] u64 ComputeAuditHash() const noexcept`
-
-## 4. Canonical Main Loop Usage
-```cpp
-for (u32 relMask = m_audio.PollReleasableScopeMask(); relMask != 0u; relMask &= (relMask - 1u)) {
-    m_assets.EndScope(static_cast<en::assets::ScopeId>(std::countr_zero(relMask)));
-}
-
-m_audio.Update({
-    .tickIndex         = m_time.GetRenderView().tickIndex,
-    .listenerX         = camX,
-    .listenerY         = camY,
-    .channelScales     = m_time.EffectiveScales(),
-    .triggers          = audioTriggerBatch,
-    .assetBank         = &m_assets.Bank(),
-    .occlusionQuery    = &QuerySpatialOcclusion,
-    .occlusionUserCtx  = &m_gameplay.Spatial(),
-    .frozenChannelMask = m_time.FrozenMask(),
-    .focusMuteOverride = m_window.State().focused ? i8(0) : i8(1)
-});
-```
+## 4. Main-Thread Coordinator (`audio/AudioSystem.h/.cpp` v2)
+- `sizeof(AudioSystem) == 128` (2 cache lines exact), `sizeof(MainVoiceTracker) == 32` (stores `instanceGain_q14` and `instancePitch_q12` so randomized spawn jitter and same-tick energy-summing boosts persist across `Update()` ticks).
+- **Near-Field Spatial Spread (`dist / minDist`), Radial 2D Doppler & Staggered 30 Hz Occlusion:** Smoothly collapses stereo panning toward center inside `minDist` to prevent speaker-flip artifacts when crossing `listenerX`.
+- **Dynamic Emitter & Voice Controls:** `SetVoicePosition`, `UpdateEmitterTransform`, `SetVoiceGain`, `SetVoicePitch`, `StopVoice` (with smooth multi-block decay that retires looping voices cleanly), `StopAllVoices`, and `RequestScopeRelease` / `PollReleasableScopeMask`.
