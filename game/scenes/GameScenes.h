@@ -17,7 +17,8 @@ enum class GameStateLayerId : u8 {
     EndingModal    = 6,
 };
 
-// Manages the 4 interconnected Vaelen rooms, enclosed tilemaps, portals, interactive props, CameraController2D confiners, and StateLayerDesc stack.
+// Manages the 8 connected Vaelen vertical-slice rooms (Ash-Sump Slums -> Collapsed Mine -> Lantern Chamber -> Warden Arena -> Shortcut Return),
+// enclosed tilemaps, portals, interactive props, CameraController2D confiners, and StateLayerDesc stack.
 class GameScenes {
 public:
     [[nodiscard]] static en::StateLayerDesc MakeGameplayLayerDesc(VeilGameApp* app) noexcept;

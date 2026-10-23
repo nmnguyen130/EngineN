@@ -6,44 +6,95 @@
 
 namespace vots {
 
-void PlayerController::ConfigureDefaultInputMap(en::InputMap& map) noexcept {
+void PlayerController::ConfigureDefaultInputMap(
+    en::InputMap& map,
+    f32 analogDeadzone) noexcept {
     using en::AxisBinding;
     using en::InputSource;
-    using en::SocdPolicy;
+
+    const f32 dz = std::clamp(analogDeadzone, 0.05f, 0.85f);
 
     AxisBinding moveX{};
-    moveX.negSource = InputSource::Key(4U);     // A
-    moveX.posSource = InputSource::Key(7U);     // D
-    moveX.altNegSource = InputSource::Key(80U); // Left
-    moveX.altPosSource = InputSource::Key(79U); // Right
+    moveX.negSource = InputSource::Key(4U);       // Key 'A'
+    moveX.posSource = InputSource::Key(7U);       // Key 'D'
+    moveX.altNegSource = InputSource::Key(80U);   // Left Arrow
+    moveX.altPosSource = InputSource::Key(79U);   // Right Arrow
     moveX.gamepadAxis = 0U;
-    moveX.socd = SocdPolicy::LastInputWins;
+    moveX.deadzone = dz;
     map.BindAxis(0U, moveX);
 
     AxisBinding moveY{};
-    moveY.negSource = InputSource::Key(22U);    // S
-    moveY.posSource = InputSource::Key(26U);    // W
-    moveY.altNegSource = InputSource::Key(81U); // Down
-    moveY.altPosSource = InputSource::Key(82U); // Up
+    moveY.negSource = InputSource::Key(22U);      // Key 'S'
+    moveY.posSource = InputSource::Key(26U);      // Key 'W'
+    moveY.altNegSource = InputSource::Key(81U);   // Down Arrow
+    moveY.altPosSource = InputSource::Key(82U);   // Up Arrow
     moveY.gamepadAxis = 1U;
-    moveX.socd = SocdPolicy::Neutral;
+    moveY.deadzone = dz;
     map.BindAxis(1U, moveY);
 
-    map.Bind(static_cast<u8>(GameAction::Jump),          {InputSource::Key(44U),  InputSource::Pad(0U)});
-    map.Bind(static_cast<u8>(GameAction::AttackLight),   {InputSource::Key(13U),  InputSource::Mouse(1U), InputSource::Pad(2U)});
-    map.Bind(static_cast<u8>(GameAction::AttackHeavy),   {InputSource::Key(14U),  InputSource::Mouse(3U), InputSource::Pad(3U)});
-    map.Bind(static_cast<u8>(GameAction::Dash),          {InputSource::Key(225U), InputSource::Key(15U),  InputSource::Pad(5U)});
-    map.Bind(static_cast<u8>(GameAction::Parry),         {InputSource::Key(12U),  InputSource::Key(9U),   InputSource::Pad(4U)});
-    map.Bind(static_cast<u8>(GameAction::CycleEchoNext), {InputSource::Key(8U),   InputSource::PadTrigger(true)});
-    map.Bind(static_cast<u8>(GameAction::CycleEchoPrev), {InputSource::Key(20U),  InputSource::PadTrigger(false)});
-    map.Bind(static_cast<u8>(GameAction::UnisonBurst),   {InputSource::Key(24U),  InputSource::Pad(6U)});
-    map.Bind(static_cast<u8>(GameAction::SacredChord),   {InputSource::Key(18U),  InputSource::Pad(7U)});
-    map.Bind(static_cast<u8>(GameAction::Interact),      {InputSource::Key(21U),  InputSource::Pad(11U)});
-    map.Bind(static_cast<u8>(GameAction::PlaceMapPin),   {InputSource::Key(19U),  InputSource::Pad(12U)});
-    map.Bind(static_cast<u8>(GameAction::ToggleMap),     {InputSource::Key(16U),  InputSource::Key(43U)});
-    map.Bind(static_cast<u8>(GameAction::Pause),         {InputSource::Key(41U)});
-    map.Bind(static_cast<u8>(GameAction::MenuConfirm),   {InputSource::Key(40U)});
-    map.Bind(static_cast<u8>(GameAction::MenuBack),      {InputSource::Key(42U)});
+    // GDD v0.3–v0.5 Conflict-Free Keyboard-First + Gamepad Bindings (SDL_SCANCODE_SPACE = 44U):
+    map.Bind(static_cast<u8>(GameAction::Jump),          {InputSource::Key(44U),  InputSource::Key(26U),  InputSource::Key(82U),  InputSource::Pad(0U)});  // Space / W / Up / A(Cross)
+    map.Bind(static_cast<u8>(GameAction::AttackLight),   {InputSource::Key(13U),  InputSource::Key(29U),  InputSource::Mouse(1U), InputSource::Pad(2U)});  // J / Z / Mouse1 / X(Square)
+    map.Bind(static_cast<u8>(GameAction::AttackHeavy),   {InputSource::Key(14U),  InputSource::Key(27U),  InputSource::Mouse(2U), InputSource::Pad(3U)});  // K / X / Mouse2 / Y(Triangle)
+    map.Bind(static_cast<u8>(GameAction::Dash),          {InputSource::Key(225U), InputSource::Key(15U),  InputSource::Pad(1U)});                          // LShift / L / B(Circle)
+    map.Bind(static_cast<u8>(GameAction::Parry),         {InputSource::Key(9U),   InputSource::Key(12U),  InputSource::Pad(9U)});                          // F / I / LB(L1)
+    map.Bind(static_cast<u8>(GameAction::SelectEcho1),   {InputSource::Key(30U)});                                                                         // Key 1
+    map.Bind(static_cast<u8>(GameAction::SelectEcho2),   {InputSource::Key(31U)});                                                                         // Key 2
+    map.Bind(static_cast<u8>(GameAction::SelectEcho3),   {InputSource::Key(32U)});                                                                         // Key 3
+    map.Bind(static_cast<u8>(GameAction::CycleEchoNext), {InputSource::Key(6U),   InputSource::PadTrigger(true)});                                         // C / RT
+    map.Bind(static_cast<u8>(GameAction::CycleEchoPrev), {InputSource::Key(20U),  InputSource::PadTrigger(false)});                                        // Q / LT
+    map.Bind(static_cast<u8>(GameAction::UnisonBurst),   {InputSource::Key(21U),  InputSource::Key(24U),  InputSource::Pad(10U)});                         // R / U / RB(R1)
+    map.Bind(static_cast<u8>(GameAction::SacredChord),   {InputSource::Key(23U),  InputSource::Key(18U),  InputSource::Pad(12U)});                         // T / O / D-Pad Down
+    map.Bind(static_cast<u8>(GameAction::Interact),      {InputSource::Key(8U),   InputSource::Key(40U),  InputSource::Pad(11U)});                         // E / Enter / D-Pad Up
+    map.Bind(static_cast<u8>(GameAction::PlaceMapPin),   {InputSource::Key(19U),  InputSource::Pad(13U)});                                                 // P / L3
+    map.Bind(static_cast<u8>(GameAction::ToggleMap),     {InputSource::Key(43U),  InputSource::Key(16U),  InputSource::Pad(4U)});                          // Tab / M / View
+    map.Bind(static_cast<u8>(GameAction::Pause),         {InputSource::Key(41U),  InputSource::Key(42U),  InputSource::Pad(6U)});                          // Esc / Backspace / Start
+}
+
+bool PlayerController::TryRebindActionWithoutConflict(
+    en::InputMap& map,
+    GameAction action,
+    u8 bindingSlot,
+    en::InputSource newSource) noexcept {
+    if (!newSource.IsValid() || bindingSlot >= en::kMaxBindingsPerSlot) return false;
+    const u8 targetIdx = static_cast<u8>(action);
+    const u16 otherActionsMask = static_cast<u16>(~(1U << targetIdx));
+    if (map.FindConflictingActions(newSource, otherActionsMask) != 0U) {
+        return false;
+    }
+    const auto cur = map.ActionBindings(targetIdx);
+    std::array<en::InputSource, en::kMaxBindingsPerSlot> updated{cur[0], cur[1], cur[2], cur[3]};
+    updated[bindingSlot] = newSource;
+    map.Bind(targetIdx, {updated[0], updated[1], updated[2], updated[3]});
+    return true;
+}
+
+void PlayerController::SetDoubleJumpEnabled(
+    EntityId playerId,
+    bool enabled,
+    en::World& world) noexcept {
+    if (!world.IsAlive(playerId)) return;
+    if (auto* ps = world.TryGet<PlayerStateComp>(playerId)) {
+        ps->doubleJumpEnabled = enabled ? 1U : 0U;
+        if (!enabled) {
+            ps->airJumpsRemaining = 0U;
+        } else if (const auto* motor = world.TryGet<en::CharacterMotor2D>(playerId)) {
+            if (motor->IsGrounded()) {
+                ps->airJumpsRemaining = 1U;
+            }
+        }
+    }
+}
+
+void PlayerController::SetMaxDashCharges(
+    EntityId playerId,
+    u8 maxCharges,
+    en::World& world) noexcept {
+    if (!world.IsAlive(playerId)) return;
+    if (auto* ps = world.TryGet<PlayerStateComp>(playerId)) {
+        ps->SetMaxDashCharges(maxCharges);
+        ps->airDashCharges = ps->MaxDashCharges();
+    }
 }
 
 en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
@@ -61,11 +112,10 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     const EntityId id = *idRes;
 
     en::Sprite2D spr{};
-    spr.width = 0.85f;
-    spr.height = 1.55f;
+    spr.width = kPlayerColliderWidthWu;
+    spr.height = kPlayerColliderHeightWu;
     spr.layer = 12U;
     spr.tint = GetEchoDef(EchoId::Ignis).primaryColor;
-    spr.sprite = en::SpriteHandle{0U, 1U};
     (void)world.Emplace<en::Sprite2D>(id, spr);
 
     en::SpriteAnimator2D anim{};
@@ -76,13 +126,14 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     (void)world.Emplace<en::SpriteAnimator2D>(id, anim);
 
     en::CharacterMotor2D motor{};
-    motor.bounds = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.36f, 0.76f);
-    motor.solidMask = 0x0001U; // Collides only with world geometry (0x0001), passes freely through enemies!
+    motor.bounds = en::CompactAabb2D::FromMeters(
+        0.0f, 0.0f, kPlayerColliderWidthWu * 0.5f, kPlayerColliderHeightWu * 0.5f);
+    motor.solidMask = 0x0001U;
     (void)world.Emplace<en::CharacterMotor2D>(id, motor);
 
     en::MotionStack2D motion{};
-    motion.groundCoyoteTicks = 8U;
-    motion.pushboxGroup = 0U; // Zero pushbox group so Kaelen can dash and move freely through enemies
+    motion.groundCoyoteTicks = kPlayerCoyoteTicks;
+    motion.pushboxGroup = 0U;
     (void)world.Emplace<en::MotionStack2D>(id, motion);
 
     en::StateMachine2D fsm{};
@@ -91,8 +142,9 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     (void)world.Emplace<en::StateMachine2D>(id, fsm);
 
     en::HitboxRig2D rig{};
-    rig.hurtbox = en::CompactAabb2D::FromMeters(0.0f, 0.0f, 0.36f, 0.76f);
-    rig.hitbox = en::CompactAabb2D::FromMeters(0.8f, 0.0f, 0.7f, 0.45f);
+    rig.hurtbox = en::CompactAabb2D::FromMeters(
+        0.0f, 0.0f, kPlayerColliderWidthWu * 0.5f, kPlayerColliderHeightWu * 0.5f);
+    rig.hitbox = en::CompactAabb2D::FromMeters(0.85f, 0.0f, 0.75f, 0.50f);
     rig.hitLayerMask = 0x02U;
     rig.SetHurtLayer(0U);
     (void)world.Emplace<en::HitboxRig2D>(id, rig);
@@ -102,7 +154,7 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     recv.maxHp = kPlayerBaseMaxHp;
     recv.poise = 30U;
     recv.maxPoise = 30U;
-    recv.autoIframeTicks = 24U;
+    recv.autoIframeTicks = static_cast<u8>(kPlayerHitProtectionTicks);
     recv.SetTeamId(1U);
     (void)world.Emplace<en::DamageReceiver2D>(id, recv);
 
@@ -124,6 +176,8 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     PlayerStateComp ps{};
     ps.activeRoomId = roomId;
     ps.lastResonatorRoomId = roomId;
+    ps.SetMaxDashCharges(kPlayerDefaultMaxDashCharges);
+    ps.airDashCharges = ps.MaxDashCharges();
     (void)world.Emplace<PlayerStateComp>(id, ps);
 
     WeaponAttackComp atk{};
@@ -137,7 +191,10 @@ void PlayerController::SwitchActiveEchoSlot(
     u8 targetSlot,
     en::World& world) noexcept {
     auto* ps = world.TryGet<PlayerStateComp>(playerId);
-    if (ps == nullptr || ps->lanternRelinquished != 0U) return;
+    const auto* recv = world.TryGet<en::DamageReceiver2D>(playerId);
+    if (ps == nullptr || ps->LanternRelinquished()) return;
+    if (recv != nullptr && recv->HasFlag(en::ReceiverFlags::Dead)) return;
+
     ps->deck.activeSlot = static_cast<u8>(targetSlot % kTriadDeckSize);
     const EchoIdentityDef& def = GetEchoDef(ps->deck.ActiveEcho());
 
@@ -159,17 +216,17 @@ void PlayerController::StartWeaponAttack(
     auto* ps = world.TryGet<PlayerStateComp>(playerId);
     auto* atk = world.TryGet<WeaponAttackComp>(playerId);
     auto* rig = world.TryGet<en::HitboxRig2D>(playerId);
-    if (ps == nullptr || atk == nullptr || rig == nullptr || ps->lanternRelinquished != 0U) return;
+    if (ps == nullptr || atk == nullptr || rig == nullptr || ps->LanternRelinquished()) return;
 
     const WeaponMoveSpec& spec = GetWeaponMoveSpec(move);
     atk->instanceId = ++ioNextAttackInstanceId;
     atk->elapsedTicks = 0U;
-    atk->totalTicks = static_cast<u16>(spec.startupTicks + spec.activeTicks + spec.recoveryTicks);
+    atk->totalTicks = spec.TotalTicks();
     atk->baseHpDamage = spec.hpDamage;
     atk->baseBreakDamage = spec.breakDamage;
     atk->moveKind = move;
     atk->capturedEchoId = ps->deck.ActiveEcho();
-    atk->hitboxTriggered = 0U;
+    atk->packedHitAndChain = 0U;
     rig->EndSwing();
 
     if (auto* fsm = world.TryGet<en::StateMachine2D>(playerId)) {
@@ -198,11 +255,37 @@ bool PlayerController::StartParryStance(
     en::World& world) noexcept {
     auto* ps = world.TryGet<PlayerStateComp>(playerId);
     auto* recv = world.TryGet<en::DamageReceiver2D>(playerId);
-    if (ps == nullptr || recv == nullptr || ps->parryCooldownTicks > 0U) return false;
+    const auto* atk = world.TryGet<WeaponAttackComp>(playerId);
+    if (ps == nullptr || recv == nullptr || ps->LanternRelinquished()) return false;
+    if (ps->parryWindowTicks > 0U || ps->unisonState != UnisonActionState::None) {
+        return false;
+    }
+
+    if (atk != nullptr && atk->moveKind != WeaponMoveKind::None) {
+        if (!CanCancelAttackWithDashOrParry(*atk)) {
+            return false;
+        }
+        if (auto* mutAtk = world.TryGet<WeaponAttackComp>(playerId)) {
+            mutAtk->moveKind = WeaponMoveKind::None;
+            mutAtk->elapsedTicks = 0U;
+            mutAtk->packedHitAndChain = 0U;
+        }
+        if (auto* rig = world.TryGet<en::HitboxRig2D>(playerId)) {
+            rig->EndSwing();
+        }
+    }
+
+    if (ps->IsInDashLockout()) {
+        ps->dashActiveTicks = 0U;
+        ps->dashLockoutTicks = 0U;
+        if (auto* motion = world.TryGet<en::MotionStack2D>(playerId)) {
+            motion->overrideTicks = 0U;
+        }
+    }
 
     ps->parryWindowTicks = kParryWindowTicks;
-    ps->parryCooldownTicks = 24U;
     ps->capturedParryEcho = ps->deck.ActiveEcho();
+    recv->stunTicks = 0U;
     recv->AddFlags(en::ReceiverFlags::Parrying);
 
     if (auto* fsm = world.TryGet<en::StateMachine2D>(playerId)) {
@@ -213,25 +296,59 @@ bool PlayerController::StartParryStance(
 
 bool PlayerController::TryStartDash(
     EntityId playerId,
-    en::World& world) noexcept {
+    en::World& world,
+    f32 moveInputX) noexcept {
     auto* ps = world.TryGet<PlayerStateComp>(playerId);
     auto* motion = world.TryGet<en::MotionStack2D>(playerId);
-    const auto* motor = world.TryGet<en::CharacterMotor2D>(playerId);
-    if (ps == nullptr || motion == nullptr || motor == nullptr || ps->dashCooldownTicks > 0U) {
-        return false;
+    auto* motor = world.TryGet<en::CharacterMotor2D>(playerId);
+    const auto* atk = world.TryGet<WeaponAttackComp>(playerId);
+    if (ps == nullptr || motion == nullptr || motor == nullptr) return false;
+    if (ps->IsInDashLockout() || ps->unisonState != UnisonActionState::None) return false;
+
+    const bool grounded = motor->IsGrounded();
+    if (grounded) {
+        if (ps->dashCooldownTicks > 0U) return false;
+        if (ps->airDashCharges > 0U) {
+            --ps->airDashCharges;
+        }
+    } else {
+        if (ps->airDashCharges == 0U || ps->dashCooldownTicks > 0U) return false;
+        --ps->airDashCharges;
     }
 
-    if (!motor->IsGrounded()) {
-        if (ps->airDashCharges == 0U) {
+    if (atk != nullptr && atk->moveKind != WeaponMoveKind::None) {
+        if (!CanCancelAttackWithDashOrParry(*atk)) {
+            ++ps->airDashCharges;
             return false;
         }
-        --ps->airDashCharges;
-        motion->flags |= en::MotionFlags::AirborneDash;
+        if (auto* mutAtk = world.TryGet<WeaponAttackComp>(playerId)) {
+            mutAtk->moveKind = WeaponMoveKind::None;
+            mutAtk->elapsedTicks = 0U;
+            mutAtk->packedHitAndChain = 0U;
+        }
+        if (auto* rig = world.TryGet<en::HitboxRig2D>(playerId)) {
+            rig->EndSwing();
+        }
     }
 
+    if (auto* recv = world.TryGet<en::DamageReceiver2D>(playerId)) {
+        recv->stunTicks = 0U;
+    }
+
+    if (std::abs(moveInputX) >= 0.18f) {
+        motion->SetFacingSign(moveInputX < 0.0f ? -1 : 1);
+    }
     const f32 dashDir = static_cast<f32>(motion->FacingSign());
-    (void)motion->RequestVelocityOverride(dashDir * 13.0f, 0.0f, 12U, 2U);
-    ps->dashCooldownTicks = 22U;
+
+    (void)motion->RequestVelocityOverride(dashDir * kPlayerDashSpeedWu, 0.0f, kPlayerDashDurationTicks, 2U);
+    ps->dashActiveTicks = kPlayerDashDurationTicks;
+
+    if (!grounded) {
+        motor->vy = 0.0f;
+        motion->currentWalkVx = dashDir * (kPlayerDashSpeedWu * kPlayerAirDashExitSpeedRatio);
+    } else {
+        motion->currentWalkVx = dashDir * kPlayerMaxGroundSpeedWu;
+    }
 
     if (auto* fsm = world.TryGet<en::StateMachine2D>(playerId)) {
         fsm->TransitionTo(static_cast<u8>(ActorFsmState::Dash));
@@ -258,9 +375,14 @@ void PlayerController::StepPlayer(
     auto* rig = world.TryGet<en::HitboxRig2D>(playerId);
     if (!ps || !motion || !motor || !recv || !atk || !rig) return;
 
-    // Out-of-bounds safety recovery via SafeAnchor2D
+    const RoomTopologySpec& roomSpec = GetRoomTopology(ps->activeRoomId);
+
+    // Out-of-bounds safety recovery scaled dynamically to each room's variable width & height
     en::LocalTransform2D loc = world.GetLocalTransform(playerId);
-    if (loc.y < -3.0f || loc.y > 14.0f || loc.x < -15.0f || loc.x > 24.0f) {
+    if (loc.y < roomSpec.MinWorldY() - 3.0f ||
+        loc.y > roomSpec.MaxWorldY() + 4.0f ||
+        loc.x < roomSpec.MinWorldX() - 4.0f ||
+        loc.x > roomSpec.MaxWorldX() + 4.0f) {
         if (const auto* anchor = world.TryGet<en::SafeAnchor2D>(playerId)) {
             loc.x = anchor->safeX;
             loc.y = std::max(1.0f, anchor->safeY);
@@ -275,8 +397,42 @@ void PlayerController::StepPlayer(
         world.Teleport(playerId, loc);
     }
 
+    // Restore Dash and Double Jump charges on WalkableGround when cooldown completes
     if (motor->IsGrounded()) {
-        ps->airDashCharges = ps->maxAirDashCharges;
+        if (ps->dashActiveTicks == 0U && ps->dashCooldownTicks == 0U) {
+            ps->airDashCharges = ps->MaxDashCharges();
+        }
+        ps->airJumpsRemaining = (ps->doubleJumpEnabled != 0U) ? 1U : 0U;
+    }
+    if (motor->vy < -kPlayerMaxFallSpeedWu) {
+        motor->vy = -kPlayerMaxFallSpeedWu;
+    }
+
+    // Step 20-tick Dash -> 3-tick Recovery Lockout & Multi-Charge Cooldown
+    if (ps->dashActiveTicks > 0U) {
+        if (!motor->IsGrounded()) {
+            motor->vy = 0.0f;
+        }
+        if (--ps->dashActiveTicks == 0U) {
+            ps->dashLockoutTicks = kPlayerDashRecoveryLockoutTicks;
+            ps->dashCooldownTicks = (ps->airDashCharges > 0U)
+                                        ? kPlayerChainDashCooldownTicks
+                                        : kPlayerGroundDashCooldownTicks;
+            if (!motor->IsGrounded()) {
+                const f32 exitVx = static_cast<f32>(motion->FacingSign()) *
+                                   (kPlayerDashSpeedWu * kPlayerAirDashExitSpeedRatio);
+                motion->currentWalkVx = exitVx;
+                motor->vx = exitVx;
+                motor->vy = 0.0f;
+            }
+        }
+    } else {
+        if (ps->dashLockoutTicks > 0U) --ps->dashLockoutTicks;
+        if (ps->dashCooldownTicks > 0U) {
+            if (--ps->dashCooldownTicks == 0U && motor->IsGrounded()) {
+                ps->airDashCharges = ps->MaxDashCharges();
+            }
+        }
     }
 
     if (ps->parryWindowTicks > 0U) {
@@ -284,11 +440,36 @@ void PlayerController::StepPlayer(
             recv->RemoveFlags(en::ReceiverFlags::Parrying);
         }
     }
-    if (ps->parryCooldownTicks > 0U) --ps->parryCooldownTicks;
-    if (ps->dashCooldownTicks > 0U) --ps->dashCooldownTicks;
     if (ps->burstVfxTicks > 0U) --ps->burstVfxTicks;
 
-    if (actions.Consume(static_cast<u8>(GameAction::CycleEchoNext), 6U)) {
+    CombatSystem::StepActiveUnisonOrChord(playerId, world, pipeline);
+
+    if (recv->HasFlag(en::ReceiverFlags::Dead) || recv->hp <= 0) {
+        motion->targetWalkVx = 0.0f;
+        return;
+    }
+
+    // Instant Defensive Escape-Cancel: Parry, Dash, or Jump immediately breaks hitstun
+    if (recv->stunTicks > 0U) {
+        const bool escapePressed =
+            input.Pressed(static_cast<u8>(GameAction::Parry)) ||
+            input.Pressed(static_cast<u8>(GameAction::Dash)) ||
+            input.Pressed(static_cast<u8>(GameAction::Jump));
+        if (escapePressed || recv->stunTicks <= (kPlayerHitstunTicks - kPlayerHardFlinchTicks)) {
+            recv->stunTicks = 0U;
+        } else {
+            motion->targetWalkVx = 0.0f;
+            return;
+        }
+    }
+
+    if (input.Pressed(static_cast<u8>(GameAction::SelectEcho1))) {
+        SwitchActiveEchoSlot(playerId, 0U, world);
+    } else if (input.Pressed(static_cast<u8>(GameAction::SelectEcho2))) {
+        SwitchActiveEchoSlot(playerId, 1U, world);
+    } else if (input.Pressed(static_cast<u8>(GameAction::SelectEcho3))) {
+        SwitchActiveEchoSlot(playerId, 2U, world);
+    } else if (actions.Consume(static_cast<u8>(GameAction::CycleEchoNext), 6U)) {
         SwitchActiveEchoSlot(playerId, static_cast<u8>((ps->deck.activeSlot + 1U) % kTriadDeckSize), world);
     } else if (actions.Consume(static_cast<u8>(GameAction::CycleEchoPrev), 6U)) {
         SwitchActiveEchoSlot(playerId, static_cast<u8>((ps->deck.activeSlot + kTriadDeckSize - 1U) % kTriadDeckSize), world);
@@ -298,8 +479,16 @@ void PlayerController::StepPlayer(
         const WeaponMoveSpec& spec = GetWeaponMoveSpec(atk->moveKind);
         ++atk->elapsedTicks;
 
-        if (atk->elapsedTicks == spec.startupTicks && atk->hitboxTriggered == 0U) {
-            atk->hitboxTriggered = 1U;
+        if (input.Pressed(static_cast<u8>(GameAction::AttackLight)) && atk->elapsedTicks >= 4U) {
+            const WeaponMoveKind nextStep = WeaponAttackComp::NextChainStepFor(atk->moveKind);
+            if (nextStep != WeaponMoveKind::None) {
+                atk->SetBufferedChainMove(nextStep);
+                (void)actions.Consume(static_cast<u8>(GameAction::AttackLight), kLightChainBufferTicks);
+            }
+        }
+
+        if (atk->elapsedTicks == spec.startupTicks && !atk->HitboxTriggered()) {
+            atk->SetHitboxTriggered(true);
             const en::CompactAabb2D box = en::CompactAabb2D::FromMeters(
                 spec.offsetX, spec.offsetY, spec.reachWidthMeters * 0.5f, spec.reachHeightMeters * 0.5f);
             rig->BeginNewSwing(box, spec.hpDamage, spec.breakDamage, 4.0f, 1.5f, 1U, 4U);
@@ -309,17 +498,63 @@ void PlayerController::StepPlayer(
 
         if (atk->elapsedTicks >= atk->totalTicks) {
             rig->EndSwing();
+            const WeaponMoveKind finishedMove = atk->moveKind;
+            const WeaponMoveKind buffered = atk->BufferedChainMove();
             atk->moveKind = WeaponMoveKind::None;
             atk->elapsedTicks = 0U;
+            atk->packedHitAndChain = 0U;
+
+            if (buffered != WeaponMoveKind::None) {
+                StartWeaponAttack(playerId, buffered, world, pipeline, ioNextAttackInstanceId);
+            } else {
+                const WeaponMoveKind graceNext = WeaponAttackComp::NextChainStepFor(finishedMove);
+                if (graceNext != WeaponMoveKind::None) {
+                    atk->SetBufferedChainMove(graceNext);
+                    atk->elapsedTicks = kLightComboGraceTicks;
+                }
+            }
+        }
+    } else if (atk->elapsedTicks > 0U) {
+        if (--atk->elapsedTicks == 0U) {
+            atk->packedHitAndChain = 0U;
         }
     }
 
     const f32 moveX = input.Axis(0U);
     const f32 moveY = input.Axis(1U);
+    const bool grounded = motor->IsGrounded();
+    const bool onWallLeft = en::HasPhysicsFlag(motor->contacts, en::ContactFlags::WallLeft);
+    const bool onWallRight = en::HasPhysicsFlag(motor->contacts, en::ContactFlags::WallRight);
+
+    const f32 maxSpeed = grounded ? kPlayerMaxGroundSpeedWu : kPlayerMaxAirSpeedWu;
     const bool inHeavyWindup = (atk->moveKind == WeaponMoveKind::Heavy &&
                                 atk->elapsedTicks < kHeavyAttackStartupTicks);
-    motion->targetWalkVx = inHeavyWindup ? (moveX * 2.0f) : (moveX * 6.8f);
-    if (atk->moveKind == WeaponMoveKind::None && std::abs(moveX) > 0.1f) {
+    motion->targetWalkVx = inHeavyWindup ? (moveX * 2.0f) : (moveX * maxSpeed);
+
+    // Prevent horizontal wall-sticking when holding Left against WallLeft or Right against WallRight,
+    // and enable smooth downward Wall Slide when falling along a wall!
+    motion->flags &= ~en::MotionFlags::WallSliding;
+    if ((onWallLeft && moveX < -0.05f) || (onWallRight && moveX > 0.05f)) {
+        if (!grounded && motor->vy < -kPlayerWallSlideSpeedWu) {
+            motor->vy = -kPlayerWallSlideSpeedWu;
+            motion->flags |= en::MotionFlags::WallSliding;
+        }
+    }
+
+    if (grounded && ps->dashActiveTicks == 0U) {
+        const bool stoppingOrReversing = (std::abs(moveX) < 0.05f) ||
+                                         (moveX * motion->currentWalkVx < 0.0f);
+        if (stoppingOrReversing) {
+            const f32 extraBrake = (kPlayerGroundBrakingWu - kPlayerGroundAccelWu) * en::kFixedDtSec;
+            if (motion->currentWalkVx > 0.0f) {
+                motion->currentWalkVx = std::max(0.0f, motion->currentWalkVx - extraBrake);
+            } else if (motion->currentWalkVx < 0.0f) {
+                motion->currentWalkVx = std::min(0.0f, motion->currentWalkVx + extraBrake);
+            }
+        }
+    }
+
+    if (atk->moveKind == WeaponMoveKind::None && ps->dashActiveTicks == 0U && std::abs(moveX) >= 0.18f) {
         motion->SetFacingSign(moveX < 0.0f ? -1 : 1);
         if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
             spr->SetFlipX(moveX < 0.0f);
@@ -332,55 +567,96 @@ void PlayerController::StepPlayer(
         motion->flags &= ~en::MotionFlags::JumpHeld;
     }
 
-    if (moveY < -0.5f && input.Pressed(static_cast<u8>(GameAction::Jump)) &&
-        en::HasPhysicsFlag(motor->contacts, en::ContactFlags::OnOneWay)) {
-        motion->oneWayDropTicks = 10U;
-        (void)actions.Consume(static_cast<u8>(GameAction::Jump), 8U);
-    } else if (actions.Peek(static_cast<u8>(GameAction::Jump), 8U)) {
-        if (motion->TryExecuteJump(11.2f, 7.5f)) {
-            (void)actions.Consume(static_cast<u8>(GameAction::Jump), 8U);
+    if (ps->unisonState != UnisonActionState::None) {
+        return;
+    }
+
+    // 1. Parry (F / I / LB)
+    if (input.Pressed(static_cast<u8>(GameAction::Parry)) ||
+        actions.Consume(static_cast<u8>(GameAction::Parry), 4U)) {
+        if (StartParryStance(playerId, world)) return;
+    }
+
+    // 2. Dash (LShift / L / B)
+    if (input.Pressed(static_cast<u8>(GameAction::Dash)) ||
+        actions.Consume(static_cast<u8>(GameAction::Dash), 5U)) {
+        if (TryStartDash(playerId, world, moveX)) return;
+    }
+
+    // 3. Ground Jump, Wall Jump (when touching a wall), & Toggleable Air Double Jump
+    if (atk->moveKind == WeaponMoveKind::None) {
+        if (moveY < -0.5f && input.Pressed(static_cast<u8>(GameAction::Jump)) &&
+            en::HasPhysicsFlag(motor->contacts, en::ContactFlags::OnOneWay)) {
+            motion->oneWayDropTicks = 10U;
+            (void)actions.Consume(static_cast<u8>(GameAction::Jump), kPlayerJumpBufferTicks);
+            return;
+        }
+        if (actions.Peek(static_cast<u8>(GameAction::Jump), kPlayerJumpBufferTicks)) {
+            if (motion->TryExecuteJump(kPlayerJumpVelocityWu, kPlayerWallJumpHorizontalWu)) {
+                motor->vy = kPlayerJumpVelocityWu;
+                if (!grounded) {
+                    motion->targetWalkVx = motion->currentWalkVx;
+                    motor->vx = motion->currentWalkVx;
+                    (void)motion->RequestVelocityOverride(motion->currentWalkVx, kPlayerJumpVelocityWu, 8U, 10U);
+                }
+                (void)actions.Consume(static_cast<u8>(GameAction::Jump), kPlayerJumpBufferTicks);
+                return;
+            }
+            if (input.Pressed(static_cast<u8>(GameAction::Jump)) &&
+                !grounded &&
+                ps->doubleJumpEnabled != 0U &&
+                ps->airJumpsRemaining > 0U) {
+                --ps->airJumpsRemaining;
+                motion->pendingLaunchVy = kPlayerDoubleJumpVelocityWu;
+                motion->flags |= en::MotionFlags::JumpCutApplied;
+                motor->vy = kPlayerDoubleJumpVelocityWu;
+                (void)actions.Consume(static_cast<u8>(GameAction::Jump), kPlayerJumpBufferTicks);
+                return;
+            }
         }
     }
 
-    if (actions.Consume(static_cast<u8>(GameAction::Parry), 6U)) {
-        (void)StartParryStance(playerId, world);
-    } else if (actions.Consume(static_cast<u8>(GameAction::Dash), 6U)) {
-        (void)TryStartDash(playerId, world);
-    } else if (actions.Consume(static_cast<u8>(GameAction::SacredChord), 6U)) {
-        if (CombatSystem::TryActivateSacredChord(playerId, world, pipeline)) {
+    if (ps->IsInDashLockout()) {
+        return;
+    }
+
+    // 4. Sacred Chord (T / O) & Standard Unison (R / U)
+    if (input.Pressed(static_cast<u8>(GameAction::SacredChord))) {
+        (void)actions.Consume(static_cast<u8>(GameAction::SacredChord), 1U);
+        if (CombatSystem::BeginUnisonOrSacredChord(playerId, UnisonActionState::SacredChord, world)) {
             ps->burstVfxTicks = 28U;
+            return;
         }
-    } else if (actions.Consume(static_cast<u8>(GameAction::UnisonBurst), 6U)) {
-        if (CombatSystem::TryActivateUnisonBurst(playerId, world, pipeline)) {
+    }
+    if (input.Pressed(static_cast<u8>(GameAction::UnisonBurst))) {
+        (void)actions.Consume(static_cast<u8>(GameAction::UnisonBurst), 1U);
+        if (CombatSystem::BeginUnisonOrSacredChord(playerId, UnisonActionState::StandardUnison, world)) {
             ps->burstVfxTicks = 20U;
+            return;
         }
-    } else if (actions.Consume(static_cast<u8>(GameAction::AttackHeavy), 8U)) {
+    }
+
+    // 5. Heavy Attack (K / X) & 3-Hit Light Combo (J / Z)
+    if (input.Pressed(static_cast<u8>(GameAction::AttackHeavy)) ||
+        actions.Consume(static_cast<u8>(GameAction::AttackHeavy), 4U)) {
         if (atk->moveKind == WeaponMoveKind::None) {
             StartWeaponAttack(playerId, WeaponMoveKind::Heavy, world, pipeline, ioNextAttackInstanceId);
+            return;
         }
-    } else if (actions.Consume(static_cast<u8>(GameAction::AttackLight), 8U)) {
-        if (motor->IsGrounded()) {
-            WeaponMoveKind nextMove = WeaponMoveKind::Light1;
-            if (atk->moveKind == WeaponMoveKind::Light1 && atk->elapsedTicks >= 10U) {
-                nextMove = WeaponMoveKind::Light2;
-            } else if (atk->moveKind == WeaponMoveKind::Light2 && atk->elapsedTicks >= 10U) {
-                nextMove = WeaponMoveKind::Light3;
-            } else if (atk->moveKind != WeaponMoveKind::None) {
-                nextMove = WeaponMoveKind::None;
+    }
+    if (input.Pressed(static_cast<u8>(GameAction::AttackLight)) ||
+        (atk->moveKind == WeaponMoveKind::None && actions.Consume(static_cast<u8>(GameAction::AttackLight), kLightChainBufferTicks))) {
+        if (atk->moveKind == WeaponMoveKind::None) {
+            WeaponMoveKind nextMove = grounded ? WeaponMoveKind::Light1 : WeaponMoveKind::Air1;
+            if (atk->elapsedTicks > 0U && atk->BufferedChainMove() != WeaponMoveKind::None) {
+                const WeaponMoveKind cand = atk->BufferedChainMove();
+                const bool candIsAir = (cand == WeaponMoveKind::Air1 || cand == WeaponMoveKind::Air2);
+                if (candIsAir == !grounded) {
+                    nextMove = cand;
+                }
             }
-            if (nextMove != WeaponMoveKind::None) {
-                StartWeaponAttack(playerId, nextMove, world, pipeline, ioNextAttackInstanceId);
-            }
-        } else {
-            WeaponMoveKind nextAir = WeaponMoveKind::Air1;
-            if (atk->moveKind == WeaponMoveKind::Air1 && atk->elapsedTicks >= 10U) {
-                nextAir = WeaponMoveKind::Air2;
-            } else if (atk->moveKind != WeaponMoveKind::None) {
-                nextAir = WeaponMoveKind::None;
-            }
-            if (nextAir != WeaponMoveKind::None) {
-                StartWeaponAttack(playerId, nextAir, world, pipeline, ioNextAttackInstanceId);
-            }
+            StartWeaponAttack(playerId, nextMove, world, pipeline, ioNextAttackInstanceId);
+            return;
         }
     }
 }

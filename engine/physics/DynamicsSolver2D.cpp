@@ -178,6 +178,9 @@ void DynamicsSolver2D::StepCharacterMotors(
                 const f32 safeToi = std::max(0.0f, hit.toi - 1e-4f);
                 curCenterX += remDX * safeToi;
                 curCenterY += remDY * safeToi;
+                if (hit.toi <= 1e-3f && std::abs(hit.normalX) > 0.7f) {
+                    curCenterX += hit.normalX * 3e-4f;
+                }
             }
 
             const f32 fracRemaining = 1.0f - hit.toi;

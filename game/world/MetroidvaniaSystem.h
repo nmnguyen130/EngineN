@@ -2,6 +2,7 @@
 
 #include "game/components/GameComponents.h"
 #include "game/core/SaveSystem.h"
+#include "game/world/WorldTopology.h"
 #include "gameplay/GameplayPipeline.h"
 #include "world/World.h"
 
@@ -10,7 +11,6 @@
 
 namespace vots {
 
-// Diagnostic description of a Frequency Gate's observable blocker, interaction type, and route role (GDD v0.2 Section 5.4).
 struct FrequencyGateDiagnostic {
     std::string_view observableBlocker{};
     std::string_view requiredInteraction{};
@@ -18,12 +18,10 @@ struct FrequencyGateDiagnostic {
     bool isUnlocked{false};
 };
 
-// Manages Tuning Resonators, the single Lost Wick Husk, enemy respawn masks, Fog of War, Map Pins, Frequency Gates, and Endings.
-// Value type owned by VeilGameApp; synchronizes directly with SaveData and GameplayPipeline world flags.
-// Invariant: at most one LostWickHuskRecord is active at any time, and cleared enemies only respawn on Resonator rest or player death.
+// Manages Tuning Resonators, the single Lost Wick Husk, enemy respawn masks, Fog of War, Map Pins,
+// GDD v0.4 Memory Tuning Flags (4 flags), Conductor Seals (3 flexible branches), and Endings (A/B/C).
 class MetroidvaniaSystem {
 public:
-    // Activates a Tuning Resonator checkpoint: heals HP to max, sets Harmony to 100, resets cleared enemies, and updates respawn point.
     void ActivateTuningResonator(
         EntityId playerId,
         u8 roomId,
@@ -31,7 +29,6 @@ public:
         en::World& world,
         en::GameplayPipeline& pipeline) noexcept;
 
-    // Reconfigures Kaelen's 3-Echo Triad Deck while resting at a Tuning Resonator.
     [[nodiscard]] bool ConfigureTriadDeckAtResonator(
         EntityId playerId,
         EchoId slot0,
@@ -39,28 +36,24 @@ public:
         EchoId slot2,
         en::World& world) noexcept;
 
-    // Handles Kaelen's death per GDD v0.2 Section 5.2: respawns at Resonator, sets Harmony to 0, applies non-stacking 25% Max HP penalty,
-    // resets cleared room enemies, and accumulates carried Tuning Shards into the single Lost Wick Husk.
     void HandlePlayerDeathAndSpawnHusk(
         EntityId playerId,
         Vec2 deathPos,
         u8 deathRoomId,
         en::World& world) noexcept;
 
-    // Recovers the Lost Wick Husk: restores banked Shards, removes the 25% Max HP penalty (clamping HP to new Max HP without overhealing),
-    // and sets Harmony to 100.
     [[nodiscard]] bool RecoverLostWickHusk(
         EntityId playerId,
         en::World& world,
         en::GameplayPipeline& pipeline) noexcept;
 
-    // Unlocks one of the 12 Apostate Echoes at an Echo Altar.
+    // Unlocks one of the 12 Apostate Echoes at an Echo Altar without forcing a Triad Deck change (GDD v0.4 Section 4).
     void UnlockEchoAtAltar(
         EntityId playerId,
         EchoId echo,
         en::World& world) noexcept;
 
-    // Advances the Memory Tuning questline required for Ending C (Symphony of the Off-Beat).
+    // Advances the 4-part Memory Tuning questline (0=SurfaceLie, 1=TheCollars, 2=TheVeil, 3=TheTwelve) required for Ending C.
     void CompleteMemoryTuningFork(
         u8 forkIndex,
         en::GameplayPipeline& pipeline) noexcept;
@@ -79,7 +72,6 @@ public:
         m_clearedEnemiesMask.fill(0U);
     }
 
-    // Marks a room discovered in the Acoustic Fog of War bitmask.
     constexpr void DiscoverRoom(u8 roomId) noexcept {
         if (roomId < 8U) {
             m_discoveredRoomsMask |= static_cast<u8>(1U << roomId);
@@ -90,7 +82,6 @@ public:
         return roomId < 8U && ((m_discoveredRoomsMask & (1U << roomId)) != 0U);
     }
 
-    // Places or updates a player Map Pin (FrequencyGate, UnreachedLedge, LoreTablet, BossArena, TuningForkQuest).
     [[nodiscard]] bool PlaceMapPin(
         u8 roomId,
         Vec2 worldPos,
@@ -102,12 +93,10 @@ public:
         Vec2 worldPos,
         f32 maxRadius = 2.0f) noexcept;
 
-    // Evaluates a Frequency Gate using permanent world-progress flags (never requiring an equipped Echo or deferred mutation).
     [[nodiscard]] static FrequencyGateDiagnostic EvaluateFrequencyGate(
         const InteractableComp& gate,
         const en::GameplayPipeline& pipeline) noexcept;
 
-    // Resolves the achieved ending (Ending A: False Dawn, Ending B: Shattered Spire, Ending C: Symphony of the Off-Beat).
     [[nodiscard]] EndingId ResolveSpireEnding(
         EntityId playerId,
         bool chooseShatterCore,

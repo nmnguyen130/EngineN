@@ -5,9 +5,9 @@
 
 namespace vots {
 
-// Tracks Kaelen's Triad Deck, Harmony gauge, air-dash charge, Parry window, and carried Tuning Shards.
+// Tracks Kaelen's Triad Deck, Harmony gauge, air-dash & double-jump charges, Dash/Unison state, Parry window, and Shards.
 // Registered in World at kTypeId = 24; strictly 32 bytes (2 per cache line, 0B padding).
-// Invariant: harmony in [0..100], airDashCharges <= maxAirDashCharges, and capturedParryEcho is fixed on Parry start.
+// Invariant: harmony in [0..100], airDashCharges <= MaxDashCharges(), and capturedParryEcho is fixed on Parry start.
 struct alignas(32) PlayerStateComp {
     static constexpr u8 kTypeId = 24U;
 
@@ -16,22 +16,61 @@ struct alignas(32) PlayerStateComp {
     TriadDeck deck{};
     u16 unlockedEchoMask{0x000FU};
     u16 parryWindowTicks{0U};
-    u16 parryCooldownTicks{0U};
     u16 dashCooldownTicks{0U};
     u16 burstVfxTicks{0U};
+    u8 dashActiveTicks{0U};
+    u8 dashLockoutTicks{0U};
+    u8 unisonElapsedTicks{0U};
+    UnisonActionState unisonState{UnisonActionState::None};
     u8 harmony{0U};
-    u8 airDashCharges{1U};
-    u8 maxAirDashCharges{1U};
+    u8 airDashCharges{kPlayerDefaultMaxDashCharges};
+    u8 airJumpsRemaining{1U};
+    u8 doubleJumpEnabled{1U};
     EchoId capturedParryEcho{EchoId::Ignis};
     u8 activeRoomId{0U};
     u8 lastResonatorRoomId{0U};
-    u8 huskPenaltyActive{0U};
-    u8 lanternRelinquished{0U};
+    u8 statusFlags{0U}; // bit 0: huskPenaltyActive, bit 1: lanternRelinquished, bits [2..3]: maxDashCharges (0 -> default)
+
+    static constexpr u8 kFlagHuskPenaltyActive   = 1U << 0U;
+    static constexpr u8 kFlagLanternRelinquished = 1U << 1U;
+    static constexpr u8 kMaxDashChargesMask      = 0x0CU;
+
+    [[nodiscard]] constexpr bool IsInDashLockout() const noexcept {
+        return dashActiveTicks > 0U || dashLockoutTicks > 0U;
+    }
+    [[nodiscard]] constexpr bool IsDashing() const noexcept {
+        return dashActiveTicks > 0U;
+    }
+
+    [[nodiscard]] constexpr u8 MaxDashCharges() const noexcept {
+        const u8 raw = static_cast<u8>((statusFlags >> 2U) & 0x03U);
+        return (raw == 0U) ? kPlayerDefaultMaxDashCharges : raw;
+    }
+    constexpr void SetMaxDashCharges(u8 charges) noexcept {
+        const u8 clamped = (charges < 1U) ? 1U : ((charges > 3U) ? 3U : charges);
+        statusFlags = static_cast<u8>((statusFlags & ~kMaxDashChargesMask) | ((clamped & 0x03U) << 2U));
+    }
+
+    [[nodiscard]] constexpr bool HuskPenaltyActive() const noexcept {
+        return (statusFlags & kFlagHuskPenaltyActive) != 0U;
+    }
+    constexpr void SetHuskPenaltyActive(bool active) noexcept {
+        if (active) statusFlags |= kFlagHuskPenaltyActive;
+        else        statusFlags &= static_cast<u8>(~kFlagHuskPenaltyActive);
+    }
+
+    [[nodiscard]] constexpr bool LanternRelinquished() const noexcept {
+        return (statusFlags & kFlagLanternRelinquished) != 0U;
+    }
+    constexpr void SetLanternRelinquished(bool rel) noexcept {
+        if (rel) statusFlags |= kFlagLanternRelinquished;
+        else     statusFlags &= static_cast<u8>(~kFlagLanternRelinquished);
+    }
 };
 static_assert(sizeof(PlayerStateComp) == 32);
 static_assert(en::Component<PlayerStateComp>);
 
-// Tracks an active weapon attack instance and the EchoId captured at the moment the swing started.
+// Tracks an active weapon attack instance, combo chain grace window, and the EchoId captured when the swing started.
 // Registered in World at kTypeId = 25; strictly 16 bytes (4 per cache line, 0B padding).
 // Invariant: capturedEchoId never changes mid-swing even if the player switches Echoes during the animation.
 struct alignas(16) WeaponAttackComp {
@@ -46,7 +85,31 @@ struct alignas(16) WeaponAttackComp {
     EchoId capturedEchoId{EchoId::Ignis};
     AttackTelegraphKind telegraph{AttackTelegraphKind::Standard};
     EchoId counterEchoId{EchoId::None};
-    u8 hitboxTriggered{0U};
+    u8 packedHitAndChain{0U}; // bit 0: hitboxTriggered, bits [1..3]: buffered/grace next WeaponMoveKind
+
+    [[nodiscard]] constexpr bool HitboxTriggered() const noexcept {
+        return (packedHitAndChain & 0x01U) != 0U;
+    }
+    constexpr void SetHitboxTriggered(bool trig) noexcept {
+        if (trig) packedHitAndChain |= 0x01U;
+        else      packedHitAndChain &= static_cast<u8>(~0x01U);
+    }
+
+    [[nodiscard]] constexpr WeaponMoveKind BufferedChainMove() const noexcept {
+        return static_cast<WeaponMoveKind>((packedHitAndChain >> 1U) & 0x07U);
+    }
+    constexpr void SetBufferedChainMove(WeaponMoveKind next) noexcept {
+        packedHitAndChain = static_cast<u8>((packedHitAndChain & 0x01U) | ((static_cast<u8>(next) & 0x07U) << 1U));
+    }
+
+    [[nodiscard]] static constexpr WeaponMoveKind NextChainStepFor(WeaponMoveKind move) noexcept {
+        switch (move) {
+            case WeaponMoveKind::Light1: return WeaponMoveKind::Light2;
+            case WeaponMoveKind::Light2: return WeaponMoveKind::Light3;
+            case WeaponMoveKind::Air1:   return WeaponMoveKind::Air2;
+            default:                     return WeaponMoveKind::None;
+        }
+    }
 };
 static_assert(sizeof(WeaponAttackComp) == 16);
 static_assert(en::Component<WeaponAttackComp>);
@@ -129,26 +192,29 @@ struct alignas(32) BreakAndCcComp {
 static_assert(sizeof(BreakAndCcComp) == 32);
 static_assert(en::Component<BreakAndCcComp>);
 
-// AI behavior controller for Standard Husks, Heavy Enforcers, and the 3-phase High Conductor Boss.
+// AI behavior controller for Drifters, Sentries, Brutes, Tuning Husk Elites, and Boss encounters.
 // Registered in World at kTypeId = 28; strictly 32 bytes (2 per cache line, 0B padding).
+// Invariant: facing is locked while actionTimerTicks > 0, and turnDelayTicks gates 180-degree turns when Kaelen crosses behind.
 struct alignas(32) EnemyAiComp {
     static constexpr u8 kTypeId = 28U;
 
     f32 patrolOriginX{0.0f};
     f32 patrolRange{4.0f};
-    f32 aggroRadius{7.0f};
+    f32 aggroRadius{7.5f};
     f32 attackRange{1.8f};
     u16 actionTimerTicks{0U};
-    u16 cooldownTicks{60U};
+    u16 cooldownTicks{48U};
     u16 shardReward{25U};
     u8 archetypeId{0U};
     u8 bossPhase{1U};
     u8 patternIndex{0U};
     AttackTelegraphKind activeTelegraph{AttackTelegraphKind::Standard};
     EchoId counterEcho{EchoId::None};
-    u8 windupInterrupted{0U};
+    u8 turnDelayTicks{0U};
     u8 roomId{0U};
     u8 spawnSlotBit{0U};
+    EnemyAttackId activeAttackId{EnemyAttackId::None};
+    u8 phaseTransitionTicks{0U};
 };
 static_assert(sizeof(EnemyAiComp) == 32);
 static_assert(en::Component<EnemyAiComp>);
@@ -180,9 +246,10 @@ enum class InteractableKind : u8 {
     MemoryTuningFork  = 5,
     SpireDecisionCore = 6,
     RoomExitPortal    = 7,
+    ShortcutLever     = 8,
 };
 
-// Interactive world prop component (Checkpoints, Husks, Echo Altars, Frequency Gates, Lore Tablets, Portals).
+// Interactive world prop component (Checkpoints, Husks, Echo Altars, Frequency Gates, Lore Tablets, Shortcut Levers).
 // Registered in World at kTypeId = 30; strictly 16 bytes (4 per cache line, 0B padding).
 struct alignas(16) InteractableComp {
     static constexpr u8 kTypeId = 30U;
@@ -194,12 +261,14 @@ struct alignas(16) InteractableComp {
     u8 paramByte{0U};
     u8 isMainRouteGate{1U};
     u8 activated{0U};
-    u32 shardPayload{0U};
+    u8 interactPriority{10U};
+    u8 reserved0{0U};
+    u16 shardPayload{0U};
 };
 static_assert(sizeof(InteractableComp) == 16);
 static_assert(en::Component<InteractableComp>);
 
-// Flagged destructible terrain wall/pillar damaged by Elemental Cataclysm Sacred Chord (GDD v0.2 Section 4.7).
+// Flagged destructible terrain wall/pillar damaged by Elemental Cataclysm Sacred Chord.
 // Registered in World at kTypeId = 31; strictly 16 bytes (4 per cache line, 0B padding).
 struct alignas(16) DestructibleTerrainComp {
     static constexpr u8 kTypeId = 31U;

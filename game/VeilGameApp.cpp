@@ -1,10 +1,13 @@
 #include "game/VeilGameApp.h"
 #include "game/ai/EnemyAiSystem.h"
+#include "game/camera/RoomCameraController.h"
 #include "game/combat/CombatSystem.h"
 #include "game/player/PlayerController.h"
 #include "game/scenes/GameScenes.h"
 #include "game/ui/HudAndMenuSystem.h"
+#include "game/world/WorldTopology.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace vots {
@@ -50,11 +53,15 @@ en::Result<void, en::FrameworkErrc> VeilGameApp::OnBootHook(
 void VeilGameApp::OnPreShutdownHook(en::SceneLoadContext&) noexcept {}
 
 void VeilGameApp::OnConsumeSimCueHook(
-    const en::SimCue&,
-    en::SimContext&,
+    const en::SimCue& cue,
+    en::SimContext& ctx,
     void* userAppState) noexcept {
     if (auto* self = static_cast<VeilGameApp*>(userAppState)) {
         ++self->m_cuesConsumedCount;
+        if (cue.kind == en::SimCueKind::CameraTraumaPulse && ctx.world != nullptr) {
+            RoomCameraController::TriggerCombatImpulse(
+                self->m_cameraEntity, Vec2{0.0f, 2.2f}, cue.Magnitude(), *ctx.world);
+        }
     }
 }
 
@@ -67,7 +74,7 @@ en::Result<void, en::FrameworkError> VeilGameApp::Init(
     cfg.viewport = viewport;
     cfg.headless = headless ? 1U : 0U;
     cfg.enableDebugTools = 1U;
-    cfg.defaultPixelsPerMeter = 48.0f;
+    cfg.defaultPixelsPerMeter = kCameraPixelsPerMeter;
 
     en::AppHooks hooks{};
     hooks.userAppState = this;
@@ -100,22 +107,28 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) no
         --m_portalCooldownTicks;
     }
 
-    // 1. Step mark expirations (420t), Chrono-Overdrive delayed strikes, Break State/Recovery, and CC timers
     CombatSystem::StepCombatTimersAndDelayedStrikes(*ctx.world, *ctx.gameplay);
 
-    // 2. Apply debug CVars if enabled
-    if (m_cvars.infiniteHarmony && ctx.world->IsAlive(m_playerEntity)) {
+    if (ctx.world->IsAlive(m_playerEntity)) {
         if (auto* ps = ctx.world->TryGet<PlayerStateComp>(m_playerEntity)) {
-            ps->harmony = kMaxHarmonyGauge;
+            if (m_cvars.infiniteHarmony) {
+                ps->harmony = kMaxHarmonyGauge;
+            }
+            if ((ps->doubleJumpEnabled != 0U) != m_cvars.doubleJump) {
+                PlayerController::SetDoubleJumpEnabled(m_playerEntity, m_cvars.doubleJump, *ctx.world);
+            }
+            const u8 targetCharges = static_cast<u8>(std::clamp(m_cvars.maxDashCharges, 1, 2));
+            if (ps->MaxDashCharges() != targetCharges) {
+                PlayerController::SetMaxDashCharges(m_playerEntity, targetCharges, *ctx.world);
+            }
         }
-    }
-    if (m_cvars.godMode && ctx.world->IsAlive(m_playerEntity)) {
-        if (auto* recv = ctx.world->TryGet<en::DamageReceiver2D>(m_playerEntity)) {
-            recv->hp = recv->maxHp;
+        if (m_cvars.godMode) {
+            if (auto* recv = ctx.world->TryGet<en::DamageReceiver2D>(m_playerEntity)) {
+                recv->hp = recv->maxHp;
+            }
         }
     }
 
-    // 3. Step Kaelen controls & attacks
     PlayerController::StepPlayer(
         m_playerEntity,
         *ctx.world,
@@ -125,14 +138,13 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) no
         *ctx.actionBuffer,
         m_nextAttackInstanceId);
 
-    // 4. Step Enemies, Boss Phases, and Projectiles (despawns dead enemies and records cleared slots)
     EnemyAiSystem::StepEnemiesAndProjectiles(m_playerEntity, *ctx.world, *ctx.gameplay, &m_metroidvania);
 
-    // 5. Step ambient projectile velocities, sprite frame animations, and transient lifetimes
     ctx.world->StepAmbientVelocities(step);
     ctx.world->StepAnimationsAndLifetimes(step);
 
-    // 6. Check Kaelen death -> spawn / update single Lost Wick Husk, reset room enemies, and snap camera
+    RoomCameraController::StepCameraFraming(m_cameraEntity, m_playerEntity, m_bossEntity, m_activeRoomId, *ctx.world);
+
     if (ctx.world->IsAlive(m_playerEntity)) {
         if (const auto* recv = ctx.world->TryGet<en::DamageReceiver2D>(m_playerEntity)) {
             if (recv->HasFlag(en::ReceiverFlags::Dead) || recv->hp <= 0) {
@@ -140,10 +152,8 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) no
                 m_metroidvania.HandlePlayerDeathAndSpawnHusk(
                     m_playerEntity, Vec2{xf.x, xf.y}, m_activeRoomId, *ctx.world);
 
-                if (auto* camCtrl = ctx.world->TryGet<en::CameraController2D>(m_cameraEntity)) {
-                    camCtrl->primaryTarget = m_playerEntity;
-                    camCtrl->flags |= en::CameraCtrlFlags::SnapNextStep;
-                }
+                RoomCameraController::SnapToTarget(
+                    m_cameraEntity, m_playerEntity, m_metroidvania.LastCheckpointRoom(), *ctx.world);
 
                 if (m_metroidvania.LastCheckpointRoom() != m_activeRoomId &&
                     !ctx.director->HasPendingWork()) {
@@ -156,23 +166,19 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) no
         }
     }
 
-    // 7. Automatic Room Exit Portal proximity transition when walking into Left/Right portals
+    // Hollow Knight-style Off-Edge Room Boundary Transition
     if (m_portalCooldownTicks == 0U &&
         !ctx.director->HasPendingWork() &&
         ctx.world->IsAlive(m_playerEntity)) {
         const en::WorldTransform2D& pxf = ctx.world->GetWorldByIndex(m_playerEntity.index);
-        for (auto [propId, inter] : ctx.world->View<InteractableComp>()) {
-            if (inter.kind != InteractableKind::RoomExitPortal) continue;
-            const en::WorldTransform2D& ixf = ctx.world->GetWorldByIndex(propId.index);
-            if (std::abs(ixf.x - pxf.x) <= 0.75f && std::abs(ixf.y - pxf.y) <= 1.4f) {
-                m_portalCooldownTicks = 40U;
-                (void)GameScenes::RequestRoomTransition(*this, inter.paramByte, en::SceneTransitionMode::RoomSwap);
-                break;
-            }
+        const u8 nextRoom = WorldTopology::CheckSeamlessBoundaryExit(
+            m_activeRoomId, Vec2{pxf.x, pxf.y}, *ctx.gameplay);
+        if (nextRoom < kRoomCount) {
+            m_portalCooldownTicks = 40U;
+            (void)GameScenes::RequestRoomTransition(*this, nextRoom, en::SceneTransitionMode::RoomSwap);
         }
     }
 
-    // 8. Check modal UI triggers (Pause, Map, PlaceMapPin, World Interactables)
     if (ctx.actionBuffer->Consume(static_cast<u8>(GameAction::Pause), 6U)) {
         (void)ctx.director->PushState(GameScenes::MakePauseModalLayerDesc(this));
     } else if (ctx.actionBuffer->Consume(static_cast<u8>(GameAction::ToggleMap), 6U)) {
@@ -182,65 +188,105 @@ void VeilGameApp::OnSimTick(en::SimContext& ctx, const en::SimStepView& step) no
             const en::WorldTransform2D& xf = ctx.world->GetWorldByIndex(m_playerEntity.index);
             (void)m_metroidvania.PlaceMapPin(m_activeRoomId, Vec2{xf.x, xf.y}, MapPinKind::FrequencyGate, 1U);
         }
-    } else if (ctx.actionBuffer->Consume(static_cast<u8>(GameAction::Interact), 6U)) {
+    } else if (ctx.tickInput->Pressed(static_cast<u8>(GameAction::Interact)) ||
+               ctx.actionBuffer->Consume(static_cast<u8>(GameAction::Interact), 6U)) {
         if (ctx.world->IsAlive(m_playerEntity)) {
-            const en::WorldTransform2D& pxf = ctx.world->GetWorldByIndex(m_playerEntity.index);
-            for (auto [propId, inter] : ctx.world->View<InteractableComp>()) {
-                const en::WorldTransform2D& ixf = ctx.world->GetWorldByIndex(propId.index);
-                const f32 dx = ixf.x - pxf.x;
-                const f32 dy = ixf.y - pxf.y;
-                if (dx * dx + dy * dy > inter.interactRadius * inter.interactRadius) continue;
+            const auto* recv = ctx.world->TryGet<en::DamageReceiver2D>(m_playerEntity);
+            const auto* ps = ctx.world->TryGet<PlayerStateComp>(m_playerEntity);
+            const bool canInteract = (recv == nullptr || !recv->HasFlag(en::ReceiverFlags::Dead)) &&
+                                     (ps == nullptr || ps->unisonState == UnisonActionState::None);
+            if (canInteract) {
+                const en::WorldTransform2D& pxf = ctx.world->GetWorldByIndex(m_playerEntity.index);
 
-                switch (inter.kind) {
-                    case InteractableKind::TuningResonator:
-                        m_metroidvania.ActivateTuningResonator(
-                            m_playerEntity, m_activeRoomId, Vec2{ixf.x, ixf.y}, *ctx.world, *ctx.gameplay);
-                        GameScenes::SpawnRoomEnemiesIfNeeded(*this, *ctx.world, m_activeRoomId);
-                        break;
-                    case InteractableKind::LostWickHusk:
-                        if (m_metroidvania.RecoverLostWickHusk(m_playerEntity, *ctx.world, *ctx.gameplay)) {
-                            (void)ctx.world->DeferDestroy(propId);
-                        }
-                        break;
-                    case InteractableKind::EchoAltar:
-                        m_metroidvania.UnlockEchoAtAltar(
-                            m_playerEntity, static_cast<EchoId>(inter.paramByte), *ctx.world);
-                        inter.activated = 1U;
-                        break;
-                    case InteractableKind::MemoryTuningFork:
-                        m_metroidvania.CompleteMemoryTuningFork(inter.paramByte, *ctx.gameplay);
-                        inter.activated = 1U;
-                        break;
-                    case InteractableKind::LoreTablet:
-                        if (inter.grantedWorldFlag != 0U) {
-                            ctx.gameplay->SetWorldFlag(inter.grantedWorldFlag, true);
-                        }
-                        inter.activated = 1U;
-                        break;
-                    case InteractableKind::FrequencyGate: {
-                        const FrequencyGateDiagnostic diag =
-                            MetroidvaniaSystem::EvaluateFrequencyGate(inter, *ctx.gameplay);
-                        if (diag.isUnlocked) {
-                            if (inter.grantedWorldFlag != 0U) {
-                                ctx.gameplay->SetWorldFlag(inter.grantedWorldFlag, true);
-                            }
-                            inter.activated = 1U;
-                        }
-                        break;
+                EntityId bestPropId = kNullEntity;
+                InteractableComp* bestInter = nullptr;
+                Vec2 bestPos{0.0f, 0.0f};
+                f32 bestDistSq = 1.0e9f;
+                u8 bestPriority = 0xFFU;
+
+                for (auto [propId, inter] : ctx.world->View<InteractableComp>()) {
+                    const en::WorldTransform2D& ixf = ctx.world->GetWorldByIndex(propId.index);
+                    const f32 dx = ixf.x - pxf.x;
+                    const f32 dy = ixf.y - pxf.y;
+                    const f32 dSq = dx * dx + dy * dy;
+                    if (dSq > inter.interactRadius * inter.interactRadius) continue;
+
+                    const bool closer = (dSq + 1.0e-4f < bestDistSq);
+                    const bool tiedDist = (std::abs(dSq - bestDistSq) <= 1.0e-4f);
+                    const bool betterPrio = tiedDist && (inter.interactPriority < bestPriority);
+                    const bool betterId = tiedDist && (inter.interactPriority == bestPriority) &&
+                                          (propId.index < bestPropId.index);
+                    if (!bestPropId.IsValid() || closer || betterPrio || betterId) {
+                        bestPropId = propId;
+                        bestInter = &inter;
+                        bestPos = Vec2{ixf.x, ixf.y};
+                        bestDistSq = dSq;
+                        bestPriority = inter.interactPriority;
                     }
-                    case InteractableKind::SpireDecisionCore:
-                        if (ctx.gameplay->TestWorldFlag(static_cast<u16>(WorldFlagId::HighConductorDefeated))) {
-                            (void)m_metroidvania.ResolveSpireEnding(
-                                m_playerEntity, false, true, *ctx.world, *ctx.gameplay);
-                            (void)ctx.director->PushState(GameScenes::MakeEndingModalLayerDesc(this));
-                        }
-                        break;
-                    case InteractableKind::RoomExitPortal:
-                        m_portalCooldownTicks = 40U;
-                        (void)GameScenes::RequestRoomTransition(*this, inter.paramByte, en::SceneTransitionMode::RoomSwap);
-                        break;
                 }
-                break;
+
+                if (bestPropId.IsValid() && bestInter != nullptr) {
+                    switch (bestInter->kind) {
+                        case InteractableKind::TuningResonator:
+                            m_metroidvania.ActivateTuningResonator(
+                                m_playerEntity, m_activeRoomId, bestPos, *ctx.world, *ctx.gameplay);
+                            GameScenes::SpawnRoomEnemiesIfNeeded(*this, *ctx.world, m_activeRoomId);
+                            break;
+                        case InteractableKind::LostWickHusk:
+                            if (m_metroidvania.RecoverLostWickHusk(m_playerEntity, *ctx.world, *ctx.gameplay)) {
+                                (void)ctx.world->DeferDestroy(bestPropId);
+                            }
+                            break;
+                        case InteractableKind::EchoAltar:
+                            m_metroidvania.UnlockEchoAtAltar(
+                                m_playerEntity, static_cast<EchoId>(bestInter->paramByte), *ctx.world);
+                            if (bestInter->grantedWorldFlag != 0U) {
+                                ctx.gameplay->SetWorldFlag(bestInter->grantedWorldFlag, true);
+                            }
+                            bestInter->activated = 1U;
+                            break;
+                        case InteractableKind::MemoryTuningFork:
+                            m_metroidvania.CompleteMemoryTuningFork(bestInter->paramByte, *ctx.gameplay);
+                            if (bestInter->grantedWorldFlag != 0U) {
+                                ctx.gameplay->SetWorldFlag(bestInter->grantedWorldFlag, true);
+                            }
+                            bestInter->activated = 1U;
+                            break;
+                        case InteractableKind::LoreTablet:
+                            if (bestInter->grantedWorldFlag != 0U) {
+                                ctx.gameplay->SetWorldFlag(bestInter->grantedWorldFlag, true);
+                            }
+                            bestInter->activated = 1U;
+                            break;
+                        case InteractableKind::FrequencyGate: {
+                            const FrequencyGateDiagnostic diag =
+                                MetroidvaniaSystem::EvaluateFrequencyGate(*bestInter, *ctx.gameplay);
+                            if (diag.isUnlocked) {
+                                if (bestInter->grantedWorldFlag != 0U) {
+                                    ctx.gameplay->SetWorldFlag(bestInter->grantedWorldFlag, true);
+                                }
+                                bestInter->activated = 1U;
+                            }
+                            break;
+                        }
+                        case InteractableKind::SpireDecisionCore:
+                            if (ctx.gameplay->TestWorldFlag(static_cast<u16>(WorldFlagId::HighConductorDefeated))) {
+                                (void)m_metroidvania.ResolveSpireEnding(
+                                    m_playerEntity, false, true, *ctx.world, *ctx.gameplay);
+                                (void)ctx.director->PushState(GameScenes::MakeEndingModalLayerDesc(this));
+                            }
+                            break;
+                        case InteractableKind::RoomExitPortal:
+                        case InteractableKind::ShortcutLever:
+                            if (bestInter->grantedWorldFlag != 0U) {
+                                ctx.gameplay->SetWorldFlag(bestInter->grantedWorldFlag, true);
+                            }
+                            bestInter->activated = 1U;
+                            m_portalCooldownTicks = 40U;
+                            (void)GameScenes::RequestRoomTransition(*this, bestInter->paramByte, en::SceneTransitionMode::RoomSwap);
+                            break;
+                    }
+                }
             }
         }
     }

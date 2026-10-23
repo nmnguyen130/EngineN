@@ -202,7 +202,6 @@ void SpatialIndex2D::RebuildDynamicGrid(const World& world, f32 dt) noexcept {
             const Vec2 center = xf.TransformPoint({col.localBounds.OffsetX(), col.localBounds.OffsetY()});
             const f32 hw = col.localBounds.HalfW() * std::abs(xf.scaleX);
             const f32 hh = col.localBounds.HalfH() * std::abs(xf.scaleY);
-            // Expand OBB AABB by rotation matrix abs values so rotated boxes never clip out of their broadphase bounds
             const f32 extX = (col.shape == ShapeKind2D::Obb)
                                  ? (hw * std::abs(xf.cosRot) + hh * std::abs(xf.sinRot))
                                  : hw;
@@ -218,7 +217,6 @@ void SpatialIndex2D::RebuildDynamicGrid(const World& world, f32 dt) noexcept {
             aabbMaxX = box.maxX;
             aabbMaxY = box.maxY;
 
-            // Expand broadphase cell span for BulletCCD bodies by their velocity displacement over dt
             if (dt > 0.0f && hasBodies &&
                 (world.GetComponentMaskByIndex(id.index) & (1ULL << RigidBody2D::kTypeId)) != 0ULL) {
                 const RigidBody2D& rb = world.GetPool<RigidBody2D>().DirectAtEntityIndex(id.index);
@@ -247,7 +245,6 @@ void SpatialIndex2D::RebuildDynamicGrid(const World& world, f32 dt) noexcept {
         }
     }
 
-    // Pass 2: Exclusive prefix sum over m_cellOffsets[0..kGridCells]
     u32 runningOffset = 0U;
     for (u32 c = 0U; c < kGridCells; ++c) {
         const u32 count = m_cellOffsets[c];
@@ -256,7 +253,6 @@ void SpatialIndex2D::RebuildDynamicGrid(const World& world, f32 dt) noexcept {
     }
     m_cellOffsets[kGridCells] = runningOffset;
 
-    // Pass 3: Scatter box indices into m_cellBoxIndices, then restore prefix offsets
     for (u16 bIdx = 0U; bIdx < m_boxCount; ++bIdx) {
         const CellSpanMeta& meta = spanMeta[bIdx];
         for (i16 y = meta.minCY; y <= meta.maxCY; ++y) {
@@ -296,7 +292,7 @@ RayHit2D SpatialIndex2D::Raycast(
     const f32 rayMinY = std::min(originY, endY);
     const f32 rayMaxY = std::max(originY, endY);
 
-    // 1. Test against static tilemap along the ray bounding box
+    // 1. Test against static tilemap using horizontal run-length merging
     if (m_tileFlags && m_tileSize > 0.0f && (categoryMask & 0x0001U) != 0U) {
         const f32 invTile = 1.0f / m_tileSize;
         const i32 minTX = std::max<i32>(0, static_cast<i32>(std::floor((rayMinX - m_originX) * invTile)));
@@ -305,14 +301,23 @@ RayHit2D SpatialIndex2D::Raycast(
         const i32 maxTY = std::min<i32>(static_cast<i32>(m_heightTiles) - 1, static_cast<i32>(std::floor((rayMaxY - m_originY) * invTile)));
 
         for (i32 ty = minTY; ty <= maxTY; ++ty) {
+            const f32 tileMinY = m_originY + static_cast<f32>(ty) * m_tileSize;
+            const f32 tileMaxY = tileMinY + m_tileSize;
             for (i32 tx = minTX; tx <= maxTX; ++tx) {
                 const TileMaterialFlags flags = SampleTileCoord(tx, ty);
                 if (!HasPhysicsFlag(flags, TileMaterialFlags::Solid)) continue;
+
+                i32 runEnd = tx;
+                while (runEnd + 1 <= maxTX && HasPhysicsFlag(SampleTileCoord(runEnd + 1, ty), TileMaterialFlags::Solid)) {
+                    ++runEnd;
+                }
                 const f32 tileMinX = m_originX + static_cast<f32>(tx) * m_tileSize;
-                const f32 tileMinY = m_originY + static_cast<f32>(ty) * m_tileSize;
+                const f32 tileMaxX = m_originX + static_cast<f32>(runEnd + 1) * m_tileSize;
+                tx = runEnd;
+
                 const RayHit2D h = Narrowphase2D::RaycastAabb(
                     originX, originY, dirX, dirY, bestHit.distance,
-                    tileMinX, tileMinY, tileMinX + m_tileSize, tileMinY + m_tileSize);
+                    tileMinX, tileMinY, tileMaxX, tileMaxY);
                 if (h.Hit() && h.distance < bestHit.distance) {
                     bestHit = h;
                     bestHit.fraction = (maxDist > 1e-8f) ? (h.distance / maxDist) : 0.0f;
@@ -322,7 +327,6 @@ RayHit2D SpatialIndex2D::Raycast(
         }
     }
 
-    // 2. Probe spatial grid cells covered by the ray segment (falls back to linear scan only if span > 8x8 cells)
     const i32 minCX = static_cast<i32>(std::floor(rayMinX * m_invCellSize));
     const i32 maxCX = static_cast<i32>(std::floor(rayMaxX * m_invCellSize));
     const i32 minCY = static_cast<i32>(std::floor(rayMinY * m_invCellSize));
@@ -391,7 +395,7 @@ SweepHit2D SpatialIndex2D::SweepAabb(
     const f32 sweepMinY = std::min(centerY, centerY + deltaY) - halfH - 0.05f;
     const f32 sweepMaxY = std::max(centerY, centerY + deltaY) + halfH + 0.05f;
 
-    // 1. Sweep against static tilemap
+    // 1. Sweep against static tilemap using greedy horizontal span merging + vertical wall seam culling
     if (m_tileFlags && m_tileSize > 0.0f && (solidMask & 0x0001U) != 0U) {
         const f32 invTile = 1.0f / m_tileSize;
         const i32 minTX = std::max<i32>(0, static_cast<i32>(std::floor((sweepMinX - m_originX) * invTile)));
@@ -400,13 +404,21 @@ SweepHit2D SpatialIndex2D::SweepAabb(
         const i32 maxTY = std::min<i32>(static_cast<i32>(m_heightTiles) - 1, static_cast<i32>(std::floor((sweepMaxY - m_originY) * invTile)));
 
         for (i32 ty = minTY; ty <= maxTY; ++ty) {
+            const f32 tileMinY = m_originY + static_cast<f32>(ty) * m_tileSize;
+            const f32 tileMaxY = tileMinY + m_tileSize;
             for (i32 tx = minTX; tx <= maxTX; ++tx) {
                 const TileMaterialFlags flags = SampleTileCoord(tx, ty);
                 if (flags == TileMaterialFlags::Empty) continue;
+
+                // Merge contiguous horizontal tiles with identical material flags into one slab AABB
+                i32 runEnd = tx;
+                while (runEnd + 1 <= maxTX && SampleTileCoord(runEnd + 1, ty) == flags) {
+                    ++runEnd;
+                }
                 const f32 tileMinX = m_originX + static_cast<f32>(tx) * m_tileSize;
-                const f32 tileMinY = m_originY + static_cast<f32>(ty) * m_tileSize;
-                const f32 tileMaxX = tileMinX + m_tileSize;
-                const f32 tileMaxY = tileMinY + m_tileSize;
+                const f32 tileMaxX = m_originX + static_cast<f32>(runEnd + 1) * m_tileSize;
+                const i32 spanStart = tx;
+                tx = runEnd;
 
                 const bool isOneWay = HasPhysicsFlag(flags, TileMaterialFlags::OneWay);
                 if (isOneWay) {
@@ -415,9 +427,28 @@ SweepHit2D SpatialIndex2D::SweepAabb(
                     }
                 }
 
-                const SweepHit2D h = Narrowphase2D::SweepAabbVsAabb(
+                SweepHit2D h = Narrowphase2D::SweepAabbVsAabb(
                     centerX, centerY, halfW, halfH, deltaX, deltaY,
                     tileMinX, tileMinY, tileMaxX, tileMaxY);
+                if (h.Hit() && !isOneWay) {
+                    const bool topCovered = HasPhysicsFlag(SampleTileCoord(spanStart, ty + 1), TileMaterialFlags::Solid) &&
+                                            HasPhysicsFlag(SampleTileCoord(runEnd, ty + 1), TileMaterialFlags::Solid);
+                    const bool botCovered = HasPhysicsFlag(SampleTileCoord(spanStart, ty - 1), TileMaterialFlags::Solid) &&
+                                            HasPhysicsFlag(SampleTileCoord(runEnd, ty - 1), TileMaterialFlags::Solid);
+                    if ((h.normalY > 0.5f && topCovered) || (h.normalY < -0.5f && botCovered)) {
+                        if (deltaX < -1e-6f && !HasPhysicsFlag(SampleTileCoord(runEnd + 1, ty), TileMaterialFlags::Solid) &&
+                            (centerX - halfW) >= tileMaxX - 2e-3f) {
+                            h.normalX = 1.0f;
+                            h.normalY = 0.0f;
+                        } else if (deltaX > 1e-6f && !HasPhysicsFlag(SampleTileCoord(spanStart - 1, ty), TileMaterialFlags::Solid) &&
+                                   (centerX + halfW) <= tileMinX + 2e-3f) {
+                            h.normalX = -1.0f;
+                            h.normalY = 0.0f;
+                        } else {
+                            continue;
+                        }
+                    }
+                }
                 if (h.Hit() && (!isOneWay || h.normalY > 0.5f) && h.toi < best.toi) {
                     best = h;
                     best.tileFlags = flags;

@@ -59,7 +59,9 @@ target_link_libraries(engine PUBLIC SDL3::SDL3)
 # Veil of the Silent (GDD v0.2) Client Game Library & Executable
 file(GLOB GAME_LIB_SRCS
     "game/core/*.cpp"
+    "game/config/*.cpp"
     "game/assets/*.cpp"
+    "game/camera/*.cpp"
     "game/player/*.cpp"
     "game/combat/*.cpp"
     "game/ai/*.cpp"

@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     }
     en::Window win{};
     en::WindowConfig wcfg{};
-    wcfg.title = "Veil of the Silent (GDD v0.2)";
+    wcfg.title = "Veil of the Silent (GDD v0.5)";
     if (!win.Create(wcfg, false).has_value()) {
         plat.Shutdown();
         game.Shutdown();

@@ -40,22 +40,25 @@ struct CookedRigPayload {
     const CancelCategory kFreeCancels = CancelCategory::Any;
     const CancelCategory kChainLight = CancelCategory::Dash | CancelCategory::Parry | CancelCategory::Light | CancelCategory::Heavy | CancelCategory::Special;
 
+    // GDD v0.3 Section 3.2, 3.4 & 3.5 tick durations:
+    // Light1 = 18t (5/3/10), Light2 = 19t (6/3/10), Light3 = 26t (8/4/14)
+    // Air1 = 17t (5/3/9), Air2 = 22t (7/3/12), Heavy = 46t (24/4/18), Dash = 12t
     setEntry(ActorFsmState::Idle,         0U,   0U, 4U, 8U, 1U, ActorFsmState::Idle,        kFreeCancels, kFreeCancels);
     setEntry(ActorFsmState::Run,          0U,   4U, 6U, 5U, 1U, ActorFsmState::Run,         kFreeCancels, kFreeCancels);
     setEntry(ActorFsmState::JumpRise,     0U,  10U, 2U, 6U, 0U, ActorFsmState::JumpRise,    kFreeCancels, kFreeCancels);
     setEntry(ActorFsmState::Fall,         0U,  12U, 2U, 6U, 1U, ActorFsmState::Fall,        kFreeCancels, kFreeCancels);
-    setEntry(ActorFsmState::Dash,        14U,  14U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Parry, CancelCategory::Any);
-    setEntry(ActorFsmState::Light1,      20U,  16U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
-    setEntry(ActorFsmState::Light2,      22U,  19U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
-    setEntry(ActorFsmState::Light3,      29U,  22U, 4U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::Dash, CancelCategory::Dash | CancelCategory::Special);
-    setEntry(ActorFsmState::Air1,        20U,  26U, 3U, 4U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Light | CancelCategory::Dash);
-    setEntry(ActorFsmState::Air2,        25U,  29U, 3U, 5U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Dash);
-    setEntry(ActorFsmState::HeavyWindup, kHeavyAttackStartupTicks, 32U, 3U, 8U, 0U, ActorFsmState::HeavyActive, CancelCategory::Dash | CancelCategory::Parry, CancelCategory::None);
-    setEntry(ActorFsmState::HeavyActive, 24U,  35U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Dash | CancelCategory::Special);
-    setEntry(ActorFsmState::ParryStance, 18U,  38U, 2U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
-    setEntry(ActorFsmState::ParrySuccess,16U,  40U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Any,  CancelCategory::Any);
-    setEntry(ActorFsmState::UnisonCast,  20U,  42U, 3U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
-    setEntry(ActorFsmState::SacredCast,  30U,  45U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
+    setEntry(ActorFsmState::Dash,        12U,  14U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Parry, CancelCategory::Any);
+    setEntry(ActorFsmState::Light1,      18U,  16U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
+    setEntry(ActorFsmState::Light2,      19U,  19U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
+    setEntry(ActorFsmState::Light3,      26U,  22U, 4U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::Dash, CancelCategory::Dash | CancelCategory::Special);
+    setEntry(ActorFsmState::Air1,        17U,  26U, 3U, 4U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Light | CancelCategory::Dash);
+    setEntry(ActorFsmState::Air2,        22U,  29U, 3U, 5U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Dash);
+    setEntry(ActorFsmState::HeavyWindup, kHeavyAttackStartupTicks, 32U, 3U, 8U, 0U, ActorFsmState::HeavyActive, CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::HeavyActive, 22U,  35U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Dash | CancelCategory::Special);
+    setEntry(ActorFsmState::ParryStance, 10U,  38U, 2U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
+    setEntry(ActorFsmState::ParrySuccess,14U,  40U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Any,  CancelCategory::Any);
+    setEntry(ActorFsmState::UnisonCast,  31U,  42U, 3U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::SacredCast,  61U,  45U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
     setEntry(ActorFsmState::HurtStagger, 45U,  48U, 2U, 8U, 1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
     setEntry(ActorFsmState::BreakExposed,150U, 50U, 2U, 10U,1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
 
@@ -108,7 +111,7 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
 
-    // 2. Cooked "ERIG" v1 FSM blobs for Kaelen, Standard/Elite Enemies, and High Conductor Boss
+    // 2. Cooked "ERIG" v1 FSM blobs for Kaelen, Prototype Enemies, and Ash-Sump Warden Boss
     const CookedRigPayload rigPayload = BuildActorRigPayload();
     const std::span<const u8> rigBytes{reinterpret_cast<const u8*>(&rigPayload), sizeof(rigPayload)};
 
@@ -121,19 +124,23 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
     out.enemyRigBlob = bank.CommitBlob(enemyRigSlot, rigBytes);
 
     const u16 bossRigSlot = bank.AcquireSlot(
-        en::AssetId::Hash("conductor_boss.erig"), en::AssetKind::Blob, persistentScope, en::AssetResidency::Sim, needsLoad);
+        en::AssetId::Hash("warden_boss.erig"), en::AssetKind::Blob, persistentScope, en::AssetResidency::Sim, needsLoad);
     out.bossRigBlob = bank.CommitBlob(bossRigSlot, rigBytes);
 
     if (!out.playerRigBlob.IsValid() || !out.enemyRigBlob.IsValid() || !out.bossRigBlob.IsValid()) {
         return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
 
-    // 3. Cooked "ESCN" v1 Scene Manifest blobs for the 4 interconnected Vaelen rooms
+    // 3. Cooked "ESCN" v1 Scene Manifest blobs for the 8 connected Vaelen rooms (GDD v0.3 Section 7)
     constexpr std::array<std::string_view, kRoomCount> kRoomManifestNames{{
-        "room_ash_sump.escn",
-        "room_resonator_sanctum.escn",
-        "room_echo_vault.escn",
-        "room_spire_arena.escn",
+        "room_00_ash_sump_west.escn",
+        "room_01_ash_sump_east.escn",
+        "room_02_collapsed_mine_upper.escn",
+        "room_03_collapsed_mine_deep.escn",
+        "room_04_lantern_chamber_approach.escn",
+        "room_05_lantern_chamber_sanctum.escn",
+        "room_06_warden_arena.escn",
+        "room_07_warden_overlook_shortcut.escn",
     }};
 
     struct RoomManifestBlob {
@@ -199,7 +206,7 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         out.soundCues[i] = cue.id;
     }
 
-    // Register 4 ambient/combat music tracks (one per room)
+    // Register 8 ambient/combat music tracks (one per room in the 8-room vertical slice)
     std::array<f32, 1024> musicLoop{};
     for (u32 s = 0U; s < musicLoop.size(); ++s) {
         const f32 t = static_cast<f32>(s) / static_cast<f32>(musicLoop.size());

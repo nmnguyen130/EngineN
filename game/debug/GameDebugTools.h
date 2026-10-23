@@ -1,6 +1,7 @@
 #pragma once
 
 #include "debug/DebugSystem.h"
+#include "game/core/GameConfig.h"
 
 namespace vots {
 
@@ -10,7 +11,9 @@ class VeilGameApp;
 struct GameDebugCVars {
     bool godMode{false};
     bool infiniteHarmony{false};
+    bool doubleJump{true};
     bool showTelegraphLabels{true};
+    i32 maxDashCharges{kPlayerDefaultMaxDashCharges};
     float playerSpeedScale{1.0f};
 };
 

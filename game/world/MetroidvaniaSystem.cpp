@@ -16,7 +16,7 @@ void MetroidvaniaSystem::ActivateTuningResonator(
     m_checkpointY = resonatorPos.y;
     m_checkpointRoomId = roomId;
     DiscoverRoom(roomId);
-    ResetClearedEnemies(); // Non-Boss enemies respawn when resting/saving at a Tuning Resonator
+    ResetClearedEnemies();
 
     const u16 flagId = static_cast<u16>(WorldFlagId::ResonatorAshSumpActive) + std::min<u8>(roomId, 3U);
     pipeline.SetWorldFlag(flagId, true);
@@ -25,13 +25,15 @@ void MetroidvaniaSystem::ActivateTuningResonator(
     auto* ps = world.TryGet<PlayerStateComp>(playerId);
     auto* recv = world.TryGet<en::DamageReceiver2D>(playerId);
     if (ps != nullptr) {
-        ps->harmony = kMaxHarmonyGauge; // GDD v0.2 Section 5.1: sets Harmony to 100
+        ps->harmony = kMaxHarmonyGauge;
         ps->lastResonatorRoomId = roomId;
+        ps->airDashCharges = ps->MaxDashCharges();
+        ps->airJumpsRemaining = (ps->doubleJumpEnabled != 0U) ? 1U : 0U;
         ps->burstVfxTicks = 20U;
     }
     if (recv != nullptr) {
         const i32 baseMax = (ps != nullptr) ? ps->baseMaxHp : kPlayerBaseMaxHp;
-        const bool hasPenalty = (ps != nullptr && ps->huskPenaltyActive != 0U) || m_husk.IsActive();
+        const bool hasPenalty = (ps != nullptr && ps->HuskPenaltyActive()) || m_husk.IsActive();
         const i32 effectiveMax = hasPenalty
                                      ? static_cast<i32>(static_cast<f32>(baseMax) * kHuskMaxHpPenaltyMultiplier + 0.5f)
                                      : baseMax;
@@ -75,9 +77,6 @@ void MetroidvaniaSystem::HandlePlayerDeathAndSpawnHusk(
     auto* recv = world.TryGet<en::DamageReceiver2D>(playerId);
     if (ps == nullptr || recv == nullptr) return;
 
-    // GDD v0.2 Section 5.2: Only one Lost Wick Husk can exist at a time.
-    // If Kaelen dies again before recovering the Husk, the Husk stays at its original position
-    // and newly carried Tuning Shards are added to the same Husk pool.
     if (!m_husk.IsActive()) {
         m_husk.worldX = deathPos.x;
         m_husk.worldY = deathPos.y;
@@ -91,23 +90,27 @@ void MetroidvaniaSystem::HandlePlayerDeathAndSpawnHusk(
     ResetClearedEnemies();
 
     ps->carriedTuningShards = 0U;
-    ps->harmony = 0U; // Harmony resets to 0 on death
-    ps->huskPenaltyActive = 1U;
+    ps->harmony = 0U;
+    ps->SetHuskPenaltyActive(true);
     ps->activeRoomId = m_checkpointRoomId;
-    ps->airDashCharges = ps->maxAirDashCharges;
+    ps->airDashCharges = ps->MaxDashCharges();
+    ps->airJumpsRemaining = (ps->doubleJumpEnabled != 0U) ? 1U : 0U;
     ps->parryWindowTicks = 0U;
-    ps->parryCooldownTicks = 0U;
     ps->dashCooldownTicks = 0U;
+    ps->dashActiveTicks = 0U;
+    ps->dashLockoutTicks = 0U;
+    ps->unisonElapsedTicks = 0U;
+    ps->unisonState = UnisonActionState::None;
     ps->burstVfxTicks = 0U;
 
-    // Non-stacking 25% Max HP penalty
     const i32 penalizedMaxHp = static_cast<i32>(
         static_cast<f32>(ps->baseMaxHp) * kHuskMaxHpPenaltyMultiplier + 0.5f);
     recv->maxHp = penalizedMaxHp;
     recv->hp = penalizedMaxHp;
     recv->RemoveFlags(en::ReceiverFlags::Dead);
     recv->RemoveFlags(en::ReceiverFlags::Parrying);
-    recv->iframeTicks = 60U;
+    recv->iframeTicks = kPlayerHitProtectionTicks;
+    recv->stunTicks = 0U;
 
     if (auto* motor = world.TryGet<en::CharacterMotor2D>(playerId)) {
         motor->vx = 0.0f;
@@ -126,7 +129,7 @@ void MetroidvaniaSystem::HandlePlayerDeathAndSpawnHusk(
     if (auto* atk = world.TryGet<WeaponAttackComp>(playerId)) {
         atk->moveKind = WeaponMoveKind::None;
         atk->elapsedTicks = 0U;
-        atk->hitboxTriggered = 0U;
+        atk->packedHitAndChain = 0U;
     }
 
     en::LocalTransform2D respawnXf = world.GetLocalTransform(playerId);
@@ -146,11 +149,10 @@ bool MetroidvaniaSystem::RecoverLostWickHusk(
     if (ps == nullptr || recv == nullptr) return false;
 
     ps->carriedTuningShards += m_husk.bankedTuningShards;
-    ps->huskPenaltyActive = 0U;
-    ps->harmony = kMaxHarmonyGauge; // Restores Harmony to 100
+    ps->SetHuskPenaltyActive(false);
+    ps->harmony = kMaxHarmonyGauge;
     ps->burstVfxTicks = 24U;
 
-    // Restore Max HP cap; clamp current HP to restored Max HP without overhealing (GDD v0.2 Section 5.2).
     recv->maxHp = ps->baseMaxHp;
     recv->hp = std::min(recv->hp, recv->maxHp);
 
@@ -180,13 +182,21 @@ void MetroidvaniaSystem::UnlockEchoAtAltar(
 void MetroidvaniaSystem::CompleteMemoryTuningFork(
     u8 forkIndex,
     en::GameplayPipeline& pipeline) noexcept {
-    if (forkIndex == 0U) pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest01Done), true);
-    else if (forkIndex == 1U) pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest02Done), true);
-    else if (forkIndex == 2U) pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest03Done), true);
+    if (forkIndex == 0U) {
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest01Done), true);
+    } else if (forkIndex == 1U) {
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest02Done), true);
+    } else if (forkIndex == 2U) {
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest03Done), true);
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest04Done), true);
+    } else if (forkIndex == 3U) {
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest04Done), true);
+    }
 
     if (pipeline.TestWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest01Done)) &&
         pipeline.TestWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest02Done)) &&
         pipeline.TestWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest03Done))) {
+        pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningQuest04Done), true);
         pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningComplete), true);
     }
 }
@@ -271,25 +281,24 @@ EndingId MetroidvaniaSystem::ResolveSpireEnding(
 
     auto* ps = world.IsAlive(playerId) ? world.TryGet<PlayerStateComp>(playerId) : nullptr;
     const bool hasAll12Echoes = (ps != nullptr && (ps->unlockedEchoMask & 0x0FFFU) == 0x0FFFU);
-    const bool memoryTuningDone = pipeline.TestWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningComplete));
+    const bool memoryTuningDone =
+        pipeline.TestWorldFlag(static_cast<u16>(WorldFlagId::MemoryTuningComplete)) ||
+        (WorldTopology::CountCompletedMemoryTuningFlags(pipeline) >= 4U);
 
     if (chooseSymphonyOffBeat && hasAll12Echoes && memoryTuningDone) {
-        // Ending C: Symphony of the Off-Beat — Kaelen transforms the Spire and relinquishes the Lantern as a weapon.
         if (ps != nullptr) {
-            ps->lanternRelinquished = 1U;
+            ps->SetLanternRelinquished(true);
         }
         m_achievedEnding = EndingId::SymphonyOfOffBeat;
         return m_achievedEnding;
     }
 
     if (chooseShatterCore) {
-        // Ending B: The Shattered Spire — destroys Spire core and severs Tuning Collars.
         pipeline.SetWorldFlag(static_cast<u16>(WorldFlagId::SpireCoreShatteredChoice), true);
         m_achievedEnding = EndingId::ShatteredSpire;
         return m_achievedEnding;
     }
 
-    // Ending A: The False Dawn — Kaelen reaches the surface without dismantling the harvesting network.
     m_achievedEnding = EndingId::FalseDawn;
     return m_achievedEnding;
 }
@@ -360,7 +369,7 @@ void MetroidvaniaSystem::ImportSaveData(
             ps->baseMaxHp = data.playerBaseMaxHp;
             ps->deck = data.triadDeck;
             ps->harmony = std::min<u8>(data.harmonyGauge, kMaxHarmonyGauge);
-            ps->huskPenaltyActive = m_husk.IsActive() ? 1U : 0U;
+            ps->SetHuskPenaltyActive(m_husk.IsActive());
             ps->lastResonatorRoomId = m_checkpointRoomId;
             PlayerController::SwitchActiveEchoSlot(playerId, ps->deck.activeSlot, world);
         }

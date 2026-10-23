@@ -13,7 +13,9 @@ void GameDebugTools::RegisterCVarsAndCommands(
     en::DebugConsole& con = debug.Console();
     (void)con.RegisterCVarBool("vots_god_mode", &app->CVars().godMode);
     (void)con.RegisterCVarBool("vots_infinite_harmony", &app->CVars().infiniteHarmony);
+    (void)con.RegisterCVarBool("vots_double_jump", &app->CVars().doubleJump);
     (void)con.RegisterCVarBool("vots_show_telegraphs", &app->CVars().showTelegraphLabels);
+    (void)con.RegisterCVarI32("vots_dash_charges", &app->CVars().maxDashCharges, 1, 2);
     (void)con.RegisterCVarF32("vots_speed_scale", &app->CVars().playerSpeedScale, 0.25f, 4.0f);
 
     (void)con.RegisterCommand(
@@ -54,7 +56,8 @@ void GameDebugTools::RegisterCVarsAndCommands(
             g->Metroidvania().CompleteMemoryTuningFork(0U, g->EngineApp().Gameplay());
             g->Metroidvania().CompleteMemoryTuningFork(1U, g->EngineApp().Gameplay());
             g->Metroidvania().CompleteMemoryTuningFork(2U, g->EngineApp().Gameplay());
-            console.Print(en::LogSeverity::Info, "Memory Tuning questline completed.");
+            g->Metroidvania().CompleteMemoryTuningFork(3U, g->EngineApp().Gameplay());
+            console.Print(en::LogSeverity::Info, "All 4 Memory Tuning flags completed.");
         },
         app);
 #else
