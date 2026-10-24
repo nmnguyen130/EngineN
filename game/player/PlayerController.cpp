@@ -112,16 +112,16 @@ en::Result<EntityId, en::WorldErrc> PlayerController::SpawnKaelen(
     const EntityId id = *idRes;
 
     en::Sprite2D spr{};
-    spr.width = kPlayerColliderWidthWu;
-    spr.height = kPlayerColliderHeightWu;
+    spr.width = kPlayerSpriteSizeWu;
+    spr.height = kPlayerSpriteSizeWu;
     spr.layer = 12U;
-    spr.tint = GetEchoDef(EchoId::Ignis).primaryColor;
+    spr.tint = Color{1.0f, 1.0f, 1.0f, 1.0f};
     (void)world.Emplace<en::Sprite2D>(id, spr);
 
     en::SpriteAnimator2D anim{};
     anim.atlas = assets.characterAtlas;
     anim.firstFrame = 0U;
-    anim.frameCount = 4U;
+    anim.frameCount = 6U;
     anim.ticksPerFrame = 8U;
     (void)world.Emplace<en::SpriteAnimator2D>(id, anim);
 
@@ -199,7 +199,7 @@ void PlayerController::SwitchActiveEchoSlot(
     const EchoIdentityDef& def = GetEchoDef(ps->deck.ActiveEcho());
 
     if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
-        spr->tint = def.primaryColor;
+        spr->tint = Color{1.0f, 1.0f, 1.0f, 1.0f};
     }
     if (auto* light = world.TryGet<en::PointLight2D>(playerId)) {
         light->color = def.primaryColor;
@@ -556,8 +556,67 @@ void PlayerController::StepPlayer(
 
     if (atk->moveKind == WeaponMoveKind::None && ps->dashActiveTicks == 0U && std::abs(moveX) >= 0.18f) {
         motion->SetFacingSign(moveX < 0.0f ? -1 : 1);
-        if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
-            spr->SetFlipX(moveX < 0.0f);
+    }
+    if (auto* spr = world.TryGet<en::Sprite2D>(playerId)) {
+        spr->SetFlipX(motion->FacingSign() < 0);
+        const u16 iframes = recv->iframeTicks;
+        const bool hurtFlash = (iframes > (kPlayerHitProtectionTicks - kPlayerHurtFlashDurationTicks));
+        const bool blinkGhost = (!hurtFlash && iframes > 0U && ((iframes >> 2U) & 1U) != 0U);
+        spr->tint = hurtFlash
+                        ? Color{1.0f, 0.35f, 0.42f, 1.0f}
+                        : Color{1.0f, 1.0f, 1.0f, blinkGhost ? 0.35f : 1.0f};
+    }
+    if (auto* anim = world.TryGet<en::SpriteAnimator2D>(playerId)) {
+        u16 wantFirst = 0U;
+        u16 wantCount = 6U;
+        u16 wantTicks = 8U;
+        bool wantLoop = true;
+        if (atk->moveKind != WeaponMoveKind::None) {
+            if (atk->moveKind == WeaponMoveKind::Light1 || atk->moveKind == WeaponMoveKind::Air1) {
+                wantFirst = 32U; wantCount = 8U; wantTicks = 3U; wantLoop = false;
+            } else if (atk->moveKind == WeaponMoveKind::Light2 || atk->moveKind == WeaponMoveKind::Air2) {
+                wantFirst = 40U; wantCount = 8U; wantTicks = 3U; wantLoop = false;
+            } else {
+                wantFirst = 48U; wantCount = 8U; wantTicks = 4U; wantLoop = false;
+            }
+        } else if (ps->parryWindowTicks > 0U) {
+            wantFirst = 6U; wantCount = 2U; wantTicks = 5U; wantLoop = false;
+        } else if (ps->IsDashing()) {
+            wantFirst = 28U; wantCount = 4U; wantTicks = 5U; wantLoop = false;
+        } else if (!grounded) {
+            wantFirst = (motor->vy >= 0.0f) ? 24U : 26U;
+            wantCount = 2U; wantTicks = 6U; wantLoop = (motor->vy < 0.0f);
+        } else if (std::abs(motor->vx) > 4.0f) {
+            wantFirst = 16U; wantCount = 8U; wantTicks = 4U; wantLoop = true;
+        } else if (std::abs(motor->vx) > 0.25f) {
+            wantFirst = 8U; wantCount = 8U; wantTicks = 5U; wantLoop = true;
+        }
+        if (anim->firstFrame != wantFirst) {
+            anim->firstFrame = wantFirst;
+            anim->frameCount = wantCount;
+            anim->ticksPerFrame = wantTicks;
+            anim->currentFrame = 0U;
+            anim->tickAccum = 0U;
+            anim->loop = wantLoop;
+            anim->playing = true;
+        }
+        if (atk->moveKind != WeaponMoveKind::None) {
+            const WeaponMoveSpec& spec = GetWeaponMoveSpec(atk->moveKind);
+            const u16 su = std::max<u16>(1U, spec.startupTicks);
+            const u16 ac = std::max<u16>(1U, spec.activeTicks);
+            const u16 rc = std::max<u16>(1U, spec.recoveryTicks);
+            const u16 el = atk->elapsedTicks;
+            u16 mappedFrame = 0U;
+            if (el < su) {
+                mappedFrame = static_cast<u16>((el * 2U) / su);
+            } else if (el < static_cast<u16>(su + ac)) {
+                mappedFrame = static_cast<u16>(2U + ((el - su) * 3U) / ac);
+            } else {
+                const u16 rem = static_cast<u16>(el - su - ac);
+                mappedFrame = static_cast<u16>(std::min<u16>(7U, 5U + (rem * 3U) / rc));
+            }
+            anim->currentFrame = mappedFrame;
+            anim->tickAccum = 0U;
         }
     }
 

@@ -573,7 +573,7 @@ void RenderList::PushText(
             const f32 u0 = static_cast<f32>(glyph & 15U) * (1.0f / 16.0f);
             const f32 v0 = static_cast<f32>(glyph >> 4U) * (1.0f / 6.0f);
             cmd.center = {cursorX + quadSize * 0.5f, cursorY + quadSize * 0.5f};
-            cmd.uv = {u0, v0, 7.0f / 128.0f, 7.2f / 48.0f};
+            cmd.uv = {u0, v0, 1.0f / 16.0f, 1.0f / 6.0f};
             PushQuad(cmd);
         }
         cursorX += advanceX;

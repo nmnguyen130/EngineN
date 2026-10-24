@@ -35,16 +35,22 @@ namespace {
     if (!idRes.has_value()) return idRes;
     const EntityId id = *idRes;
 
+    (void)tint;
+    u16 baseRowFrame = 56U;
+    if (archetype == EnemyArchetype::ChoirSentry) baseRowFrame = 64U;
+    else if (archetype == EnemyArchetype::ResonanceBrute || archetype == EnemyArchetype::TuningHuskElite) baseRowFrame = 72U;
+    else if (archetype == EnemyArchetype::AshSumpWardenBoss) baseRowFrame = 80U;
+
     en::Sprite2D spr{};
-    spr.width = halfExtents.x * 2.0f;
-    spr.height = halfExtents.y * 2.0f;
+    spr.width = std::max(2.25f, halfExtents.y * 2.60f);
+    spr.height = std::max(2.25f, halfExtents.y * 2.60f);
     spr.layer = 11U;
-    spr.tint = tint;
+    spr.tint = Color{1.0f, 1.0f, 1.0f, 1.0f};
     (void)world.Emplace<en::Sprite2D>(id, spr);
 
     en::SpriteAnimator2D anim{};
     anim.atlas = atlas;
-    anim.firstFrame = 0U;
+    anim.firstFrame = baseRowFrame;
     anim.frameCount = 4U;
     anim.ticksPerFrame = 8U;
     (void)world.Emplace<en::SpriteAnimator2D>(id, anim);
@@ -668,6 +674,25 @@ void EnemyAiSystem::StepEnemiesAndProjectiles(
                 motion.SetFacingSign(1);
             }
             motion.targetWalkVx = static_cast<f32>(motion.FacingSign()) * 1.2f * speedMult;
+        }
+
+        const auto arch = static_cast<EnemyArchetype>(ai.archetypeId);
+        u16 rowBase = 56U;
+        if (arch == EnemyArchetype::ChoirSentry) rowBase = 64U;
+        else if (arch == EnemyArchetype::ResonanceBrute || arch == EnemyArchetype::TuningHuskElite) rowBase = 72U;
+        else if (arch == EnemyArchetype::AshSumpWardenBoss) rowBase = 80U;
+        const u16 wantFirst = (ai.actionTimerTicks > 0U) ? static_cast<u16>(rowBase + 4U) : rowBase;
+        if (auto* anim = world.TryGet<en::SpriteAnimator2D>(id)) {
+            if (anim->firstFrame != wantFirst) {
+                anim->firstFrame = wantFirst;
+                anim->frameCount = 4U;
+                anim->ticksPerFrame = (ai.actionTimerTicks > 0U) ? 6U : 8U;
+                anim->currentFrame = 0U;
+                anim->tickAccum = 0U;
+            }
+        }
+        if (auto* spr = world.TryGet<en::Sprite2D>(id)) {
+            spr->SetFlipX(motion.FacingSign() < 0);
         }
     }
 

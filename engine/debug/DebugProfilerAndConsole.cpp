@@ -191,12 +191,16 @@ void DebugProfiler::EmitProfilerAndTimeHud(
     OverlayFlags flags,
     ViewportExtent viewportSize,
     DebugBatcher& hudBatcher) const noexcept {
-    (void)viewportSize;
+    const f32 panelW = 320.0f;
+    const f32 baseX = (viewportSize.w > 344) ? (static_cast<f32>(viewportSize.w) - panelW - 12.0f) : 948.0f;
+    const f32 subW = 220.0f;
+    const f32 subX = baseX + (panelW - subW);
+
     if (m_samples && m_validFrames > 0U) {
         const FrameProfileSample& latest = Latest();
         if (HasOverlay(flags, OverlayFlags::ProfilerHud)) {
-            hudBatcher.PushSolidRect(Rect{12.0f, 12.0f, 320.0f, 118.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
-            hudBatcher.PushBoxOutline(Rect{12.0f, 12.0f, 320.0f, 118.0f}, 1.0f, Color{0.25f, 0.85f, 0.55f, 0.9f});
+            hudBatcher.PushSolidRect(Rect{baseX, 12.0f, panelW, 118.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
+            hudBatcher.PushBoxOutline(Rect{baseX, 12.0f, panelW, 118.0f}, 1.0f, Color{0.25f, 0.85f, 0.55f, 0.9f});
 
             char buf[96]{};
             char* end = buf + sizeof(buf);
@@ -206,7 +210,7 @@ void DebugProfiler::EmitProfilerAndTimeHud(
             std::memcpy(p, "ms P99 ", 7U); p += 7;
             p = DebugBatcher::FormatF32Fixed2(p, end, static_cast<f32>(ComputePercentileUs(253U)) * 0.001f);
             std::memcpy(p, "ms", 2U); p += 2;
-            hudBatcher.PushText(20.0f, 20.0f, {buf, static_cast<usize>(p - buf)}, Color{0.3f, 1.0f, 0.6f, 1.0f}, 1.1f);
+            hudBatcher.PushText(baseX + 8.0f, 20.0f, {buf, static_cast<usize>(p - buf)}, Color{0.3f, 1.0f, 0.6f, 1.0f}, 1.1f);
 
             p = buf;
             std::memcpy(p, "ENT ", 4U); p += 4;
@@ -215,7 +219,7 @@ void DebugProfiler::EmitProfilerAndTimeHud(
             p = DebugBatcher::FormatI64(p, end, latest.submittedQuads);
             std::memcpy(p, " BATCH ", 7U); p += 7;
             p = DebugBatcher::FormatI64(p, end, latest.drawBatches);
-            hudBatcher.PushText(20.0f, 38.0f, {buf, static_cast<usize>(p - buf)}, Color{0.85f, 0.95f, 1.0f, 1.0f}, 1.0f);
+            hudBatcher.PushText(baseX + 8.0f, 38.0f, {buf, static_cast<usize>(p - buf)}, Color{0.85f, 0.95f, 1.0f, 1.0f}, 1.0f);
 
             p = buf;
             std::memcpy(p, "PHYS CONT ", 10U); p += 10;
@@ -224,7 +228,7 @@ void DebugProfiler::EmitProfilerAndTimeHud(
             p = DebugBatcher::FormatI64(p, end, latest.audioActiveVoices);
             std::memcpy(p, "/", 1U); p += 1;
             p = DebugBatcher::FormatI64(p, end, latest.audioVirtualVoices);
-            hudBatcher.PushText(20.0f, 54.0f, {buf, static_cast<usize>(p - buf)}, Color{0.9f, 0.85f, 0.4f, 1.0f}, 1.0f);
+            hudBatcher.PushText(baseX + 8.0f, 54.0f, {buf, static_cast<usize>(p - buf)}, Color{0.9f, 0.85f, 0.4f, 1.0f}, 1.0f);
 
             const u32 count = std::min<u32>(m_validFrames, 64U);
             for (u32 i = 0U; i < count; ++i) {
@@ -234,13 +238,13 @@ void DebugProfiler::EmitProfilerAndTimeHud(
                 const Color barCol = (m_samples[idx].frameSpikeFlag != 0U)
                                          ? Color{1.0f, 0.25f, 0.25f, 0.9f}
                                          : Color{0.2f, 0.85f, 0.55f, 0.85f};
-                const f32 bx = 320.0f - static_cast<f32>(i) * 4.5f;
+                const f32 bx = (baseX + panelW - 12.0f) - static_cast<f32>(i) * 4.5f;
                 hudBatcher.PushSolidRect(Rect{bx, 122.0f - h, 3.5f, h}, barCol);
             }
         }
 
         if (HasOverlay(flags, OverlayFlags::TimeChannelHud)) {
-            hudBatcher.PushSolidRect(Rect{12.0f, 136.0f, 220.0f, 36.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
+            hudBatcher.PushSolidRect(Rect{subX, 136.0f, subW, 36.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
             char buf[64]{};
             char* end = buf + sizeof(buf);
             char* p = buf;
@@ -249,18 +253,18 @@ void DebugProfiler::EmitProfilerAndTimeHud(
             std::memcpy(p, "x PLR ", 6U); p += 6;
             p = DebugBatcher::FormatF32Fixed2(p, end, static_cast<f32>(latest.channelScaleQ6[1]) * (1.0f / 64.0f));
             *p++ = 'x';
-            hudBatcher.PushText(20.0f, 148.0f, {buf, static_cast<usize>(p - buf)}, Color{0.6f, 0.9f, 1.0f, 1.0f}, 1.0f);
+            hudBatcher.PushText(subX + 8.0f, 148.0f, {buf, static_cast<usize>(p - buf)}, Color{0.6f, 0.9f, 1.0f, 1.0f}, 1.0f);
         }
     }
 
-    // Real-time WatchPlotHud sparkline waveforms
+    // Real-time WatchPlotHud sparkline waveforms (Top-Right aligned below profiler)
     if (HasOverlay(flags, OverlayFlags::WatchPlotHud) && m_plots) {
         f32 plotY = 178.0f;
         for (u32 t = 0U; t < kMaxWatchPlots; ++t) {
             const WatchPlotTrack& tr = m_plots[t];
             if (tr.nameHash == 0U || tr.validCount == 0U) continue;
-            hudBatcher.PushSolidRect(Rect{12.0f, plotY, 220.0f, 38.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
-            hudBatcher.PushText(18.0f, plotY + 4.0f, tr.Label(), Color{1.0f, 0.85f, 0.3f, 1.0f}, 1.0f);
+            hudBatcher.PushSolidRect(Rect{subX, plotY, subW, 38.0f}, Color{0.05f, 0.07f, 0.11f, 0.85f});
+            hudBatcher.PushText(subX + 6.0f, plotY + 4.0f, tr.Label(), Color{1.0f, 0.85f, 0.3f, 1.0f}, 1.0f);
 
             const f32 span = std::max(1e-3f, tr.maxVal - tr.minVal);
             f32 prevX = 0.0f, prevY = 0.0f;
@@ -268,7 +272,7 @@ void DebugProfiler::EmitProfilerAndTimeHud(
                 const u32 idx = (static_cast<u32>(tr.writeIdx) + kWatchPlotHistorySamples - tr.validCount + s) &
                                 (kWatchPlotHistorySamples - 1U);
                 const f32 norm = std::clamp((tr.samples[idx] - tr.minVal) / span, 0.0f, 1.0f);
-                const f32 sx = 18.0f + static_cast<f32>(s) * 3.1f;
+                const f32 sx = subX + 6.0f + static_cast<f32>(s) * 3.1f;
                 const f32 sy = plotY + 34.0f - norm * 18.0f;
                 if (s > 0U) {
                     hudBatcher.PushLine(prevX, prevY, sx, sy, 1.2f, Color{0.3f, 0.95f, 1.0f, 0.95f});

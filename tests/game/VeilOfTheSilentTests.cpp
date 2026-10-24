@@ -557,15 +557,30 @@ void TestVisualTilemapSlashVfxEnemyRespawnAndPassThrough(TestSuite& suite) noexc
     const en::Camera2D& cam0 = app.EngineApp().GetRenderList().View(0U);
     EXPECT_TRUE(suite, cam0.yUp);
 
-    // 2D Rectangular Greedy Meshing merges adjacent tiles into maximal slabs, keeping total room+HUD quads compact (< 260)
+    // Verify runtime-loaded 768x1056 (8x11 of 96x96 frames) Spritesheet & 128x48 Pixel-Art Font Atlas from disk:
+    const en::TextureRecord& sheetRec = app.EngineApp().Assets().GetTexture(app.AssetHandles().characterSheetTex);
+    EXPECT_EQ(suite, sheetRec.width, 768U);
+    EXPECT_EQ(suite, sheetRec.height, 1056U);
+    EXPECT_TRUE(suite, sheetRec.pixels != nullptr);
+    const en::TextureRecord& fontRec = app.EngineApp().Assets().GetTexture(app.AssetHandles().pixelFontTex);
+    EXPECT_EQ(suite, fontRec.width, 512U);
+    EXPECT_EQ(suite, fontRec.height, 192U);
+    EXPECT_TRUE(suite, fontRec.pixels != nullptr);
+    EXPECT_NEAR(suite, world.TryGet<en::Sprite2D>(pid)->width, kPlayerSpriteSizeWu, 1e-3f);
+    EXPECT_NEAR(suite, world.TryGet<en::Sprite2D>(pid)->height, kPlayerSpriteSizeWu, 1e-3f);
+    (void)app.StepHeadlessTicks(16U, 1U);
+    EXPECT_EQ(suite, world.TryGet<en::SpriteAnimator2D>(pid)->firstFrame, 0U);
+    EXPECT_EQ(suite, world.TryGet<en::SpriteAnimator2D>(pid)->frameCount, 6U);
+
+    // 2D Rectangular Greedy Meshing + clean Top-Left HUD & zero redundant player VFX keep total quads super lean
     const u32 baseQuadCount = app.EngineApp().GetRenderList().Stats().submittedQuads;
-    EXPECT_TRUE(suite, baseQuadCount > 150U && baseQuadCount < 500U);
+    EXPECT_TRUE(suite, baseQuadCount > 80U && baseQuadCount < 350U);
 
     PlayerController::StartWeaponAttack(
         pid, WeaponMoveKind::Light1, world, app.EngineApp().Gameplay(), app.NextAttackInstanceId());
     (void)app.StepHeadlessTicks(8U, 1U);
-    const u32 activeSlashQuadCount = app.EngineApp().GetRenderList().Stats().submittedQuads;
-    EXPECT_TRUE(suite, activeSlashQuadCount > baseQuadCount + 8U);
+    EXPECT_EQ(suite, world.TryGet<en::SpriteAnimator2D>(pid)->firstFrame, 32U);
+    EXPECT_EQ(suite, world.TryGet<en::SpriteAnimator2D>(pid)->frameCount, 8U);
 
     EXPECT_EQ(suite, world.TryGet<en::MotionStack2D>(pid)->pushboxGroup, 0U);
     EXPECT_TRUE(suite, !world.Has<en::Collider2D>(pid));

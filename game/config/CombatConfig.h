@@ -72,7 +72,7 @@ inline constexpr std::array<EchoIdentityDef, kEchoCount> kEchoTable{{
     return kEchoTable[idx];
 }
 
-// Shared Resonance Blade move statistics per GDD v0.3 Section 3.4.
+// Shared Resonance Blade move statistics per GDD v0.3 Section 3.4, scaled to match the 96x96 (2.40 wu) sword swings.
 struct WeaponMoveSpec {
     WeaponMoveKind kind{WeaponMoveKind::None};
     i16 hpDamage{0};
@@ -80,9 +80,9 @@ struct WeaponMoveSpec {
     u8 startupTicks{0U};
     u8 activeTicks{0U};
     u8 recoveryTicks{0U};
-    f32 reachWidthMeters{1.5f};
-    f32 reachHeightMeters{1.0f};
-    f32 offsetX{0.85f};
+    f32 reachWidthMeters{1.70f};
+    f32 reachHeightMeters{1.20f};
+    f32 offsetX{0.92f};
     f32 offsetY{0.0f};
 
     [[nodiscard]] constexpr u16 TotalTicks() const noexcept {
@@ -91,13 +91,13 @@ struct WeaponMoveSpec {
 };
 
 inline constexpr std::array<WeaponMoveSpec, 7> kResonanceBladeMoves{{
-    {WeaponMoveKind::None,   0,  0U,  0U, 0U,  0U, 0.0f, 0.0f, 0.00f, 0.0f},
-    {WeaponMoveKind::Light1, 10, 4U,  6U, 6U, 14U, 1.5f, 1.0f, 0.85f, 0.0f},
-    {WeaponMoveKind::Light2, 12, 5U,  7U, 6U, 15U, 1.6f, 1.0f, 0.90f, 0.0f},
-    {WeaponMoveKind::Light3, 18, 9U,  9U, 8U, 19U, 1.8f, 1.2f, 1.00f, 0.0f},
-    {WeaponMoveKind::Air1,   10, 4U,  6U, 6U, 12U, 1.5f, 1.1f, 0.80f, 0.0f},
-    {WeaponMoveKind::Air2,   15, 7U,  8U, 6U, 16U, 1.7f, 1.2f, 0.90f, 0.0f},
-    {WeaponMoveKind::Heavy,  24, 18U, 24U, 8U, 20U, 2.0f, 1.3f, 1.10f, 0.0f},
+    {WeaponMoveKind::None,   0,  0U,  0U, 0U,  0U, 0.00f, 0.00f, 0.00f, 0.0f},
+    {WeaponMoveKind::Light1, 10, 4U,  6U, 6U, 14U, 1.90f, 1.55f, 1.05f, 0.0f},
+    {WeaponMoveKind::Light2, 12, 5U,  7U, 6U, 15U, 2.00f, 1.65f, 1.10f, 0.0f},
+    {WeaponMoveKind::Light3, 18, 9U,  9U, 8U, 19U, 2.25f, 1.80f, 1.22f, 0.0f},
+    {WeaponMoveKind::Air1,   10, 4U,  6U, 6U, 12U, 1.90f, 1.60f, 1.02f, 0.0f},
+    {WeaponMoveKind::Air2,   15, 7U,  8U, 6U, 16U, 2.05f, 1.70f, 1.10f, 0.0f},
+    {WeaponMoveKind::Heavy,  24, 18U, 24U, 8U, 20U, 2.45f, 1.90f, 1.30f, 0.0f},
 }};
 
 [[nodiscard]] constexpr const WeaponMoveSpec& GetWeaponMoveSpec(WeaponMoveKind kind) noexcept {

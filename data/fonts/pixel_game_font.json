@@ -1,0 +1,11 @@
+{
+  "sourceTrueTypeFont": "DejaVuSerifCondensed-Bold.ttf",
+  "atlasWidth": 512,
+  "atlasHeight": 192,
+  "cellWidth": 32,
+  "cellHeight": 32,
+  "columns": 16,
+  "rows": 6,
+  "firstAscii": 32,
+  "lastAscii": 127
+}

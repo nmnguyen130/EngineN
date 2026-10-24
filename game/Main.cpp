@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     }
     en::Window win{};
     en::WindowConfig wcfg{};
-    wcfg.title = "Veil of the Silent (GDD v0.5)";
+    wcfg.title = "Veil of the Silent (GDD v0.5 - 96x96 Indie-Anime Edition)";
     if (!win.Create(wcfg, false).has_value()) {
         plat.Shutdown();
         game.Shutdown();
@@ -62,6 +62,33 @@ int main(int argc, char** argv) {
         plat.Shutdown();
         game.Shutdown();
         return 1;
+    }
+
+    // Upload runtime-loaded pixel-art character spritesheet & custom game font from AssetBank to GPU
+    en::AssetBank& bank = game.EngineApp().Assets();
+    const en::TextureRecord& fontRec = bank.GetTexture(game.AssetHandles().pixelFontTex);
+    if (fontRec.pixels != nullptr && fontRec.width == vots::kPixelFontWidthPx && fontRec.height == vots::kPixelFontHeightPx) {
+        (void)renderer.UpdateTexture(
+            en::kBuiltinFontTexture,
+            en::Rect{0.0f, 0.0f, static_cast<en::f32>(fontRec.width), static_cast<en::f32>(fontRec.height)},
+            std::span<const en::u8>{fontRec.pixels, static_cast<en::usize>(fontRec.width) * fontRec.height * 4U});
+    }
+
+    for (en::u16 slot = 1U; slot < bank.HighWaterTex(); ++slot) {
+        if (slot == game.AssetHandles().pixelFontTex.index) {
+            continue;
+        }
+        const en::TextureRecord& rec = bank.GetTextureBySlot(slot);
+        if (rec.pixels != nullptr && rec.width > 0U && rec.height > 0U) {
+            en::TextureDesc tdesc{};
+            tdesc.width = rec.width;
+            tdesc.height = rec.height;
+            tdesc.filter = en::TextureFilter::PixelArt;
+            tdesc.pixels = std::span<const en::u8>{rec.pixels, static_cast<en::usize>(rec.width) * rec.height * 4U};
+            if (auto gpuRes = renderer.CreateTexture(tdesc); gpuRes.has_value()) {
+                bank.BindGpuTexture(slot, *gpuRes);
+            }
+        }
     }
 
     en::FramePacer pacer{};

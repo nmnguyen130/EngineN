@@ -1,4 +1,5 @@
 #include "game/assets/GameAssetPipeline.h"
+#include "game/assets/ImageLoader.h"
 #include "game/core/GameConfig.h"
 #include "gameplay/GameplayTypes.h"
 
@@ -40,27 +41,32 @@ struct CookedRigPayload {
     const CancelCategory kFreeCancels = CancelCategory::Any;
     const CancelCategory kChainLight = CancelCategory::Dash | CancelCategory::Parry | CancelCategory::Light | CancelCategory::Heavy | CancelCategory::Special;
 
-    // GDD v0.3 Section 3.2, 3.4 & 3.5 tick durations:
-    // Light1 = 18t (5/3/10), Light2 = 19t (6/3/10), Light3 = 26t (8/4/14)
-    // Air1 = 17t (5/3/9), Air2 = 22t (7/3/12), Heavy = 46t (24/4/18), Dash = 12t
-    setEntry(ActorFsmState::Idle,         0U,   0U, 4U, 8U, 1U, ActorFsmState::Idle,        kFreeCancels, kFreeCancels);
-    setEntry(ActorFsmState::Run,          0U,   4U, 6U, 5U, 1U, ActorFsmState::Run,         kFreeCancels, kFreeCancels);
-    setEntry(ActorFsmState::JumpRise,     0U,  10U, 2U, 6U, 0U, ActorFsmState::JumpRise,    kFreeCancels, kFreeCancels);
-    setEntry(ActorFsmState::Fall,         0U,  12U, 2U, 6U, 1U, ActorFsmState::Fall,        kFreeCancels, kFreeCancels);
-    setEntry(ActorFsmState::Dash,        12U,  14U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Parry, CancelCategory::Any);
-    setEntry(ActorFsmState::Light1,      18U,  16U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
-    setEntry(ActorFsmState::Light2,      19U,  19U, 3U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
-    setEntry(ActorFsmState::Light3,      26U,  22U, 4U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::Dash, CancelCategory::Dash | CancelCategory::Special);
-    setEntry(ActorFsmState::Air1,        17U,  26U, 3U, 4U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Light | CancelCategory::Dash);
-    setEntry(ActorFsmState::Air2,        22U,  29U, 3U, 5U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Dash);
-    setEntry(ActorFsmState::HeavyWindup, kHeavyAttackStartupTicks, 32U, 3U, 8U, 0U, ActorFsmState::HeavyActive, CancelCategory::None, CancelCategory::None);
-    setEntry(ActorFsmState::HeavyActive, 22U,  35U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Dash | CancelCategory::Special);
-    setEntry(ActorFsmState::ParryStance, 10U,  38U, 2U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
-    setEntry(ActorFsmState::ParrySuccess,14U,  40U, 2U, 4U, 0U, ActorFsmState::Idle,        CancelCategory::Any,  CancelCategory::Any);
-    setEntry(ActorFsmState::UnisonCast,  31U,  42U, 3U, 5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
-    setEntry(ActorFsmState::SacredCast,  61U,  45U, 3U, 6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
-    setEntry(ActorFsmState::HurtStagger, 45U,  48U, 2U, 8U, 1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
-    setEntry(ActorFsmState::BreakExposed,150U, 50U, 2U, 10U,1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
+    // Mapped directly to the 8x11 (88-frame, 96x96 px per frame) external spritesheet:
+    // Row 0 (00..07): Idle (0..5, 6F), Parry (6..7, 2F)
+    // Row 1 (08..15): Walk (8..15, 8F)
+    // Row 2 (16..23): Run (16..23, 8F)
+    // Row 3 (24..31): JumpRise (24..25, 2F), Fall (26..27, 2F), Dash (28..31, 4F)
+    // Row 4 (32..39): Combo Hit 1 - Diagonal Cross-Slash Right->Left (32..39, 8F)
+    // Row 5 (40..47): Combo Hit 2 - Reverse Rising Slash Left->Right (40..47, 8F)
+    // Row 6 (48..55): Combo Hit 3 / Heavy - Overhead Cleave Downward (48..55, 8F)
+    setEntry(ActorFsmState::Idle,         0U,   0U, 6U,  8U, 1U, ActorFsmState::Idle,        kFreeCancels, kFreeCancels);
+    setEntry(ActorFsmState::Run,          0U,  16U, 8U,  4U, 1U, ActorFsmState::Run,         kFreeCancels, kFreeCancels);
+    setEntry(ActorFsmState::JumpRise,     0U,  24U, 2U,  6U, 0U, ActorFsmState::JumpRise,    kFreeCancels, kFreeCancels);
+    setEntry(ActorFsmState::Fall,         0U,  26U, 2U,  6U, 1U, ActorFsmState::Fall,        kFreeCancels, kFreeCancels);
+    setEntry(ActorFsmState::Dash,        12U,  28U, 4U,  5U, 0U, ActorFsmState::Idle,        CancelCategory::Parry, CancelCategory::Any);
+    setEntry(ActorFsmState::Light1,      26U,  32U, 8U,  3U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
+    setEntry(ActorFsmState::Light2,      28U,  40U, 8U,  3U, 0U, ActorFsmState::Idle,        CancelCategory::Dash | CancelCategory::Parry, kChainLight);
+    setEntry(ActorFsmState::Light3,      36U,  48U, 8U,  4U, 0U, ActorFsmState::Idle,        CancelCategory::Dash, CancelCategory::Dash | CancelCategory::Special);
+    setEntry(ActorFsmState::Air1,        24U,  32U, 8U,  3U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Light | CancelCategory::Dash);
+    setEntry(ActorFsmState::Air2,        30U,  40U, 8U,  3U, 0U, ActorFsmState::Fall,        CancelCategory::Dash, CancelCategory::Dash);
+    setEntry(ActorFsmState::HeavyWindup, kHeavyAttackStartupTicks, 48U, 2U, 8U, 0U, ActorFsmState::HeavyActive, CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::HeavyActive, 28U,  50U, 6U,  4U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Dash | CancelCategory::Special);
+    setEntry(ActorFsmState::ParryStance, 16U,   6U, 2U,  5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::Any);
+    setEntry(ActorFsmState::ParrySuccess,14U,   6U, 2U,  4U, 0U, ActorFsmState::Idle,        CancelCategory::Any,  CancelCategory::Any);
+    setEntry(ActorFsmState::UnisonCast,  31U,   6U, 2U,  5U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::SacredCast,  61U,   6U, 2U,  6U, 0U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::HurtStagger, 45U,  26U, 2U,  8U, 1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
+    setEntry(ActorFsmState::BreakExposed,150U, 26U, 2U, 10U, 1U, ActorFsmState::Idle,        CancelCategory::None, CancelCategory::None);
 
     return rig;
 }
@@ -74,19 +80,19 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
     GameAssetHandles out{};
     bool needsLoad = false;
 
-    // 1. Procedural 64x64 RGBA8 character/VFX sprite sheet (8x8 uniform grid = 64 SpriteFrames)
-    std::array<u8, 64U * 64U * 4U> sheetPixels{};
-    for (u32 y = 0U; y < 64U; ++y) {
-        for (u32 x = 0U; x < 64U; ++x) {
-            const usize idx = (y * 64U + x) * 4U;
-            const u32 cellX = x / 8U;
-            const u32 cellY = y / 8U;
-            const bool border = (x % 8U == 0U) || (y % 8U == 0U) || (x % 8U == 7U) || (y % 8U == 7U);
-            sheetPixels[idx + 0U] = border ? 240U : static_cast<u8>(64U + cellX * 24U);
-            sheetPixels[idx + 1U] = border ? 240U : static_cast<u8>(80U + cellY * 20U);
-            sheetPixels[idx + 2U] = border ? 255U : static_cast<u8>(120U + ((cellX + cellY) * 14U));
-            sheetPixels[idx + 3U] = 255U;
-        }
+    // 1. Load 768x1056 RGBA8 Pixel-Art Spritesheet (8x11 grid of 96x96 frames = 88 SpriteFrames) directly from disk
+    constexpr usize kSheetByteSize = static_cast<usize>(kSpriteSheetWidthPx) * kSpriteSheetHeightPx * 4U;
+    std::span<u8> sheetPixels = bank.AllocatePayloadSlice(kSheetByteSize);
+    if (sheetPixels.empty()) {
+        return en::Err(en::FrameworkErrc::AssetInitFailed);
+    }
+    if (!ImageLoader::LoadRgbaImageFromDisk(
+            "data/sprites/vots_spritesheet.png",
+            "data/sprites/vots_spritesheet.bmp",
+            kSpriteSheetWidthPx,
+            kSpriteSheetHeightPx,
+            sheetPixels)) {
+        return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
 
     const u16 texSlot = bank.AcquireSlot(
@@ -95,7 +101,8 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         persistentScope,
         en::AssetResidency::Sim,
         needsLoad);
-    out.characterSheetTex = bank.CommitTexture(texSlot, 64U, 64U, sheetPixels);
+    out.characterSheetTex = bank.CommitTexture(
+        texSlot, kSpriteSheetWidthPx, kSpriteSheetHeightPx, sheetPixels, en::kWhiteTexture, true);
     if (!out.characterSheetTex.IsValid()) {
         return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
@@ -106,8 +113,33 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         persistentScope,
         en::AssetResidency::Sim,
         needsLoad);
-    out.characterAtlas = bank.CommitGridAtlas(atlasSlot, out.characterSheetTex, 8U, 8U);
+    out.characterAtlas = bank.CommitGridAtlas(
+        atlasSlot, out.characterSheetTex, kSpriteSheetCols, kSpriteSheetRows);
     if (!out.characterAtlas.IsValid()) {
+        return en::Err(en::FrameworkErrc::AssetInitFailed);
+    }
+
+    // 1b. Load 128x48 RGBA8 Pixel-Art Game Font Atlas ("Alchemical Press 8x8", 16x6 ASCII grid) directly from disk
+    constexpr usize kFontByteSize = static_cast<usize>(kPixelFontWidthPx) * kPixelFontHeightPx * 4U;
+    std::span<u8> fontPixels = bank.AllocatePayloadSlice(kFontByteSize);
+    if (fontPixels.empty() ||
+        !ImageLoader::LoadRgbaImageFromDisk(
+            "data/fonts/pixel_game_font.png",
+            "data/fonts/pixel_game_font.bmp",
+            kPixelFontWidthPx,
+            kPixelFontHeightPx,
+            fontPixels)) {
+        return en::Err(en::FrameworkErrc::AssetInitFailed);
+    }
+    const u16 fontSlot = bank.AcquireSlot(
+        en::AssetId::Hash("vots_pixel_font.tex"),
+        en::AssetKind::Texture,
+        persistentScope,
+        en::AssetResidency::Sim,
+        needsLoad);
+    out.pixelFontTex = bank.CommitTexture(
+        fontSlot, kPixelFontWidthPx, kPixelFontHeightPx, fontPixels, en::kBuiltinFontTexture, true);
+    if (!out.pixelFontTex.IsValid()) {
         return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
 
@@ -131,7 +163,7 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         return en::Err(en::FrameworkErrc::AssetInitFailed);
     }
 
-    // 3. Cooked "ESCN" v1 Scene Manifest blobs for the 8 connected Vaelen rooms (GDD v0.3 Section 7)
+    // 3. Cooked "ESCN" v1 Scene Manifest blobs for the 8 connected Vaelen rooms
     constexpr std::array<std::string_view, kRoomCount> kRoomManifestNames{{
         "room_00_ash_sump_west.escn",
         "room_01_ash_sump_east.escn",
@@ -206,7 +238,6 @@ en::Result<GameAssetHandles, en::FrameworkErrc> GameAssetPipeline::BuildAndCommi
         out.soundCues[i] = cue.id;
     }
 
-    // Register 8 ambient/combat music tracks (one per room in the 8-room vertical slice)
     std::array<f32, 1024> musicLoop{};
     for (u32 s = 0U; s < musicLoop.size(); ++s) {
         const f32 t = static_cast<f32>(s) / static_cast<f32>(musicLoop.size());

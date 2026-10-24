@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "renderer/Renderer.h"
 #include "platform/Window.h"
 #include <SDL3/SDL.h>
@@ -79,6 +80,30 @@ constexpr u8 kFont5x7[64][7] = {
 
 void BuildBuiltinFontAtlas(std::span<u8> outPixels) noexcept {
     std::memset(outPixels.data(), 0, outPixels.size());
+    static constexpr const char* kFontBmpPaths[] = {
+        "data/fonts/pixel_game_font.bmp",
+        "../data/fonts/pixel_game_font.bmp",
+        "../../data/fonts/pixel_game_font.bmp"
+    };
+    for (const char* path : kFontBmpPaths) {
+        if (std::FILE* fp = std::fopen(path, "rb")) {
+            u8 hdr[54]{};
+            if (std::fread(hdr, 1U, 54U, fp) == 54U && hdr[0] == 'B' && hdr[1] == 'M') {
+                const u32 offset = static_cast<u32>(hdr[10]) | (static_cast<u32>(hdr[11]) << 8U);
+                if (std::fseek(fp, static_cast<long>(offset), SEEK_SET) == 0 &&
+                    std::fread(outPixels.data(), 1U, outPixels.size(), fp) == outPixels.size()) {
+                    for (usize i = 0U; i < outPixels.size(); i += 4U) {
+                        const u8 b = outPixels[i + 0U];
+                        outPixels[i + 0U] = outPixels[i + 2U];
+                        outPixels[i + 2U] = b;
+                    }
+                    std::fclose(fp);
+                    return;
+                }
+            }
+            std::fclose(fp);
+        }
+    }
     auto putPx = [&](u32 x, u32 y, u8 r, u8 g, u8 b, u8 a) noexcept {
         if (x >= 128U || y >= 48U) return;
         const usize off = (static_cast<usize>(y) * 128U + x) * 4U;
@@ -247,15 +272,15 @@ Result<void, RendererErrc> Renderer::Init(Window& window, const RendererConfig& 
         return Err(RendererErrc::TextureCreateFailed);
     }
 
-    // Slot 1: built-in 128x48 ASCII bitmap font atlas (kBuiltinFontTexture = {1, 1})
-    std::array<u8, 128U * 48U * 4U> fontPixels{};
-    BuildBuiltinFontAtlas(fontPixels);
+    // Slot 1: 512x192 TrueType-rasterized ASCII font atlas (kBuiltinFontTexture = {1, 1})
+    static std::array<u8, 512U * 192U * 4U> s_fontPixels{};
+    BuildBuiltinFontAtlas(s_fontPixels);
     TextureDesc fontDesc{};
-    fontDesc.width = 128U;
-    fontDesc.height = 48U;
-    fontDesc.pitch = 128U * 4U;
-    fontDesc.pixels = fontPixels;
-    fontDesc.filter = TextureFilter::Nearest;
+    fontDesc.width = 512U;
+    fontDesc.height = 192U;
+    fontDesc.pitch = 512U * 4U;
+    fontDesc.pixels = s_fontPixels;
+    fontDesc.filter = TextureFilter::Linear;
     (void)CreateTexture(fontDesc);
 
     // Slot 2: built-in 64x64 radial soft light texture (kBuiltinSoftLightTexture = {2, 1})

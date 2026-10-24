@@ -4,26 +4,28 @@
 
 namespace vots {
 
-// Centralized Kaelen locomotion, Wall Slide/Jump, Double Jump, Dash, Parry, Nail Recoil & Hitstun tuning (1 wu = 1 m, 120 Hz).
-inline constexpr f32 kPlayerColliderWidthWu          = 0.55f;
-inline constexpr f32 kPlayerColliderHeightWu         = 1.65f;
-inline constexpr f32 kPlayerMaxGroundSpeedWu         = 7.2f;
-inline constexpr f32 kPlayerGroundAccelWu            = 58.0f;
-inline constexpr f32 kPlayerGroundBrakingWu          = 76.0f;
-inline constexpr f32 kPlayerMaxAirSpeedWu            = 6.8f;
-inline constexpr f32 kPlayerAirAccelWu               = 36.0f;
+// Centralized Kaelen locomotion, Wall Slide/Jump, Double Jump, Dash, Parry, Nail Recoil & Hitstun tuning (1 wu = 1 m = 64 px, 120 Hz).
+// Player collider (0.68 x 1.85 wu) and 96x96 Sprite2D quad (2.40 x 2.40 wu, boots at y=85/96 -> -0.925 wu) align 1:1 with floor tiles.
+inline constexpr f32 kPlayerColliderWidthWu          = 0.68f;
+inline constexpr f32 kPlayerColliderHeightWu         = 1.85f;
+inline constexpr f32 kPlayerSpriteSizeWu             = 2.40f;
+inline constexpr f32 kPlayerMaxGroundSpeedWu         = 7.6f;
+inline constexpr f32 kPlayerGroundAccelWu            = 60.0f;
+inline constexpr f32 kPlayerGroundBrakingWu          = 80.0f;
+inline constexpr f32 kPlayerMaxAirSpeedWu            = 7.2f;
+inline constexpr f32 kPlayerAirAccelWu               = 38.0f;
 inline constexpr f32 kPlayerMaxFallSpeedWu           = 22.0f;
 inline constexpr f32 kPlayerWallSlideSpeedWu         = 3.8f;  // Smooth downward glide speed when holding into a wall
-inline constexpr f32 kPlayerWallJumpHorizontalWu     = 7.2f;  // Horizontal push away from wall on Wall Jump
-inline constexpr f32 kPlayerJumpVelocityWu           = 13.2f;
-inline constexpr f32 kPlayerDoubleJumpVelocityWu     = 11.8f;
-inline constexpr f32 kPlayerGravityWu                = 24.0f;
+inline constexpr f32 kPlayerWallJumpHorizontalWu     = 7.5f;  // Horizontal push away from wall on Wall Jump
+inline constexpr f32 kPlayerJumpVelocityWu           = 13.6f; // Apex = 13.6^2 / (2*25.0) = 3.70 wu (clears 3.0 wu platform tiers cleanly)
+inline constexpr f32 kPlayerDoubleJumpVelocityWu     = 12.2f; // Additional 2.98 wu air boost (~6.68 wu combined two-jump reach)
+inline constexpr f32 kPlayerGravityWu                = 25.0f;
 inline constexpr f32 kPlayerJumpCutMultiplier        = 0.55f;
 inline constexpr u8  kPlayerCoyoteTicks              = 10U;
 inline constexpr u8  kPlayerJumpBufferTicks          = 12U;
 
-// Extended Dash tuning: 20.5 wu/s for 20 ticks (166 ms) = 3.42 wu direct dash + 0.48x exit momentum (~4.10 wu total span).
-inline constexpr f32 kPlayerDashSpeedWu              = 20.5f;
+// Extended Dash tuning: 21.0 wu/s for 20 ticks (166 ms) = 3.50 wu direct dash + 0.48x exit momentum (~4.25 wu total span).
+inline constexpr f32 kPlayerDashSpeedWu              = 21.0f;
 inline constexpr u8  kPlayerDashDurationTicks        = 20U;
 inline constexpr f32 kPlayerAirDashExitSpeedRatio    = 0.48f;
 inline constexpr u8  kPlayerDashRecoveryLockoutTicks = 3U;
