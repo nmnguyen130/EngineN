@@ -10,9 +10,9 @@
 
 namespace en {
 
-// Lock-free Chase-Lev single-producer multi-consumer circular work-stealing deque.
-// Owner thread invokes PushBottom/PopBottom; thief threads invoke StealTop concurrently.
-// Invariant: CapacityPow2 is a power of two and m_top/m_bottom reside on separate 64B cache lines.
+// Chase-Lev single-producer multi-consumer circular work-stealing deque.
+// Owner thread calls PushBottom and PopBottom; worker threads call StealTop concurrently.
+// Invariant: CapacityPow2 is a power of two and m_top/m_bottom sit on separate cache lines.
 template <typename T, usize CapacityPow2 = 256>
     requires (std::has_single_bit(CapacityPow2) && std::is_trivially_copyable_v<T>)
 class WorkStealingDeque {
@@ -39,22 +39,18 @@ public:
         std::atomic_thread_fence(std::memory_order_seq_cst);
         i64 t = m_top.load(std::memory_order_relaxed);
 
-        if (t <= b) {
-            if (t == b) {
-                if (!m_top.compare_exchange_strong(
-                        t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed)) {
-                    m_bottom.store(b + 1, std::memory_order_relaxed);
-                    return false;
-                }
-                outItem = m_buffer[static_cast<usize>(b) & kMask];
-                m_bottom.store(b + 1, std::memory_order_relaxed);
-                return true;
-            }
-            outItem = m_buffer[static_cast<usize>(b) & kMask];
+        if (t > b) {
+            m_bottom.store(b + 1, std::memory_order_relaxed);
+            return false;
+        }
+        outItem = m_buffer[static_cast<usize>(b) & kMask];
+        if (t != b) {
             return true;
         }
+        const bool won = m_top.compare_exchange_strong(
+            t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed);
         m_bottom.store(b + 1, std::memory_order_relaxed);
-        return false;
+        return won;
     }
 
     [[nodiscard]] bool StealTop(T& outItem) noexcept {
@@ -65,11 +61,8 @@ public:
             return false;
         }
         outItem = m_buffer[static_cast<usize>(t) & kMask];
-        if (!m_top.compare_exchange_strong(
-                t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed)) {
-            return false;
-        }
-        return true;
+        return m_top.compare_exchange_strong(
+            t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed);
     }
 
     void Clear() noexcept {
@@ -78,9 +71,7 @@ public:
     }
 
     [[nodiscard]] bool Empty() const noexcept {
-        const i64 b = m_bottom.load(std::memory_order_relaxed);
-        const i64 t = m_top.load(std::memory_order_relaxed);
-        return b <= t;
+        return m_bottom.load(std::memory_order_acquire) <= m_top.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] static constexpr usize Capacity() noexcept { return CapacityPow2; }
@@ -93,9 +84,9 @@ private:
     std::array<T, CapacityPow2> m_buffer{};
 };
 
-// Multi-threaded Chase-Lev work-stealing batch dispatcher with help-while-waiting and single-thread fallback.
-// Move-disabled RAII owner of worker threads; allocates zero heap memory after Init().
-// Invariant: m_workerCount <= kMaxWorkers; Queue 0 belongs to the main/calling thread and 1..N to workers.
+// Multi-threaded work-stealing batch dispatcher with help-while-waiting and single-thread fallback.
+// Non-copyable owner of worker threads; uses fixed per-thread deques and batch-counter slots allocated inline.
+// Invariant: m_workerCount <= kMaxWorkers; queue 0 belongs to the main thread and 1..N to workers.
 class alignas(64) JobSystem {
 public:
     static constexpr u32 kMaxWorkers = 16;
@@ -107,9 +98,10 @@ public:
     struct alignas(32) JobItem {
         ParallelTaskFn fn{nullptr};
         void* userCtx{nullptr};
-        std::atomic<u32>* pending{nullptr};
         u32 startIdx{0};
         u32 endIdx{0};
+        u32 batchSlot{0};
+        u32 reserved{0};
     };
     static_assert(sizeof(JobItem) == 32);
 
@@ -139,16 +131,22 @@ public:
     [[nodiscard]] bool IsDeterministicSingleThread() const noexcept { return m_workerCount == 0U; }
 
 private:
+    struct alignas(64) BatchCounterSlot {
+        std::atomic<u32> remaining{0};
+    };
+
     void WorkerLoop(u32 queueIdx) noexcept;
     [[nodiscard]] bool ExecuteOneJob(u32 callerQueueIdx) noexcept;
-    static void ExecuteJobItem(const JobItem& item, u32 threadIdx) noexcept;
+    void ExecuteJobItem(const JobItem& item, u32 threadIdx) noexcept;
     [[nodiscard]] u32 ResolveCallerQueueIndex() const noexcept;
 
     std::array<WorkStealingDeque<JobItem, kDequeCapacity>, kQueueCount> m_deques{};
+    std::array<BatchCounterSlot, kQueueCount * 2U> m_batchCounters{};
     std::array<std::thread, kMaxWorkers> m_workers{};
     std::mutex m_wakeMutex{};
     std::condition_variable m_wakeCv{};
     std::atomic<u32> m_inFlightJobs{0};
+    std::atomic<u32> m_nextCounterSlot{0};
     std::atomic<bool> m_stop{false};
     u32 m_workerCount{0};
 };

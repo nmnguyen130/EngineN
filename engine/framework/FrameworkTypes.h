@@ -3,13 +3,13 @@
 #include "assets/AssetTypes.h"
 #include "core/Math.h"
 #include "core/Memory.h"
-#include "core/Types.h"
 #include "gameplay/GameplayTypes.h"
 #include "input/ActionBuffer.h"
 #include "input/InputTypes.h"
 #include "time/TimePipeline.h"
 #include "world/WorldTypes.h"
 
+#include <algorithm>
 #include <array>
 #include <span>
 
@@ -19,7 +19,6 @@ class World;
 class PhysicsSystem;
 class GameplayPipeline;
 class AssetBank;
-class AssetSystem;
 class AudioSystem;
 class DebugSystem;
 class RenderList;
@@ -54,6 +53,7 @@ enum class FrameworkErrc : u8 {
     ScopeAllocationFailed,
     CorruptedSceneManifest,
     SimAssetWaitFailed,
+    ReplayDesyncOrExhausted,
 };
 
 enum class SubSystemStage : u8 {
@@ -77,7 +77,6 @@ enum class ReplayMode : u8 {
     Playback = 2,
 };
 
-// 4-byte structured initialization and runtime error report identifying the exact failing subsystem stage.
 struct alignas(4) FrameworkError {
     FrameworkErrc code{FrameworkErrc::None};
     SubSystemStage stage{SubSystemStage::None};
@@ -92,14 +91,10 @@ enum class StateLayerFlags : u8 {
     BlockLowerSimTicks = 1U << 0U,
     BlockLowerInput    = 1U << 1U,
     BlockLowerRender   = 1U << 2U,
-    PauseSimClock      = 1U << 3U, // Freezes World/Gameplay/Physics ticks while keeping UI & top modal state ticking
+    PauseSimClock      = 1U << 3U,
 };
 
 consteval bool enable_bitmask_operators(StateLayerFlags) noexcept { return true; }
-
-[[nodiscard]] constexpr bool HasStateFlag(StateLayerFlags flags, StateLayerFlags test) noexcept {
-    return HasFlag(flags, test);
-}
 
 enum class StateCmdKind : u8 {
     Push         = 0,
@@ -109,8 +104,8 @@ enum class StateCmdKind : u8 {
 };
 
 enum class SceneTransitionMode : u8 {
-    FullReset = 0, // Calls World::Clear() before instantiating the new scene
-    RoomSwap  = 1, // Destroys transient Lifetime2D / kRoomTransientCategoryBit entities while preserving persistent actors
+    FullReset = 0,
+    RoomSwap  = 1,
 };
 
 enum class TransitionWipeKind : u8 {
@@ -128,7 +123,6 @@ enum class TransitionPhase : u8 {
     FadingIn             = 3,
 };
 
-// 16-byte cooked binary scene manifest header ("ESCN" v1).
 struct alignas(16) CookedSceneManifestHeader {
     static constexpr u32 kMagic = 0x4E435345U; // "ESCN"
     static constexpr u16 kVersion = 1U;
@@ -137,17 +131,24 @@ struct alignas(16) CookedSceneManifestHeader {
     u16 version{kVersion};
     u16 assetEntryCount{0U};
     u32 musicTrackId{0U};
-    u32 checksum{0U}; // Optional FNV-1a 32-bit checksum over CookedSceneAssetEntry[assetEntryCount] (0 = skip)
+    u32 checksum{0U};
 };
 static_assert(sizeof(CookedSceneManifestHeader) == 16);
 
-// 16-byte cooked scene asset pin entry following CookedSceneManifestHeader.
 struct alignas(16) CookedSceneAssetEntry {
     AssetId id{};
     u32 byteSizeHint{0U};
     AssetKind kind{AssetKind::Blob};
     AssetResidency residency{AssetResidency::Sim};
     u16 flags{0U};
+
+    [[nodiscard]] constexpr u32 MixChecksum(u32 h) const noexcept {
+        for (u32 b = 0U; b < 64U; b += 8U) {
+            h = (h ^ static_cast<u32>((id.value >> b) & 0xFFU)) * 16777619U;
+        }
+        h = (h ^ static_cast<u32>(kind)) * 16777619U;
+        return (h ^ static_cast<u32>(residency)) * 16777619U;
+    }
 };
 static_assert(sizeof(CookedSceneAssetEntry) == 16);
 
@@ -155,20 +156,11 @@ static_assert(sizeof(CookedSceneAssetEntry) == 16);
     std::span<const CookedSceneAssetEntry> entries) noexcept {
     u32 h = 2166136261U;
     for (const CookedSceneAssetEntry& e : entries) {
-        const u64 idVal = e.id.value;
-        for (u32 b = 0U; b < 8U; ++b) {
-            h ^= static_cast<u32>((idVal >> (b * 8U)) & 0xFFU);
-            h *= 16777619U;
-        }
-        h ^= static_cast<u32>(e.kind);
-        h *= 16777619U;
-        h ^= static_cast<u32>(e.residency);
-        h *= 16777619U;
+        h = e.MixChecksum(h);
     }
     return (h == 0U) ? 1U : h;
 }
 
-// 64-byte (1 cache line exact, zero padding) non-owning simulation tick execution context passed to StateLayerDesc::onSimTick.
 struct alignas(64) SimContext {
     World* world{nullptr};
     PhysicsSystem* physics{nullptr};
@@ -181,7 +173,6 @@ struct alignas(64) SimContext {
 };
 static_assert(sizeof(SimContext) == 64);
 
-// 64-byte (1 cache line exact, zero padding) non-owning render extraction context passed to StateLayerDesc::onRenderExtract.
 struct alignas(64) RenderContext {
     const World* world{nullptr};
     const PhysicsSystem* physics{nullptr};
@@ -194,7 +185,6 @@ struct alignas(64) RenderContext {
 };
 static_assert(sizeof(RenderContext) == 64);
 
-// 64-byte (1 cache line exact, zero padding) scene/state lifecycle transition context passed at safe frame barriers.
 struct alignas(64) SceneLoadContext {
     World* world{nullptr};
     PhysicsSystem* physics{nullptr};
@@ -210,7 +200,6 @@ struct alignas(64) SceneLoadContext {
 };
 static_assert(sizeof(SceneLoadContext) == 64);
 
-// 48-byte (3 x 16B exact, zero padding) pushdown state layer descriptor with embedded command tag.
 struct alignas(16) StateLayerDesc {
     void (*onSimTick)(SimContext& ctx, const SimStepView& step, void* stateData) noexcept{nullptr};
     void (*onRenderExtract)(RenderContext& ctx, void* stateData) noexcept{nullptr};
@@ -226,7 +215,6 @@ struct alignas(16) StateLayerDesc {
 };
 static_assert(sizeof(StateLayerDesc) == 48);
 
-// 64-byte (1 cache line exact, zero padding) asynchronous scene/room transition descriptor.
 struct alignas(64) SceneTransitionDesc {
     AssetId sceneId{};
     AssetId manifestBlobId{};
@@ -243,7 +231,6 @@ struct alignas(64) SceneTransitionDesc {
 };
 static_assert(sizeof(SceneTransitionDesc) == 64);
 
-// 64-byte (1 cache line exact, zero padding) deterministic cross-subsystem state audit digest.
 struct alignas(64) FrameAuditDigest {
     u64 tickIndex{0ULL};
     u64 worldHash{0ULL};
@@ -258,7 +245,6 @@ struct alignas(64) FrameAuditDigest {
 };
 static_assert(sizeof(FrameAuditDigest) == 64);
 
-// 64-byte (1 cache line exact, zero padding) client game inversion-of-control hook table.
 struct alignas(64) AppHooks {
     void* userAppState{nullptr};
     GameplayPolicyTable gameplayPolicies{};

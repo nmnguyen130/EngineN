@@ -6,12 +6,15 @@
 
 namespace en {
 
-// Stateless Layer 2 presentation and binary prefab bridge between World, AssetBank, and RenderList.
-// Keeps Layer 1 World headers decoupled from AssetBank.h and RenderList.h.
-// Invariant: Stationary sprites (MovedWords bit == 0) bypass PrevWorldSnapshot2D and TimeChannel loads during Extract.
+// Stateless presentation, visual/lifetime stepping, and prefab bridge between World, AssetBank, and RenderList.
+// Keeps World storage decoupled from AssetBank.h, RenderList.h, and visual/lifetime tick systems.
+// Invariant: Stationary sprites (MovedWords bit == 0) bypass PrevWorldSnapshot2D and TimeChannel reads during Extract.
 class WorldExtractor {
 public:
     WorldExtractor() = delete;
+
+    static void StepAmbientVelocities(World& world, const SimStepView& step) noexcept;
+    static void StepVisualsAndLifetimes(World& world, const SimStepView& step) noexcept;
 
     static void Extract(
         const World& world,
@@ -25,7 +28,9 @@ public:
         const AssetBank& assetBank,
         BlobHandle prefabBlob,
         const LocalTransform2D& rootTransform = {},
-        std::span<EntityId> outSpawnedEntities = {}) noexcept;
+        std::span<EntityId> outSpawnedEntities = {}) noexcept {
+        return world.InstantiatePrefab(assetBank, prefabBlob, rootTransform, outSpawnedEntities);
+    }
 };
 
 } // namespace en

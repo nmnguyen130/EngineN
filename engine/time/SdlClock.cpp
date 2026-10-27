@@ -11,9 +11,7 @@ u64 SdlClock::NowNs() noexcept {
 }
 
 void SdlClock::SleepNs(u64 durationNs) noexcept {
-    if (durationNs > 0ULL) {
-        SDL_DelayNS(durationNs);
-    }
+    if (durationNs > 0ULL) SDL_DelayPrecise(durationNs);
 }
 
 void SdlClock::YieldThread() noexcept {
@@ -38,10 +36,10 @@ void FramePacer::EndFrameAndPace() noexcept {
             const u64 reqSleepNs = remainingNs - m_sleepMarginNs;
             SdlClock::SleepNs(reqSleepNs);
             const u64 afterSleep = SdlClock::NowNs();
-            const u64 actualSleptNs = (afterSleep > now) ? (afterSleep - now) : reqSleepNs;
-            m_lastSleepNs = static_cast<u32>(std::min<u64>(actualSleptNs, 0xFFFFFFFFULL));
+            const u64 sleptNs = (afterSleep > now) ? (afterSleep - now) : reqSleepNs;
+            m_lastSleepNs = static_cast<u32>(std::min<u64>(sleptNs, 0xFFFFFFFFULL));
 
-            const u64 overshootNs = (actualSleptNs > reqSleepNs) ? (actualSleptNs - reqSleepNs) : 0ULL;
+            const u64 overshootNs = (sleptNs > reqSleepNs) ? (sleptNs - reqSleepNs) : 0ULL;
             const u32 sampleMargin = static_cast<u32>(
                 std::clamp<u64>(overshootNs + kMinSpinMarginNs, kMinSpinMarginNs, kMaxSpinMarginNs));
             m_sleepMarginNs = static_cast<u32>((static_cast<u64>(m_sleepMarginNs) * 7ULL + sampleMargin) >> 3U);
@@ -53,7 +51,7 @@ void FramePacer::EndFrameAndPace() noexcept {
             SdlClock::YieldThread();
             now = SdlClock::NowNs();
         }
-        m_lastSpinNs = static_cast<u32>(std::min<u64>((now > spinStart) ? (now - spinStart) : 0ULL, 0xFFFFFFFFULL));
+        m_lastSpinNs = static_cast<u32>(std::min<u64>(now - spinStart, 0xFFFFFFFFULL));
     }
 
     m_frameStartNs = (now - targetEndNs < m_targetFrameNs) ? targetEndNs : now;

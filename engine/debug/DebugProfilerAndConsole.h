@@ -8,19 +8,17 @@ inline constexpr u32 kMaxConsoleSymbols = 256U;
 inline constexpr u32 kMaxConsoleLogs = 512U;
 inline constexpr u32 kConsoleLogTextBytes = 16384U;
 
-enum class ConsoleSymbolKind : u8 {
-    Empty    = 0,
-    Command  = 1,
-    CVarF32  = 2,
-    CVarI32  = 3,
-    CVarU32  = 4,
-    CVarBool = 5,
-};
-
 class DebugConsole;
 
-// 32-byte (2 per 64B cache line, zero padding) open-addressed command or live CVar table entry.
 struct alignas(32) ConsoleSymbol {
+    enum class Kind : u8 {
+        Empty    = 0,
+        Command  = 1,
+        CVarF32  = 2,
+        CVarI32  = 3,
+        CVarBool = 4,
+    };
+
     const char* namePtr{nullptr};
     void* targetPtr{nullptr};
     union {
@@ -33,15 +31,10 @@ struct alignas(32) ConsoleSymbol {
             i32 minVal;
             i32 maxVal;
         } i32Bounds;
-        struct {
-            u32 minVal;
-            u32 maxVal;
-        } u32Bounds;
     } spec{};
     u32 nameHash{0U};
-    ConsoleSymbolKind kind{ConsoleSymbolKind::Empty};
+    Kind kind{Kind::Empty};
     u8 nameLen{0U};
-    u16 flags{0U};
 
     [[nodiscard]] constexpr std::string_view Name() const noexcept {
         return namePtr ? std::string_view{namePtr, nameLen} : std::string_view{};
@@ -49,20 +42,19 @@ struct alignas(32) ConsoleSymbol {
 };
 static_assert(sizeof(ConsoleSymbol) == 32);
 
-// 8-byte circular log ring metadata entry pointing into the 16 KB log character slab.
-struct alignas(8) LogEntryMeta {
-    u32 textOffset{0U};
-    u16 tickLow16{0U};
+// Compact 4-byte log metadata entry (16 entries per 64B cache line).
+struct alignas(4) LogEntryMeta {
+    u16 textOffset{0U};
     u8 textLength{0U};
     LogSeverity severity{LogSeverity::Info};
 };
-static_assert(sizeof(LogEntryMeta) == 8);
+static_assert(sizeof(LogEntryMeta) == 4);
 
-// 160-byte (5 x 32B blocks exact, zero padding) O(1) 64-bucket quantized percentile frame profiler and sparkline plotter.
-// Non-owning view over 256 FrameProfileSamples and 4 WatchPlotTracks; computes P50/P95/P99 via bit-scanning without sorting.
-// Invariant: sizeof(DebugProfiler) == 160 and m_activeBucketMask bit B is set iff m_buckets[B] > 0.
-class alignas(32) DebugProfiler {
+// 48-bucket quantized percentile frame profiler and sparkline plotter (exact 128B / 2 cache lines).
+class alignas(64) DebugProfiler {
 public:
+    static constexpr u16 kSpikeThresholdUs = 18000U;
+
     constexpr void Init(
         std::span<FrameProfileSample, kProfileHistoryFrames> sampleStorage,
         std::span<WatchPlotTrack, kMaxWatchPlots> plotStorage) noexcept {
@@ -86,11 +78,9 @@ public:
         m_activeBucketMask = 0ULL;
         m_currentIdx = 0U;
         m_validFrames = 0U;
-        m_spikeCount = 0U;
-        m_spikeThresholdUs = 18000U;
     }
 
-    void BeginFrame(u32 frameIndex, u32 simTickIndex) noexcept;
+    void BeginFrame() noexcept;
     void RecordScopeUs(ProfileScopeId scope, u32 durationUs) noexcept;
     void RecordSubsystemTelemetry(const SubsystemTelemetryDesc& desc) noexcept;
     void EndFrame() noexcept;
@@ -101,33 +91,27 @@ public:
     [[nodiscard]] const FrameProfileSample& Latest() const noexcept;
     [[nodiscard]] const WatchPlotTrack* FindPlotTrack(std::string_view label) const noexcept;
     [[nodiscard]] constexpr u16 ValidFrames() const noexcept { return m_validFrames; }
-    [[nodiscard]] constexpr u16 SpikeCount() const noexcept { return m_spikeCount; }
 
     void EmitProfilerAndTimeHud(
         OverlayFlags flags,
         ViewportExtent viewportSize,
         DebugBatcher& hudBatcher) const noexcept;
 
-    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
-
 private:
     [[nodiscard]] static constexpr u8 DurationToBucket(u32 durationUs) noexcept {
         const u32 b = durationUs / 500U;
-        return static_cast<u8>(b < 63U ? b : 63U);
+        return static_cast<u8>(b < (kProfileBucketCount - 1U) ? b : (kProfileBucketCount - 1U));
     }
 
-    std::array<u16, kProfileBucketCount> m_buckets{}; // 128B (2 cache lines)
-    FrameProfileSample* m_samples{nullptr};           // 8B
-    WatchPlotTrack* m_plots{nullptr};                 // 8B
-    u64 m_activeBucketMask{0ULL};                     // 8B
-    u16 m_currentIdx{0U};                             // 2B
-    u16 m_validFrames{0U};                            // 2B
-    u16 m_spikeCount{0U};                             // 2B
-    u16 m_spikeThresholdUs{18000U};                   // 2B
+    std::array<u16, kProfileBucketCount> m_buckets{};
+    FrameProfileSample* m_samples{nullptr};
+    WatchPlotTrack* m_plots{nullptr};
+    u64 m_activeBucketMask{0ULL};
+    u16 m_currentIdx{0U};
+    u16 m_validFrames{0U};
 };
-static_assert(sizeof(DebugProfiler) == 160);
+static_assert(sizeof(DebugProfiler) == 128);
 
-// RAII scope timer that records elapsed microseconds into DebugProfiler (compiles to a zero-byte no-op when EN_ENABLE_DEBUG_TOOLS == 0).
 template <typename ClockT>
 class ScopedProfileTimer {
 public:
@@ -159,9 +143,7 @@ private:
 #endif
 };
 
-// 2752-byte (43 cache lines exact, zero padding) Fibonacci open-addressed developer console and live CVar registry.
-// Non-owning view over arena-allocated symbol and log tables; supports Tab prefix autocomplete and deterministic pre-tick command flushing.
-// Invariant: sizeof(DebugConsole) == 2752 and history/pending line buffers pack their string length in byte 127.
+// Open-addressed developer console and live CVar registry.
 class alignas(64) DebugConsole {
 public:
     void Init(
@@ -194,22 +176,16 @@ public:
         i32 minVal = -2147483647,
         i32 maxVal = 2147483647) noexcept;
 
-    [[nodiscard]] Result<void, DebugErrc> RegisterCVarU32(
-        std::string_view name,
-        u32* target,
-        u32 minVal = 0U,
-        u32 maxVal = 0xFFFFFFFFU) noexcept;
-
     [[nodiscard]] Result<void, DebugErrc> RegisterCVarBool(
         std::string_view name,
         bool* target) noexcept;
 
-    void Print(LogSeverity severity, std::string_view msg, u32 tickIndex = 0U) noexcept;
-    void ListAllCVars(u32 tickIndex = 0U) noexcept;
+    void Print(LogSeverity severity, std::string_view msg) noexcept;
+    void ListAllCVars() noexcept;
 
     void EnqueueCommandLine(std::string_view line) noexcept;
-    void FlushPendingCommands(u32 currentTickIndex = 0U) noexcept;
-    void ExecuteImmediate(std::string_view line, u32 currentTickIndex = 0U) noexcept;
+    void FlushPendingCommands() noexcept;
+    void ExecuteImmediate(std::string_view line) noexcept;
 
     bool AutocompleteInput() noexcept;
     void NavigateHistory(i32 direction) noexcept;
@@ -222,41 +198,37 @@ public:
     [[nodiscard]] constexpr bool IsOpen() const noexcept { return m_isOpen != 0U; }
 
     [[nodiscard]] constexpr std::string_view InputView() const noexcept {
-        return {m_inputLine.data(), m_inputLen};
+        return m_inputLine.View();
     }
     [[nodiscard]] constexpr u16 SymbolCount() const noexcept { return m_symbolCount; }
     [[nodiscard]] constexpr u16 LogCount() const noexcept { return m_logCount; }
-    [[nodiscard]] constexpr u64 ExecutedCommandCount() const noexcept { return m_executedCmdCount; }
 
     void EmitConsoleOverlay(ViewportExtent viewportSize, DebugBatcher& hudBatcher) const noexcept;
 
-    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
-
 private:
     [[nodiscard]] ConsoleSymbol* FindOrInsertSlot(std::string_view name, bool allowInsert) noexcept;
+    [[nodiscard]] Result<ConsoleSymbol*, DebugErrc> AllocateSymbol(
+        std::string_view name,
+        ConsoleSymbol::Kind kind,
+        void* targetPtr) noexcept;
 
-    // Cache Line 0 (64 bytes exact): pointers, hash accumulator, and counters
-    ConsoleSymbol* m_symbols{nullptr};                      // 8B
-    LogEntryMeta* m_logMeta{nullptr};                       // 8B
-    char* m_logText{nullptr};                               // 8B
-    u64 m_symbolHash{14695981039346656037ULL};              // 8B
-    u64 m_executedCmdCount{0ULL};                           // 8B
-    u64 m_autocompleteCursor{0ULL};                         // 8B
-    u32 m_logByteWriteCursor{0U};                           // 4B
-    u16 m_logWriteIdx{0U};                                  // 2B
-    u16 m_logCount{0U};                                     // 2B
-    u16 m_symbolCount{0U};                                  // 2B
-    u8 m_historyWriteIdx{0U};                               // 1B
-    u8 m_historyCount{0U};                                  // 1B
-    i8 m_historyNavOffset{-1};                              // 1B
-    u8 m_pendingCount{0U};                                  // 1B
-    u8 m_inputLen{0U};                                      // 1B
-    u8 m_isOpen{0U};                                        // 1B
+    ConsoleSymbol* m_symbols{nullptr};
+    LogEntryMeta* m_logMeta{nullptr};
+    char* m_logText{nullptr};
+    u16 m_logByteWriteCursor{0U};
+    u16 m_logWriteIdx{0U};
+    u16 m_logCount{0U};
+    u16 m_symbolCount{0U};
+    u8 m_autocompleteCursor{0U};
+    u8 m_historyWriteIdx{0U};
+    u8 m_historyCount{0U};
+    i8 m_historyNavOffset{-1};
+    u8 m_pendingCount{0U};
+    u8 m_isOpen{0U};
 
-    // Cache Lines 1..42 (2688 bytes exact): input line, 16-entry history ring, and 4-entry deterministic command queue
-    std::array<char, 128> m_inputLine{};
-    std::array<std::array<char, 128>, 16> m_historyLines{};
-    std::array<std::array<char, 128>, 4> m_pendingLines{};
+    FixedString<128> m_inputLine{};
+    std::array<FixedString<128>, 16> m_historyLines{};
+    std::array<FixedString<128>, 4> m_pendingLines{};
 };
 static_assert(sizeof(DebugConsole) == 2752);
 

@@ -1,56 +1,8 @@
 #include "physics/PhysicsSystem.h"
+
 #include "assets/AssetBank.h"
 
 namespace en {
-
-PhysicsSystem::PhysicsSystem(PhysicsSystem&& other) noexcept
-    : m_spatial(other.m_spatial),
-      m_cfg(other.m_cfg),
-      m_manifolds(other.m_manifolds),
-      m_events(other.m_events),
-      m_arena(std::move(other.m_arena)),
-      m_activeManifoldCount(other.m_activeManifoldCount),
-      m_prevManifoldCount(other.m_prevManifoldCount),
-      m_eventCount(other.m_eventCount),
-      m_manifoldFlip(other.m_manifoldFlip),
-      m_initialized(other.m_initialized),
-      m_stepCount(other.m_stepCount),
-      m_totalResolvedContacts(other.m_totalResolvedContacts),
-      m_totalSpeculativeHits(other.m_totalSpeculativeHits) {
-    other.m_manifolds = nullptr;
-    other.m_events = nullptr;
-    other.m_activeManifoldCount = 0U;
-    other.m_prevManifoldCount = 0U;
-    other.m_eventCount = 0U;
-    other.m_initialized = 0U;
-}
-
-PhysicsSystem& PhysicsSystem::operator=(PhysicsSystem&& other) noexcept {
-    if (this != &other) {
-        Shutdown();
-        m_spatial = other.m_spatial;
-        m_cfg = other.m_cfg;
-        m_manifolds = other.m_manifolds;
-        m_events = other.m_events;
-        m_arena = std::move(other.m_arena);
-        m_activeManifoldCount = other.m_activeManifoldCount;
-        m_prevManifoldCount = other.m_prevManifoldCount;
-        m_eventCount = other.m_eventCount;
-        m_manifoldFlip = other.m_manifoldFlip;
-        m_initialized = other.m_initialized;
-        m_stepCount = other.m_stepCount;
-        m_totalResolvedContacts = other.m_totalResolvedContacts;
-        m_totalSpeculativeHits = other.m_totalSpeculativeHits;
-
-        other.m_manifolds = nullptr;
-        other.m_events = nullptr;
-        other.m_activeManifoldCount = 0U;
-        other.m_prevManifoldCount = 0U;
-        other.m_eventCount = 0U;
-        other.m_initialized = 0U;
-    }
-    return *this;
-}
 
 Result<void, PhysicsErrc> PhysicsSystem::Init(World& world, const PhysicsConfig& cfg) noexcept {
     Shutdown();
@@ -61,8 +13,7 @@ Result<void, PhysicsErrc> PhysicsSystem::Init(World& world, const PhysicsConfig&
 
     if (!world.RegisterComponentPool<Collider2D>().has_value() ||
         !world.RegisterComponentPool<RigidBody2D>().has_value() ||
-        !world.RegisterComponentPool<CharacterMotor2D>().has_value() ||
-        !world.RegisterComponentPool<DistanceJoint2D>(256U).has_value()) {
+        !world.RegisterComponentPool<CharacterMotor2D>().has_value()) {
         return Err(PhysicsErrc::PoolRegistrationFailed);
     }
 
@@ -81,14 +32,7 @@ Result<void, PhysicsErrc> PhysicsSystem::Init(World& world, const PhysicsConfig&
     m_cfg = cfg;
     m_manifolds = manifoldsSpan.data();
     m_events = eventsSpan.data();
-    m_activeManifoldCount = 0U;
-    m_prevManifoldCount = 0U;
-    m_eventCount = 0U;
-    m_manifoldFlip = 0U;
     m_initialized = 1U;
-    m_stepCount = 0ULL;
-    m_totalResolvedContacts = 0ULL;
-    m_totalSpeculativeHits = 0ULL;
     return {};
 }
 
@@ -97,10 +41,7 @@ void PhysicsSystem::Shutdown() noexcept {
     m_spatial = SpatialIndex2D{};
     m_manifolds = nullptr;
     m_events = nullptr;
-    m_activeManifoldCount = 0U;
-    m_prevManifoldCount = 0U;
-    m_eventCount = 0U;
-    m_manifoldFlip = 0U;
+    Clear();
     m_initialized = 0U;
     m_stepCount = 0ULL;
     m_totalResolvedContacts = 0ULL;
@@ -119,27 +60,28 @@ Result<void, PhysicsErrc> PhysicsSystem::BindCollisionMapBlob(
     const AssetBank& bank,
     BlobHandle collisionBlob) noexcept {
     const BlobRecord& rec = bank.GetBlob(collisionBlob);
-    if (!rec.IsValid()) {
-        return Err(PhysicsErrc::CorruptedCollisionBlob);
-    }
-    return BindCollisionMapBytes(rec.Bytes());
+    return rec.IsValid() ? BindCollisionMapBytes(rec.Bytes()) : Err(PhysicsErrc::CorruptedCollisionBlob);
 }
 
 void PhysicsSystem::Step(World& world, const SimStepView& step) noexcept {
-    if (!m_initialized || !step.valid) return;
+    if (!m_initialized || !step.valid) {
+        return;
+    }
 
     m_eventCount = 0U;
     const f32 dt = step.Dt(TimeChannel::World);
 
-    // Stage 1: Rebuild spatial grid and step kinematic bodies + latched riders
-    m_spatial.RebuildDynamicGrid(world, dt);
-    DynamicsSolver2D::StepKinematicBodiesAndRiders(world, m_spatial, step);
+    if (m_spatial.ActiveBoxes().empty() &&
+        (world.RegisteredPoolsMask() & (1ULL << Collider2D::kTypeId)) != 0ULL &&
+        world.GetPool<Collider2D>().Size() > 0U) {
+        m_spatial.RebuildDynamicGrid(world, dt);
+    }
 
-    // Stage 2: Refresh spatial grid with updated kinematic positions and step CharacterMotor2D (MoveAndSlide)
-    m_spatial.RebuildDynamicGrid(world, dt);
+    (void)DynamicsSolver2D::StepKinematicBodiesAndRiders(world, m_spatial, step);
     DynamicsSolver2D::StepCharacterMotors(world, m_spatial, step, m_cfg);
 
-    // Stage 3: Gather narrowphase + speculative contact manifolds via SpatialIndex2D cell buckets
+    m_spatial.RebuildDynamicGrid(world, dt);
+
     const u8 prevFlip = m_manifoldFlip;
     const u8 nextFlip = static_cast<u8>(1U - prevFlip);
     const std::span<const ContactManifold2D> prevSpan{
@@ -156,12 +98,9 @@ void PhysicsSystem::Step(World& world, const SimStepView& step) noexcept {
     m_prevManifoldCount = m_activeManifoldCount;
     m_totalResolvedContacts += m_activeManifoldCount;
 
-    // Stage 4: Step RigidBody2D and DistanceJoint2D Soft-Step TGS rotational & linear constraints
-    DynamicsSolver2D::StepRigidBodiesAndJointsSoftTgs(
+    DynamicsSolver2D::StepRigidBodiesSoftTgs(
         world, step, m_cfg, nextSpan.subspan(0U, m_activeManifoldCount), eventSpan, m_eventCount);
 
-    // Stage 5: Final spatial grid refresh so post-step queries see final positions
-    m_spatial.RebuildDynamicGrid(world, 0.0f);
     ++m_stepCount;
 }
 
@@ -185,18 +124,21 @@ u64 PhysicsSystem::ComputeAuditHash(const World& world) const noexcept {
         mixBytes(manifolds.data(), manifolds.size_bytes());
     }
 
-    if ((world.RegisteredPoolsMask() & (1ULL << RigidBody2D::kTypeId)) != 0ULL) {
-        const auto& pool = world.GetPool<RigidBody2D>();
-        mixBytes(pool.Components().data(), pool.Components().size_bytes());
-    }
-    if ((world.RegisteredPoolsMask() & (1ULL << CharacterMotor2D::kTypeId)) != 0ULL) {
-        const auto& pool = world.GetPool<CharacterMotor2D>();
-        mixBytes(pool.Components().data(), pool.Components().size_bytes());
-    }
-    if ((world.RegisteredPoolsMask() & (1ULL << DistanceJoint2D::kTypeId)) != 0ULL) {
-        const auto& pool = world.GetPool<DistanceJoint2D>();
-        mixBytes(pool.Components().data(), pool.Components().size_bytes());
-    }
+    const u64 regMask = world.RegisteredPoolsMask();
+    const auto mixPool = [&]<typename T>() noexcept {
+        if ((regMask & (1ULL << T::kTypeId)) != 0ULL) {
+            const auto& pool = world.GetPool<T>();
+            mixBytes(pool.Components().data(), pool.Components().size_bytes());
+            for (const EntityId id : pool.Entities()) {
+                const WorldTransform2D& xf = world.GetWorldByIndex(id.index);
+                mixBytes(&xf.x, sizeof(f32) * 2U);
+                mixBytes(&xf.worldRotRad, sizeof(f32));
+            }
+        }
+    };
+
+    mixPool.template operator()<RigidBody2D>();
+    mixPool.template operator()<CharacterMotor2D>();
     return h;
 }
 

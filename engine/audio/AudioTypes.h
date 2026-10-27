@@ -2,12 +2,10 @@
 
 #include "assets/AssetTypes.h"
 #include "core/Math.h"
-#include "core/Types.h"
 #include "time/TimeTypes.h"
 
 #include <array>
 #include <span>
-#include <type_traits>
 
 namespace en {
 
@@ -20,50 +18,56 @@ inline constexpr u32 kAudioBusCount = 8U;
 inline constexpr u32 kMaxMusicStems = 4U;
 inline constexpr u32 kNullAudioEmitter = 0xFFFFFFFFU;
 
+inline constexpr u64 kPhaseOne = 1ULL << 32U;
+inline constexpr u64 kPhaseFracMask = 0xFFFFFFFFULL;
+inline constexpr f32 kInvPhaseOne = 1.0f / 4294967296.0f;
+inline constexpr f32 kInvMixBlockFrames = 1.0f / static_cast<f32>(kMixBlockFrames);
+inline constexpr f32 kInvAudioSampleRate = 1.0f / static_cast<f32>(kAudioSampleRate);
+inline constexpr f32 kPhaseStepPerHz = 4294967296.0f * kInvAudioSampleRate;
+
+inline constexpr f32 kMinCutoffHz = 40.0f;
+inline constexpr f32 kMaxCutoffHz = 20000.0f;
+inline constexpr f32 kVoiceSvfBypassHz = 18500.0f;
+inline constexpr f32 kDefaultOccludedCutoffHz = 900.0f;
+inline constexpr f32 kSvfButterworthDamping = 1.41421356f;
+inline constexpr f32 kEqualPowerCenterGain = 0.70710678f;
+inline constexpr f32 kSilenceThreshold = 1e-6f;
+inline constexpr f32 kMaxVoiceGain = 4.0f;
+inline constexpr f32 kMinVoicePitch = 0.125f;
+inline constexpr f32 kMaxVoicePitch = 8.0f;
+inline constexpr u64 kFnvOffsetBasis64 = 0xCBF29CE484222325ULL;
+
 enum class AudioErrc : u8 {
     None = 0,
     InvalidConfig,
     OutOfMemory,
-    ArenaExhausted,
-    DeviceOpenFailed,
     CorruptedBankBlob,
     CueTableFull,
-    VoicePoolExhausted,
 };
 
 enum class AudioBusId : u8 {
-    Master    = 0,
-    Music     = 1,
-    SfxPlayer = 2,
-    SfxCombat = 3,
-    SfxWorld  = 4,
-    Ambience  = 5,
-    Ui        = 6,
-    Voice     = 7,
-    // Domain-neutral SFX bus aliases for non-combat genres
-    Sfx0      = SfxPlayer,
-    Sfx1      = SfxCombat,
-    Sfx2      = SfxWorld,
+    Master = 0,
+    Music,
+    SfxPlayer,
+    SfxCombat,
+    SfxWorld,
+    Ambience,
+    Ui,
+    Voice,
 };
 
 enum class FilterMode : u8 {
-    Bypass   = 0,
-    LowPass  = 1,
-    HighPass = 2,
-    BandPass = 3,
+    Bypass = 0,
+    LowPass,
+    HighPass,
+    BandPass,
 };
 
 enum class AttenuationCurve : u8 {
-    None           = 0,
-    Linear         = 1,
-    InverseClamped = 2,
-    Smoothstep     = 3,
-};
-
-enum class StealPolicy : u8 {
-    Reject        = 0,
-    StealOldest   = 1,
-    StealQuietest = 2,
+    None = 0,
+    Linear,
+    InverseClamped,
+    Smoothstep,
 };
 
 enum class VoiceFlags : u8 {
@@ -74,37 +78,22 @@ enum class VoiceFlags : u8 {
     PauseOnFreeze     = 1U << 3U,
     BypassOcclusion   = 1U << 4U,
     OneVoicePerEntity = 1U << 5U,
-    EnableDoppler     = 1U << 6U,
-    ReverbSend        = 1U << 7U,
 };
-
 consteval bool enable_bitmask_operators(VoiceFlags) noexcept { return true; }
 
-[[nodiscard]] constexpr bool HasVoiceFlag(VoiceFlags flags, VoiceFlags test) noexcept {
-    return HasFlag(flags, test);
-}
-
 enum class AudioCmdType : u8 {
-    SpawnVoice      = 0,
-    StopVoice       = 1,
-    BindMusicStem   = 2,
-    CommitMusicDeck = 3,
-    PanicReset      = 4,
+    SpawnVoice = 0,
+    StopVoice,
+    BindMusicStem,
+    CommitMusicDeck,
+    PanicReset,
 };
 
-// 4-byte generational handle to an active polyphonic voice slot in [0..63].
-struct alignas(4) VoiceHandle {
-    u16 index{0U};
-    u16 generation{0U};
-
-    [[nodiscard]] constexpr bool IsValid() const noexcept { return generation != 0U && index < kMaxAudioVoices; }
-    [[nodiscard]] constexpr bool operator==(const VoiceHandle&) const noexcept = default;
-};
+struct VoiceTag {};
+using VoiceHandle = Handle<VoiceTag>;
+inline constexpr VoiceHandle kNullVoiceHandle{};
 static_assert(sizeof(VoiceHandle) == 4);
 
-inline constexpr VoiceHandle kNullVoiceHandle{0U, 0U};
-
-// 4-byte hashed sound cue identifier (folded 32-bit FNV-1a from AssetId).
 struct alignas(4) SoundCueId {
     u32 value{0U};
 
@@ -119,7 +108,6 @@ struct alignas(4) SoundCueId {
 };
 static_assert(sizeof(SoundCueId) == 4);
 
-// 16-byte (4 per 64B cache line, zero padding) sound trigger request submitted from simulation/gameplay cues.
 struct alignas(16) AudioTriggerReq {
     SoundCueId cueId{};
     f32 worldX{0.0f};
@@ -128,7 +116,6 @@ struct alignas(16) AudioTriggerReq {
 };
 static_assert(sizeof(AudioTriggerReq) == 16);
 
-// 16-byte (4 per 64B cache line, zero padding) debug/HUD view of an active spatialized emitter.
 struct alignas(16) AudioEmitterView {
     f32 worldX{0.0f};
     f32 worldY{0.0f};
@@ -137,7 +124,6 @@ struct alignas(16) AudioEmitterView {
 };
 static_assert(sizeof(AudioEmitterView) == 16);
 
-// 16-byte cooked audio bank binary header ("EAUD" v1).
 struct alignas(16) CookedAudioBankHeader {
     static constexpr u32 kMagic = 0x44554145U; // "EAUD"
     static constexpr u16 kVersion = 1U;
@@ -151,103 +137,44 @@ struct alignas(16) CookedAudioBankHeader {
 };
 static_assert(sizeof(CookedAudioBankHeader) == 16);
 
-// 32-byte (2 per 64B cache line, zero padding) sound cue descriptor with loop-start point, randomized jitter, and routing.
-struct alignas(32) SoundCueDef {
+struct alignas(16) SoundCueDef {
     SoundCueId id{};
     AudioHandle clipVariants[2]{};
     f32 minDist{2.0f};
     f32 maxDist{24.0f};
-    u16 baseGain_q14{16384U};       // 16384 == 1.0f linear gain
-    u16 basePitch_q12{4096U};       // 4096 == 1.0f pitch ratio
-    u16 loopStartFrame{0U};         // Sample frame index for seamless sustain loops [loopStartFrame .. frameCount)
-    u8 priority{128U};              // [0..255], higher priority steals lower priority
-    u8 maxConcurrency{4U};          // Max simultaneous voices for this cue (0 == unlimited)
-    u8 cooldownTicks{2U};           // Same-cue energy-summing coalescer window in ticks
+    f32 baseGain{1.0f};
+    f32 basePitch{1.0f};
+    f32 gainJitter{0.0f};
+    f32 pitchJitter{0.0f};
+    u32 loopStartFrame{0U};
+    u16 cooldownTicks{2U};
+    u8 priority{128U};
+    u8 maxConcurrency{4U};
     VoiceFlags flags{VoiceFlags::Spatialized2D | VoiceFlags::FollowTimeScale};
-    u8 packedRouting{static_cast<u8>(AudioBusId::SfxWorld) |
-                     (static_cast<u8>(StealPolicy::StealQuietest) << 6U)}; // bits 0..2: AudioBusId, bits 3..5: TimeChannel, bits 6..7: StealPolicy
-    u8 packedCurveAndJitter{static_cast<u8>(AttenuationCurve::Smoothstep)}; // bits 0..1: AttenuationCurve, bits 2..4: gainJitter, bits 5..7: pitchJitter
-
-    [[nodiscard]] constexpr AudioBusId Bus() const noexcept {
-        return static_cast<AudioBusId>(packedRouting & 0x07U);
-    }
-    constexpr void SetBus(AudioBusId bus) noexcept {
-        packedRouting = static_cast<u8>((packedRouting & 0xF8U) | (static_cast<u8>(bus) & 0x07U));
-    }
-
-    [[nodiscard]] constexpr TimeChannel Channel() const noexcept {
-        return static_cast<TimeChannel>((packedRouting >> 3U) & 0x07U);
-    }
-    constexpr void SetChannel(TimeChannel ch) noexcept {
-        packedRouting = static_cast<u8>((packedRouting & 0xC7U) | ((static_cast<u8>(ch) & 0x07U) << 3U));
-    }
-
-    [[nodiscard]] constexpr StealPolicy Steal() const noexcept {
-        return static_cast<StealPolicy>((packedRouting >> 6U) & 0x03U);
-    }
-    constexpr void SetStealPolicy(StealPolicy s) noexcept {
-        packedRouting = static_cast<u8>((packedRouting & 0x3FU) | ((static_cast<u8>(s) & 0x03U) << 6U));
-    }
-
-    [[nodiscard]] constexpr AttenuationCurve Attenuation() const noexcept {
-        return static_cast<AttenuationCurve>(packedCurveAndJitter & 0x03U);
-    }
-    constexpr void SetAttenuation(AttenuationCurve c) noexcept {
-        packedCurveAndJitter = static_cast<u8>((packedCurveAndJitter & 0xFCU) | (static_cast<u8>(c) & 0x03U));
-    }
-
-    [[nodiscard]] constexpr f32 GainJitter() const noexcept {
-        return static_cast<f32>((packedCurveAndJitter >> 2U) & 0x07U) * (1.0f / 32.0f);
-    }
-    constexpr void SetGainJitter(f32 jitterRatio) noexcept {
-        const u8 steps = static_cast<u8>(std::clamp(jitterRatio, 0.0f, 0.21875f) * 32.0f + 0.5f) & 0x07U;
-        packedCurveAndJitter = static_cast<u8>((packedCurveAndJitter & 0xE3U) | (steps << 2U));
-    }
-
-    [[nodiscard]] constexpr f32 PitchJitter() const noexcept {
-        return static_cast<f32>((packedCurveAndJitter >> 5U) & 0x07U) * (1.0f / 32.0f);
-    }
-    constexpr void SetPitchJitter(f32 jitterRatio) noexcept {
-        const u8 steps = static_cast<u8>(std::clamp(jitterRatio, 0.0f, 0.21875f) * 32.0f + 0.5f) & 0x07U;
-        packedCurveAndJitter = static_cast<u8>((packedCurveAndJitter & 0x1FU) | (steps << 5U));
-    }
-
-    [[nodiscard]] constexpr f32 BaseGain() const noexcept {
-        return static_cast<f32>(baseGain_q14) * (1.0f / 16384.0f);
-    }
-    constexpr void SetBaseGain(f32 g) noexcept {
-        baseGain_q14 = static_cast<u16>(std::clamp(g, 0.0f, 4.0f) * 16384.0f + 0.5f);
-    }
-
-    [[nodiscard]] constexpr f32 BasePitch() const noexcept {
-        return static_cast<f32>(basePitch_q12) * (1.0f / 4096.0f);
-    }
-    constexpr void SetBasePitch(f32 p) noexcept {
-        basePitch_q12 = static_cast<u16>(std::clamp(p, 0.125f, 8.0f) * 4096.0f + 0.5f);
-    }
+    AudioBusId bus{AudioBusId::SfxWorld};
+    TimeChannel channel{TimeChannel::World};
+    AttenuationCurve attenuation{AttenuationCurve::Smoothstep};
 };
-static_assert(sizeof(SoundCueDef) == 32);
+static_assert(sizeof(SoundCueDef) == 48);
 
-// 32-byte (2 per 64B cache line, zero padding) 4-stem sample-locked interactive music track descriptor.
-struct alignas(32) MusicTrackDef {
+struct alignas(16) MusicTrackDef {
     u32 trackId{0U};
+    u32 loopStartFrame{0U};
     AudioHandle stems[kMaxMusicStems]{};
-    u16 defaultWeights_q14[kMaxMusicStems]{16384U, 0U, 0U, 0U};
-    u16 loopStartFrame{0U};
+    f32 defaultWeights[kMaxMusicStems]{1.0f, 0.0f, 0.0f, 0.0f};
     u8 stemCount{1U};
-    u8 loop{1U};
+    bool loop{true};
 };
-static_assert(sizeof(MusicTrackDef) == 32);
+static_assert(sizeof(MusicTrackDef) == 48);
 
-// 32-byte (2 per 64B cache line, zero padding) discrete lifecycle command packed in descending alignment order.
-struct alignas(32) AudioCommand {
+struct alignas(8) AudioCommand {
     const f32* pcmData{nullptr};
     u32 frameCount{0U};
-    u16 loopStartFrame{0U};
+    u32 loopStartFrame{0U};
+    f32 initialGainL{1.0f};
+    f32 initialGainR{1.0f};
+    f32 initialPitch{1.0f};
     u16 sampleRate{48000U};
-    u16 initialGainL_q14{16384U};
-    u16 initialGainR_q14{16384U};
-    u16 initialPitch_q12{4096U};
     u16 generation{1U};
     u16 fadeBlocks{1U};
     AudioCmdType type{AudioCmdType::SpawnVoice};
@@ -257,35 +184,30 @@ struct alignas(32) AudioCommand {
     u8 channels{1U};
     u8 assetScope{0U};
 };
-static_assert(sizeof(AudioCommand) == 32);
+static_assert(sizeof(AudioCommand) == 40);
 
-// 576-byte (9 cache lines exact, zero padding) continuous per-frame parameter snapshot.
 struct alignas(64) AudioFrameSnapshot {
-    std::array<u16, kMaxAudioVoices> targetGainL_q14{};
-    std::array<u16, kMaxAudioVoices> targetGainR_q14{};
-    std::array<u16, kMaxAudioVoices> targetPitch_q12{};
-    std::array<u16, kMaxAudioVoices> voiceCutoffHz{};
-    std::array<u16, kAudioBusCount> busGain_q14{16384U, 16384U, 16384U, 16384U, 16384U, 16384U, 16384U, 16384U};
-    std::array<u16, kAudioBusCount> busCutoffHz{20000U, 20000U, 20000U, 20000U, 20000U, 20000U, 20000U, 20000U};
-    std::array<FilterMode, kAudioBusCount> busFilterMode{};
-    std::array<u16, kMaxMusicStems> musicStemWeights_q14{16384U, 0U, 0U, 0U};
+    std::array<f32, kMaxAudioVoices> targetGainL{};
+    std::array<f32, kMaxAudioVoices> targetGainR{};
+    std::array<f32, kMaxAudioVoices> targetPitch{};
+    std::array<f32, kAudioBusCount> busGain{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    std::array<f32, kAudioBusCount> busCutoffHz{
+        kMaxCutoffHz, kMaxCutoffHz, kMaxCutoffHz, kMaxCutoffHz,
+        kMaxCutoffHz, kMaxCutoffHz, kMaxCutoffHz, kMaxCutoffHz};
+    std::array<f32, kMaxMusicStems> musicStemWeights{1.0f, 0.0f, 0.0f, 0.0f};
     u64 pausedVoicesMask{0ULL};
-    u16 sidechainDuckStrength_q14{11468U};
-    u16 reverbWetGain_q14{0U};
-    u8 reverbRoomSize_q8{180U};
-    u8 reverbDamping_q8{100U};
-    u8 masterMuted{0U};
-    u8 reverbBusSendMask{0U};
+    u64 occludedVoicesMask{0ULL};
+    f32 occludedCutoffHz{kDefaultOccludedCutoffHz};
+    f32 sidechainDuckStrength{0.7f};
+    std::array<FilterMode, kAudioBusCount> busFilterMode{};
+    bool masterMuted{false};
 };
-static_assert(sizeof(AudioFrameSnapshot) == 576);
 
-// 32-byte (2 per 64B cache line, zero padding) real-time mixer telemetry snapshot.
-struct alignas(32) AudioTelemetrySnapshot {
+struct alignas(8) AudioTelemetrySnapshot {
     u64 mixedBlocksCount{0ULL};
     f32 masterPeakL{0.0f};
     f32 masterPeakR{0.0f};
     f32 sidechainEnvelope{0.0f};
-    f32 reverbPeak{0.0f};
     u16 activeVoiceCount{0U};
     u16 virtualVoiceCount{0U};
     u16 stolenVoiceCount{0U};
@@ -293,8 +215,7 @@ struct alignas(32) AudioTelemetrySnapshot {
 };
 static_assert(sizeof(AudioTelemetrySnapshot) == 32);
 
-// 64-byte (1 cache line exact, zero padding) consolidated per-frame update descriptor for AudioSystem::Update().
-struct alignas(64) AudioUpdateDesc {
+struct alignas(8) AudioUpdateDesc {
     std::span<const AudioTriggerReq> triggers{};
     const AssetBank* assetBank{nullptr};
     bool (*occlusionQuery)(f32 listenerX, f32 listenerY, f32 emitterX, f32 emitterY, void* userCtx) noexcept{nullptr};
@@ -305,18 +226,13 @@ struct alignas(64) AudioUpdateDesc {
     f32 listenerY{0.0f};
     u8 frozenChannelMask{0U};
     i8 focusMuteOverride{-1};
-    u16 dopplerScale_q8{256U};
 };
-static_assert(sizeof(AudioUpdateDesc) == 64);
 
-// 16-byte configuration descriptor for AudioSystem::Init().
 struct alignas(8) AudioSystemConfig {
-    u32 arenaBytes{131072U};
+    u32 arenaBytes{65536U};
     f32 panWidthMeters{16.0f};
-    f32 speedOfSoundMetersPerSec{343.0f};
-    u16 occludedLowPassHz{900U};
-    u8 defaultMusicCrossfadeBlocks{48U};
-    u8 enableAuxReverb{1U};
+    f32 occludedLowPassHz{kDefaultOccludedCutoffHz};
+    bool headless{false};
 };
 static_assert(sizeof(AudioSystemConfig) == 16);
 

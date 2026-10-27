@@ -5,9 +5,9 @@
 
 namespace en {
 
-// Stateless finite-state-machine stepper, frame-directive dispatcher, and O(1) Bloom-deduplicated combat resolver.
-// Operates directly over dense World component pools with zero dynamic memory allocations.
-// Invariant: each animation frame directive executes at most once per frame transition, and a swingId never hits the same defender twice.
+// Stateless finite-state-machine stepper, frame-directive dispatcher, and bloom-deduplicated combat resolver.
+// Non-owning simulation stage helper invoked by GameplayPipeline::Tick.
+// Invariant: combat overlap checks strictly ignore frozen TimeChannels and already-recorded defender hits per swing.
 class StateAndCombatSolver2D {
 public:
     static void StepStateMachinesAndDirectives(

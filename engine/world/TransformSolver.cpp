@@ -2,57 +2,65 @@
 
 namespace en {
 
+namespace {
+
+constexpr void UpdateTrig(WorldTransform2D& w) noexcept {
+    if (w.worldRotRad == 0.0f) {
+        w.cosRot = 1.0f;
+        w.sinRot = 0.0f;
+    } else {
+        FastSinCos(w.worldRotRad, w.cosRot, w.sinRot);
+    }
+}
+
+} // namespace
+
 bool TransformSolver::Init(AlignedArena& arena, u16 maxEntities) noexcept {
-    if (maxEntities == 0U) return false;
+    if (maxEntities == 0U) {
+        return false;
+    }
     const u32 marker = arena.SaveMarker();
-    const usize wordCount = (static_cast<usize>(maxEntities) + 63U) >> 6U;
+    const usize count = maxEntities;
+    const usize wordCount = (count + 63U) >> 6U;
 
-    auto localSpan = arena.Carve<LocalTransform2D>(maxEntities);
-    auto worldSpan = arena.Carve<WorldTransform2D>(maxEntities);
-    auto prevSpan = arena.Carve<PrevWorldSnapshot2D>(maxEntities);
-    auto parentSpan = arena.Carve<u16>(maxEntities);
-    auto childSpan = arena.Carve<u16>(maxEntities);
-    auto siblingSpan = arena.Carve<u16>(maxEntities);
-    auto dirtySpan = arena.Carve<u64>(wordCount);
-    auto movedSpan = arena.Carve<u64>(wordCount);
+    // Carve largest-alignment arrays first (32B -> 8B -> 4B -> 2B) to eliminate arena alignment holes.
+    auto worldSpan = arena.Carve<WorldTransform2D>(count);
+    auto bitSpan = arena.Carve<u64>(wordCount * 2U);
+    auto localSpan = arena.Carve<LocalTransform2D>(count);
+    auto prevSpan = arena.Carve<PrevWorldSnapshot2D>(count);
+    auto linkSpan = arena.Carve<u16>(count * 3U);
 
-    if (localSpan.empty() || worldSpan.empty() || prevSpan.empty() ||
-        parentSpan.empty() || childSpan.empty() || siblingSpan.empty() ||
-        dirtySpan.empty() || movedSpan.empty()) {
+    if (worldSpan.empty() || bitSpan.empty() || localSpan.empty() ||
+        prevSpan.empty() || linkSpan.empty()) {
         arena.RollbackToMarker(marker);
         return false;
     }
 
-    m_local = localSpan.data();
     m_world = worldSpan.data();
+    m_dirtyWords = bitSpan.data();
+    m_movedWords = m_dirtyWords + wordCount;
+    m_local = localSpan.data();
     m_prev = prevSpan.data();
-    m_parent = parentSpan.data();
-    m_firstChild = childSpan.data();
-    m_nextSibling = siblingSpan.data();
-    m_dirtyWords = dirtySpan.data();
-    m_movedWords = movedSpan.data();
+    m_parent = linkSpan.data();
+    m_firstChild = m_parent + count;
+    m_nextSibling = m_firstChild + count;
 
-    for (u16 i = 0U; i < maxEntities; ++i) {
-        m_parent[i] = kInvalidDenseIndex;
-        m_firstChild[i] = kInvalidDenseIndex;
-        m_nextSibling[i] = kInvalidDenseIndex;
-    }
+    std::fill_n(m_parent, count * 3U, kInvalidDenseIndex);
     return true;
 }
 
 void TransformSolver::Clear(u16 maxAllocatedIndex) noexcept {
-    if (!m_parent) return;
+    if (!m_parent) {
+        return;
+    }
     const usize limit = static_cast<usize>(maxAllocatedIndex) + 1U;
-    for (usize i = 0U; i < limit; ++i) {
-        m_parent[i] = kInvalidDenseIndex;
-        m_firstChild[i] = kInvalidDenseIndex;
-        m_nextSibling[i] = kInvalidDenseIndex;
-    }
+    std::fill_n(m_parent, limit, kInvalidDenseIndex);
+    std::fill_n(m_firstChild, limit, kInvalidDenseIndex);
+    std::fill_n(m_nextSibling, limit, kInvalidDenseIndex);
+
     const usize wordCount = (limit + 63U) >> 6U;
-    for (usize w = 0U; w < wordCount; ++w) {
-        m_dirtyWords[w] = 0ULL;
-        m_movedWords[w] = 0ULL;
-    }
+    std::fill_n(m_dirtyWords, wordCount, 0ULL);
+    std::fill_n(m_movedWords, wordCount, 0ULL);
 }
 
 void TransformSolver::ComputeWorldFromLocal(const LocalTransform2D& loc, WorldTransform2D& outW) noexcept {
@@ -62,12 +70,7 @@ void TransformSolver::ComputeWorldFromLocal(const LocalTransform2D& loc, WorldTr
     outW.scaleY = loc.scaleY;
     outW.worldRotRad = loc.rotationRad;
     outW.worldDepth = loc.depthOffset;
-    if (loc.rotationRad == 0.0f) {
-        outW.cosRot = 1.0f;
-        outW.sinRot = 0.0f;
-    } else {
-        FastSinCos(loc.rotationRad, outW.cosRot, outW.sinRot);
-    }
+    UpdateTrig(outW);
 }
 
 void TransformSolver::CombineParentChild(
@@ -80,14 +83,10 @@ void TransformSolver::CombineParentChild(
     outW.y = p.y + (sx * p.sinRot + sy * p.cosRot);
     outW.scaleX = p.scaleX * c.scaleX;
     outW.scaleY = p.scaleY * c.scaleY;
-    outW.worldRotRad = p.worldRotRad + c.rotationRad;
+    const f32 reflectionSign = (p.scaleX * p.scaleY < 0.0f) ? -1.0f : 1.0f;
+    outW.worldRotRad = p.worldRotRad + c.rotationRad * reflectionSign;
     outW.worldDepth = p.worldDepth + c.depthOffset;
-    if (outW.worldRotRad == 0.0f) {
-        outW.cosRot = 1.0f;
-        outW.sinRot = 0.0f;
-    } else {
-        FastSinCos(outW.worldRotRad, outW.cosRot, outW.sinRot);
-    }
+    UpdateTrig(outW);
 }
 
 void TransformSolver::InverseCombineParentChild(
@@ -102,60 +101,48 @@ void TransformSolver::InverseCombineParentChild(
     outLocal.y = (p.scaleY != 0.0f) ? (ry / p.scaleY) : ry;
     outLocal.scaleX = (p.scaleX != 0.0f) ? (childWorld.scaleX / p.scaleX) : childWorld.scaleX;
     outLocal.scaleY = (p.scaleY != 0.0f) ? (childWorld.scaleY / p.scaleY) : childWorld.scaleY;
-    outLocal.rotationRad = childWorld.worldRotRad - p.worldRotRad;
+    const f32 reflectionSign = (p.scaleX * p.scaleY < 0.0f) ? -1.0f : 1.0f;
+    outLocal.rotationRad = (childWorld.worldRotRad - p.worldRotRad) * reflectionSign;
     outLocal.depthOffset = childWorld.worldDepth - p.worldDepth;
 }
 
 void TransformSolver::DetachFromParentList(u16 childIdx) noexcept {
     const u16 p = m_parent[childIdx];
-    if (p == kInvalidDenseIndex) return;
-    u16 cur = m_firstChild[p];
-    u16 prev = kInvalidDenseIndex;
-    while (cur != kInvalidDenseIndex) {
-        if (cur == childIdx) {
-            if (prev == kInvalidDenseIndex) {
-                m_firstChild[p] = m_nextSibling[cur];
-            } else {
-                m_nextSibling[prev] = m_nextSibling[cur];
-            }
+    if (p == kInvalidDenseIndex) {
+        return;
+    }
+    for (u16* link = &m_firstChild[p]; *link != kInvalidDenseIndex; link = &m_nextSibling[*link]) {
+        if (*link == childIdx) {
+            *link = m_nextSibling[childIdx];
             break;
         }
-        prev = cur;
-        cur = m_nextSibling[cur];
     }
     m_parent[childIdx] = kInvalidDenseIndex;
     m_nextSibling[childIdx] = kInvalidDenseIndex;
 }
 
-void TransformSolver::ResolveAncestorsIfDirty(u16 idx, u16 maxEntities) noexcept {
+void TransformSolver::ResolveDirtyChain(u16 idx, u16 maxEntities) noexcept {
+    if (idx == 0U || idx >= maxEntities) {
+        return;
+    }
     u16 topDirty = kInvalidDenseIndex;
-    u16 anc = m_parent[idx];
-    while (anc != kInvalidDenseIndex) {
-        if (IsDirty(anc)) topDirty = anc;
-        anc = m_parent[anc];
+    for (u16 anc = idx; anc != kInvalidDenseIndex; anc = m_parent[anc]) {
+        if (IsDirty(anc)) {
+            topDirty = anc;
+        }
     }
     if (topDirty != kInvalidDenseIndex) {
-        EvaluateSubtree(topDirty, maxEntities, false);
+        EvaluateDirtySubtree(topDirty, maxEntities);
     }
 }
 
-void TransformSolver::EvaluateSubtree(u16 rootIdx, u16 maxEntities, bool snapPrev) noexcept {
+void TransformSolver::EvaluateDirtySubtree(u16 rootIdx, u16 maxEntities) noexcept {
     TraverseSubtree(rootIdx, maxEntities, [&](u16 cur) noexcept {
         const u64 bit = (1ULL << (cur & 63U));
-        if (snapPrev || (m_dirtyWords[cur >> 6U] & bit) != 0ULL) {
-            const u16 p = m_parent[cur];
-            if (p == kInvalidDenseIndex) {
-                ComputeWorldFromLocal(m_local[cur], m_world[cur]);
-            } else {
-                CombineParentChild(m_world[p], m_local[cur], m_world[cur]);
-            }
+        if ((m_dirtyWords[cur >> 6U] & bit) != 0ULL) {
+            UpdateNodeWorld(cur);
             m_dirtyWords[cur >> 6U] &= ~bit;
-            if (snapPrev) {
-                m_prev[cur] = m_world[cur].ToSnapshot();
-                m_movedWords[cur >> 6U] &= ~bit;
-            } else {
-                m_movedWords[cur >> 6U] |= bit;
-            }
+            m_movedWords[cur >> 6U] |= bit;
         }
     });
 }
@@ -168,13 +155,12 @@ void TransformSolver::InitializeSlot(
     m_parent[idx] = parentIdx;
     m_firstChild[idx] = kInvalidDenseIndex;
     if (parentIdx != kInvalidDenseIndex) {
+        ResolveDirtyChain(parentIdx);
         m_nextSibling[idx] = m_firstChild[parentIdx];
         m_firstChild[parentIdx] = idx;
         if (keepWorldTransform) {
-            WorldTransform2D desiredWorld{};
-            ComputeWorldFromLocal(local, desiredWorld);
-            InverseCombineParentChild(m_world[parentIdx], desiredWorld, m_local[idx]);
-            m_world[idx] = desiredWorld;
+            ComputeWorldFromLocal(local, m_world[idx]);
+            InverseCombineParentChild(m_world[parentIdx], m_world[idx], m_local[idx]);
         } else {
             m_local[idx] = local;
             CombineParentChild(m_world[parentIdx], local, m_world[idx]);
@@ -191,47 +177,51 @@ void TransformSolver::InitializeSlot(
 }
 
 void TransformSolver::MarkSubtreeDirty(u16 rootIdx, u16 maxEntities) noexcept {
-    TraverseSubtree(rootIdx, maxEntities, [&](u16 cur) noexcept {
-        MarkDirty(cur);
-    });
+    TraverseSubtree(rootIdx, maxEntities, [&](u16 cur) noexcept { MarkDirty(cur); });
 }
 
 void TransformSolver::TeleportSubtree(u16 rootIdx, u16 maxEntities) noexcept {
-    if (rootIdx == 0U || rootIdx >= maxEntities) return;
-    ResolveAncestorsIfDirty(rootIdx, maxEntities);
-    EvaluateSubtree(rootIdx, maxEntities, true);
+    if (rootIdx == 0U || rootIdx >= maxEntities) {
+        return;
+    }
+    ResolveDirtyChain(m_parent[rootIdx], maxEntities);
+    TraverseSubtree(rootIdx, maxEntities, [&](u16 cur) noexcept {
+        UpdateNodeWorld(cur);
+        m_prev[cur] = m_world[cur].ToSnapshot();
+        const u64 bit = (1ULL << (cur & 63U));
+        m_dirtyWords[cur >> 6U] &= ~bit;
+        m_movedWords[cur >> 6U] &= ~bit;
+    });
 }
 
 void TransformSolver::UnlinkSlot(u16 idx, u16 maxEntities) noexcept {
-    ResolveAncestorsIfDirty(idx, maxEntities);
-    if (IsDirty(idx)) {
-        EvaluateSubtree(idx, maxEntities, false);
+    if (m_firstChild[idx] != kInvalidDenseIndex) {
+        ResolveDirtyChain(idx, maxEntities);
+        EvaluateDirtySubtree(idx, maxEntities);
+        for (u16 child = m_firstChild[idx]; child != kInvalidDenseIndex;) {
+            const u16 next = m_nextSibling[child];
+            m_local[child] = m_world[child].ToLocal();
+            m_parent[child] = kInvalidDenseIndex;
+            m_nextSibling[child] = kInvalidDenseIndex;
+            child = next;
+        }
+        m_firstChild[idx] = kInvalidDenseIndex;
     }
     DetachFromParentList(idx);
-    u16 child = m_firstChild[idx];
-    while (child != kInvalidDenseIndex) {
-        const u16 next = m_nextSibling[child];
-        // Bake current world transform into child's local transform so unparented survivors never snap to origin
-        const WorldTransform2D& cw = m_world[child];
-        m_local[child] = LocalTransform2D{
-            cw.x, cw.y, cw.scaleX, cw.scaleY, cw.worldRotRad, cw.worldDepth};
-        m_parent[child] = kInvalidDenseIndex;
-        m_nextSibling[child] = kInvalidDenseIndex;
-        child = next;
-    }
-    m_firstChild[idx] = kInvalidDenseIndex;
     const u64 bit = (1ULL << (idx & 63U));
     m_dirtyWords[idx >> 6U] &= ~bit;
     m_movedWords[idx >> 6U] &= ~bit;
 }
 
 u16 TransformSolver::MaxSubtreeDepth(u16 rootIdx, u16 maxEntities) const noexcept {
-    if (rootIdx == 0U || rootIdx >= maxEntities) return 0U;
+    if (rootIdx == 0U || rootIdx >= maxEntities) {
+        return 0U;
+    }
     u16 maxDepth = 0U;
     u16 curDepth = 0U;
     u16 cur = rootIdx;
     for (;;) {
-        if (curDepth > maxDepth) maxDepth = curDepth;
+        maxDepth = std::max(maxDepth, curDepth);
         const u16 child = m_firstChild[cur];
         if (child != kInvalidDenseIndex) {
             cur = child;
@@ -242,7 +232,9 @@ u16 TransformSolver::MaxSubtreeDepth(u16 rootIdx, u16 maxEntities) const noexcep
             cur = m_parent[cur];
             --curDepth;
         }
-        if (cur == rootIdx) break;
+        if (cur == rootIdx) {
+            break;
+        }
         cur = m_nextSibling[cur];
     }
     return maxDepth;
@@ -253,36 +245,31 @@ Result<void, WorldErrc> TransformSolver::SetParent(
     u16 parentIdx,
     u16 maxEntities,
     bool keepWorldTransform) noexcept {
-    if (childIdx == parentIdx) return Err(WorldErrc::HierarchyCycle);
+    if (childIdx == parentIdx) {
+        return Err(WorldErrc::HierarchyCycle);
+    }
     if (parentIdx != kInvalidDenseIndex) {
-        u16 anc = parentIdx;
         usize ancestorDepth = 1U;
-        while (anc != kInvalidDenseIndex) {
-            if (anc == childIdx) return Err(WorldErrc::HierarchyCycle);
-            anc = m_parent[anc];
+        for (u16 anc = parentIdx; anc != kInvalidDenseIndex; anc = m_parent[anc]) {
+            if (anc == childIdx) {
+                return Err(WorldErrc::HierarchyCycle);
+            }
             if (++ancestorDepth > kMaxHierarchyDepth) {
                 return Err(WorldErrc::HierarchyDepthExceeded);
             }
         }
-        const u16 childSubtreeDepth = MaxSubtreeDepth(childIdx, maxEntities);
-        if (ancestorDepth + childSubtreeDepth > kMaxHierarchyDepth) {
+        if (ancestorDepth + MaxSubtreeDepth(childIdx, maxEntities) > kMaxHierarchyDepth) {
             return Err(WorldErrc::HierarchyDepthExceeded);
         }
     }
 
-    if (m_parent[childIdx] == parentIdx) return {};
+    if (m_parent[childIdx] == parentIdx) {
+        return {};
+    }
 
     if (keepWorldTransform) {
-        ResolveAncestorsIfDirty(childIdx, maxEntities);
-        if (IsDirty(childIdx)) {
-            EvaluateSubtree(childIdx, maxEntities, false);
-        }
-        if (parentIdx != kInvalidDenseIndex) {
-            ResolveAncestorsIfDirty(parentIdx, maxEntities);
-            if (IsDirty(parentIdx)) {
-                EvaluateSubtree(parentIdx, maxEntities, false);
-            }
-        }
+        ResolveDirtyChain(childIdx, maxEntities);
+        ResolveDirtyChain(parentIdx, maxEntities);
     }
 
     DetachFromParentList(childIdx);
@@ -293,13 +280,8 @@ Result<void, WorldErrc> TransformSolver::SetParent(
         if (keepWorldTransform) {
             InverseCombineParentChild(m_world[parentIdx], m_world[childIdx], m_local[childIdx]);
         }
-    } else {
-        m_nextSibling[childIdx] = kInvalidDenseIndex;
-        if (keepWorldTransform) {
-            const WorldTransform2D& cw = m_world[childIdx];
-            m_local[childIdx] = LocalTransform2D{
-                cw.x, cw.y, cw.scaleX, cw.scaleY, cw.worldRotRad, cw.worldDepth};
-        }
+    } else if (keepWorldTransform) {
+        m_local[childIdx] = m_world[childIdx].ToLocal();
     }
     MarkSubtreeDirty(childIdx, maxEntities);
     return {};
@@ -312,37 +294,20 @@ void TransformSolver::SnapshotPreviousTransforms(
     u16 maxAllocatedIndex) noexcept {
     const usize wordCount = std::min<usize>(
         aliveWords.size(), (static_cast<usize>(maxAllocatedIndex) + 64U) >> 6U);
-    if (frozenMask == 0U) {
-        for (usize w = 0U; w < wordCount; ++w) {
-            u64 moved = m_movedWords[w] & aliveWords[w];
-            if (moved == 0ULL) continue;
-            while (moved != 0ULL) {
-                const u16 bit = static_cast<u16>(std::countr_zero(moved));
-                moved &= (moved - 1ULL);
-                const u16 idx = static_cast<u16>((w << 6U) + bit);
-                m_prev[idx] = m_world[idx].ToSnapshot();
-            }
-            m_movedWords[w] = 0ULL;
-        }
-        return;
-    }
-
     for (usize w = 0U; w < wordCount; ++w) {
         u64 moved = m_movedWords[w] & aliveWords[w];
-        if (moved == 0ULL) continue;
-        u64 stillFrozenMoved = 0ULL;
+        u64 stillFrozen = 0ULL;
         while (moved != 0ULL) {
             const u16 bit = static_cast<u16>(std::countr_zero(moved));
             moved &= (moved - 1ULL);
             const u16 idx = static_cast<u16>((w << 6U) + bit);
-            const u8 ch = timeChannels[idx] & 7U;
-            if ((frozenMask & (1U << ch)) != 0U) {
-                stillFrozenMoved |= (1ULL << bit);
+            if (frozenMask != 0U && ((frozenMask >> (timeChannels[idx] & 7U)) & 1U) != 0U) {
+                stillFrozen |= (1ULL << bit);
                 continue;
             }
             m_prev[idx] = m_world[idx].ToSnapshot();
         }
-        m_movedWords[w] = stillFrozenMoved;
+        m_movedWords[w] = stillFrozen;
     }
 }
 
@@ -356,12 +321,11 @@ void TransformSolver::PropagateHierarchy(
     for (usize w = 0U; w < wordCount; ++w) {
         u64 candidates = m_dirtyWords[w] & aliveWords[w];
         while (candidates != 0ULL) {
-            const u16 bit = static_cast<u16>(std::countr_zero(candidates));
-            u16 top = static_cast<u16>((w << 6U) + bit);
+            u16 top = static_cast<u16>((w << 6U) + std::countr_zero(candidates));
             while (m_parent[top] != kInvalidDenseIndex && IsDirty(m_parent[top])) {
                 top = m_parent[top];
             }
-            EvaluateSubtree(top, maxEnt, false);
+            EvaluateDirtySubtree(top, maxEnt);
             candidates &= m_dirtyWords[w];
         }
     }

@@ -4,9 +4,7 @@
 
 namespace en {
 
-// 16-byte (4 per 64B cache line, zero padding) immediate-mode 2D primitive and bitmap text quad emitter.
-// Non-owning adapter writing directly into RenderList using kWhiteTexture and kBuiltinFontTexture.
-// Invariant: sizeof(DebugBatcher) == 16, zero heap allocations, and all glyph UVs address the 128x48 built-in 16x6 ASCII font grid.
+// Immediate-mode 2D primitive and bitmap text quad emitter writing into RenderList.
 class alignas(16) DebugBatcher {
 public:
     constexpr DebugBatcher(
@@ -15,7 +13,6 @@ public:
         u8 viewSlot = kDebugWorldViewSlot,
         u16 depth = kDebugFixedDepth) noexcept
         : m_list(&list),
-          m_fontTex(kBuiltinFontTexture),
           m_depth(depth),
           m_passId(passId),
           m_viewSlot(viewSlot) {}
@@ -30,13 +27,11 @@ public:
     void PushCrosshair(f32 cx, f32 cy, f32 halfSize, f32 thickness, Color color) noexcept;
     void PushText(f32 x, f32 y, std::string_view text, Color color, f32 scale = 1.0f) noexcept;
 
+    [[nodiscard]] static char* AppendStr(char* out, char* end, std::string_view sv) noexcept;
     [[nodiscard]] static char* FormatI64(char* out, char* end, i64 val) noexcept;
     [[nodiscard]] static char* FormatU64Hex(char* out, char* end, u64 val, u8 digits = 8U) noexcept;
     [[nodiscard]] static char* FormatF32Fixed2(char* out, char* end, f32 val) noexcept;
 
-    [[nodiscard]] static constexpr u32 PackRgba8(Color c) noexcept {
-        return c.ToRGBA8();
-    }
     [[nodiscard]] static constexpr Color UnpackRgba8(u32 rgba8) noexcept {
         constexpr f32 kInv = 1.0f / 255.0f;
         return {
@@ -48,17 +43,14 @@ public:
     }
 
 private:
-    RenderList* m_list{nullptr};                // 8B
-    TextureHandle m_fontTex{kBuiltinFontTexture}; // 4B
-    u16 m_depth{kDebugFixedDepth};              // 2B
-    u8 m_passId{kDebugWorldPassId};             // 1B
-    u8 m_viewSlot{kDebugWorldViewSlot};         // 1B
+    RenderList* m_list{nullptr};
+    u16 m_depth{kDebugFixedDepth};
+    u8 m_passId{kDebugWorldPassId};
+    u8 m_viewSlot{kDebugWorldViewSlot};
 };
 static_assert(sizeof(DebugBatcher) == 16);
 
-// 288-byte (9 x 32B blocks exact, zero padding) two-level bitmask transient/persistent 2D debug shape pool.
-// Non-owning view over a 2048-slot DebugShapeCmd arena slice; packs allocations into the lowest free bit index.
-// Invariant: sizeof(DebugShapePool) == 288 and expired shapes are reclaimed in O(activeWords) via bit-scanning.
+// Two-level bitmask transient/persistent 2D debug shape pool.
 class alignas(32) DebugShapePool {
 public:
     constexpr void Init(std::span<DebugShapeCmd, kMaxDebugShapes> storage) noexcept {
@@ -72,7 +64,7 @@ public:
         m_nonFullWordMask = 0xFFFFFFFFU;
         m_currentTick = 0U;
         m_activeCount = 0U;
-        m_totalSubmitted = 0ULL;
+        m_evictCursor = 0U;
     }
 
     constexpr void SetCurrentTick(u32 tickIndex) noexcept { m_currentTick = tickIndex; }
@@ -88,19 +80,24 @@ public:
     void EmitAndExpire(u32 currentTickIndex, DebugBatcher& worldBatcher, DebugBatcher& hudBatcher) noexcept;
 
     [[nodiscard]] constexpr u32 ActiveCount() const noexcept { return m_activeCount; }
-    [[nodiscard]] constexpr u64 TotalSubmitted() const noexcept { return m_totalSubmitted; }
-    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
 private:
     [[nodiscard]] DebugShapeCmd* AllocateSlot(u32 durationTicks) noexcept;
+    [[nodiscard]] DebugShapeCmd* AllocateShape(
+        DebugShapeCmd::Kind kind,
+        f32 x0,
+        f32 y0,
+        Color color,
+        f32 thicknessOrScale,
+        u32 durationTicks) noexcept;
 
-    std::array<u64, 32> m_activeWords{};        // 256B (32 x 64-bit active slot bitmasks = 2048 slots)
-    DebugShapeCmd* m_pool{nullptr};             // 8B
-    u64 m_totalSubmitted{0ULL};                 // 8B
-    u32 m_nonEmptyWordMask{0U};                 // 4B
-    u32 m_nonFullWordMask{0xFFFFFFFFU};         // 4B
-    u32 m_currentTick{0U};                      // 4B
-    u32 m_activeCount{0U};                      // 4B
+    std::array<u64, 32> m_activeWords{};
+    DebugShapeCmd* m_pool{nullptr};
+    u32 m_nonEmptyWordMask{0U};
+    u32 m_nonFullWordMask{0xFFFFFFFFU};
+    u32 m_currentTick{0U};
+    u16 m_activeCount{0U};
+    u16 m_evictCursor{0U};
 };
 static_assert(sizeof(DebugShapePool) == 288);
 

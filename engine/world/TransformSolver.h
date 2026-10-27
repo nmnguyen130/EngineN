@@ -5,8 +5,8 @@
 
 namespace en {
 
-// 64-byte (1 cache line exact, zero padding) non-recursive scene-graph hierarchy and world-transform solver.
-// Non-owning view over World's AlignedArena; traverses arbitrary-fanout LCRS subtrees in O(1) auxiliary space via parent pointers.
+// Non-recursive scene-graph hierarchy and world-transform solver.
+// Non-owning view over World's AlignedArena; traverses arbitrary-fanout Left-Child Right-Sibling subtrees via parent links.
 // Invariant: whenever bit idx in m_movedWords is 0, m_prev[idx] equals m_world[idx].ToSnapshot().
 class alignas(64) TransformSolver {
 public:
@@ -19,12 +19,22 @@ public:
         u16 parentIdx = kInvalidDenseIndex,
         bool keepWorldTransform = false) noexcept;
 
-    void UnlinkSlot(u16 idx, u16 maxEntities) noexcept;
+    constexpr void LinkLoadedSlot(u16 idx, const LocalTransform2D& local, u16 parentIdx) noexcept {
+        m_local[idx] = local;
+        m_parent[idx] = parentIdx;
+        if (parentIdx != kInvalidDenseIndex) {
+            m_nextSibling[idx] = m_firstChild[parentIdx];
+            m_firstChild[parentIdx] = idx;
+        }
+        MarkDirty(idx);
+    }
+
+    void UnlinkSlot(u16 idx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
     [[nodiscard]] Result<void, WorldErrc> SetParent(
         u16 childIdx,
         u16 parentIdx,
-        u16 maxEntities,
+        u16 maxEntities = kInvalidDenseIndex,
         bool keepWorldTransform = false) noexcept;
 
     constexpr void MarkDirty(u16 idx) noexcept {
@@ -35,10 +45,11 @@ public:
         return (m_dirtyWords[idx >> 6U] & (1ULL << (idx & 63U))) != 0ULL;
     }
 
-    // Unified O(1)-space parent-threaded Left-Child Right-Sibling (LCRS) pre-order subtree traversal.
     template <typename Fn>
     constexpr void TraverseSubtree(u16 rootIdx, u16 maxEntities, Fn&& fn) const noexcept {
-        if (rootIdx == 0U || rootIdx >= maxEntities) return;
+        if (rootIdx == 0U || rootIdx >= maxEntities) {
+            return;
+        }
         u16 cur = rootIdx;
         for (;;) {
             fn(cur);
@@ -50,13 +61,15 @@ public:
             while (cur != rootIdx && m_nextSibling[cur] == kInvalidDenseIndex) {
                 cur = m_parent[cur];
             }
-            if (cur == rootIdx) break;
+            if (cur == rootIdx) {
+                break;
+            }
             cur = m_nextSibling[cur];
         }
     }
 
-    void MarkSubtreeDirty(u16 rootIdx, u16 maxEntities) noexcept;
-    void TeleportSubtree(u16 rootIdx, u16 maxEntities) noexcept;
+    void MarkSubtreeDirty(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
+    void TeleportSubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
     void SnapshotPreviousTransforms(
         std::span<const u64> aliveWords,
@@ -96,7 +109,7 @@ public:
     [[nodiscard]] constexpr u16 ParentOf(u16 idx) const noexcept { return m_parent[idx]; }
     [[nodiscard]] constexpr u16 FirstChildOf(u16 idx) const noexcept { return m_firstChild[idx]; }
     [[nodiscard]] constexpr u16 NextSiblingOf(u16 idx) const noexcept { return m_nextSibling[idx]; }
-    [[nodiscard]] u16 MaxSubtreeDepth(u16 rootIdx, u16 maxEntities) const noexcept;
+    [[nodiscard]] u16 MaxSubtreeDepth(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) const noexcept;
 
     static void ComputeWorldFromLocal(const LocalTransform2D& loc, WorldTransform2D& outW) noexcept;
     static void CombineParentChild(
@@ -109,9 +122,17 @@ public:
         LocalTransform2D& outLocal) noexcept;
 
 private:
+    void UpdateNodeWorld(u16 cur) noexcept {
+        const u16 p = m_parent[cur];
+        if (p == kInvalidDenseIndex) {
+            ComputeWorldFromLocal(m_local[cur], m_world[cur]);
+        } else {
+            CombineParentChild(m_world[p], m_local[cur], m_world[cur]);
+        }
+    }
     void DetachFromParentList(u16 childIdx) noexcept;
-    void ResolveAncestorsIfDirty(u16 idx, u16 maxEntities) noexcept;
-    void EvaluateSubtree(u16 rootIdx, u16 maxEntities, bool snapPrev) noexcept;
+    void ResolveDirtyChain(u16 idx, u16 maxEntities = kInvalidDenseIndex) noexcept;
+    void EvaluateDirtySubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
     LocalTransform2D* m_local{nullptr};
     WorldTransform2D* m_world{nullptr};

@@ -16,8 +16,7 @@ enum class LogLevel : u8 {
     Off = 6,
 };
 
-// Cache-line-aligned 128-byte structured log entry with zero internal padding.
-// Stores static string literals from std::source_location by pointer and message text inline.
+// 128-byte structured log entry holding source location pointers and inline message text.
 struct alignas(64) LogRecord {
     u64 sequence{0};
     StringId category{};
@@ -32,9 +31,9 @@ static_assert(sizeof(LogRecord) == 128);
 
 using LogSinkFn = void (*)(const LogRecord& record, void* userCtx) noexcept;
 
-// Thread-safe, zero-heap-allocation structured logger with an in-memory ring history for crash dumps.
-// Static process-wide service; retains the most recent kHistoryCapacity records in a circular buffer.
-// Invariant: messages below MinLevel() are filtered out in O(1) before formatting or locking.
+// Thread-safe structured logger with an in-memory circular history for crash diagnostics.
+// Process-wide service retaining the most recent kHistoryCapacity records.
+// Invariant: messages below MinLevel() are discarded before formatting or locking.
 class Logger {
 public:
     static constexpr usize kHistoryCapacity = 64;
@@ -43,6 +42,7 @@ public:
     [[nodiscard]] static LogLevel MinLevel() noexcept;
 
     static void SetSink(LogSinkFn sinkFn, void* userCtx = nullptr) noexcept;
+    static void DefaultStderrSink(const LogRecord& record, void* userCtx) noexcept;
     static void Clear() noexcept;
 
     static void Log(
@@ -62,6 +62,7 @@ using AssertHandlerFn = bool (*)(
     void* userCtx) noexcept;
 
 void SetAssertHandler(AssertHandlerFn handler, void* userCtx = nullptr) noexcept;
+void SetAbortOnUnhandledAssert(bool abortOnFail) noexcept;
 
 bool ReportAssertionFailure(
     const char* expression,
@@ -90,8 +91,8 @@ struct alignas(8) TraceFrameEntry {
 };
 static_assert(sizeof(TraceFrameEntry) == 24);
 
-// Captures thread-local call-stack breadcrumbs and writes diagnostic crash dumps on fatal standard signals.
-// Static process-wide utility with zero dynamic allocation and zero OS-header pollution.
+// Tracks thread-local call-stack breadcrumbs and writes crash reports on fatal signals.
+// Process-wide service with fixed-size thread-local storage.
 // Invariant: PushFrame and PopFrame remain balanced even when call depth exceeds kMaxTraceDepth.
 class CrashHandler {
 public:
@@ -108,7 +109,6 @@ public:
     [[nodiscard]] static u32 CurrentDepth() noexcept;
 };
 
-// RAII call-stack breadcrumb guard balanced with CrashHandler::PushFrame / PopFrame.
 class ScopedTraceFrame {
 public:
     explicit ScopedTraceFrame(std::source_location loc = std::source_location::current()) noexcept {

@@ -7,22 +7,21 @@
 
 namespace en {
 
-// 640-byte (10 cache lines exact, zero padding) 120 Hz gameplay orchestrator over World and PhysicsSystem.
-// Move-only RAII subsystem owning a single AlignedArena slab for SimCue and CombatHitEvent buffers, plus a 4096-bit sparse-summary world flag table.
-// Invariant: sizeof(GameplayPipeline) == 640, Cache Line 0 holds hot dispatch pointers/configs, and Cache Lines 2..9 hold m_worldFlags[64].
+// Fixed-rate gameplay orchestrator over World and PhysicsSystem.
+// Non-copyable, non-movable subsystem owning a single AlignedArena slab; zero heap allocations occur after Init().
+// Invariant: sizeof(GameplayPipeline) == 640 (10 cache lines exact).
 class alignas(64) GameplayPipeline {
 public:
     static constexpr u32 kWorldFlagWords = 64U;
-    static constexpr u32 kMaxWorldFlags = kWorldFlagWords * 64U; // 4096 persistent flags
+    static constexpr u32 kMaxWorldFlags = kWorldFlagWords * 64U;
 
     GameplayPipeline() noexcept = default;
     ~GameplayPipeline() noexcept { Shutdown(); }
 
     GameplayPipeline(const GameplayPipeline&) = delete;
     GameplayPipeline& operator=(const GameplayPipeline&) = delete;
-
-    GameplayPipeline(GameplayPipeline&& other) noexcept;
-    GameplayPipeline& operator=(GameplayPipeline&& other) noexcept;
+    GameplayPipeline(GameplayPipeline&&) = delete;
+    GameplayPipeline& operator=(GameplayPipeline&&) = delete;
 
     [[nodiscard]] Result<void, GameplayErrc> Init(
         World& world,
@@ -61,7 +60,9 @@ public:
     }
 
     constexpr void SetWorldFlag(u16 flagId, bool value = true) noexcept {
-        if (flagId >= kMaxWorldFlags) return;
+        if (flagId >= kMaxWorldFlags) {
+            return;
+        }
         const u32 wordIdx = static_cast<u32>(flagId >> 6U);
         const u64 bit = (1ULL << (flagId & 63U));
         if (value) {
@@ -76,9 +77,10 @@ public:
     }
 
     [[nodiscard]] constexpr bool TestWorldFlag(u16 flagId) const noexcept {
-        if (flagId >= kMaxWorldFlags) return false;
-        const u32 wordIdx = static_cast<u32>(flagId >> 6U);
-        return (m_worldFlags[wordIdx] & (1ULL << (flagId & 63U))) != 0ULL;
+        if (flagId >= kMaxWorldFlags) {
+            return false;
+        }
+        return (m_worldFlags[flagId >> 6U] & (1ULL << (flagId & 63U))) != 0ULL;
     }
 
     constexpr void ClearWorldFlags() noexcept {
@@ -104,12 +106,10 @@ public:
     [[nodiscard]] u64 ComputeAuditHash(const World& world) const noexcept;
 
 private:
-    // Cache Line 0 (64B exact: 32B GameplayConfig + 24B GameplayPolicyTable + 8B m_cues pointer)
     GameplayConfig m_cfg{};
     GameplayPolicyTable m_policies{};
     SimCue* m_cues{nullptr};
 
-    // Cache Line 1 (64B exact: 8B m_hitEvents + 32B AlignedArena + 8B m_activeFlagWordsMask + 8B m_tickCount + 8B m_totalCombatHits/counters)
     CombatHitEvent* m_hitEvents{nullptr};
     AlignedArena m_arena{};
     u64 m_activeFlagWordsMask{0ULL};
@@ -118,7 +118,6 @@ private:
     u16 m_cueCount{0U};
     u16 m_hitEventCount{0U};
 
-    // Cache Lines 2..9 (512B exact: 64 * 8B persistent world flags)
     alignas(64) std::array<u64, kWorldFlagWords> m_worldFlags{};
 };
 static_assert(sizeof(GameplayPipeline) == 640);

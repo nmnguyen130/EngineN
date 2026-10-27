@@ -3,15 +3,16 @@
 #include "time/SdlClock.h"
 #include "time/TimeTypes.h"
 
-#include <algorithm>
+#include <bit>
+#include <span>
 
 namespace en {
 
 class TimePipeline;
 
-// Compact 32-byte non-owning simulation step view referencing Cache Line 0 of TimePipeline.
-// Value type; passed to 120 Hz simulation ticks without copying the 64B BakedTickState table.
-// Invariant: when valid == true, baked and pipeline are non-null and substepTotal >= 1.
+// Non-owning per-tick view into TimePipeline passed to 120 Hz simulation steps.
+// Value type; references the pipeline's baked channel table without copying it.
+// Invariant: when valid is true, baked and pipeline are non-null and substepTotal >= 1.
 struct alignas(32) SimStepView {
     const BakedTickState* baked{nullptr};
     TimePipeline* pipeline{nullptr};
@@ -23,18 +24,16 @@ struct alignas(32) SimStepView {
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept { return valid; }
 
+    [[nodiscard]] constexpr bool IsFrozen(TimeChannel ch = TimeChannel::World) const noexcept {
+        return (frozenMask & ChannelBit(ch)) != 0U;
+    }
+
     [[nodiscard]] constexpr f32 Dt(TimeChannel ch = TimeChannel::World) const noexcept {
-        const u8 idx = static_cast<u8>(ch) & 7U;
-        return ((frozenMask & (1U << idx)) != 0U || !baked) ? 0.0f : baked->scaledDt[idx];
+        return (IsFrozen(ch) || !baked) ? 0.0f : baked->scaledDt[ChannelIdx(ch)];
     }
 
     [[nodiscard]] constexpr f32 EffectiveScale(TimeChannel ch = TimeChannel::World) const noexcept {
-        const u8 idx = static_cast<u8>(ch) & 7U;
-        return ((frozenMask & (1U << idx)) != 0U || !baked) ? 0.0f : baked->effectiveScale[idx];
-    }
-
-    [[nodiscard]] constexpr bool IsFrozen(TimeChannel ch = TimeChannel::World) const noexcept {
-        return (frozenMask & (1U << (static_cast<u8>(ch) & 7U))) != 0U;
+        return (IsFrozen(ch) || !baked) ? 0.0f : baked->effectiveScale[ChannelIdx(ch)];
     }
 
     constexpr void RequestHitstop(TimeChannel ch, u32 ticks) const noexcept;
@@ -43,9 +42,8 @@ struct alignas(32) SimStepView {
 };
 static_assert(sizeof(SimStepView) == 32);
 
-// Layer 1 constexpr 120 Hz rational time pipeline packed into 256 bytes (4 cache lines, zero padding).
-// Uses a 1440 Hz LCM harmonic accumulator for zero-drift VSync snapping across 30..480 Hz (including 90/144/180/360 Hz)
-// and an EWMA micro-jitter filter for VRR displays.
+// Fixed-timestep 120 Hz simulation clock with 1440 Hz rational VSync snapping and VRR smoothing.
+// Self-contained value type; owns no external resources.
 // Invariant: m_accUnits <= maxCatchupTicks * kTickUnits, and Channel 0 (World) cascades to Channels 1..5.
 class alignas(64) TimePipeline {
 public:
@@ -53,47 +51,26 @@ public:
     static constexpr u64 kVsyncSnapMarginNs = 150'000ULL;
     static constexpr f32 kMaxTimeScale = 10.0f;
 
-    // Bitmask of valid 1440 Hz harmonic multiples k in [3..48] (k = 1440 / RefreshHz):
-    // k=3(480Hz), 4(360Hz), 6(240Hz), 8(180Hz), 9(160Hz), 10(144Hz), 12(120Hz),
-    // 16(90Hz), 18(80Hz), 20(72Hz), 24(60Hz), 30(48Hz), 36(40Hz), 48(30Hz).
+    // Bitmask of valid 1440 Hz divisors k in [3..48] (k = 1440 / RefreshHz).
     static constexpr u64 kValidHarmonicMask =
         (1ULL << 3U) | (1ULL << 4U) | (1ULL << 6U) | (1ULL << 8U) | (1ULL << 9U) |
         (1ULL << 10U) | (1ULL << 12U) | (1ULL << 16U) | (1ULL << 18U) | (1ULL << 20U) |
         (1ULL << 24U) | (1ULL << 30U) | (1ULL << 36U) | (1ULL << 48U);
 
-    constexpr TimePipeline() noexcept { Reset(); }
+    constexpr TimePipeline() noexcept {
+        m_bakedTick.effectiveScale.fill(1.0f);
+        m_bakedTick.scaledDt.fill(kFixedDtSec);
+    }
 
     constexpr void Reset() noexcept {
-        m_accUnits = 0ULL;
-        m_lastWallNs = 0ULL;
-        m_telemetry = TimeTelemetry{};
-        m_smoothedDeltaNs = 0ULL;
-        m_masterScale = 1.0f;
-        m_realDtSec = kFixedDtSec;
-        m_stepAllowanceTicks = 0U;
-        m_plannedSubsteps = 0U;
-        m_activeHitstopMask = 0U;
-        m_activeRampMask = 0U;
-        m_frozenMask = 0U;
-        m_paused = false;
-
-        for (u8 i = 0; i < kMaxTimeChannels; ++i) {
-            m_slots[i] = ChannelModSlot{};
-            m_bakedTick.effectiveScale[i] = 1.0f;
-            m_bakedTick.scaledDt[i] = kFixedDtSec;
-        }
+        *this = TimePipeline{};
     }
 
     void BeginFrame() noexcept {
         const u64 now = SdlClock::NowNs();
-        if (m_lastWallNs == 0ULL || now <= m_lastWallNs) {
-            m_lastWallNs = now;
-            BeginFrameManual(kFixedDtNs);
-            return;
-        }
-        const u64 deltaNs = now - m_lastWallNs;
+        const u64 delta = (m_lastWallNs != 0ULL && now > m_lastWallNs) ? (now - m_lastWallNs) : kFixedDtNs;
         m_lastWallNs = now;
-        BeginFrameManual(deltaNs);
+        BeginFrameManual(delta);
     }
 
     constexpr void BeginFrameManual(u64 rawDeltaNs) noexcept {
@@ -102,137 +79,97 @@ public:
         ++m_telemetry.totalFrames;
         m_telemetry.ticksLastFrame = 0U;
 
-        const u32 maxCatchup = std::max<u32>(1U, m_telemetry.maxCatchupTicks);
-        if (m_paused) {
-            m_plannedSubsteps = static_cast<u16>(std::min<u64>(m_accUnits / kTickUnits, maxCatchup));
-            return;
-        }
-
-        // Stage 1: O(1) bitmask-driven harmonic snapping in 1440 Hz rational units.
-        u64 units = clampedNs * kHarmonicHz;
-        constexpr u64 kSnapMarginUnits = kVsyncSnapMarginNs * kHarmonicHz;
-        const u64 nearestK = (units + (kNsPerSecond >> 1U)) / kNsPerSecond;
-        if (nearestK <= 48ULL && ((kValidHarmonicMask >> nearestK) & 1ULL) != 0ULL) {
-            const u64 targetUnits = nearestK * kNsPerSecond;
-            const u64 diff = (units >= targetUnits) ? (units - targetUnits) : (targetUnits - units);
-            if (diff <= kSnapMarginUnits) {
-                units = targetUnits;
-                m_smoothedDeltaNs = targetUnits / kHarmonicHz;
-            } else {
-                units = FilterVrrDeltaUnits(clampedNs);
+        const u32 maxCatchup = m_telemetry.maxCatchupTicks;
+        if (!m_paused) {
+            // Clamp accumulated time to maxCatchup ticks to prevent spiral-of-death stalls.
+            m_accUnits += ResolveFrameUnits(clampedNs);
+            const u64 maxAccUnits = static_cast<u64>(maxCatchup) * kTickUnits;
+            if (m_accUnits > maxAccUnits) {
+                const u64 dropped = (m_accUnits - maxAccUnits + (kTickUnits - 1ULL)) / kTickUnits;
+                m_telemetry.droppedTicks += static_cast<u32>(dropped);
+                m_accUnits = maxAccUnits;
             }
-        } else {
-            units = FilterVrrDeltaUnits(clampedNs);
         }
-
-        // Stage 2: Accumulate and enforce spiral-of-death ceiling.
-        m_accUnits += units;
-        const u64 maxAccUnits = static_cast<u64>(maxCatchup) * kTickUnits;
-        if (m_accUnits > maxAccUnits) {
-            const u64 dropped = (m_accUnits - maxAccUnits + (kTickUnits - 1ULL)) / kTickUnits;
-            m_telemetry.droppedTicks += static_cast<u32>(dropped);
-            m_accUnits = maxAccUnits;
-        }
-        m_plannedSubsteps = static_cast<u16>(std::min<u64>(m_accUnits / kTickUnits, maxCatchup));
+        m_plannedSubsteps = static_cast<u16>(m_accUnits / kTickUnits);
     }
 
     [[nodiscard]] constexpr SimStepView PollTick() noexcept {
-        const u32 maxCatchup = std::max<u32>(1U, m_telemetry.maxCatchupTicks);
-        if (m_accUnits < kTickUnits || m_telemetry.ticksLastFrame >= maxCatchup) {
-            return SimStepView{};
-        }
-        if (m_paused && m_stepAllowanceTicks == 0U) {
-            return SimStepView{};
-        }
+        const u32 maxCatchup = m_telemetry.maxCatchupTicks;
+        if (m_accUnits < kTickUnits || m_telemetry.ticksLastFrame >= maxCatchup) return {};
+        if (m_paused && m_stepAllowanceTicks == 0U) return {};
 
         m_accUnits -= kTickUnits;
         const u32 catchupIdx = m_telemetry.ticksLastFrame++;
         ++m_telemetry.totalSimTicks;
+        if (m_stepAllowanceTicks > 0U) --m_stepAllowanceTicks;
 
-        if (m_stepAllowanceTicks > 0U) {
-            --m_stepAllowanceTicks;
-        }
-
-        SimStepView view{};
-        view.baked = &m_bakedTick;
-        view.pipeline = this;
-        view.tickIndex = m_telemetry.totalSimTicks;
-        view.catchupIndex = catchupIdx;
-        view.substepTotal = std::max<u16>(m_plannedSubsteps, m_telemetry.ticksLastFrame);
-        view.frozenMask = m_frozenMask;
-        view.valid = true;
+        SimStepView view{
+            .baked = &m_bakedTick,
+            .pipeline = this,
+            .tickIndex = m_telemetry.totalSimTicks,
+            .catchupIndex = catchupIdx,
+            .substepTotal = std::max<u16>(m_plannedSubsteps, m_telemetry.ticksLastFrame),
+            .frozenMask = m_frozenMask,
+            .valid = true,
+        };
 
         AdvanceChannelModulationTick();
-        if (m_paused && m_stepAllowanceTicks == 0U) {
-            RebakeAllChannels();
-        }
+        if (m_paused && m_stepAllowanceTicks == 0U) RebakeChannels(0xFFU);
         return view;
     }
 
     [[nodiscard]] constexpr RenderTimeView GetRenderView() const noexcept {
-        RenderTimeView rv{};
-        rv.rawAlpha = std::clamp(
+        const f32 alpha = std::clamp(
             static_cast<f32>(m_accUnits) * (1.0f / static_cast<f32>(kTickUnits)), 0.0f, 1.0f);
-        rv.realDt = m_realDtSec;
-        rv.tickIndex = m_telemetry.totalSimTicks;
+        RenderTimeView rv{
+            .tickIndex = m_telemetry.totalSimTicks,
+            .rawAlpha = alpha,
+            .realDt = m_realDtSec,
+        };
         const u8 frozen = FrozenMask();
         for (u8 i = 0; i < kMaxTimeChannels; ++i) {
-            rv.channelAlpha[i] = ((frozen & (1U << i)) != 0U) ? 1.0f : rv.rawAlpha;
+            rv.channelAlpha[i] = ((frozen & (1U << i)) != 0U) ? 1.0f : alpha;
         }
         return rv;
     }
 
+    constexpr void SetMaxCatchupTicks(u16 maxCatchup) noexcept {
+        m_telemetry.maxCatchupTicks = std::clamp<u16>(maxCatchup, 1U, 64U);
+    }
+
     constexpr void SetMasterScale(f32 scale) noexcept {
-        if (!(scale >= 0.0f)) scale = 0.0f;
-        m_masterScale = std::clamp(scale, 0.0f, kMaxTimeScale);
-        RebakeAllChannels();
+        m_masterScale = SanitizeScale(scale);
+        RebakeChannels(0xFFU);
     }
 
     [[nodiscard]] constexpr f32 MasterScale() const noexcept { return m_masterScale; }
 
     constexpr void SetBaseScale(TimeChannel ch, f32 scale) noexcept {
-        if (!(scale >= 0.0f)) scale = 0.0f;
-        const u8 idx = static_cast<u8>(ch) & 7U;
-        m_slots[idx].baseScale = std::clamp(scale, 0.0f, kMaxTimeScale);
-        if (idx == 0U) {
-            RebakeAllChannels();
-        } else {
-            BakeSingleChannel(idx);
-        }
+        m_slots[ChannelIdx(ch)].baseScale = SanitizeScale(scale);
+        RebakeChannels(ChannelBit(ch));
     }
 
     [[nodiscard]] constexpr f32 BaseScale(TimeChannel ch) const noexcept {
-        return m_slots[static_cast<u8>(ch) & 7U].baseScale;
+        return m_slots[ChannelIdx(ch)].baseScale;
     }
 
     constexpr void RequestHitstop(TimeChannel ch, u32 ticks) noexcept {
-        if (ticks == 0U) return;
-        const u8 idx = static_cast<u8>(ch) & 7U;
-        const u16 clamped = static_cast<u16>(std::min<u32>(ticks, 0xFFFFU));
-        if (clamped >= m_slots[idx].hitstopTicks) {
-            m_slots[idx].hitstopTicks = clamped;
-            m_activeHitstopMask |= static_cast<u8>(1U << idx);
-            if (idx == 0U) {
-                RebakeAllChannels();
-            } else {
-                BakeSingleChannel(idx);
-            }
-        }
+        RequestMaskHitstop(ChannelBit(ch), ticks);
     }
 
     constexpr void RequestMaskHitstop(u8 channelMask, u32 ticks) noexcept {
         if (ticks == 0U || channelMask == 0U) return;
-        const u16 clamped = static_cast<u16>(std::min<u32>(ticks, 0xFFFFU));
-        u8 m = channelMask;
-        while (m != 0U) {
+        const u16 clamped = static_cast<u16>(std::min<u32>(ticks, kMaxFreezeTicks));
+        u8 dirtyMask = 0U;
+        for (u8 m = channelMask; m != 0U; m &= static_cast<u8>(m - 1U)) {
             const u8 idx = static_cast<u8>(std::countr_zero(m));
-            m &= static_cast<u8>(m - 1U);
             if (clamped >= m_slots[idx].hitstopTicks) {
                 m_slots[idx].hitstopTicks = clamped;
-                m_activeHitstopMask |= static_cast<u8>(1U << idx);
+                dirtyMask |= static_cast<u8>(1U << idx);
             }
         }
-        RebakeAllChannels();
+        m_activeHitstopMask |= dirtyMask;
+        RebakeChannels(dirtyMask);
     }
 
     constexpr void RequestGameplayFreeze(u32 ticks) noexcept {
@@ -240,46 +177,36 @@ public:
     }
 
     constexpr void RequestTimeRamp(TimeChannel ch, f32 targetScale, u32 holdTicks, u32 blendTicks) noexcept {
-        const u8 idx = static_cast<u8>(ch) & 7U;
+        const u8 idx = ChannelIdx(ch);
+        const u8 bit = ChannelBit(ch);
         if (holdTicks == 0U && blendTicks == 0U) {
-            ClearChannelEffects(ch);
+            m_slots[idx].ClearRamp();
+            m_activeRampMask &= static_cast<u8>(~bit);
+            RebakeChannels(bit);
             return;
         }
-        if (!(targetScale >= 0.0f)) targetScale = 0.0f;
-        ChannelModSlot& s = m_slots[idx];
-        s.rampTargetScale = std::clamp(targetScale, 0.0f, kMaxTimeScale);
-        s.rampHoldTicks = static_cast<u16>(std::min<u32>(holdTicks, 0xFFFFU));
-        s.rampBlendTicks = static_cast<u16>(std::min<u32>(blendTicks, 0xFFFFU));
-        s.rampElapsedTicks = 0U;
-        m_activeRampMask |= static_cast<u8>(1U << idx);
-        if (idx == 0U) {
-            RebakeAllChannels();
-        } else {
-            BakeSingleChannel(idx);
-        }
+        m_slots[idx].rampTargetScale = SanitizeScale(targetScale);
+        m_slots[idx].rampHoldTicks = static_cast<u16>(std::min<u32>(holdTicks, 0xFFFFU));
+        m_slots[idx].rampBlendTicks = static_cast<u16>(std::min<u32>(blendTicks, 0xFFFFU));
+        m_slots[idx].rampElapsedTicks = 0U;
+        m_activeRampMask |= bit;
+        RebakeChannels(bit);
     }
 
     constexpr void ClearChannelEffects(TimeChannel ch) noexcept {
-        const u8 idx = static_cast<u8>(ch) & 7U;
-        const u8 clearBit = static_cast<u8>(~(1U << idx));
-        const f32 savedBase = m_slots[idx].baseScale;
-        m_slots[idx] = ChannelModSlot{savedBase, 1.0f, 0U, 0U, 0U, 0U};
-        m_activeHitstopMask &= clearBit;
-        m_activeRampMask &= clearBit;
-        if (idx == 0U) {
-            RebakeAllChannels();
-        } else {
-            BakeSingleChannel(idx);
-        }
+        const u8 idx = ChannelIdx(ch);
+        const u8 bit = ChannelBit(ch);
+        m_slots[idx].ClearEffects();
+        m_activeHitstopMask &= static_cast<u8>(~bit);
+        m_activeRampMask &= static_cast<u8>(~bit);
+        RebakeChannels(bit);
     }
 
     constexpr void SetPaused(bool paused) noexcept {
         if (m_paused != paused) {
             m_paused = paused;
-            if (!paused) {
-                m_stepAllowanceTicks = 0U;
-            }
-            RebakeAllChannels();
+            if (!paused) m_stepAllowanceTicks = 0U;
+            RebakeChannels(0xFFU);
         }
     }
 
@@ -287,15 +214,12 @@ public:
 
     constexpr void RequestStep(u32 ticks = 1U) noexcept {
         if (ticks == 0U) return;
-        const u32 maxCatchup = std::max<u32>(1U, m_telemetry.maxCatchupTicks);
-        const u32 clamped = std::min(ticks, maxCatchup);
-        m_stepAllowanceTicks = static_cast<u16>(std::min<u32>(m_stepAllowanceTicks + clamped, maxCatchup));
-        const u64 requiredUnits = static_cast<u64>(m_stepAllowanceTicks) * kTickUnits;
-        if (m_accUnits < requiredUnits) {
-            m_accUnits = requiredUnits;
-        }
+        const u32 maxCatchup = m_telemetry.maxCatchupTicks;
+        m_stepAllowanceTicks = static_cast<u16>(
+            std::min<u32>(m_stepAllowanceTicks + std::min(ticks, maxCatchup), maxCatchup));
+        m_accUnits = std::max(m_accUnits, static_cast<u64>(m_stepAllowanceTicks) * kTickUnits);
         m_plannedSubsteps = static_cast<u16>(std::min<u64>(m_accUnits / kTickUnits, maxCatchup));
-        RebakeAllChannels();
+        RebakeChannels(0xFFU);
     }
 
     constexpr void OnWindowRefocus() noexcept {
@@ -313,10 +237,7 @@ public:
         return m_bakedTick.effectiveScale;
     }
 
-    [[nodiscard]] constexpr u64 AccumulatorNs() const noexcept {
-        return m_accUnits / kHarmonicHz;
-    }
-
+    [[nodiscard]] constexpr u64 AccumulatorNs() const noexcept { return m_accUnits / kHarmonicHz; }
     [[nodiscard]] constexpr const TimeTelemetry& Telemetry() const noexcept { return m_telemetry; }
 
     [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
@@ -331,45 +252,36 @@ public:
     }
 
 private:
-    // VRR micro-jitter filter: smooths frame-to-frame fluctuations within +-20% while passing step changes immediately.
-    [[nodiscard]] constexpr u64 FilterVrrDeltaUnits(u64 clampedNs) noexcept {
-        if (m_smoothedDeltaNs == 0ULL) {
-            m_smoothedDeltaNs = clampedNs;
-            return clampedNs * kHarmonicHz;
+    [[nodiscard]] static constexpr f32 SanitizeScale(f32 scale) noexcept {
+        return (scale >= 0.0f) ? std::clamp(scale, 0.0f, kMaxTimeScale) : 0.0f;
+    }
+
+    [[nodiscard]] static constexpr u64 AbsDiff(u64 a, u64 b) noexcept {
+        return (a >= b) ? (a - b) : (b - a);
+    }
+
+    // Snaps standard VSync frame intervals within +-150us, or smooths VRR micro-jitter within +-20%.
+    [[nodiscard]] constexpr u64 ResolveFrameUnits(u64 clampedNs) noexcept {
+        const u64 units = clampedNs * kHarmonicHz;
+        const u64 nearestK = (units + (kNsPerSecond >> 1U)) / kNsPerSecond;
+        if (nearestK <= 48ULL && ((kValidHarmonicMask >> nearestK) & 1ULL) != 0ULL) {
+            const u64 targetUnits = nearestK * kNsPerSecond;
+            if (AbsDiff(units, targetUnits) <= kVsyncSnapMarginNs * kHarmonicHz) {
+                m_smoothedDeltaNs = targetUnits / kHarmonicHz;
+                return targetUnits;
+            }
         }
-        const u64 diff = (clampedNs >= m_smoothedDeltaNs)
-                             ? (clampedNs - m_smoothedDeltaNs)
-                             : (m_smoothedDeltaNs - clampedNs);
-        if (diff * 5ULL <= m_smoothedDeltaNs) {
+        if (m_smoothedDeltaNs != 0ULL && AbsDiff(clampedNs, m_smoothedDeltaNs) * 5ULL <= m_smoothedDeltaNs) {
             m_smoothedDeltaNs = (m_smoothedDeltaNs * 3ULL + clampedNs + 2ULL) >> 2U;
             return m_smoothedDeltaNs * kHarmonicHz;
         }
         m_smoothedDeltaNs = clampedNs;
-        return clampedNs * kHarmonicHz;
-    }
-
-    [[nodiscard]] constexpr f32 EvaluateChannelLocalScale(u8 idx) const noexcept {
-        const ChannelModSlot& s = m_slots[idx];
-        if (s.hitstopTicks > 0U) return 0.0f;
-        f32 rampScale = 1.0f;
-        if ((m_activeRampMask & (1U << idx)) != 0U) {
-            if (s.rampElapsedTicks < s.rampHoldTicks) {
-                rampScale = s.rampTargetScale;
-            } else if (s.rampBlendTicks > 0U) {
-                const u32 blendElapsed = static_cast<u32>(s.rampElapsedTicks - s.rampHoldTicks);
-                const f32 rawT = std::clamp(
-                    static_cast<f32>(blendElapsed) / static_cast<f32>(s.rampBlendTicks), 0.0f, 1.0f);
-                const f32 smoothT = rawT * rawT * (3.0f - 2.0f * rawT);
-                rampScale = s.rampTargetScale + (1.0f - s.rampTargetScale) * smoothT;
-            }
-        }
-        return s.baseScale * rampScale;
+        return units;
     }
 
     constexpr void BakeSingleChannel(u8 idx) noexcept {
         const u8 bit = static_cast<u8>(1U << idx);
-        const bool pausedGameplay = (m_paused && m_stepAllowanceTicks == 0U && idx <= 5U);
-        if (pausedGameplay) {
+        if (m_paused && m_stepAllowanceTicks == 0U && idx <= 5U) {
             m_frozenMask |= bit;
             m_bakedTick.effectiveScale[idx] = 0.0f;
             m_bakedTick.scaledDt[idx] = 0.0f;
@@ -377,69 +289,46 @@ private:
         }
 
         const f32 parentScale = (idx >= 1U && idx <= 5U) ? m_bakedTick.effectiveScale[0] : m_masterScale;
-        const f32 eff = std::clamp(parentScale * EvaluateChannelLocalScale(idx), 0.0f, kMaxTimeScale);
+        const f32 eff = std::clamp(
+            parentScale * m_slots[idx].EvaluateLocalScale((m_activeRampMask & bit) != 0U), 0.0f, kMaxTimeScale);
         m_bakedTick.effectiveScale[idx] = eff;
         m_bakedTick.scaledDt[idx] = eff * kFixedDtSec;
-        if (eff <= 1e-6f) {
-            m_frozenMask |= bit;
-        } else {
-            m_frozenMask &= static_cast<u8>(~bit);
-        }
+        if (eff <= 1e-6f) m_frozenMask |= bit;
+        else m_frozenMask &= static_cast<u8>(~bit);
     }
 
-    constexpr void RebakeAllChannels() noexcept {
-        for (u8 idx = 0; idx < kMaxTimeChannels; ++idx) {
-            BakeSingleChannel(idx);
+    // Rebakes dirty channels; if World (bit 0) is dirty, cascades to gameplay channels 0..5.
+    constexpr void RebakeChannels(u8 dirtyMask) noexcept {
+        if ((dirtyMask & 1U) != 0U) dirtyMask |= kGameplayChannelsMask;
+        for (u8 m = dirtyMask; m != 0U; m &= static_cast<u8>(m - 1U)) {
+            BakeSingleChannel(static_cast<u8>(std::countr_zero(m)));
         }
     }
 
     constexpr void AdvanceChannelModulationTick() noexcept {
-        u8 activeMask = static_cast<u8>(m_activeHitstopMask | m_activeRampMask);
+        const u8 activeMask = static_cast<u8>(m_activeHitstopMask | m_activeRampMask);
         if (activeMask == 0U) return;
 
-        bool worldChanged = false;
-        while (activeMask != 0U) {
-            const u8 idx = static_cast<u8>(std::countr_zero(activeMask));
-            activeMask &= static_cast<u8>(activeMask - 1U);
+        for (u8 m = activeMask; m != 0U; m &= static_cast<u8>(m - 1U)) {
+            const u8 idx = static_cast<u8>(std::countr_zero(m));
             const u8 bit = static_cast<u8>(1U << idx);
             ChannelModSlot& s = m_slots[idx];
 
             if (s.hitstopTicks > 0U) {
-                --s.hitstopTicks;
-                if (s.hitstopTicks == 0U) {
-                    m_activeHitstopMask &= static_cast<u8>(~bit);
-                }
+                if (--s.hitstopTicks == 0U) m_activeHitstopMask &= static_cast<u8>(~bit);
             } else if ((m_activeRampMask & bit) != 0U) {
-                ++s.rampElapsedTicks;
-                const u32 totalRamp = static_cast<u32>(s.rampHoldTicks) + static_cast<u32>(s.rampBlendTicks);
-                if (s.rampElapsedTicks >= totalRamp) {
-                    s.rampTargetScale = 1.0f;
-                    s.rampHoldTicks = 0U;
-                    s.rampBlendTicks = 0U;
-                    s.rampElapsedTicks = 0U;
+                if (++s.rampElapsedTicks >= static_cast<u32>(s.rampHoldTicks) + static_cast<u32>(s.rampBlendTicks)) {
+                    s.ClearEffects();
                     m_activeRampMask &= static_cast<u8>(~bit);
                 }
             }
-
-            if (idx == 0U) {
-                worldChanged = true;
-            } else if (!worldChanged) {
-                BakeSingleChannel(idx);
-            }
         }
-
-        if (worldChanged) {
-            RebakeAllChannels();
-        }
+        RebakeChannels(activeMask);
     }
 
-    // Cache Line 0 (offset 0..63): Baked per-channel dt and effective scale lookup table.
     BakedTickState m_bakedTick{};
-
-    // Cache Lines 1 & 2 (offset 64..191): 8 x 16B SIMD-aligned channel modulation slots.
     std::array<ChannelModSlot, kMaxTimeChannels> m_slots{};
 
-    // Cache Line 3 (offset 192..255): Rational accumulator, telemetry, VRR filter, and control flags (64B exact).
     u64 m_accUnits{0};
     u64 m_lastWallNs{0};
     TimeTelemetry m_telemetry{};
@@ -467,14 +356,14 @@ constexpr void SimStepView::RequestTimeRamp(TimeChannel ch, f32 targetScale, u32
     if (pipeline) pipeline->RequestTimeRamp(ch, targetScale, holdTicks, blendTicks);
 }
 
-// Adaptive hybrid SDL3-sleep + sub-millisecond spin-wait frame pacer packed into 32 bytes.
-// Tracks an EWMA of OS sleep overshoot (m_sleepMarginNs) to hit frame deadlines without 100% CPU burn.
-// Invariant: m_sleepMarginNs stays clamped within [kMinSpinMarginNs, kMaxSpinMarginNs].
+// Hybrid sleep and sub-millisecond spin-wait frame limiter.
+// Tracks an exponentially weighted moving average of OS sleep overshoot to meet frame deadlines.
+// Invariant: m_sleepMarginNs stays within [kMinSpinMarginNs, kMaxSpinMarginNs] (<= 0.3 ms).
 class alignas(8) FramePacer {
 public:
-    static constexpr u32 kMinSpinMarginNs = 250'000U;
-    static constexpr u32 kDefaultSpinMarginNs = 1'500'000U;
-    static constexpr u32 kMaxSpinMarginNs = 4'000'000U;
+    static constexpr u32 kMinSpinMarginNs = 50'000U;
+    static constexpr u32 kDefaultSpinMarginNs = 150'000U;
+    static constexpr u32 kMaxSpinMarginNs = 300'000U;
 
     constexpr explicit FramePacer(u32 targetFps = 120U) noexcept { SetTargetFps(targetFps); }
 

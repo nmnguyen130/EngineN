@@ -2,6 +2,7 @@
 
 #include "core/Types.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -11,14 +12,9 @@ namespace en {
 
 namespace detail {
 
-// Bounded 64-byte word zeroer preventing GCC VRP [-Wstringop-overflow] false positives at -O2.
+// Clears 64-byte aligned slabs in 8-byte words to avoid GCC VRP false-positive stringop warnings.
 inline void ZeroAlignedBlocks(u8* base, usize alignedByteCount) noexcept {
-    const usize safeBytes = alignedByteCount & 0x3FFFFFFFULL;
-    auto* words = reinterpret_cast<u64*>(base);
-    const usize wordCount = safeBytes >> 3U;
-    for (usize i = 0; i < wordCount; ++i) {
-        words[i] = 0ULL;
-    }
+    std::fill_n(reinterpret_cast<u64*>(base), (alignedByteCount & 0x3FFFFFFFULL) >> 3U, 0ULL);
 }
 
 template <typename T>
@@ -32,9 +28,9 @@ template <typename T>
 
 } // namespace detail
 
-// Single-slab 64-byte cache-line-aligned linear arena allocator packed into 16 bytes.
-// Move-only RAII owner; Init() zeroes the slab once and Reset()/RollbackToMarker() zero only rewound bytes.
-// Invariant: m_offset <= m_capacity <= kMaxArenaBytes, both are multiples of 64, and suffix [m_offset..m_capacity) is always zeroed.
+// Linear arena allocator backed by a single 64-byte-aligned memory slab.
+// Move-only owner of the underlying slab; Reset and RollbackToMarker zero rewound regions.
+// Invariant: m_offset <= m_capacity <= kMaxArenaBytes, both are multiples of 64, and [m_offset, m_capacity) is zeroed.
 class alignas(16) AlignedArena {
 public:
     static constexpr u32 kCacheLineBytes = 64U;
@@ -46,12 +42,9 @@ public:
     AlignedArena(const AlignedArena&) = delete;
     AlignedArena& operator=(const AlignedArena&) = delete;
 
-    constexpr AlignedArena(AlignedArena&& other) noexcept
-        : m_base(std::exchange(other.m_base, nullptr)),
-          m_capacity(std::exchange(other.m_capacity, 0U)),
-          m_offset(std::exchange(other.m_offset, 0U)) {}
+    constexpr AlignedArena(AlignedArena&& other) noexcept { *this = std::move(other); }
 
-    AlignedArena& operator=(AlignedArena&& other) noexcept {
+    constexpr AlignedArena& operator=(AlignedArena&& other) noexcept {
         if (this != &other) {
             Shutdown();
             m_base = std::exchange(other.m_base, nullptr);
@@ -63,12 +56,15 @@ public:
 
     [[nodiscard]] bool Init(usize capacityBytes) noexcept {
         Shutdown();
-        if (capacityBytes == 0U || capacityBytes > kMaxArenaBytes) return false;
+        if (capacityBytes == 0U || capacityBytes > kMaxArenaBytes) {
+            return false;
+        }
         const u32 alignedCap = static_cast<u32>(AlignUp(capacityBytes, kCacheLineBytes));
-        if (alignedCap == 0U || alignedCap > kMaxArenaBytes) return false;
         auto* raw = static_cast<u8*>(
             ::operator new(alignedCap, std::align_val_t{kCacheLineBytes}, std::nothrow));
-        if (!raw) return false;
+        if (!raw) {
+            return false;
+        }
         detail::ZeroAlignedBlocks(raw, alignedCap);
         m_base = raw;
         m_capacity = alignedCap;
@@ -76,7 +72,7 @@ public:
         return true;
     }
 
-    void Shutdown() noexcept {
+    constexpr void Shutdown() noexcept {
         if (m_base != nullptr) {
             ::operator delete(m_base, std::align_val_t{kCacheLineBytes});
             m_base = nullptr;
@@ -85,14 +81,16 @@ public:
         m_offset = 0U;
     }
 
-    void Reset() noexcept {
-        RollbackToMarker(0U);
-    }
+    void Reset() noexcept { RollbackToMarker(0U); }
 
     [[nodiscard]] u8* CarveRawBytes(usize rawBytes) noexcept {
-        if (rawBytes == 0U || m_base == nullptr || rawBytes > kMaxArenaBytes) return nullptr;
+        if (rawBytes == 0U || m_base == nullptr || rawBytes > kMaxArenaBytes) {
+            return nullptr;
+        }
         const u32 paddedBytes = static_cast<u32>(AlignUp(rawBytes, kCacheLineBytes));
-        if (paddedBytes > (m_capacity - m_offset)) return nullptr;
+        if (paddedBytes > (m_capacity - m_offset)) {
+            return nullptr;
+        }
         u8* slicePtr = m_base + m_offset;
         m_offset += paddedBytes;
         return slicePtr;
@@ -101,14 +99,19 @@ public:
     template <typename T>
     [[nodiscard]] std::span<T> Carve(usize count) noexcept {
         static_assert(alignof(T) <= kCacheLineBytes);
-        if (count == 0U || count > (kMaxArenaBytes / sizeof(T))) return {};
+        static_assert(std::is_trivially_destructible_v<T>, "AlignedArena::Carve requires trivially destructible types");
+        if (count == 0U || count > (kMaxArenaBytes / sizeof(T))) {
+            return {};
+        }
         u8* slicePtr = CarveRawBytes(sizeof(T) * count);
-        if (!slicePtr) return {};
+        if (!slicePtr) {
+            return {};
+        }
         T* typedPtr = reinterpret_cast<T*>(slicePtr);
         for (usize i = 0; i < count; ++i) {
             std::construct_at(typedPtr + i);
         }
-        return std::span<T>(typedPtr, count);
+        return {typedPtr, count};
     }
 
     [[nodiscard]] constexpr u32 SaveMarker() const noexcept { return m_offset; }
@@ -135,13 +138,15 @@ private:
 };
 static_assert(sizeof(AlignedArena) == 16);
 
-// RAII scope guard that rewinds an AlignedArena to its entry marker on scope exit.
+// Scope guard that rewinds an AlignedArena to its saved marker on destruction.
 // Non-owning stack guard; must not outlive the referenced AlignedArena.
-// Invariant: m_arena is restored to AlignUp(m_marker, 64) upon destruction.
+// Invariant: m_arena is rewound to AlignUp(m_marker, 64) when the scope exits.
 class alignas(8) ArenaTempScope {
 public:
     explicit ArenaTempScope(AlignedArena& arena) noexcept
-        : m_arena(arena), m_marker(arena.SaveMarker()) {}
+        : m_arena(arena),
+          m_marker(arena.SaveMarker()) {}
+
     ~ArenaTempScope() noexcept { m_arena.RollbackToMarker(m_marker); }
 
     ArenaTempScope(const ArenaTempScope&) = delete;
@@ -153,28 +158,24 @@ private:
 };
 static_assert(sizeof(ArenaTempScope) == 16);
 
-// Bounds-checked little-endian binary writer over a pre-allocated byte span.
-// Non-owning 24-byte cursor; never reallocates or writes past m_capacity.
-// Invariant: once m_ok becomes false, all subsequent writes fail without mutating the buffer.
+// Bounds-checked little-endian binary writer over a caller-supplied byte span.
+// Non-owning view; never reallocates or writes past m_capacity.
+// Invariant: once m_ok becomes false, subsequent writes fail without modifying the buffer.
 class alignas(8) BinaryWriter {
 public:
     constexpr explicit BinaryWriter(std::span<u8> buffer) noexcept
         : m_data(buffer.data()),
-          m_capacity(static_cast<u32>(buffer.size() > 0x7FFFFFFFU ? 0x7FFFFFFFU : buffer.size())) {}
+          m_capacity(static_cast<u32>(std::min<usize>(buffer.size(), 0x7FFFFFFFU))) {}
 
     template <typename T>
         requires std::is_trivially_copyable_v<T>
     bool Write(const T& value) noexcept {
-        if constexpr (std::is_integral_v<T> && sizeof(T) > 1U) {
-            const T leVal = detail::NormalizeLittleEndian(value);
-            return WriteBytes(std::span<const u8>(reinterpret_cast<const u8*>(&leVal), sizeof(T)));
-        } else {
-            return WriteBytes(std::span<const u8>(reinterpret_cast<const u8*>(&value), sizeof(T)));
-        }
+        const T leVal = detail::NormalizeLittleEndian(value);
+        return WriteBytes({reinterpret_cast<const u8*>(&leVal), sizeof(T)});
     }
 
     bool WriteBytes(std::span<const u8> bytes) noexcept {
-        if (!m_ok || bytes.size() > (m_capacity - m_offset)) {
+        if (!m_ok || bytes.size() > Remaining()) {
             m_ok = false;
             return false;
         }
@@ -186,17 +187,15 @@ public:
     }
 
     bool WriteString(std::string_view sv) noexcept {
-        if (!m_ok || sv.size() > 0xFFFFU || (2U + sv.size()) > (m_capacity - m_offset)) {
+        if (!m_ok || sv.size() > 0xFFFFU || (2U + sv.size()) > Remaining()) {
             m_ok = false;
             return false;
         }
         return Write(static_cast<u16>(sv.size())) &&
-               WriteBytes(std::span<const u8>(reinterpret_cast<const u8*>(sv.data()), sv.size()));
+               WriteBytes({reinterpret_cast<const u8*>(sv.data()), sv.size()});
     }
 
-    [[nodiscard]] constexpr std::span<const u8> WrittenSpan() const noexcept {
-        return {m_data, m_offset};
-    }
+    [[nodiscard]] constexpr std::span<const u8> WrittenSpan() const noexcept { return {m_data, m_offset}; }
     [[nodiscard]] constexpr u32 Offset() const noexcept { return m_offset; }
     [[nodiscard]] constexpr u32 Remaining() const noexcept { return m_capacity - m_offset; }
     [[nodiscard]] constexpr bool Ok() const noexcept { return m_ok; }
@@ -210,34 +209,30 @@ private:
 static_assert(sizeof(BinaryWriter) == 24);
 
 // Bounds-checked little-endian binary reader over a read-only byte span.
-// Non-owning 24-byte cursor; never reads past m_size.
-// Invariant: once m_ok becomes false, all subsequent reads fail and leave out-parameters untouched.
+// Non-owning view; never reads past m_size.
+// Invariant: once m_ok becomes false, subsequent reads fail and leave output arguments unchanged.
 class alignas(8) BinaryReader {
 public:
     constexpr explicit BinaryReader(std::span<const u8> buffer) noexcept
         : m_data(buffer.data()),
-          m_size(static_cast<u32>(buffer.size() > 0x7FFFFFFFU ? 0x7FFFFFFFU : buffer.size())) {}
+          m_size(static_cast<u32>(std::min<usize>(buffer.size(), 0x7FFFFFFFU))) {}
 
     template <typename T>
         requires std::is_trivially_copyable_v<T>
     [[nodiscard]] bool Read(T& outValue) noexcept {
-        if (!m_ok || sizeof(T) > (m_size - m_offset)) {
+        if (!m_ok || sizeof(T) > Remaining()) {
             m_ok = false;
             return false;
         }
         T tmp{};
         std::memcpy(&tmp, m_data + m_offset, sizeof(T));
         m_offset += static_cast<u32>(sizeof(T));
-        if constexpr (std::is_integral_v<T> && sizeof(T) > 1U) {
-            outValue = detail::NormalizeLittleEndian(tmp);
-        } else {
-            outValue = tmp;
-        }
+        outValue = detail::NormalizeLittleEndian(tmp);
         return true;
     }
 
     [[nodiscard]] bool ReadBytes(std::span<u8> outBytes) noexcept {
-        if (!m_ok || outBytes.size() > (m_size - m_offset)) {
+        if (!m_ok || outBytes.size() > Remaining()) {
             m_ok = false;
             return false;
         }
@@ -249,7 +244,7 @@ public:
     }
 
     [[nodiscard]] constexpr bool Skip(u32 byteCount) noexcept {
-        if (!m_ok || byteCount > (m_size - m_offset)) {
+        if (!m_ok || byteCount > Remaining()) {
             m_ok = false;
             return false;
         }
@@ -260,12 +255,12 @@ public:
     [[nodiscard]] bool ReadStringView(std::string_view& outSv) noexcept {
         const u32 savedOffset = m_offset;
         u16 len = 0;
-        if (!Read(len) || len > (m_size - m_offset)) {
+        if (!Read(len) || len > Remaining()) {
             m_offset = savedOffset;
             m_ok = false;
             return false;
         }
-        outSv = std::string_view(reinterpret_cast<const char*>(m_data + m_offset), len);
+        outSv = {reinterpret_cast<const char*>(m_data + m_offset), len};
         m_offset += len;
         return true;
     }

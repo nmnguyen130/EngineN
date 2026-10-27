@@ -4,9 +4,7 @@
 
 namespace en {
 
-// 16-byte (4 per 64B cache line, zero padding) 1-hop read-only World/Physics/Gameplay/Audio introspector, picker, and flight recorder.
-// Non-owning view over a 64-slot ActorTickRecord ring buffer; zero heap allocations and zero mutation of inspected subsystems.
-// Invariant: sizeof(DebugInspector) == 16, m_scrubOffset < kActorFlightHistoryTicks, and all component reads use 1-hop DirectAtEntityIndex.
+// Read-only World/Physics/Gameplay/Audio introspector, picker, and flight recorder.
 class alignas(16) DebugInspector {
 public:
     constexpr void Init(std::span<ActorTickRecord, kActorFlightHistoryTicks> historyStorage) noexcept {
@@ -76,14 +74,12 @@ public:
         DebugBatcher& worldBatcher,
         DebugBatcher& hudBatcher) const noexcept;
 
-    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
-
 private:
-    ActorTickRecord* m_history{nullptr};    // 8B
-    EntityId m_pinnedEntity{kNullEntity};   // 4B
-    u16 m_writeIdx{0U};                     // 2B
-    u8 m_validCount{0U};                    // 1B
-    u8 m_scrubOffset{0U};                   // 1B
+    ActorTickRecord* m_history{nullptr};
+    EntityId m_pinnedEntity{kNullEntity};
+    u16 m_writeIdx{0U};
+    u8 m_validCount{0U};
+    u8 m_scrubOffset{0U};
 };
 static_assert(sizeof(DebugInspector) == 16);
 

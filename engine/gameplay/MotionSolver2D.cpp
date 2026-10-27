@@ -21,15 +21,17 @@ void MotionSolver2D::SyncPostPhysicsContactsAndTimers(
 
     for (usize i = 0U; i < entities.size(); ++i) {
         const EntityId id = entities[i];
-        const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(id.index));
-        if (step.IsFrozen(ch)) continue;
+        if (step.IsFrozen(static_cast<TimeChannel>(world.GetTimeChannelByIndex(id.index)))) {
+            continue;
+        }
         const u64 entMask = world.GetComponentMaskByIndex(id.index);
-        if ((entMask & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) continue;
+        if ((entMask & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) {
+            continue;
+        }
 
         MotionStack2D& stack = stacks[i];
         CharacterMotor2D& motor = motorPool.DirectAtEntityIndex(id.index);
 
-        // 1. Update one-way platform drop-through timer and sync BodyFlags2D::IgnoreOneWay on motor
         if (stack.oneWayDropTicks > 0U) {
             --stack.oneWayDropTicks;
             motor.flags |= BodyFlags2D::IgnoreOneWay;
@@ -37,24 +39,21 @@ void MotionSolver2D::SyncPostPhysicsContactsAndTimers(
             motor.flags &= ~BodyFlags2D::IgnoreOneWay;
         }
 
-        // 2. Clamp walk/knockback horizontal speed if blocked by a solid wall
-        if (HasPhysicsFlag(motor.contacts, ContactFlags::WallLeft)) {
-            if (stack.currentWalkVx < 0.0f) stack.currentWalkVx = 0.0f;
-            if (stack.impulseVx < 0.0f)     stack.impulseVx = 0.0f;
+        const i8 wallSign = HasFlag(motor.contacts, ContactFlags::WallLeft)
+            ? static_cast<i8>(-1)
+            : (HasFlag(motor.contacts, ContactFlags::WallRight) ? static_cast<i8>(1) : static_cast<i8>(0));
+        if (wallSign != 0) {
+            const f32 fSign = static_cast<f32>(wallSign);
+            if (stack.currentWalkVx * fSign > 0.0f) stack.currentWalkVx = 0.0f;
+            if (stack.impulseVx * fSign > 0.0f)     stack.impulseVx = 0.0f;
             stack.wallCoyoteTicks = defaultCoyoteTicks;
-            stack.wallContactSign = -1;
-        } else if (HasPhysicsFlag(motor.contacts, ContactFlags::WallRight)) {
-            if (stack.currentWalkVx > 0.0f) stack.currentWalkVx = 0.0f;
-            if (stack.impulseVx > 0.0f)     stack.impulseVx = 0.0f;
-            stack.wallCoyoteTicks = defaultCoyoteTicks;
-            stack.wallContactSign = 1;
+            stack.wallContactSign = wallSign;
         } else if (stack.wallCoyoteTicks > 0U) {
             --stack.wallCoyoteTicks;
         } else {
             stack.wallContactSign = 0;
         }
 
-        // 3. Refresh or decrement ground coyote grace timer
         if (motor.IsGrounded()) {
             stack.groundCoyoteTicks = defaultCoyoteTicks;
             stack.flags &= ~(MotionFlags::AirborneDash | MotionFlags::JumpCutApplied);
@@ -62,9 +61,8 @@ void MotionSolver2D::SyncPostPhysicsContactsAndTimers(
             --stack.groundCoyoteTicks;
         }
 
-        // 4. Verify 3-ray safe ground anchor when standing on stable non-one-way static ground
         if (hasAnchors && motor.IsGrounded() &&
-            !HasPhysicsFlag(motor.contacts, ContactFlags::OnOneWay | ContactFlags::OnSlope) &&
+            !HasFlag(motor.contacts, ContactFlags::OnOneWay) &&
             !motor.carrierId.IsValid() &&
             (entMask & (1ULL << SafeAnchor2D::kTypeId)) != 0ULL) {
             const WorldTransform2D& xf = world.GetWorldByIndex(id.index);
@@ -72,17 +70,18 @@ void MotionSolver2D::SyncPostPhysicsContactsAndTimers(
             const f32 halfH = motor.bounds.HalfH() * std::abs(xf.scaleY);
             const f32 cx = xf.x + motor.bounds.OffsetX() * xf.scaleX;
             const f32 bottomY = (xf.y + motor.bounds.OffsetY() * xf.scaleY) - halfH + 0.05f;
-            const f32 probeDist = 0.20f;
+            constexpr f32 kProbeDist = 0.25f;
 
-            const RayHit2D rLeft   = physics.Raycast(cx - halfW * 0.8f, bottomY, 0.0f, -1.0f, probeDist, motor.solidMask, id);
-            const RayHit2D rCenter = physics.Raycast(cx,                bottomY, 0.0f, -1.0f, probeDist, motor.solidMask, id);
-            const RayHit2D rRight  = physics.Raycast(cx + halfW * 0.8f, bottomY, 0.0f, -1.0f, probeDist, motor.solidMask, id);
-
-            if (rLeft.Hit() && rCenter.Hit() && rRight.Hit() &&
-                !rLeft.hitEntity.IsValid() && !rCenter.hitEntity.IsValid() && !rRight.hitEntity.IsValid()) {
+            if (physics.Raycast(cx - halfW * 0.8f, bottomY, 0.0f, -1.0f, kProbeDist, motor.solidMask, id, false).Hit() &&
+                physics.Raycast(cx,                bottomY, 0.0f, -1.0f, kProbeDist, motor.solidMask, id, false).Hit() &&
+                physics.Raycast(cx + halfW * 0.8f, bottomY, 0.0f, -1.0f, kProbeDist, motor.solidMask, id, false).Hit()) {
                 SafeAnchor2D& anchor = world.GetPool<SafeAnchor2D>().DirectAtEntityIndex(id.index);
-                anchor.prevSafeX = anchor.safeX;
-                anchor.prevSafeY = anchor.safeY;
+                const f32 dx = xf.x - anchor.safeX;
+                const f32 dy = xf.y - anchor.safeY;
+                if (dx * dx + dy * dy >= 0.0625f) {
+                    anchor.prevSafeX = anchor.safeX;
+                    anchor.prevSafeY = anchor.safeY;
+                }
                 anchor.safeX = xf.x;
                 anchor.safeY = xf.y;
             }
@@ -109,19 +108,29 @@ void MotionSolver2D::BlendMotionStacksIntoMotors(
     for (usize i = 0U; i < entities.size(); ++i) {
         const EntityId id = entities[i];
         const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(id.index));
-        if (step.IsFrozen(ch)) continue;
+        if (step.IsFrozen(ch)) {
+            continue;
+        }
         const f32 dt = step.Dt(ch);
-        if (dt <= 0.0f) continue;
+        if (dt <= 0.0f) {
+            continue;
+        }
 
         const u64 entMask = world.GetComponentMaskByIndex(id.index);
-        if ((entMask & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) continue;
+        if ((entMask & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) {
+            continue;
+        }
 
+        MotionStack2D& stack = stacks[i];
         CharacterMotor2D& motor = motorPool.DirectAtEntityIndex(id.index);
 
-        // Freeze motor motion while entity is in per-entity combat hitstop
         if (hasFsm && (entMask & (1ULL << StateMachine2D::kTypeId)) != 0ULL) {
             const StateMachine2D& fsm = world.GetPool<StateMachine2D>().DirectAtEntityIndex(id.index);
             if (fsm.hitstopTicks > 0U) {
+                // Cache pre-hitstop vertical velocity in pendingLaunchVy so jump arcs resume after hitstop ends.
+                if (motor.vy != 0.0f && stack.pendingLaunchVy == 0.0f) {
+                    stack.pendingLaunchVy = motor.vy;
+                }
                 motor.vx = 0.0f;
                 motor.vy = 0.0f;
                 motor.flags &= ~BodyFlags2D::UseGravity;
@@ -130,31 +139,25 @@ void MotionSolver2D::BlendMotionStacksIntoMotors(
             motor.flags |= BodyFlags2D::UseGravity;
         }
 
-        MotionStack2D& stack = stacks[i];
         const f32 invDt = 1.0f / dt;
-
-        // 1. Consume animation root-motion displacement into an instantaneous frame velocity
         const f32 rootVx = stack.RootMotionDx() * invDt;
         const f32 rootVy = stack.RootMotionDy() * invDt;
         stack.rootMotionDx_q8 = 0;
         stack.rootMotionDy_q8 = 0;
 
-        // 2. Consume one-shot vertical launch (jump or vertical knockback) cleanly without multi-tick accumulation
         if (stack.pendingLaunchVy != 0.0f) {
             motor.vy = stack.pendingLaunchVy;
             stack.pendingLaunchVy = 0.0f;
         }
 
-        // 3. Variable jump height: apply early-release upward velocity cut once when JumpHeld is cleared while ascending
         if (!motor.IsGrounded() && motor.vy > 0.0f &&
-            !HasPhysicsFlag(stack.flags, MotionFlags::JumpHeld) &&
-            !HasPhysicsFlag(stack.flags, MotionFlags::JumpCutApplied) &&
+            !HasFlag(stack.flags, MotionFlags::JumpHeld) &&
+            !HasFlag(stack.flags, MotionFlags::JumpCutApplied) &&
             stack.overrideTicks == 0U) {
             motor.vy *= cfg.jumpCutMultiplier;
             stack.flags |= MotionFlags::JumpCutApplied;
         }
 
-        // 4. Priority velocity override (dash / air-stall / lunge) vs accelerated walk locomotion
         if (stack.overrideTicks > 0U) {
             --stack.overrideTicks;
             motor.vx = stack.OverrideVx() + rootVx + stack.impulseVx;
@@ -163,20 +166,18 @@ void MotionSolver2D::BlendMotionStacksIntoMotors(
                 stack.activePriority = 0U;
             }
         } else {
-            const f32 accel = motor.IsGrounded() ? cfg.groundAccel : cfg.airAccel;
-            const f32 maxStep = accel * dt;
-            const f32 diff = stack.targetWalkVx - stack.currentWalkVx;
-            stack.currentWalkVx += std::clamp(diff, -maxStep, maxStep);
+            const f32 maxStep = (motor.IsGrounded() ? cfg.groundAccel : cfg.airAccel) * dt;
+            stack.currentWalkVx += std::clamp(stack.targetWalkVx - stack.currentWalkVx, -maxStep, maxStep);
             motor.vx = stack.currentWalkVx + rootVx + stack.impulseVx;
             if (rootVy != 0.0f) {
                 motor.vy = rootVy;
             }
         }
 
-        // 5. Exponentially decay horizontal knockback impulse
-        const f32 decay = 1.0f / (1.0f + dt * cfg.knockbackDecayRate);
-        stack.impulseVx *= decay;
-        if (std::abs(stack.impulseVx) < 0.02f) stack.impulseVx = 0.0f;
+        stack.impulseVx *= 1.0f / (1.0f + dt * cfg.knockbackDecayRate);
+        if (std::abs(stack.impulseVx) < 0.02f) {
+            stack.impulseVx = 0.0f;
+        }
     }
 }
 
@@ -192,18 +193,27 @@ void MotionSolver2D::ResolveSoftCharacterPushboxes(
     }
 
     auto& motionPool = world.GetPool<MotionStack2D>();
-    if (motionPool.Size() < 2U) return;
+    if (motionPool.Size() < 2U) {
+        return;
+    }
     auto& motorPool = world.GetPool<CharacterMotor2D>();
     const auto entities = motionPool.Entities();
     const auto stacks = motionPool.Components();
+    const f32 dt = step.Dt(TimeChannel::World);
+    bool anyPushed = false;
 
     for (usize i = 0U; i < entities.size(); ++i) {
         const EntityId idA = entities[i];
         const MotionStack2D& sA = stacks[i];
-        if (sA.pushboxGroup == 0U) continue;
-        if ((world.GetComponentMaskByIndex(idA.index) & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) continue;
+        if (sA.pushboxGroup == 0U ||
+            step.IsFrozen(static_cast<TimeChannel>(world.GetTimeChannelByIndex(idA.index))) ||
+            (world.GetComponentMaskByIndex(idA.index) & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) {
+            continue;
+        }
         const CharacterMotor2D& mA = motorPool.DirectAtEntityIndex(idA.index);
-        if (!HasPhysicsFlag(mA.flags, BodyFlags2D::Enabled)) continue;
+        if (!HasFlag(mA.flags, BodyFlags2D::Enabled)) {
+            continue;
+        }
 
         const WorldTransform2D& xfA = world.GetWorldByIndex(idA.index);
         const f32 cAX = xfA.x + mA.bounds.OffsetX() * xfA.scaleX;
@@ -214,10 +224,15 @@ void MotionSolver2D::ResolveSoftCharacterPushboxes(
         for (usize j = i + 1U; j < entities.size(); ++j) {
             const EntityId idB = entities[j];
             const MotionStack2D& sB = stacks[j];
-            if (sB.pushboxGroup != sA.pushboxGroup) continue;
-            if ((world.GetComponentMaskByIndex(idB.index) & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) continue;
+            if (sB.pushboxGroup != sA.pushboxGroup ||
+                step.IsFrozen(static_cast<TimeChannel>(world.GetTimeChannelByIndex(idB.index))) ||
+                (world.GetComponentMaskByIndex(idB.index) & (1ULL << CharacterMotor2D::kTypeId)) == 0ULL) {
+                continue;
+            }
             const CharacterMotor2D& mB = motorPool.DirectAtEntityIndex(idB.index);
-            if (!HasPhysicsFlag(mB.flags, BodyFlags2D::Enabled)) continue;
+            if (!HasFlag(mB.flags, BodyFlags2D::Enabled)) {
+                continue;
+            }
 
             const WorldTransform2D& xfB = world.GetWorldByIndex(idB.index);
             const f32 cBX = xfB.x + mB.bounds.OffsetX() * xfB.scaleX;
@@ -227,20 +242,28 @@ void MotionSolver2D::ResolveSoftCharacterPushboxes(
 
             const f32 overlapX = (hAW + hBW) - std::abs(cBX - cAX);
             const f32 overlapY = (hAH + hBH) - std::abs(cBY - cAY);
-            if (overlapX <= 0.0f || overlapY <= 0.0f) continue;
+            if (overlapX <= 0.0f || overlapY <= 0.0f) {
+                continue;
+            }
 
-            const f32 dt = step.Dt(TimeChannel::World);
-            const f32 dir = (cBX >= cAX) ? 1.0f : -1.0f;
+            const f32 dir = (std::abs(cBX - cAX) > 1e-5f)
+                ? ((cBX > cAX) ? 1.0f : -1.0f)
+                : ((idB.index > idA.index) ? 1.0f : -1.0f);
             const f32 push = std::min(overlapX * 0.5f, cfg.pushboxSeparationSpeed * dt);
 
-            const SweepHit2D hitA = physics.SweepAabb(idA, cAX, cAY, hAW, hAH, -dir * push, 0.0f, mA.solidMask, true);
-            const SweepHit2D hitB = physics.SweepAabb(idB, cBX, cBY, hBW, hBH,  dir * push, 0.0f, mB.solidMask, true);
-
-            if (!hitA.Hit()) world.ModifyLocalTransformByIndex(idA.index).x -= dir * push;
-            if (!hitB.Hit()) world.ModifyLocalTransformByIndex(idB.index).x += dir * push;
+            if (!physics.SweepAabb(idA, cAX, cAY, hAW, hAH, -dir * push, 0.0f, mA.solidMask, true).Hit()) {
+                world.ModifyLocalTransformByIndex(idA.index).x -= dir * push;
+                anyPushed = true;
+            }
+            if (!physics.SweepAabb(idB, cBX, cBY, hBW, hBH,  dir * push, 0.0f, mB.solidMask, true).Hit()) {
+                world.ModifyLocalTransformByIndex(idB.index).x += dir * push;
+                anyPushed = true;
+            }
         }
     }
-    world.PropagateTransforms();
+    if (anyPushed) {
+        world.PropagateTransforms();
+    }
 }
 
 } // namespace en

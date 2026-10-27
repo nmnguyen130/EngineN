@@ -5,8 +5,8 @@
 
 namespace en {
 
-// 4-byte generational entity identifier preventing ABA use-after-free bugs in the ECS slot table.
-// Value type; generation == 0 represents the invalid sentinel kNullEntity.
+// Generational entity identifier for the ECS slot table.
+// Value type; generation == 0 represents kNullEntity.
 // Invariant: IsValid() holds iff index != 0 and generation != 0.
 struct alignas(4) EntityId {
     u16 index{0};
@@ -19,7 +19,7 @@ struct alignas(4) EntityId {
     }
 
     [[nodiscard]] static constexpr EntityId FromPacked(u32 packed) noexcept {
-        return EntityId{static_cast<u16>(packed & 0xFFFFU), static_cast<u16>(packed >> 16U)};
+        return {static_cast<u16>(packed & 0xFFFFU), static_cast<u16>(packed >> 16U)};
     }
 
     [[nodiscard]] constexpr auto operator<=>(const EntityId&) const noexcept = default;
@@ -36,9 +36,8 @@ concept Component = std::is_trivially_copyable_v<T> &&
                     std::is_trivially_destructible_v<T> &&
                     std::is_standard_layout_v<T> &&
                     alignof(T) <= 64U &&
-                    requires {
-                        { T::kTypeId } -> std::convertible_to<u8>;
-                    } && (static_cast<u8>(T::kTypeId) < kMaxComponentTypes);
+                    requires { { T::kTypeId } -> std::convertible_to<u8>; } &&
+                    (static_cast<u8>(T::kTypeId) < kMaxComponentTypes);
 
 template <Component... Ts>
 [[nodiscard]] consteval u64 MakeComponentMask() noexcept {
@@ -62,16 +61,14 @@ enum class WorldErrc : u8 {
     CorruptedPrefab,
 };
 
-// 12-byte configuration descriptor for World initialization.
 struct alignas(4) WorldConfig {
     u16 maxEntities{4096};
-    u16 defaultPoolCapacity{2048};
+    u16 defaultPoolCapacity{4096};
     u32 commandBufferBytes{131072};
     u32 arenaBytes{4U * 1024U * 1024U};
 };
 static_assert(sizeof(WorldConfig) == 12);
 
-// 24-byte local 2D transform relative to parent (or world origin if unparented).
 struct alignas(4) LocalTransform2D {
     static constexpr u8 kTypeId = 0;
     f32 x{0.0f};
@@ -83,7 +80,6 @@ struct alignas(4) LocalTransform2D {
 };
 static_assert(sizeof(LocalTransform2D) == 24);
 
-// 24-byte previous-tick world transform snapshot used for render interpolation.
 struct alignas(4) PrevWorldSnapshot2D {
     f32 x{0.0f};
     f32 y{0.0f};
@@ -94,7 +90,7 @@ struct alignas(4) PrevWorldSnapshot2D {
 };
 static_assert(sizeof(PrevWorldSnapshot2D) == 24);
 
-// 32-byte (2 per 64B cache line, zero padding) resolved world-space 2D transform with precomputed sin/cos.
+// Resolved world-space 2D transform with precomputed rotation sine and cosine.
 struct alignas(32) WorldTransform2D {
     f32 x{0.0f};
     f32 y{0.0f};
@@ -109,19 +105,19 @@ struct alignas(32) WorldTransform2D {
         return {x, y, scaleX, scaleY, worldRotRad, worldDepth};
     }
 
+    [[nodiscard]] constexpr LocalTransform2D ToLocal() const noexcept {
+        return {x, y, scaleX, scaleY, worldRotRad, worldDepth};
+    }
+
     [[nodiscard]] constexpr Vec2 TransformPoint(Vec2 localPt) const noexcept {
         const f32 sx = localPt.x * scaleX;
         const f32 sy = localPt.y * scaleY;
-        return {
-            x + (sx * cosRot - sy * sinRot),
-            y + (sx * sinRot + sy * cosRot),
-        };
+        return {x + (sx * cosRot - sy * sinRot), y + (sx * sinRot + sy * cosRot)};
     }
 };
 static_assert(sizeof(WorldTransform2D) == 32);
 
-// 32-byte spawn descriptor for World::Spawn and World::DeferSpawn.
-// When keepWorldTransform is true and parent is valid, local is interpreted in world space and converted relative to parent.
+// Spawn parameters for World::Spawn; when keepWorldTransform is true, local is interpreted in world space.
 struct alignas(4) EntitySpawnDesc {
     LocalTransform2D local{};
     EntityId parent{kNullEntity};
@@ -131,7 +127,6 @@ struct alignas(4) EntitySpawnDesc {
 };
 static_assert(sizeof(EntitySpawnDesc) == 32);
 
-// 16-byte ambient linear/angular velocity component for non-colliding props and particles.
 struct alignas(16) Velocity2D {
     static constexpr u8 kTypeId = 1;
     f32 vx{0.0f};
@@ -141,8 +136,7 @@ struct alignas(16) Velocity2D {
 };
 static_assert(sizeof(Velocity2D) == 16);
 
-// 32-byte (2 per 64B cache line, zero padding) 2D sprite component.
-// Bits in flags: [0]=visible, [1]=flipX, [2]=flipY, [3]=ySort, [4..5]=BlendMode, [6..7]=viewSlot.
+// 2D sprite component; flags pack [0]=visible, [1]=flipX, [2]=flipY, [3]=ySort, [4..5]=BlendMode, [6..7]=viewSlot.
 struct alignas(32) Sprite2D {
     static constexpr u8 kTypeId = 2;
     Color tint{1.0f, 1.0f, 1.0f, 1.0f};
@@ -162,18 +156,10 @@ struct alignas(32) Sprite2D {
     }
     [[nodiscard]] constexpr u8 ViewSlot() const noexcept { return static_cast<u8>((flags >> 6U) & 0x03U); }
 
-    constexpr void SetVisible(bool v) noexcept {
-        flags = v ? static_cast<u8>(flags | 0x01U) : static_cast<u8>(flags & ~0x01U);
-    }
-    constexpr void SetFlipX(bool f) noexcept {
-        flags = f ? static_cast<u8>(flags | 0x02U) : static_cast<u8>(flags & ~0x02U);
-    }
-    constexpr void SetFlipY(bool f) noexcept {
-        flags = f ? static_cast<u8>(flags | 0x04U) : static_cast<u8>(flags & ~0x04U);
-    }
-    constexpr void SetYSort(bool y) noexcept {
-        flags = y ? static_cast<u8>(flags | 0x08U) : static_cast<u8>(flags & ~0x08U);
-    }
+    constexpr void SetVisible(bool v) noexcept { flags = static_cast<u8>((flags & ~0x01U) | u8(v)); }
+    constexpr void SetFlipX(bool f) noexcept { flags = static_cast<u8>((flags & ~0x02U) | (u8(f) << 1U)); }
+    constexpr void SetFlipY(bool f) noexcept { flags = static_cast<u8>((flags & ~0x04U) | (u8(f) << 2U)); }
+    constexpr void SetYSort(bool y) noexcept { flags = static_cast<u8>((flags & ~0x08U) | (u8(y) << 3U)); }
     constexpr void SetBlend(BlendMode b) noexcept {
         flags = static_cast<u8>((flags & ~0x30U) | ((static_cast<u8>(b) & 0x03U) << 4U));
     }
@@ -183,7 +169,6 @@ struct alignas(32) Sprite2D {
 };
 static_assert(sizeof(Sprite2D) == 32);
 
-// 16-byte (4 per 64B cache line, zero padding) sprite frame-strip animator component.
 struct alignas(16) SpriteAnimator2D {
     static constexpr u8 kTypeId = 3;
     AtlasHandle atlas{};
@@ -197,7 +182,6 @@ struct alignas(16) SpriteAnimator2D {
 };
 static_assert(sizeof(SpriteAnimator2D) == 16);
 
-// 32-byte (2 per 64B cache line, zero padding) 2D camera rig component.
 struct alignas(32) CameraRig2D {
     static constexpr u8 kTypeId = 4;
     Rect viewport{0.0f, 0.0f, 1.0f, 1.0f};
@@ -211,7 +195,6 @@ struct alignas(32) CameraRig2D {
 };
 static_assert(sizeof(CameraRig2D) == 32);
 
-// 16-byte (4 per 64B cache line, zero padding) entity lifetime and alpha fade component.
 struct alignas(16) Lifetime2D {
     static constexpr u8 kTypeId = 5;
     u32 remainingTicks{60};
@@ -223,7 +206,6 @@ struct alignas(16) Lifetime2D {
 };
 static_assert(sizeof(Lifetime2D) == 16);
 
-// 32-byte (2 per 64B cache line, zero padding) 2D point light component.
 struct alignas(32) PointLight2D {
     static constexpr u8 kTypeId = 6;
     Color color{1.0f, 0.9f, 0.7f, 1.0f};
@@ -234,7 +216,6 @@ struct alignas(32) PointLight2D {
 };
 static_assert(sizeof(PointLight2D) == 32);
 
-// 16-byte (4 per 64B cache line, zero padding) symbolic tag and category filter component.
 struct alignas(16) Tag2D {
     static constexpr u8 kTypeId = 7;
     StringId name{};
@@ -244,8 +225,8 @@ struct alignas(16) Tag2D {
 static_assert(sizeof(Tag2D) == 16);
 
 inline constexpr u32 kCookedPrefabMagic = 0x42465045U; // 'EPFB'
+inline constexpr u32 kWorldSnapshotMagic = 0x504E5357U; // 'WSNP'
 
-// 16-byte binary header for cooked .epfb prefab blobs.
 struct alignas(16) CookedPrefabHeader {
     u32 magic{kCookedPrefabMagic};
     u16 version{1};
@@ -255,7 +236,6 @@ struct alignas(16) CookedPrefabHeader {
 };
 static_assert(sizeof(CookedPrefabHeader) == 16);
 
-// 32-byte (2 per 64B cache line, zero padding) cooked entity record inside a prefab blob.
 struct alignas(8) CookedPrefabEntityRecord {
     LocalTransform2D local{};
     i16 parentEntityIndex{-1};
@@ -264,5 +244,14 @@ struct alignas(8) CookedPrefabEntityRecord {
     u32 entityFlags{0};
 };
 static_assert(sizeof(CookedPrefabEntityRecord) == 32);
+
+struct alignas(16) WorldSnapshotHeader {
+    u32 magic{kWorldSnapshotMagic};
+    u16 version{1};
+    u16 entityCount{0};
+    u32 tickCount{0};
+    u32 payloadCrc32{0};
+};
+static_assert(sizeof(WorldSnapshotHeader) == 16);
 
 } // namespace en

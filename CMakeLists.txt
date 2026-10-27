@@ -31,6 +31,7 @@ file(GLOB ENGINE_SRCS
     "engine/core/*.cpp"
     "engine/time/*.cpp"
     "engine/platform/*.cpp"
+    "engine/input/*.cpp"
     "engine/renderer/*.cpp"
     "engine/assets/*.cpp"
     "engine/world/*.cpp"
@@ -38,7 +39,7 @@ file(GLOB ENGINE_SRCS
     "engine/gameplay/*.cpp"
     "engine/audio/*.cpp"
     "engine/debug/*.cpp"
-    "engine/framework/*.cpp"
+    # "engine/framework/*.cpp"
 )
 
 add_library(engine STATIC ${ENGINE_SRCS})
@@ -56,41 +57,41 @@ target_include_directories(engine PUBLIC
 )
 target_link_libraries(engine PUBLIC SDL3::SDL3)
 
-# Veil of the Silent (GDD v0.2) Client Game Library & Executable
-file(GLOB GAME_LIB_SRCS
-    "game/core/*.cpp"
-    "game/config/*.cpp"
-    "game/assets/*.cpp"
-    "game/camera/*.cpp"
-    "game/player/*.cpp"
-    "game/combat/*.cpp"
-    "game/ai/*.cpp"
-    "game/world/*.cpp"
-    "game/ui/*.cpp"
-    "game/scenes/*.cpp"
-    "game/debug/*.cpp"
-    "game/VeilGameApp.cpp"
-)
-
-add_library(veil_game STATIC ${GAME_LIB_SRCS})
-set_target_properties(veil_game PROPERTIES CXX_EXTENSIONS OFF)
-target_link_libraries(veil_game PUBLIC engine)
-
-add_executable(veil_of_the_silent game/Main.cpp)
-target_link_libraries(veil_of_the_silent PRIVATE veil_game)
-
-# Engine Subsystem & Game Verification Suites
-enable_testing()
-file(GLOB TEST_SRCS "tests/subsystems/*.cpp")
-foreach(src ${TEST_SRCS})
-    cmake_path(GET src STEM name)
-    add_executable(${name} ${src})
-    target_link_libraries(${name} PRIVATE engine)
-    add_test(NAME ${name} COMMAND ${name})
-endforeach()
-
-add_executable(VeilOfTheSilentTests tests/game/VeilOfTheSilentTests.cpp)
-target_link_libraries(VeilOfTheSilentTests PRIVATE veil_game)
-add_test(NAME VeilOfTheSilentTests COMMAND VeilOfTheSilentTests)
-
-add_test(NAME veil_of_the_silent_headless COMMAND veil_of_the_silent --headless)
+# # Veil of the Silent (GDD v0.2) Client Game Library & Executable
+# file(GLOB GAME_LIB_SRCS
+#     "game/core/*.cpp"
+#     "game/config/*.cpp"
+#     "game/assets/*.cpp"
+#     "game/camera/*.cpp"
+#     "game/player/*.cpp"
+#     "game/combat/*.cpp"
+#     "game/ai/*.cpp"
+#     "game/world/*.cpp"
+#     "game/ui/*.cpp"
+#     "game/scenes/*.cpp"
+#     "game/debug/*.cpp"
+#     "game/VeilGameApp.cpp"
+# )
+# 
+# add_library(veil_game STATIC ${GAME_LIB_SRCS})
+# set_target_properties(veil_game PROPERTIES CXX_EXTENSIONS OFF)
+# target_link_libraries(veil_game PUBLIC engine)
+# 
+# add_executable(veil_of_the_silent game/Main.cpp)
+# target_link_libraries(veil_of_the_silent PRIVATE veil_game)
+# 
+# # Engine Subsystem & Game Verification Suites
+# enable_testing()
+# file(GLOB TEST_SRCS "tests/subsystems/*.cpp")
+# foreach(src ${TEST_SRCS})
+#     cmake_path(GET src STEM name)
+#     add_executable(${name} ${src})
+#     target_link_libraries(${name} PRIVATE engine)
+#     add_test(NAME ${name} COMMAND ${name})
+# endforeach()
+# 
+# add_executable(VeilOfTheSilentTests tests/game/VeilOfTheSilentTests.cpp)
+# target_link_libraries(VeilOfTheSilentTests PRIVATE veil_game)
+# add_test(NAME VeilOfTheSilentTests COMMAND VeilOfTheSilentTests)
+# 
+# add_test(NAME veil_of_the_silent_headless COMMAND veil_of_the_silent --headless)

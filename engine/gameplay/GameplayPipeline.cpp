@@ -2,49 +2,6 @@
 
 namespace en {
 
-GameplayPipeline::GameplayPipeline(GameplayPipeline&& other) noexcept
-    : m_cfg(other.m_cfg),
-      m_policies(other.m_policies),
-      m_cues(other.m_cues),
-      m_hitEvents(other.m_hitEvents),
-      m_arena(std::move(other.m_arena)),
-      m_activeFlagWordsMask(other.m_activeFlagWordsMask),
-      m_tickCount(other.m_tickCount),
-      m_totalCombatHits(other.m_totalCombatHits),
-      m_cueCount(other.m_cueCount),
-      m_hitEventCount(other.m_hitEventCount),
-      m_worldFlags(other.m_worldFlags) {
-    other.m_cues = nullptr;
-    other.m_hitEvents = nullptr;
-    other.m_activeFlagWordsMask = 0ULL;
-    other.m_cueCount = 0U;
-    other.m_hitEventCount = 0U;
-}
-
-GameplayPipeline& GameplayPipeline::operator=(GameplayPipeline&& other) noexcept {
-    if (this != &other) {
-        Shutdown();
-        m_cfg = other.m_cfg;
-        m_policies = other.m_policies;
-        m_cues = other.m_cues;
-        m_hitEvents = other.m_hitEvents;
-        m_arena = std::move(other.m_arena);
-        m_activeFlagWordsMask = other.m_activeFlagWordsMask;
-        m_tickCount = other.m_tickCount;
-        m_totalCombatHits = other.m_totalCombatHits;
-        m_cueCount = other.m_cueCount;
-        m_hitEventCount = other.m_hitEventCount;
-        m_worldFlags = other.m_worldFlags;
-
-        other.m_cues = nullptr;
-        other.m_hitEvents = nullptr;
-        other.m_activeFlagWordsMask = 0ULL;
-        other.m_cueCount = 0U;
-        other.m_hitEventCount = 0U;
-    }
-    return *this;
-}
-
 Result<void, GameplayErrc> GameplayPipeline::Init(
     World& world,
     const GameplayPolicyTable& policies,
@@ -78,12 +35,6 @@ Result<void, GameplayErrc> GameplayPipeline::Init(
     m_policies = policies;
     m_cues = cuesSpan.data();
     m_hitEvents = hitsSpan.data();
-    m_activeFlagWordsMask = 0ULL;
-    m_tickCount = 0ULL;
-    m_totalCombatHits = 0U;
-    m_cueCount = 0U;
-    m_hitEventCount = 0U;
-    m_worldFlags.fill(0ULL);
     return {};
 }
 
@@ -91,12 +42,9 @@ void GameplayPipeline::Shutdown() noexcept {
     m_arena.Shutdown();
     m_cues = nullptr;
     m_hitEvents = nullptr;
-    m_activeFlagWordsMask = 0ULL;
+    Clear();
     m_tickCount = 0ULL;
     m_totalCombatHits = 0U;
-    m_cueCount = 0U;
-    m_hitEventCount = 0U;
-    m_worldFlags.fill(0ULL);
 }
 
 void GameplayPipeline::Clear() noexcept {
@@ -112,31 +60,27 @@ void GameplayPipeline::Tick(
     const SimStepView& step,
     const TickInput& input,
     ActionBuffer& actions) noexcept {
-    if (!m_cues || !step.valid) return;
+    if (!m_cues || !step.valid) {
+        return;
+    }
 
     m_hitEventCount = 0U;
 
-    // Stage 1: Step state machines, timeline frame directives, and client policies
     StateAndCombatSolver2D::StepStateMachinesAndDirectives(
         world, assetBank, step, input, actions, m_policies, *this);
 
-    // Stage 2: Blend MotionStack2D velocities/root-motion/impulses into CharacterMotor2D
     MotionSolver2D::BlendMotionStacksIntoMotors(world, step, m_cfg);
 
-    // Stage 3: Step 2D PhysicsSystem (kinematic platforms, MoveAndSlide characters, Soft-Step TGS rigid bodies & joints)
     physics.Step(world, step);
 
-    // Stage 4: Resolve soft character pushbox separation & refresh post-physics coyote timers and 3-ray safe anchors
     MotionSolver2D::ResolveSoftCharacterPushboxes(world, physics, step, m_cfg);
     MotionSolver2D::SyncPostPhysicsContactsAndTimers(world, physics, step);
 
-    // Stage 5: Resolve Bloom-deduplicated hitbox/hurtbox combat overlaps and clash/parry arbitration
     std::span<CombatHitEvent> hitSpan{m_hitEvents, m_cfg.maxHitEventsPerTick};
     m_hitEventCount = StateAndCombatSolver2D::ResolveCombatOverlaps(
         world, step, m_policies, *this, hitSpan);
     m_totalCombatHits += m_hitEventCount;
 
-    // Stage 6: Step 2nd-order critically damped spring cameras, room confiners, and trauma shake
     CameraDirector2D::StepCameras(world, step, m_cfg, m_tickCount);
     ++m_tickCount;
 }
@@ -164,30 +108,19 @@ u64 GameplayPipeline::ComputeAuditHash(const World& world) const noexcept {
     }
 
     const u64 regMask = world.RegisteredPoolsMask();
-    if ((regMask & (1ULL << MotionStack2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<MotionStack2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
-    if ((regMask & (1ULL << StateMachine2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<StateMachine2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
-    if ((regMask & (1ULL << HitboxRig2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<HitboxRig2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
-    if ((regMask & (1ULL << DamageReceiver2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<DamageReceiver2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
-    if ((regMask & (1ULL << SafeAnchor2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<SafeAnchor2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
-    if ((regMask & (1ULL << CameraController2D::kTypeId)) != 0ULL) {
-        const auto& p = world.GetPool<CameraController2D>();
-        mixBytes(p.Components().data(), p.Components().size_bytes());
-    }
+    const auto mixPool = [&]<typename T>() noexcept {
+        if ((regMask & (1ULL << T::kTypeId)) != 0ULL) {
+            const auto& p = world.GetPool<T>();
+            mixBytes(p.Components().data(), p.Components().size_bytes());
+        }
+    };
+
+    mixPool.template operator()<MotionStack2D>();
+    mixPool.template operator()<StateMachine2D>();
+    mixPool.template operator()<HitboxRig2D>();
+    mixPool.template operator()<DamageReceiver2D>();
+    mixPool.template operator()<SafeAnchor2D>();
+    mixPool.template operator()<CameraController2D>();
     return h;
 }
 

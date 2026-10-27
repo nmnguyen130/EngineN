@@ -1,11 +1,29 @@
 #include "debug/DebugSystem.h"
+#include "platform/PlatformTypes.h"
 #include "input/InputPipeline.h"
 
 #include <charconv>
-#include <cstdlib>
-#include <cstring>
 
 namespace en {
+
+namespace {
+
+[[nodiscard]] DebugShapePool& NullShapePool() noexcept {
+    static DebugShapePool s_null{};
+    return s_null;
+}
+
+[[nodiscard]] DebugProfiler& NullProfiler() noexcept {
+    static DebugProfiler s_null{};
+    return s_null;
+}
+
+[[nodiscard]] DebugConsole& NullConsole() noexcept {
+    static DebugConsole s_null{};
+    return s_null;
+}
+
+} // namespace
 
 struct alignas(64) DebugSystem::DebugArenaState {
     DebugShapePool shapes{};
@@ -13,7 +31,6 @@ struct alignas(64) DebugSystem::DebugArenaState {
     DebugConsole console{};
     DebugSystemConfig cfg{};
     OverlayFlags activeOverlays{OverlayFlags::ProfilerHud};
-    u32 frameCount{0U};
     u16 savedActionMask{0xFFFFU};
     u8 actionMaskSaved{0U};
     std::array<DebugShapeCmd, kMaxDebugShapes> shapeStorage{};
@@ -24,26 +41,6 @@ struct alignas(64) DebugSystem::DebugArenaState {
     std::array<LogEntryMeta, kMaxConsoleLogs> logMetaStorage{};
     std::array<char, kConsoleLogTextBytes> logTextStorage{};
 };
-
-DebugSystem::DebugSystem(DebugSystem&& other) noexcept
-    : m_arena(std::move(other.m_arena)),
-      m_inspector(other.m_inspector),
-      m_state(other.m_state),
-      m_pendingDirectives(other.m_pendingDirectives) {
-    other.m_state = nullptr;
-}
-
-DebugSystem& DebugSystem::operator=(DebugSystem&& other) noexcept {
-    if (this != &other) {
-        Shutdown();
-        m_arena = std::move(other.m_arena);
-        m_inspector = other.m_inspector;
-        m_state = other.m_state;
-        m_pendingDirectives = other.m_pendingDirectives;
-        other.m_state = nullptr;
-    }
-    return *this;
-}
 
 #if EN_ENABLE_DEBUG_TOOLS
 
@@ -57,6 +54,23 @@ inline constexpr u16 kScancodeRight     = 79U;
 inline constexpr u16 kScancodeLeft      = 80U;
 inline constexpr u16 kScancodeDown      = 81U;
 inline constexpr u16 kScancodeUp        = 82U;
+
+struct OverlayShortcut {
+    std::string_view name;
+    OverlayFlags flag;
+};
+
+inline constexpr std::array<OverlayShortcut, 9> kOverlayTable{{
+    {"profiler",   OverlayFlags::ProfilerHud},
+    {"colliders",  OverlayFlags::PhysicsColliders},
+    {"broadphase", OverlayFlags::SpatialBroadphase},
+    {"hitboxes",   OverlayFlags::CombatHitboxes},
+    {"velocity",   OverlayFlags::VelocityVectors},
+    {"contacts",   OverlayFlags::ContactManifolds},
+    {"inspector",  OverlayFlags::EntityInspector | OverlayFlags::FlightScrubber},
+    {"input",      OverlayFlags::InputViewerHud},
+    {"plots",      OverlayFlags::WatchPlotHud},
+}};
 
 void CmdHelp(std::string_view, void*, DebugConsole& console) noexcept {
     console.Print(
@@ -73,16 +87,14 @@ void CmdCVarList(std::string_view, void*, DebugConsole& console) noexcept {
 }
 
 void CmdReset(std::string_view, void* userCtx, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (sys) {
+    if (auto* sys = static_cast<DebugSystem*>(userCtx)) {
         sys->RequestStateReset();
         console.Print(LogSeverity::Info, "Requested simulation state reset.");
     }
 }
 
 void CmdPause(std::string_view, void* userCtx, DebugConsole& console) noexcept {
-    auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (sys) {
+    if (auto* sys = static_cast<DebugSystem*>(userCtx)) {
         sys->RequestPauseToggle();
         console.Print(LogSeverity::Info, "Toggled simulation pause.");
     }
@@ -90,7 +102,9 @@ void CmdPause(std::string_view, void* userCtx, DebugConsole& console) noexcept {
 
 void CmdStep(std::string_view args, void* userCtx, DebugConsole& console) noexcept {
     auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (!sys) return;
+    if (!sys) {
+        return;
+    }
     u16 steps = 1U;
     if (!args.empty()) {
         u32 parsed = 1U;
@@ -105,23 +119,26 @@ void CmdStep(std::string_view args, void* userCtx, DebugConsole& console) noexce
 
 void CmdTimeScale(std::string_view args, void* userCtx, DebugConsole& console) noexcept {
     auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (!sys || args.empty()) return;
+    if (!sys || args.empty()) {
+        return;
+    }
 
-    char numBuf[32]{};
     const usize spacePos = args.find(' ');
     const std::string_view scaleStr = (spacePos == std::string_view::npos) ? args : args.substr(0U, spacePos);
-    const usize len = std::min<usize>(scaleStr.size(), 31U);
-    std::memcpy(numBuf, scaleStr.data(), len);
-    char* endPtr = nullptr;
-    const f32 scale = std::strtof(numBuf, &endPtr);
-    if (endPtr == numBuf) return;
+    f32 scale = 1.0f;
+    const auto rScale = std::from_chars(scaleStr.data(), scaleStr.data() + scaleStr.size(), scale);
+    if (rScale.ec != std::errc{}) {
+        return;
+    }
 
     u8 chIdx = 0U;
     if (spacePos != std::string_view::npos) {
         const std::string_view chStr = args.substr(spacePos + 1U);
         u32 parsedCh = 0U;
-        const auto r = std::from_chars(chStr.data(), chStr.data() + chStr.size(), parsedCh);
-        if (r.ec == std::errc{}) chIdx = static_cast<u8>(parsedCh & 7U);
+        const auto rCh = std::from_chars(chStr.data(), chStr.data() + chStr.size(), parsedCh);
+        if (rCh.ec == std::errc{}) {
+            chIdx = static_cast<u8>(parsedCh & 7U);
+        }
     }
 
     sys->RequestChannelTimeScale(scale, static_cast<TimeChannel>(chIdx));
@@ -130,38 +147,29 @@ void CmdTimeScale(std::string_view args, void* userCtx, DebugConsole& console) n
 
 void CmdOverlay(std::string_view args, void* userCtx, DebugConsole& console) noexcept {
     auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (!sys || args.empty()) return;
+    if (!sys || args.empty()) {
+        return;
+    }
     if (args == "all") {
         sys->SetActiveOverlays(OverlayFlags::AllWorld | OverlayFlags::AllHud);
     } else if (args == "none") {
         sys->SetActiveOverlays(OverlayFlags::None);
-    } else if (args == "profiler") {
-        sys->ToggleOverlay(OverlayFlags::ProfilerHud);
-    } else if (args == "colliders") {
-        sys->ToggleOverlay(OverlayFlags::PhysicsColliders);
-    } else if (args == "joints") {
-        sys->ToggleOverlay(OverlayFlags::PhysicsJoints);
-    } else if (args == "broadphase") {
-        sys->ToggleOverlay(OverlayFlags::SpatialBroadphase);
-    } else if (args == "hitboxes") {
-        sys->ToggleOverlay(OverlayFlags::CombatHitboxes);
-    } else if (args == "velocity") {
-        sys->ToggleOverlay(OverlayFlags::VelocityVectors);
-    } else if (args == "contacts") {
-        sys->ToggleOverlay(OverlayFlags::ContactManifolds);
-    } else if (args == "inspector") {
-        sys->ToggleOverlay(OverlayFlags::EntityInspector | OverlayFlags::FlightScrubber);
-    } else if (args == "input") {
-        sys->ToggleOverlay(OverlayFlags::InputViewerHud);
-    } else if (args == "plots") {
-        sys->ToggleOverlay(OverlayFlags::WatchPlotHud);
+    } else {
+        for (const OverlayShortcut& entry : kOverlayTable) {
+            if (args == entry.name) {
+                sys->ToggleOverlay(entry.flag);
+                break;
+            }
+        }
     }
     console.Print(LogSeverity::Info, "Updated debug overlays.");
 }
 
 void CmdInspect(std::string_view args, void* userCtx, DebugConsole& console) noexcept {
     auto* sys = static_cast<DebugSystem*>(userCtx);
-    if (!sys || args.empty()) return;
+    if (!sys || args.empty()) {
+        return;
+    }
     u32 idx = 0U;
     const auto r = std::from_chars(args.data(), args.data() + args.size(), idx);
     if (r.ec == std::errc{} && idx > 0U && idx <= 0xFFFFU) {
@@ -223,17 +231,21 @@ OverlayFlags DebugSystem::ActiveOverlays() const noexcept {
 }
 
 void DebugSystem::SetActiveOverlays(OverlayFlags flags) noexcept {
-    if (m_state) m_state->activeOverlays = flags;
+    if (m_state) {
+        m_state->activeOverlays = flags;
+    }
 }
 
 void DebugSystem::ToggleOverlay(OverlayFlags flag) noexcept {
-    if (m_state) m_state->activeOverlays ^= flag;
+    if (m_state) {
+        m_state->activeOverlays ^= flag;
+    }
 }
 
-bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool ctrl) noexcept {
-    (void)shift;
-    (void)ctrl;
-    if (!m_state || !down) return false;
+bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down) noexcept {
+    if (!m_state || !down) {
+        return false;
+    }
 
     if (scancode == m_state->cfg.toggleConsoleScancode) {
         m_state->console.ToggleOpen();
@@ -275,13 +287,17 @@ bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool c
         ToggleOverlay(OverlayFlags::ProfilerHud);
         return true;
     }
-    if (scancode == kScancodeLeft) {
-        m_inspector.StepScrubOffset(1);
-        return true;
-    }
-    if (scancode == kScancodeRight) {
-        m_inspector.StepScrubOffset(-1);
-        return true;
+
+    if (HasFlag(m_state->activeOverlays, OverlayFlags::EntityInspector | OverlayFlags::FlightScrubber) &&
+        m_inspector.RecordedTickCount() > 0U) {
+        if (scancode == kScancodeLeft) {
+            m_inspector.StepScrubOffset(1);
+            return true;
+        }
+        if (scancode == kScancodeRight) {
+            m_inspector.StepScrubOffset(-1);
+            return true;
+        }
     }
     return false;
 }
@@ -289,12 +305,12 @@ bool DebugSystem::OnPlatformKeyEvent(u16 scancode, bool down, bool shift, bool c
 bool DebugSystem::OnPlatformKeyEvent(
     u16 scancode,
     bool down,
-    bool shift,
-    bool ctrl,
     InputPipeline& inputPipeline) noexcept {
-    if (!m_state) return false;
+    if (!m_state) {
+        return false;
+    }
     const bool wasOpen = m_state->console.IsOpen();
-    const bool consumed = OnPlatformKeyEvent(scancode, down, shift, ctrl);
+    const bool consumed = OnPlatformKeyEvent(scancode, down);
     const bool isOpen = m_state->console.IsOpen();
 
     if (!wasOpen && isOpen) {
@@ -309,16 +325,22 @@ bool DebugSystem::OnPlatformKeyEvent(
 }
 
 bool DebugSystem::OnPlatformTextInput(std::string_view textUtf8) noexcept {
-    if (!m_state || !m_state->console.IsOpen()) return false;
-    if (textUtf8 == "`" || textUtf8 == "~") return true;
+    if (!m_state || !m_state->console.IsOpen()) {
+        return false;
+    }
+    if (textUtf8 == "`" || textUtf8 == "~") {
+        return true;
+    }
     m_state->console.AppendInputText(textUtf8);
     return true;
 }
 
-DebugLoopDirectives DebugSystem::BeginFrame(const DebugFrameContext& ctx) noexcept {
-    if (!m_state) return {};
-    m_state->console.FlushPendingCommands(ctx.currentTickIndex);
-    m_state->profiler.BeginFrame(m_state->frameCount++, ctx.currentTickIndex);
+DebugLoopDirectives DebugSystem::BeginFrame(const DebugFrameContext&) noexcept {
+    if (!m_state) {
+        return {};
+    }
+    m_state->console.FlushPendingCommands();
+    m_state->profiler.BeginFrame();
 
     const DebugLoopDirectives out = m_pendingDirectives;
     m_pendingDirectives = DebugLoopDirectives{};
@@ -330,56 +352,64 @@ void DebugSystem::EndSimTick(
     u32 tickIndex,
     const TickInput* tickInput,
     const ActionBuffer* actionBuffer) noexcept {
-    if (!m_state) return;
-    m_state->shapes.SetCurrentTick(tickIndex);
-    m_inspector.RecordActorTick(world, tickIndex, tickInput, actionBuffer);
+    if (m_state) {
+        m_state->shapes.SetCurrentTick(tickIndex);
+        m_inspector.RecordActorTick(world, tickIndex, tickInput, actionBuffer);
+    }
 }
 
 void DebugSystem::EmitOverlays(const DebugFrameContext& ctx, RenderList& outList) noexcept {
-    if (!m_state) return;
+    if (!m_state) {
+        return;
+    }
 
-    RenderPassDesc worldPass{};
-    worldPass.enabled = true;
-    worldPass.clear = false;
-    outList.SetPass(kDebugWorldPassId, worldPass);
+    const OverlayFlags flags = m_state->activeOverlays;
+    if (flags == OverlayFlags::None &&
+        m_state->shapes.ActiveCount() == 0U &&
+        !m_state->console.IsOpen()) {
+        return;
+    }
 
-    RenderPassDesc hudPass{};
-    hudPass.enabled = true;
-    hudPass.clear = false;
-    outList.SetPass(kDebugHudPassId, hudPass);
+    RenderPassDesc passDesc{};
+    passDesc.enabled = true;
+    passDesc.clear = false;
+    outList.SetPass(kDebugWorldPassId, passDesc);
+    outList.SetPass(kDebugHudPassId, passDesc);
 
     DebugBatcher worldBatcher(outList, kDebugWorldPassId, ctx.worldViewSlot, kDebugFixedDepth);
     DebugBatcher hudBatcher(outList, kDebugHudPassId, kDebugHudViewSlot, kDebugFixedDepth);
 
-    const OverlayFlags flags = m_state->activeOverlays;
-    m_state->shapes.EmitAndExpire(ctx.currentTickIndex, worldBatcher, hudBatcher);
-    m_inspector.EmitWorldAndInspectorOverlays(flags, ctx, worldBatcher, hudBatcher);
-    m_state->profiler.EmitProfilerAndTimeHud(flags, ctx.viewportSize, hudBatcher);
-    m_state->console.EmitConsoleOverlay(ctx.viewportSize, hudBatcher);
+    if (m_state->shapes.ActiveCount() > 0U) {
+        m_state->shapes.EmitAndExpire(ctx.currentTickIndex, worldBatcher, hudBatcher);
+    }
+    if (flags != OverlayFlags::None) {
+        m_inspector.EmitWorldAndInspectorOverlays(flags, ctx, worldBatcher, hudBatcher);
+        m_state->profiler.EmitProfilerAndTimeHud(flags, ctx.viewportSize, hudBatcher);
+    }
+    if (m_state->console.IsOpen()) {
+        m_state->console.EmitConsoleOverlay(ctx.viewportSize, hudBatcher);
+    }
 }
 
-DebugShapePool& DebugSystem::Shapes() noexcept { return m_state->shapes; }
-const DebugShapePool& DebugSystem::Shapes() const noexcept { return m_state->shapes; }
+DebugShapePool& DebugSystem::Shapes() noexcept { return m_state ? m_state->shapes : NullShapePool(); }
+const DebugShapePool& DebugSystem::Shapes() const noexcept { return m_state ? m_state->shapes : NullShapePool(); }
 
-DebugProfiler& DebugSystem::Profiler() noexcept { return m_state->profiler; }
-const DebugProfiler& DebugSystem::Profiler() const noexcept { return m_state->profiler; }
+DebugProfiler& DebugSystem::Profiler() noexcept { return m_state ? m_state->profiler : NullProfiler(); }
+const DebugProfiler& DebugSystem::Profiler() const noexcept { return m_state ? m_state->profiler : NullProfiler(); }
 
-DebugConsole& DebugSystem::Console() noexcept { return m_state->console; }
-const DebugConsole& DebugSystem::Console() const noexcept { return m_state->console; }
+DebugConsole& DebugSystem::Console() noexcept { return m_state ? m_state->console : NullConsole(); }
+const DebugConsole& DebugSystem::Console() const noexcept { return m_state ? m_state->console : NullConsole(); }
 
-u64 DebugSystem::ComputeAuditHash() const noexcept {
-    if (!m_state) return 0ULL;
-    u64 h = m_state->shapes.ComputeAuditHash();
-    h ^= m_inspector.ComputeAuditHash();
-    h *= 1099511628211ULL;
-    h ^= m_state->profiler.ComputeAuditHash();
-    h *= 1099511628211ULL;
-    h ^= m_state->console.ComputeAuditHash();
-    h *= 1099511628211ULL;
-    h ^= static_cast<u64>(m_state->activeOverlays);
-    h *= 1099511628211ULL;
-    return h;
-}
+#else
+
+DebugShapePool& DebugSystem::Shapes() noexcept { return NullShapePool(); }
+const DebugShapePool& DebugSystem::Shapes() const noexcept { return NullShapePool(); }
+
+DebugProfiler& DebugSystem::Profiler() noexcept { return NullProfiler(); }
+const DebugProfiler& DebugSystem::Profiler() const noexcept { return NullProfiler(); }
+
+DebugConsole& DebugSystem::Console() noexcept { return NullConsole(); }
+const DebugConsole& DebugSystem::Console() const noexcept { return NullConsole(); }
 
 #endif // EN_ENABLE_DEBUG_TOOLS
 

@@ -4,12 +4,12 @@
 
 namespace en {
 
-// Stateless 2D rotational Soft-Step (TGS) sequential impulse solver, distance/spring joint solver, speculative CCD integrator, and MoveAndSlide character controller.
-// Pure algorithmic layer operating over World component pools and SpatialIndex2D with zero dynamic allocations.
-// Invariant: sleeping bodies retain zero velocity and are woken deterministically upon manifold creation, joint tension, or external impulse.
+// Stateless 2D rotational Soft-Step (TGS) sequential impulse solver and MoveAndSlide character controller.
+// Non-owning simulation stage helper invoked by PhysicsSystem::Step.
+// Invariant: respects per-entity TimeChannel freeze states and preserves deterministic manifold ordering.
 class DynamicsSolver2D {
 public:
-    static void StepKinematicBodiesAndRiders(
+    static bool StepKinematicBodiesAndRiders(
         World& world,
         const SpatialIndex2D& spatial,
         const SimStepView& step) noexcept;
@@ -31,7 +31,7 @@ public:
         u16& ioEventCount,
         u64& ioSpeculativeHitCount) noexcept;
 
-    static void StepRigidBodiesAndJointsSoftTgs(
+    static void StepRigidBodiesSoftTgs(
         World& world,
         const SimStepView& step,
         const PhysicsConfig& cfg,

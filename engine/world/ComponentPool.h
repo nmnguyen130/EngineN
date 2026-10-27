@@ -5,8 +5,8 @@
 
 namespace en {
 
-// 32-byte (2 per 64B cache line, zero padding) non-template Sparse-Set component pool base.
-// Executes Clear, RemoveUnchecked, EmplaceRaw, CloneFromEntityIndex, and GetRawByIndex directly without function-pointer tables or indirect calls.
+// Type-erased sparse-set component pool base.
+// Non-owning view over World's AlignedArena; supports untyped emplace, clone, and swap-and-pop removal.
 // Invariant: for every d in [0, m_size), m_sparse[m_denseEntities[d].index] == d.
 class alignas(32) RawComponentPool {
 public:
@@ -20,7 +20,9 @@ public:
     }
 
     [[nodiscard]] constexpr bool Contains(EntityId id) const noexcept {
-        if (id.index >= m_maxEntities) return false;
+        if (id.index >= m_maxEntities) {
+            return false;
+        }
         const u16 d = m_sparse[id.index];
         return d < m_size && m_denseEntities[d] == id;
     }
@@ -30,57 +32,61 @@ public:
     }
 
     [[nodiscard]] bool EmplaceRaw(EntityId id, const void* rawComponent) noexcept {
-        if (!rawComponent || id.index >= m_maxEntities || m_denseBytes == nullptr) return false;
-        const u16 existing = m_sparse[id.index];
-        if (existing < m_size && m_denseEntities[existing] == id) {
-            std::memcpy(
-                m_denseBytes + static_cast<usize>(existing) * m_elemBytes,
-                rawComponent,
-                m_elemBytes);
-            return true;
+        if (!rawComponent || id.index >= m_maxEntities || !m_denseBytes) {
+            return false;
         }
-        if (m_size >= m_capacity) return false;
-        const u16 d = m_size++;
-        m_sparse[id.index] = d;
-        m_denseEntities[d] = id;
-        std::memcpy(
-            m_denseBytes + static_cast<usize>(d) * m_elemBytes,
-            rawComponent,
-            m_elemBytes);
+        u16 d = m_sparse[id.index];
+        if (d >= m_size || m_denseEntities[d] != id) {
+            if (m_size >= m_capacity) {
+                return false;
+            }
+            d = m_size++;
+            m_sparse[id.index] = d;
+            m_denseEntities[d] = id;
+        }
+        std::memcpy(m_denseBytes + static_cast<usize>(d) * m_elemBytes, rawComponent, m_elemBytes);
         return true;
     }
 
     [[nodiscard]] bool CloneFromEntityIndex(EntityId dstId, u16 srcEntityIndex) noexcept {
-        if (srcEntityIndex >= m_maxEntities || m_denseBytes == nullptr) return false;
+        if (srcEntityIndex >= m_maxEntities || !m_denseBytes) {
+            return false;
+        }
         const u16 srcDense = m_sparse[srcEntityIndex];
-        if (srcDense >= m_size) return false;
-        return EmplaceRaw(dstId, m_denseBytes + static_cast<usize>(srcDense) * m_elemBytes);
+        return srcDense < m_size &&
+               EmplaceRaw(dstId, m_denseBytes + static_cast<usize>(srcDense) * m_elemBytes);
     }
 
     void RemoveUnchecked(EntityId id) noexcept {
-        if (id.index >= m_maxEntities || m_denseBytes == nullptr) return;
+        if (id.index >= m_maxEntities || !m_denseBytes) {
+            return;
+        }
         const u16 d = m_sparse[id.index];
-        if (d >= m_size) return;
-        const u16 lastIdx = static_cast<u16>(m_size - 1U);
+        if (d >= m_size) {
+            return;
+        }
+        const u16 lastIdx = static_cast<u16>(--m_size);
         if (d != lastIdx) {
-            const EntityId movedEntity = m_denseEntities[lastIdx];
-            m_denseEntities[d] = movedEntity;
+            const EntityId moved = m_denseEntities[lastIdx];
+            m_denseEntities[d] = moved;
             std::memcpy(
                 m_denseBytes + static_cast<usize>(d) * m_elemBytes,
                 m_denseBytes + static_cast<usize>(lastIdx) * m_elemBytes,
                 m_elemBytes);
-            m_sparse[movedEntity.index] = d;
+            m_sparse[moved.index] = d;
         }
         m_sparse[id.index] = kInvalidDenseIndex;
-        --m_size;
+    }
+
+    [[nodiscard]] constexpr const u8* RawAtEntityIndex(u16 entityIndex) const noexcept {
+        return m_denseBytes + static_cast<usize>(m_sparse[entityIndex]) * m_elemBytes;
     }
 
     [[nodiscard]] constexpr const void* GetRawByEntityIndex(
         u16 entityIndex,
         u16& outElemBytes) const noexcept {
         outElemBytes = m_elemBytes;
-        const u16 d = m_sparse[entityIndex];
-        return m_denseBytes + static_cast<usize>(d) * m_elemBytes;
+        return RawAtEntityIndex(entityIndex);
     }
 
     [[nodiscard]] constexpr u16 Size() const noexcept { return m_size; }
@@ -102,12 +108,14 @@ protected:
 };
 static_assert(sizeof(RawComponentPool) == 32);
 
-// Zero-overhead typed Sparse-Set view over RawComponentPool (32 bytes exact, zero additional members).
+// Typed sparse-set view over RawComponentPool.
 template <Component T>
 class alignas(32) ComponentPool : public RawComponentPool {
 public:
     [[nodiscard]] bool Init(AlignedArena& arena, u16 maxEntities, u16 capacity) noexcept {
-        if (maxEntities == 0U || capacity == 0U) return false;
+        if (maxEntities == 0U || capacity == 0U) {
+            return false;
+        }
         const u32 marker = arena.SaveMarker();
         auto sparseSpan = arena.Carve<u16>(maxEntities);
         auto entitySpan = arena.Carve<EntityId>(capacity);
@@ -125,22 +133,16 @@ public:
         m_size = 0U;
         m_elemBytes = static_cast<u16>(sizeof(T));
 
-        for (u16 i = 0U; i < maxEntities; ++i) {
-            m_sparse[i] = kInvalidDenseIndex;
-        }
+        std::fill_n(m_sparse, maxEntities, kInvalidDenseIndex);
         return true;
     }
 
     [[nodiscard]] constexpr T* TryGet(EntityId id) noexcept {
-        if (id.index >= m_maxEntities) return nullptr;
-        const u16 d = m_sparse[id.index];
-        return (d < m_size && m_denseEntities[d] == id) ? &DenseTyped()[d] : nullptr;
+        return Contains(id) ? &DenseTyped()[m_sparse[id.index]] : nullptr;
     }
 
     [[nodiscard]] constexpr const T* TryGet(EntityId id) const noexcept {
-        if (id.index >= m_maxEntities) return nullptr;
-        const u16 d = m_sparse[id.index];
-        return (d < m_size && m_denseEntities[d] == id) ? &DenseTyped()[d] : nullptr;
+        return Contains(id) ? &DenseTyped()[m_sparse[id.index]] : nullptr;
     }
 
     [[nodiscard]] constexpr T& DirectAtEntityIndex(u16 entityIndex) noexcept {
@@ -161,42 +163,37 @@ public:
 
     template <typename... Args>
     [[nodiscard]] constexpr Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
-        if (id.index >= m_maxEntities) return Err(WorldErrc::DeadEntity);
-        T* dense = DenseTyped();
-        const u16 existing = m_sparse[id.index];
-        if (existing < m_size && m_denseEntities[existing] == id) {
-            dense[existing] = T{std::forward<Args>(args)...};
-            return &dense[existing];
+        if (id.index >= m_maxEntities) {
+            return Err(WorldErrc::DeadEntity);
         }
-        if (m_size >= m_capacity) return Err(WorldErrc::PoolCapacityReached);
-        const u16 d = m_size++;
-        m_sparse[id.index] = d;
-        m_denseEntities[d] = id;
-        dense[d] = T{std::forward<Args>(args)...};
-        return &dense[d];
+        u16 d = m_sparse[id.index];
+        if (d >= m_size || m_denseEntities[d] != id) {
+            if (m_size >= m_capacity) {
+                return Err(WorldErrc::PoolCapacityReached);
+            }
+            d = m_size++;
+            m_sparse[id.index] = d;
+            m_denseEntities[d] = id;
+        }
+        T& slot = DenseTyped()[d];
+        slot = T{std::forward<Args>(args)...};
+        return &slot;
     }
 
     constexpr bool Remove(EntityId id) noexcept {
-        if (!Contains(id)) return false;
+        if (!Contains(id)) {
+            return false;
+        }
         RemoveUnchecked(id);
         return true;
     }
 
-    [[nodiscard]] constexpr std::span<T> Components() noexcept {
-        return {DenseTyped(), m_size};
-    }
-
-    [[nodiscard]] constexpr std::span<const T> Components() const noexcept {
-        return {DenseTyped(), m_size};
-    }
+    [[nodiscard]] constexpr std::span<T> Components() noexcept { return {DenseTyped(), m_size}; }
+    [[nodiscard]] constexpr std::span<const T> Components() const noexcept { return {DenseTyped(), m_size}; }
 
 private:
-    [[nodiscard]] constexpr T* DenseTyped() noexcept {
-        return reinterpret_cast<T*>(m_denseBytes);
-    }
-    [[nodiscard]] constexpr const T* DenseTyped() const noexcept {
-        return reinterpret_cast<const T*>(m_denseBytes);
-    }
+    [[nodiscard]] constexpr T* DenseTyped() noexcept { return reinterpret_cast<T*>(m_denseBytes); }
+    [[nodiscard]] constexpr const T* DenseTyped() const noexcept { return reinterpret_cast<const T*>(m_denseBytes); }
 };
 static_assert(sizeof(ComponentPool<Velocity2D>) == 32);
 

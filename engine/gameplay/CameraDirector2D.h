@@ -6,11 +6,10 @@
 namespace en {
 
 // Stateless 2nd-order critically damped spring 2D camera director with dual-target framing, deadzones, room confiner, and trauma shake.
-// Pure functional solver operating over CameraController2D and CameraRig2D pools in World.
-// Invariant: kickOffsetX/Y and trauma shake are applied strictly to the presentation CameraRig2D without polluting the spring anchor transform.
+// Non-owning simulation stage helper invoked by GameplayPipeline::Tick.
+// Invariant: camera anchor remains confined within activeRoomBounds when ConfineToRoom is set.
 class CameraDirector2D {
 public:
-    // Analytical Padé-approximated critically damped 2nd-order spring step (zero std::exp call).
     static constexpr void StepCriticallyDampedSpring1D(
         f32& ioPos,
         f32& ioVel,

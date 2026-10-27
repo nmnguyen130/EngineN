@@ -14,33 +14,12 @@
 namespace en {
 
 Result<void, FrameworkErrc> SceneDirector::Init(AssetBank& assetBank) noexcept {
-    m_activeSimMask = 0U;
-    m_activeRenderMask = 0U;
-    m_pausedClockMask = 0U;
-    m_stackDepth = 0U;
-    m_cmdCount = 0U;
-    m_phase = TransitionPhase::Idle;
-    m_persistentScope = 0xFFU;
-    m_activeScope = 0xFFU;
-    m_stagingScope = 0xFFU;
-    m_wipeElapsedTicks = 0U;
-    m_wipeDurationTicks = 0U;
-    m_activeWipe = TransitionWipeKind::None;
-    m_topInputMask = 0xFFFFU;
-    m_transitionCount = 0U;
-    m_layerFlags.fill(StateLayerFlags::None);
-    m_stateIds.fill(kInvalidStateId);
-    m_inputMasks.fill(0xFFFFU);
-    m_activeSceneId = AssetId{};
-    m_activeSceneDeactivateFn = nullptr;
-    m_simFns.fill(nullptr);
-    m_renderFns.fill(nullptr);
-    m_userStates.fill(nullptr);
-    m_exitFns.fill(nullptr);
-    m_pendingScene = SceneTransitionDesc{};
+    *this = SceneDirector{};
 
     auto pScope = assetBank.BeginScope();
-    if (!pScope) return Err(FrameworkErrc::ScopeAllocationFailed);
+    if (!pScope) {
+        return Err(FrameworkErrc::ScopeAllocationFailed);
+    }
     m_persistentScope = *pScope;
 
     auto sScope = assetBank.BeginScope();
@@ -57,42 +36,26 @@ void SceneDirector::Shutdown(
     AssetBank& assetBank,
     AudioSystem& audio,
     SceneLoadContext* optionalLoadCtx) noexcept {
-    if (optionalLoadCtx) {
+    if (optionalLoadCtx != nullptr && optionalLoadCtx->world != nullptr) {
         while (m_stackDepth > 0U) {
             const u8 top = --m_stackDepth;
-            if (m_exitFns[top]) {
+            if (m_exitFns[top] != nullptr) {
                 m_exitFns[top](*optionalLoadCtx, m_userStates[top]);
             }
         }
-        if (m_activeSceneDeactivateFn) {
+        if (m_activeSceneDeactivateFn != nullptr) {
             m_activeSceneDeactivateFn(*optionalLoadCtx);
-            m_activeSceneDeactivateFn = nullptr;
         }
-    } else {
-        m_stackDepth = 0U;
-        m_activeSceneDeactivateFn = nullptr;
     }
 
-    m_cmdCount = 0U;
-    m_activeSimMask = 0U;
-    m_activeRenderMask = 0U;
-    m_pausedClockMask = 0U;
-    m_topInputMask = 0xFFFFU;
-
-    const auto releaseScope = [&](u8& scope) noexcept {
+    for (u8 scope : {m_stagingScope, m_activeScope, m_persistentScope}) {
         if (scope < kMaxAssetScopes) {
             audio.RequestScopeRelease(scope);
             assetBank.EndScope(scope);
-            scope = 0xFFU;
         }
-    };
-    releaseScope(m_stagingScope);
-    releaseScope(m_activeScope);
-    releaseScope(m_persistentScope);
+    }
 
-    m_phase = TransitionPhase::Idle;
-    m_activeWipe = TransitionWipeKind::None;
-    m_activeSceneId = AssetId{};
+    *this = SceneDirector{};
 }
 
 Result<void, FrameworkErrc> SceneDirector::RequestSceneTransition(
@@ -117,16 +80,11 @@ Result<void, FrameworkErrc> SceneDirector::RequestSceneTransition(
     m_wipeDurationTicks = desc.transitionDurationTicks;
 
     bool needsLoad = false;
-    const auto stageBlob = [&](AssetId id) noexcept {
+    for (AssetId id : {desc.manifestBlobId, desc.collisionMapId, desc.rootPrefabId, desc.cueBankId}) {
         if (id.IsValid() && !assetBank.FindBlobHandle(id).IsValid()) {
             (void)assetBank.AcquireSlot(id, AssetKind::Blob, m_stagingScope, AssetResidency::Sim, needsLoad);
         }
-    };
-
-    stageBlob(desc.manifestBlobId);
-    stageBlob(desc.collisionMapId);
-    stageBlob(desc.rootPrefabId);
-    stageBlob(desc.cueBankId);
+    }
 
     m_phase = (desc.wipe != TransitionWipeKind::None && desc.transitionDurationTicks > 0U)
                   ? TransitionPhase::FadingOut
@@ -147,17 +105,12 @@ Result<void, FrameworkErrc> SceneDirector::ReloadActiveScene(AssetBank& assetBan
 
 void SceneDirector::StepTransitionWipeTick() noexcept {
     if (m_phase == TransitionPhase::FadingOut) {
-        if (m_wipeElapsedTicks < m_wipeDurationTicks) {
-            ++m_wipeElapsedTicks;
-        }
-        if (m_wipeElapsedTicks >= m_wipeDurationTicks) {
+        if (++m_wipeElapsedTicks >= m_wipeDurationTicks) {
+            m_wipeElapsedTicks = m_wipeDurationTicks;
             m_phase = TransitionPhase::StreamingSceneAssets;
         }
     } else if (m_phase == TransitionPhase::FadingIn) {
-        if (m_wipeElapsedTicks > 0U) {
-            --m_wipeElapsedTicks;
-        }
-        if (m_wipeElapsedTicks == 0U) {
+        if (m_wipeElapsedTicks == 0U || --m_wipeElapsedTicks == 0U) {
             m_phase = TransitionPhase::Idle;
             m_activeWipe = TransitionWipeKind::None;
         }
@@ -169,137 +122,226 @@ Result<bool, FrameworkErrc> SceneDirector::ActivatePendingScene(SceneLoadContext
         return Err(FrameworkErrc::InvalidConfig);
     }
     AssetBank& assetBank = *loadCtx.assetBank;
+
+    const auto rollbackStaging = [&](FrameworkErrc err) noexcept -> Result<bool, FrameworkErrc> {
+        if (m_stagingScope < kMaxAssetScopes && m_stagingScope != m_persistentScope && m_stagingScope != m_activeScope) {
+            assetBank.EndScope(m_stagingScope);
+        }
+        m_stagingScope = 0xFFU;
+        m_phase = TransitionPhase::Idle;
+        m_activeWipe = TransitionWipeKind::None;
+        m_wipeElapsedTicks = 0U;
+        return Err(err);
+    };
+
     u32 manifestMusicTrackId = 0U;
 
-    // 1. Parse and verify optional CookedSceneManifestHeader ("ESCN" v1) if present
+    // AssetBank blob slices are 64-byte aligned; read headers and entries directly without memcpy.
     if (m_pendingScene.manifestBlobId.IsValid()) {
         const BlobHandle manifestBlob = assetBank.FindBlobHandle(m_pendingScene.manifestBlobId);
-        if (manifestBlob.IsValid()) {
-            const BlobRecord& rec = assetBank.GetBlob(manifestBlob);
-            if (rec.data != nullptr && rec.size >= sizeof(CookedSceneManifestHeader)) {
-                CookedSceneManifestHeader hdr{};
-                std::memcpy(&hdr, rec.data, sizeof(CookedSceneManifestHeader));
-                const usize expectedBytes = sizeof(CookedSceneManifestHeader) +
-                                            static_cast<usize>(hdr.assetEntryCount) * sizeof(CookedSceneAssetEntry);
-                if (hdr.magic != CookedSceneManifestHeader::kMagic ||
-                    hdr.version != CookedSceneManifestHeader::kVersion ||
-                    rec.size < expectedBytes) {
-                    return Err(FrameworkErrc::CorruptedSceneManifest);
-                }
-                const u8* entriesBytes = rec.data + sizeof(CookedSceneManifestHeader);
-                if (hdr.checksum != 0U) {
-                    u32 h = 2166136261U;
-                    for (u32 i = 0U; i < hdr.assetEntryCount; ++i) {
-                        CookedSceneAssetEntry e{};
-                        std::memcpy(&e, entriesBytes + static_cast<usize>(i) * sizeof(CookedSceneAssetEntry), sizeof(CookedSceneAssetEntry));
-                        const u64 idVal = e.id.value;
-                        for (u32 b = 0U; b < 8U; ++b) {
-                            h ^= static_cast<u32>((idVal >> (b * 8U)) & 0xFFU);
-                            h *= 16777619U;
-                        }
-                        h ^= static_cast<u32>(e.kind);
-                        h *= 16777619U;
-                        h ^= static_cast<u32>(e.residency);
-                        h *= 16777619U;
-                    }
-                    const u32 actualChecksum = (h == 0U) ? 1U : h;
-                    if (actualChecksum != hdr.checksum) {
-                        return Err(FrameworkErrc::CorruptedSceneManifest);
-                    }
-                }
-                manifestMusicTrackId = hdr.musicTrackId;
-                bool needsLoad = false;
-                for (u32 i = 0U; i < hdr.assetEntryCount; ++i) {
-                    CookedSceneAssetEntry e{};
-                    std::memcpy(&e, entriesBytes + static_cast<usize>(i) * sizeof(CookedSceneAssetEntry), sizeof(CookedSceneAssetEntry));
-                    if (e.id.IsValid()) {
-                        (void)assetBank.AcquireSlot(e.id, e.kind, m_stagingScope, e.residency, needsLoad);
-                    }
-                }
+        if (!manifestBlob.IsValid()) {
+            return rollbackStaging(FrameworkErrc::CorruptedSceneManifest);
+        }
+        const BlobRecord& rec = assetBank.GetBlob(manifestBlob);
+        if (rec.data == nullptr || rec.size < sizeof(CookedSceneManifestHeader)) {
+            return rollbackStaging(FrameworkErrc::CorruptedSceneManifest);
+        }
+        const auto& hdr = *reinterpret_cast<const CookedSceneManifestHeader*>(rec.data);
+        const usize expectedBytes = sizeof(CookedSceneManifestHeader) +
+                                    static_cast<usize>(hdr.assetEntryCount) * sizeof(CookedSceneAssetEntry);
+        if (hdr.magic != CookedSceneManifestHeader::kMagic ||
+            hdr.version != CookedSceneManifestHeader::kVersion ||
+            rec.size < expectedBytes) {
+            return rollbackStaging(FrameworkErrc::CorruptedSceneManifest);
+        }
+        const auto* entriesPtr = reinterpret_cast<const CookedSceneAssetEntry*>(
+            rec.data + sizeof(CookedSceneManifestHeader));
+        const std::span<const CookedSceneAssetEntry> entries{entriesPtr, hdr.assetEntryCount};
+        if (hdr.checksum != 0U && ComputeSceneManifestChecksum(entries) != hdr.checksum) {
+            return rollbackStaging(FrameworkErrc::CorruptedSceneManifest);
+        }
+        manifestMusicTrackId = hdr.musicTrackId;
+        bool needsLoad = false;
+        for (const CookedSceneAssetEntry& e : entries) {
+            if (e.id.IsValid()) {
+                (void)assetBank.AcquireSlot(e.id, e.kind, m_stagingScope, e.residency, needsLoad);
             }
         }
     }
 
-    // 2. Non-blocking check: wait until all Residency::Sim assets in m_stagingScope are ready
     if (!assetBank.IsScopeSimReady(m_stagingScope)) {
         return false;
     }
 
-    // 3. Deactivate old scene at safe frame barrier
+    BlobHandle validColBlob{};
+    if (m_pendingScene.collisionMapId.IsValid() && loadCtx.physics != nullptr) {
+        validColBlob = assetBank.FindBlobHandle(m_pendingScene.collisionMapId);
+        if (!validColBlob.IsValid()) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+        const BlobRecord& colRec = assetBank.GetBlob(validColBlob);
+        if (!colRec.IsValid() || colRec.size < sizeof(CookedCollisionMapHeader)) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+        const auto& cmHdr = *reinterpret_cast<const CookedCollisionMapHeader*>(colRec.data);
+        const usize tilesBytes = static_cast<usize>(cmHdr.widthTiles) * cmHdr.heightTiles;
+        if (cmHdr.magic != CookedCollisionMapHeader::kMagic ||
+            cmHdr.version != CookedCollisionMapHeader::kVersion ||
+            cmHdr.widthTiles == 0U || cmHdr.heightTiles == 0U ||
+            colRec.size < sizeof(CookedCollisionMapHeader) + tilesBytes) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+    }
+
+    BlobHandle validPrefabBlob{};
+    if (m_pendingScene.rootPrefabId.IsValid()) {
+        validPrefabBlob = assetBank.FindBlobHandle(m_pendingScene.rootPrefabId);
+        if (!validPrefabBlob.IsValid()) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+        const BlobRecord& prefRec = assetBank.GetBlob(validPrefabBlob);
+        if (!prefRec.IsValid() || prefRec.size < sizeof(CookedPrefabHeader)) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+        const auto& pfHdr = *reinterpret_cast<const CookedPrefabHeader*>(prefRec.data);
+        if (pfHdr.magic != kCookedPrefabMagic || pfHdr.version != 1U || pfHdr.entityCount == 0U) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+    }
+
+    BlobHandle validCueBlob{};
+    if (m_pendingScene.cueBankId.IsValid()) {
+        validCueBlob = assetBank.FindBlobHandle(m_pendingScene.cueBankId);
+        if (!validCueBlob.IsValid() || !assetBank.GetBlob(validCueBlob).IsValid()) {
+            return rollbackStaging(FrameworkErrc::SimAssetWaitFailed);
+        }
+    }
+
+    // Carve temporary rollback snapshot from AssetBank payload pool before mutating World.
+    u8* rollbackSlicePtr = nullptr;
+    usize rollbackAllocCap = 0U;
+    usize rollbackWrittenBytes = 0U;
+    if (loadCtx.world->AliveCount() > 0U) {
+        rollbackAllocCap = loadCtx.world->RequiredSnapshotBytes();
+        const std::span<u8> sliceSpan = assetBank.AllocatePayloadSlice(rollbackAllocCap);
+        if (!sliceSpan.empty()) {
+            rollbackSlicePtr = sliceSpan.data();
+            if (auto sr = loadCtx.world->SerializeWorldSnapshot(sliceSpan); sr) {
+                rollbackWrittenBytes = *sr;
+            } else {
+                assetBank.FreePayloadSlice(rollbackSlicePtr, rollbackAllocCap);
+                rollbackSlicePtr = nullptr;
+                rollbackAllocCap = 0U;
+            }
+        }
+    }
+
+    const auto freeRollbackSlice = [&]() noexcept {
+        if (rollbackSlicePtr != nullptr) {
+            assetBank.FreePayloadSlice(rollbackSlicePtr, rollbackAllocCap);
+            rollbackSlicePtr = nullptr;
+            rollbackAllocCap = 0U;
+            rollbackWrittenBytes = 0U;
+        }
+    };
+
     const u8 oldScope = m_activeScope;
+    const AssetId oldSceneId = m_activeSceneId;
+    auto* const oldDeactivateFn = m_activeSceneDeactivateFn;
+
+    const auto rollbackPostSwap = [&](FrameworkErrc err) noexcept -> Result<bool, FrameworkErrc> {
+        loadCtx.world->Clear();
+        if (rollbackSlicePtr != nullptr && rollbackWrittenBytes > 0U) {
+            (void)loadCtx.world->DeserializeWorldSnapshot(std::span<const u8>{rollbackSlicePtr, rollbackWrittenBytes});
+        }
+        freeRollbackSlice();
+        if (m_activeScope < kMaxAssetScopes && m_activeScope != oldScope && m_activeScope != m_persistentScope) {
+            assetBank.EndScope(m_activeScope);
+        }
+        m_activeScope = oldScope;
+        m_stagingScope = 0xFFU;
+        m_activeSceneId = oldSceneId;
+        m_activeSceneDeactivateFn = oldDeactivateFn;
+        loadCtx.sceneScope = oldScope;
+        m_phase = TransitionPhase::Idle;
+        m_activeWipe = TransitionWipeKind::None;
+        m_wipeElapsedTicks = 0U;
+        return Err(err);
+    };
+
     loadCtx.sceneScope = oldScope;
-    if (m_activeSceneDeactivateFn) {
+    loadCtx.transitionTicks = m_wipeDurationTicks;
+    if (m_activeSceneDeactivateFn != nullptr) {
         m_activeSceneDeactivateFn(loadCtx);
         m_activeSceneDeactivateFn = nullptr;
     }
 
     if (m_pendingScene.mode == SceneTransitionMode::FullReset) {
         loadCtx.world->Clear();
-        if (loadCtx.physics) loadCtx.physics->Clear();
-        if (loadCtx.gameplay) loadCtx.gameplay->Clear();
     } else {
-        // RoomSwap: destroy temporary Lifetime2D entities and kRoomTransientCategoryBit actors while preserving persistent entities
+        // Clamp index on each iteration because cascading LCRS Destroy() may remove multiple pool entries.
         const u64 regMask = loadCtx.world->RegisteredPoolsMask();
         if ((regMask & MakeComponentMask<Lifetime2D>()) != 0ULL) {
             const auto& lifePool = loadCtx.world->GetPool<Lifetime2D>();
-            for (u16 i = lifePool.Size(); i > 0U; --i) {
-                (void)loadCtx.world->Destroy(lifePool.Entities()[i - 1U], true);
+            while (lifePool.Size() > 0U) {
+                (void)loadCtx.world->Destroy(lifePool.Entities()[lifePool.Size() - 1U], true);
             }
         }
         if ((regMask & MakeComponentMask<Tag2D>()) != 0ULL) {
             const auto& tagPool = loadCtx.world->GetPool<Tag2D>();
-            for (u16 i = tagPool.Size(); i > 0U; --i) {
-                if ((tagPool.ComponentAtDense(i - 1U).categoryMask & kRoomTransientCategoryBit) != 0U) {
-                    (void)loadCtx.world->Destroy(tagPool.Entities()[i - 1U], true);
+            for (u16 i = tagPool.Size(); i > 0U;) {
+                i = std::min<u16>(i, tagPool.Size());
+                if (i == 0U) {
+                    break;
+                }
+                --i;
+                if ((tagPool.ComponentAtDense(i).categoryMask & kRoomTransientCategoryBit) != 0U) {
+                    (void)loadCtx.world->Destroy(tagPool.Entities()[i], true);
                 }
             }
         }
-        if (loadCtx.physics) loadCtx.physics->Clear();
-        if (loadCtx.gameplay) loadCtx.gameplay->Clear();
     }
 
-    if (oldScope < kMaxAssetScopes && oldScope != m_persistentScope) {
-        loadCtx.audio->RequestScopeRelease(oldScope);
-        const u32 releasable = loadCtx.audio->PollReleasableScopeMask();
-        if ((releasable & (1U << oldScope)) != 0U) {
-            assetBank.EndScope(oldScope);
-        }
+    if (loadCtx.physics != nullptr) {
+        loadCtx.physics->Clear();
+    }
+    if (loadCtx.gameplay != nullptr) {
+        loadCtx.gameplay->Clear();
     }
 
     m_activeScope = m_stagingScope;
     m_stagingScope = 0xFFU;
     m_activeSceneId = m_pendingScene.sceneId;
     m_activeSceneDeactivateFn = m_pendingScene.onDeactivating;
-    ++m_transitionCount;
     loadCtx.sceneScope = m_activeScope;
 
-    // 4. Bind new scene resources (CollisionMap, SoundCueBank, RootPrefab, and Music Track)
-    if (m_pendingScene.collisionMapId.IsValid() && loadCtx.physics) {
-        const BlobHandle colBlob = assetBank.FindBlobHandle(m_pendingScene.collisionMapId);
-        if (colBlob.IsValid()) {
-            if (auto r = loadCtx.physics->BindCollisionMapBlob(assetBank, colBlob); !r) {
-                return Err(FrameworkErrc::SimAssetWaitFailed);
-            }
+    if (validColBlob.IsValid() && loadCtx.physics != nullptr) {
+        if (auto r = loadCtx.physics->BindCollisionMapBlob(assetBank, validColBlob); !r) {
+            return rollbackPostSwap(FrameworkErrc::SimAssetWaitFailed);
         }
     }
-    if (m_pendingScene.cueBankId.IsValid()) {
-        const BlobHandle cueBlob = assetBank.FindBlobHandle(m_pendingScene.cueBankId);
-        if (cueBlob.IsValid()) {
-            const BlobRecord& cueRec = assetBank.GetBlob(cueBlob);
-            if (cueRec.IsValid()) {
-                (void)loadCtx.audio->RegisterCueBank(cueRec, m_activeScope);
-            }
+    if (validCueBlob.IsValid()) {
+        if (auto r = loadCtx.audio->RegisterCueBank(assetBank.GetBlob(validCueBlob), m_activeScope); !r) {
+            return rollbackPostSwap(FrameworkErrc::SimAssetWaitFailed);
         }
     }
-    if (m_pendingScene.rootPrefabId.IsValid()) {
-        const BlobHandle prefBlob = assetBank.FindBlobHandle(m_pendingScene.rootPrefabId);
-        if (prefBlob.IsValid()) {
-            const BlobRecord& prefRec = assetBank.GetBlob(prefBlob);
-            if (prefRec.IsValid()) {
-                if (auto r = WorldExtractor::InstantiatePrefab(*loadCtx.world, assetBank, prefBlob); !r) {
-                    return Err(FrameworkErrc::SimAssetWaitFailed);
-                }
-            }
+    if (validPrefabBlob.IsValid()) {
+        if (auto r = WorldExtractor::InstantiatePrefab(*loadCtx.world, assetBank, validPrefabBlob); !r) {
+            return rollbackPostSwap(FrameworkErrc::SimAssetWaitFailed);
+        }
+    }
+    if (m_pendingScene.onActivated != nullptr) {
+        if (auto r = m_pendingScene.onActivated(loadCtx); !r) {
+            return rollbackPostSwap(r.error());
+        }
+    }
+
+    freeRollbackSlice();
+
+    if (oldScope < kMaxAssetScopes && oldScope != m_persistentScope && oldScope != m_activeScope) {
+        loadCtx.audio->RequestScopeRelease(oldScope);
+        if ((loadCtx.audio->PollReleasableScopeMask() & (1U << oldScope)) != 0U) {
+            assetBank.EndScope(oldScope);
         }
     }
 
@@ -308,14 +350,8 @@ Result<bool, FrameworkErrc> SceneDirector::ActivatePendingScene(SceneLoadContext
         (void)loadCtx.audio->TransitionMusic(targetMusicId, assetBank, m_pendingScene.musicCrossfadeBlocks);
     }
 
-    // 5. Invoke client scene activation callback
-    if (m_pendingScene.onActivated) {
-        if (auto r = m_pendingScene.onActivated(loadCtx); !r) {
-            return Err(r.error());
-        }
-    }
+    ++m_transitionCount;
 
-    // 6. Transition to FadingIn or Idle
     if (m_activeWipe != TransitionWipeKind::None && m_wipeDurationTicks > 0U) {
         m_wipeElapsedTicks = m_wipeDurationTicks;
         m_phase = TransitionPhase::FadingIn;
@@ -328,96 +364,71 @@ Result<bool, FrameworkErrc> SceneDirector::ActivatePendingScene(SceneLoadContext
 }
 
 Result<bool, FrameworkErrc> SceneDirector::CommitSafeFramePoint(SceneLoadContext& loadCtx) noexcept {
+    if (!HasPendingWork()) {
+        return false;
+    }
+
     bool didMutate = false;
+
+    if (m_phase == TransitionPhase::StreamingSceneAssets) {
+        auto actRes = ActivatePendingScene(loadCtx);
+        if (!actRes) {
+            return Err(actRes.error());
+        }
+        if (*actRes) {
+            didMutate = true;
+            loadCtx.sceneScope = m_activeScope;
+        }
+    }
+
     const u8 cmdCount = m_cmdCount;
     m_cmdCount = 0U;
 
-    const auto pushLayer = [&](const StateLayerDesc& d) noexcept -> Result<void, FrameworkErrc> {
-        if (m_stackDepth >= kMaxStateStackDepth) {
-            return Err(FrameworkErrc::StateStackOverflow);
-        }
-        const u8 idx = m_stackDepth++;
-        m_layerFlags[idx] = d.flags;
-        m_stateIds[idx] = d.id;
-        m_inputMasks[idx] = d.inputActionMask;
-        m_simFns[idx] = d.onSimTick;
-        m_renderFns[idx] = d.onRenderExtract;
-        m_userStates[idx] = d.stateData;
-        m_exitFns[idx] = d.onExit;
-        if (d.onEnter) {
-            d.onEnter(loadCtx, d.stateData);
-        }
-        didMutate = true;
-        return {};
-    };
-
-    const auto popTopLayer = [&]() noexcept -> Result<void, FrameworkErrc> {
-        if (m_stackDepth == 0U) {
-            return Err(FrameworkErrc::StateStackUnderflow);
-        }
+    const auto popTopLayer = [&]() noexcept {
         const u8 idx = --m_stackDepth;
-        if (m_exitFns[idx]) {
+        if (m_exitFns[idx] != nullptr) {
             m_exitFns[idx](loadCtx, m_userStates[idx]);
         }
-        m_layerFlags[idx] = StateLayerFlags::None;
-        m_stateIds[idx] = kInvalidStateId;
-        m_inputMasks[idx] = 0xFFFFU;
-        m_simFns[idx] = nullptr;
-        m_renderFns[idx] = nullptr;
-        m_userStates[idx] = nullptr;
-        m_exitFns[idx] = nullptr;
         didMutate = true;
-        return {};
     };
 
     for (u8 i = 0U; i < cmdCount; ++i) {
         const StateLayerDesc& cmd = m_pendingCmds[i];
-        switch (cmd.cmdKind) {
-            case StateCmdKind::Push: {
-                if (auto r = pushLayer(cmd); !r) {
-                    RebakeStackMasks();
-                    return Err(r.error());
-                }
-                break;
+        if (cmd.cmdKind == StateCmdKind::Pop) {
+            if (m_stackDepth == 0U) {
+                RebakeStackMasks();
+                return Err(FrameworkErrc::StateStackUnderflow);
             }
-            case StateCmdKind::Pop: {
-                if (auto r = popTopLayer(); !r) {
-                    RebakeStackMasks();
-                    return Err(r.error());
-                }
-                break;
-            }
-            case StateCmdKind::Switch: {
-                if (m_stackDepth > 0U) {
-                    (void)popTopLayer();
-                }
-                if (auto r = pushLayer(cmd); !r) {
-                    RebakeStackMasks();
-                    return Err(r.error());
-                }
-                break;
-            }
-            case StateCmdKind::ClearAndPush: {
-                while (m_stackDepth > 0U) {
-                    (void)popTopLayer();
-                }
-                if (auto r = pushLayer(cmd); !r) {
-                    RebakeStackMasks();
-                    return Err(r.error());
-                }
-                break;
+            popTopLayer();
+            continue;
+        }
+        if (cmd.cmdKind == StateCmdKind::Switch && m_stackDepth > 0U) {
+            popTopLayer();
+        } else if (cmd.cmdKind == StateCmdKind::ClearAndPush) {
+            while (m_stackDepth > 0U) {
+                popTopLayer();
             }
         }
+        if (m_stackDepth >= kMaxStateStackDepth) {
+            RebakeStackMasks();
+            return Err(FrameworkErrc::StateStackOverflow);
+        }
+        const u8 idx = m_stackDepth++;
+        m_layerFlags[idx] = cmd.flags;
+        m_stateIds[idx] = cmd.id;
+        m_inputMasks[idx] = cmd.inputActionMask;
+        m_simFns[idx] = cmd.onSimTick;
+        m_renderFns[idx] = cmd.onRenderExtract;
+        m_userStates[idx] = cmd.stateData;
+        m_exitFns[idx] = cmd.onExit;
+        if (cmd.onEnter != nullptr) {
+            cmd.onEnter(loadCtx, cmd.stateData);
+        }
+        didMutate = true;
     }
 
     if (didMutate) {
         RebakeStackMasks();
-    }
-
-    if (m_phase == TransitionPhase::StreamingSceneAssets) {
-        auto actRes = ActivatePendingScene(loadCtx);
-        if (!actRes) return Err(actRes.error());
-        if (*actRes) didMutate = true;
     }
 
     return didMutate;
@@ -440,22 +451,26 @@ void SceneDirector::RebakeStackMasks() noexcept {
 
         if (!inputResolved) {
             topInput = m_inputMasks[idx];
-            if (HasStateFlag(flags, StateLayerFlags::BlockLowerInput)) {
+            if (HasFlag(flags, StateLayerFlags::BlockLowerInput)) {
                 inputResolved = true;
             }
         }
-        if (HasStateFlag(flags, StateLayerFlags::PauseSimClock)) {
+        if (HasFlag(flags, StateLayerFlags::PauseSimClock)) {
             pauseMask |= bit;
         }
         if (!simBlocked) {
-            if (m_simFns[idx] != nullptr) simMask |= bit;
-            if (HasStateFlag(flags, StateLayerFlags::BlockLowerSimTicks)) {
+            if (m_simFns[idx] != nullptr) {
+                simMask |= bit;
+            }
+            if (HasFlag(flags, StateLayerFlags::BlockLowerSimTicks)) {
                 simBlocked = true;
             }
         }
         if (!renderBlocked) {
-            if (m_renderFns[idx] != nullptr) renderMask |= bit;
-            if (HasStateFlag(flags, StateLayerFlags::BlockLowerRender)) {
+            if (m_renderFns[idx] != nullptr) {
+                renderMask |= bit;
+            }
+            if (HasFlag(flags, StateLayerFlags::BlockLowerRender)) {
                 renderBlocked = true;
             }
         }
@@ -468,24 +483,16 @@ void SceneDirector::RebakeStackMasks() noexcept {
 }
 
 void SceneDirector::DispatchSimTick(SimContext& simCtx, const SimStepView& step) const noexcept {
-    u8 mask = m_activeSimMask;
-    while (mask != 0U) {
+    for (u8 mask = m_activeSimMask; mask != 0U; mask &= static_cast<u8>(mask - 1U)) {
         const u8 idx = static_cast<u8>(std::countr_zero(mask));
-        mask &= static_cast<u8>(mask - 1U);
-        if (m_simFns[idx]) {
-            m_simFns[idx](simCtx, step, m_userStates[idx]);
-        }
+        m_simFns[idx](simCtx, step, m_userStates[idx]);
     }
 }
 
 void SceneDirector::DispatchRenderExtract(RenderContext& renderCtx) const noexcept {
-    u8 mask = m_activeRenderMask;
-    while (mask != 0U) {
+    for (u8 mask = m_activeRenderMask; mask != 0U; mask &= static_cast<u8>(mask - 1U)) {
         const u8 idx = static_cast<u8>(std::countr_zero(mask));
-        mask &= static_cast<u8>(mask - 1U);
-        if (m_renderFns[idx]) {
-            m_renderFns[idx](renderCtx, m_userStates[idx]);
-        }
+        m_renderFns[idx](renderCtx, m_userStates[idx]);
     }
 }
 
@@ -497,8 +504,12 @@ void SceneDirector::EmitTransitionOverlay(RenderList& outList, ViewportExtent vi
 
     const f32 vw = static_cast<f32>(viewportSize.w);
     const f32 vh = static_cast<f32>(viewportSize.h);
+    const Vec2 center{vw * 0.5f, vh * 0.5f};
 
     QuadCmd cmd{};
+    cmd.center = center;
+    cmd.size = {vw, vh};
+    cmd.color = Color{0.03f, 0.03f, 0.05f, 1.0f};
     cmd.texture = kWhiteTexture;
     cmd.depth = 65500U;
     cmd.layer = 250U;
@@ -507,35 +518,34 @@ void SceneDirector::EmitTransitionOverlay(RenderList& outList, ViewportExtent vi
 
     switch (m_activeWipe) {
         case TransitionWipeKind::FadeToBlack: {
-            cmd.center = {vw * 0.5f, vh * 0.5f};
-            cmd.size = {vw, vh};
             cmd.color = Color{0.0f, 0.0f, 0.0f, progress};
             outList.PushQuad(cmd);
             break;
         }
         case TransitionWipeKind::HorizontalCurtain: {
-            const f32 curW = vw * progress;
-            cmd.center = {curW * 0.5f, vh * 0.5f};
-            cmd.size = {curW, vh};
-            cmd.color = Color{0.0f, 0.0f, 0.0f, 1.0f};
+            const f32 panelW = center.x * progress;
+            cmd.size.x = panelW;
+            cmd.center.x = panelW * 0.5f;
+            outList.PushQuad(cmd);
+            cmd.center.x = vw - panelW * 0.5f;
             outList.PushQuad(cmd);
             break;
         }
         case TransitionWipeKind::VerticalCurtain: {
-            const f32 curH = vh * progress;
-            cmd.center = {vw * 0.5f, curH * 0.5f};
-            cmd.size = {vw, curH};
-            cmd.color = Color{0.0f, 0.0f, 0.0f, 1.0f};
+            const f32 panelH = center.y * progress;
+            cmd.size.y = panelH;
+            cmd.center.y = panelH * 0.5f;
+            outList.PushQuad(cmd);
+            cmd.center.y = vh - panelH * 0.5f;
             outList.PushQuad(cmd);
             break;
         }
         case TransitionWipeKind::DiamondIris: {
-            const f32 maxDim = std::max(vw, vh) * 1.42f * progress;
-            cmd.center = {vw * 0.5f, vh * 0.5f};
-            cmd.size = {maxDim, maxDim};
+            const f32 curDim = std::sqrt(vw * vw + vh * vh) * 1.42f * progress;
+            cmd.size = {curDim, curDim};
             cmd.cosRot = 0.70710678f;
             cmd.sinRot = 0.70710678f;
-            cmd.color = Color{0.0f, 0.0f, 0.0f, 1.0f};
+            cmd.color = Color{0.02f, 0.02f, 0.04f, 1.0f};
             outList.PushQuad(cmd);
             break;
         }

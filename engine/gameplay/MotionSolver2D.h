@@ -5,9 +5,9 @@
 
 namespace en {
 
-// Stateless priority motion blender, coyote/drop-through timer updater, soft character pushbox separator, and 3-ray safe anchor verifier.
-// Operates over World component pools and PhysicsSystem spatial queries with zero dynamic memory allocations.
-// Invariant: MotionStack2D root-motion deltas are consumed and zeroed once per simulation tick when blended into CharacterMotor2D.
+// Stateless priority motion blender, coyote/drop-through timer updater, character pushbox separator, and safe anchor verifier.
+// Non-owning simulation stage helper invoked by GameplayPipeline::Tick.
+// Invariant: respects per-entity TimeChannel freeze states and hitstop freeze ticks.
 class MotionSolver2D {
 public:
     static void SyncPostPhysicsContactsAndTimers(

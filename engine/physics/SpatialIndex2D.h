@@ -6,9 +6,8 @@
 
 namespace en {
 
-// 24-byte (zero padding) spatial grid proxy record for cache-coherent broadphase and ray/sweep queries.
-// For Aabb/Circle/CapsuleY/Obb: (minX, minY, maxX, maxY) is the world AABB.
-// For Segment: (minX, minY) is world endpoint p0 and (maxX, maxY) is world endpoint p1.
+// Spatial grid proxy record for broadphase and ray/sweep queries.
+// Stores world AABB (minX, minY, maxX, maxY) for standard shapes, or world endpoints p0->p1 for Segment.
 struct alignas(8) SpatialBox2D {
     f32 minX{0.0f};
     f32 minY{0.0f};
@@ -17,27 +16,32 @@ struct alignas(8) SpatialBox2D {
     EntityId entity{kNullEntity};
     u16 categoryBits{0x0001U};
     ShapeKind2D shape{ShapeKind2D::Aabb};
-    ColliderFlags2D flags{ColliderFlags2D::None};
+    TileMaterialFlags flags{TileMaterialFlags::Solid};
 
     [[nodiscard]] constexpr f32 BoundMinX() const noexcept { return (shape == ShapeKind2D::Segment) ? std::min(minX, maxX) : minX; }
     [[nodiscard]] constexpr f32 BoundMinY() const noexcept { return (shape == ShapeKind2D::Segment) ? std::min(minY, maxY) : minY; }
     [[nodiscard]] constexpr f32 BoundMaxX() const noexcept { return (shape == ShapeKind2D::Segment) ? std::max(minX, maxX) : maxX; }
     [[nodiscard]] constexpr f32 BoundMaxY() const noexcept { return (shape == ShapeKind2D::Segment) ? std::max(minY, maxY) : maxY; }
+    [[nodiscard]] constexpr bool IsSensor() const noexcept { return !HasFlag(flags, TileMaterialFlags::Solid); }
+    [[nodiscard]] constexpr bool IsOneWay() const noexcept { return HasFlag(flags, TileMaterialFlags::OneWay); }
 };
 static_assert(sizeof(SpatialBox2D) == 24);
 
-// 64-byte (1 cache line exact, zero padding) hybrid 2-level hierarchical tile bitplane and 3-pass counting-sort uniform grid.
-// Non-owning view over PhysicsSystem's AlignedArena; zero heap allocations and zero stack buffers during RebuildDynamicGrid.
-// Invariant: m_cellOffsets[kGridCells] equals the total number of scattered cell references in the active build.
+// Two-level hierarchical 8x8 tile bitplane, counting-sort uniform spatial grid, and oversized-proxy accelerator.
+// Non-owning view over memory carved from PhysicsSystem's AlignedArena.
+// Invariant: sizeof(SpatialIndex2D) == 64 (1 cache line exact) and CellOffsets()[kGridCells] == TotalCellRefs().
 class alignas(64) SpatialIndex2D {
 public:
     static constexpr u32 kGridDim = 32U;
-    static constexpr u32 kGridCells = kGridDim * kGridDim; // 1024 cells
+    static constexpr u32 kGridCells = kGridDim * kGridDim;
 
     [[nodiscard]] bool Init(AlignedArena& arena, u16 maxProxies, f32 cellSizeMeters = 2.0f) noexcept;
     void Clear() noexcept;
 
-    [[nodiscard]] Result<void, PhysicsErrc> BindCollisionMap(std::span<const u8> blobBytes) noexcept;
+    [[nodiscard]] Result<void, PhysicsErrc> BindCollisionMap(
+        AlignedArena& arena,
+        std::span<const u8> blobBytes) noexcept;
+
     [[nodiscard]] Result<void, PhysicsErrc> BuildTileMapFromGrid(
         AlignedArena& arena,
         u16 widthTiles,
@@ -53,53 +57,38 @@ public:
     [[nodiscard]] TileMaterialFlags SampleTileCoord(i32 tx, i32 ty) const noexcept;
 
     [[nodiscard]] RayHit2D Raycast(
-        f32 originX,
-        f32 originY,
-        f32 dirX,
-        f32 dirY,
-        f32 maxDist,
+        f32 originX, f32 originY, f32 dirX, f32 dirY, f32 maxDist,
         u16 categoryMask = 0xFFFFU,
-        EntityId ignoreEntity = kNullEntity) const noexcept;
+        EntityId ignoreEntity = kNullEntity,
+        bool includeSensors = true) const noexcept;
 
     [[nodiscard]] SweepHit2D SweepAabb(
         EntityId ignoreEntity,
-        f32 centerX,
-        f32 centerY,
-        f32 halfW,
-        f32 halfH,
-        f32 deltaX,
-        f32 deltaY,
+        f32 centerX, f32 centerY, f32 halfW, f32 halfH,
+        f32 deltaX, f32 deltaY,
         u16 solidMask = 0xFFFFU,
         bool ignoreOneWay = false) const noexcept;
 
     [[nodiscard]] SweepHit2D CastCircle(
         EntityId ignoreEntity,
-        f32 centerX,
-        f32 centerY,
-        f32 radius,
-        f32 deltaX,
-        f32 deltaY,
+        f32 centerX, f32 centerY, f32 radius,
+        f32 deltaX, f32 deltaY,
         u16 solidMask = 0xFFFFU,
-        bool ignoreOneWay = false) const noexcept {
-        return SweepAabb(ignoreEntity, centerX, centerY, radius, radius, deltaX, deltaY, solidMask, ignoreOneWay);
-    }
+        bool ignoreOneWay = false) const noexcept;
 
     [[nodiscard]] u32 QueryAabb(
-        f32 minX,
-        f32 minY,
-        f32 maxX,
-        f32 maxY,
+        f32 minX, f32 minY, f32 maxX, f32 maxY,
         u16 categoryMask,
         std::span<EntityId> outEntities,
-        EntityId ignoreEntity = kNullEntity) const noexcept;
+        EntityId ignoreEntity = kNullEntity,
+        bool includeSensors = true) const noexcept;
 
     [[nodiscard]] u32 QueryCircle(
-        f32 centerX,
-        f32 centerY,
-        f32 radius,
+        f32 centerX, f32 centerY, f32 radius,
         u16 categoryMask,
         std::span<EntityId> outEntities,
-        EntityId ignoreEntity = kNullEntity) const noexcept;
+        EntityId ignoreEntity = kNullEntity,
+        bool includeSensors = true) const noexcept;
 
     [[nodiscard]] constexpr std::span<const SpatialBox2D> ActiveBoxes() const noexcept {
         return {m_boxes, m_boxCount};
@@ -111,6 +100,11 @@ public:
 
     [[nodiscard]] constexpr std::span<const u16> CellBoxIndices() const noexcept {
         return {m_cellBoxIndices, TotalCellRefs()};
+    }
+
+    [[nodiscard]] std::span<const u16> OversizedBoxIndices() const noexcept {
+        if (!m_boxes || !m_cellOffsets) return {};
+        return {reinterpret_cast<const u16*>(m_boxes + m_maxBoxes), m_cellOffsets[kGridCells + 1U]};
     }
 
     [[nodiscard]] constexpr u32 TotalCellRefs() const noexcept {
@@ -133,19 +127,19 @@ public:
     }
 
 private:
-    SpatialBox2D* m_boxes{nullptr};       // 8B (first half: active, second half: staging)
-    u32* m_cellOffsets{nullptr};          // 8B (kGridCells + 1 entries)
-    u16* m_cellBoxIndices{nullptr};       // 8B (scattered proxy indices)
-    const u64* m_chunkBitplanes{nullptr}; // 8B (1 u64 per 8x8 tile chunk)
-    const u8* m_tileFlags{nullptr};       // 8B (widthTiles * heightTiles bytes)
-    f32 m_originX{0.0f};                  // 4B
-    f32 m_originY{0.0f};                  // 4B
-    f32 m_tileSize{1.0f};                 // 4B
-    f32 m_invCellSize{0.5f};              // 4B
-    u16 m_widthTiles{0U};                 // 2B
-    u16 m_heightTiles{0U};                // 2B
-    u16 m_boxCount{0U};                   // 2B
-    u16 m_maxBoxes{0U};                   // 2B
+    SpatialBox2D* m_boxes{nullptr};
+    u32* m_cellOffsets{nullptr};
+    u16* m_cellBoxIndices{nullptr};
+    const u64* m_chunkBitplanes{nullptr};
+    const u8* m_tileFlags{nullptr};
+    f32 m_originX{0.0f};
+    f32 m_originY{0.0f};
+    f32 m_tileSize{1.0f};
+    f32 m_invCellSize{0.5f};
+    u16 m_widthTiles{0U};
+    u16 m_heightTiles{0U};
+    u16 m_boxCount{0U};
+    u16 m_maxBoxes{0U};
 };
 static_assert(sizeof(SpatialIndex2D) == 64);
 

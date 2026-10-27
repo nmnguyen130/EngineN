@@ -4,8 +4,7 @@
 
 namespace en {
 
-// Layer 2 thin hardware clock and high-precision sleep seam backed by SDL3 (<SDL3/SDL_timer.h>).
-// Stateless static interface; isolates OS/SDL timer dependencies from Layer 1 constexpr TimePipeline.
+// Monotonic high-resolution clock and thread sleep wrapper backed by SDL3 timer routines.
 struct SdlClock {
     [[nodiscard]] static u64 NowNs() noexcept;
     static void SleepNs(u64 durationNs) noexcept;
