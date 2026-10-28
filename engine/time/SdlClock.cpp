@@ -10,51 +10,55 @@ u64 SdlClock::NowNs() noexcept {
     return static_cast<u64>(SDL_GetTicksNS());
 }
 
-void SdlClock::SleepNs(u64 durationNs) noexcept {
-    if (durationNs > 0ULL) SDL_DelayPrecise(durationNs);
+void SdlClock::SleepNs(u64 ns) noexcept {
+    if (ns > 0ULL) SDL_DelayPrecise(ns);
 }
 
 void SdlClock::YieldThread() noexcept {
     SDL_DelayNS(0ULL);
 }
 
+void FramePacer::BeginFrame() noexcept {
+    m_start = SdlClock::NowNs();
+}
+
 void FramePacer::EndFrameAndPace() noexcept {
-    m_lastSleepNs = 0U;
-    m_lastSpinNs = 0U;
-    if (m_targetFrameNs == 0ULL) return;
+    m_lastSleep = 0U;
+    m_lastSpin  = 0U;
+    if (m_targetNs == 0ULL) return;
 
     u64 now = SdlClock::NowNs();
-    if (m_frameStartNs == 0ULL || now < m_frameStartNs) {
-        m_frameStartNs = now;
+    if (m_start == 0ULL || now < m_start) {
+        m_start = now;
         return;
     }
 
-    const u64 targetEndNs = m_frameStartNs + m_targetFrameNs;
-    if (now < targetEndNs) {
-        const u64 remainingNs = targetEndNs - now;
-        if (remainingNs > m_sleepMarginNs) {
-            const u64 reqSleepNs = remainingNs - m_sleepMarginNs;
-            SdlClock::SleepNs(reqSleepNs);
-            const u64 afterSleep = SdlClock::NowNs();
-            const u64 sleptNs = (afterSleep > now) ? (afterSleep - now) : reqSleepNs;
-            m_lastSleepNs = static_cast<u32>(std::min<u64>(sleptNs, 0xFFFFFFFFULL));
+    const u64 end = m_start + m_targetNs;
+    if (now < end) {
+        const u64 remain = end - now;
+        if (remain > m_margin) {
+            const u64 req = remain - m_margin;
+            SdlClock::SleepNs(req);
+            const u64 after = SdlClock::NowNs();
+            const u64 slept = (after > now) ? (after - now) : req;
+            m_lastSleep = static_cast<u32>(std::min<u64>(slept, 0xFFFFFFFFULL));
 
-            const u64 overshootNs = (sleptNs > reqSleepNs) ? (sleptNs - reqSleepNs) : 0ULL;
-            const u32 sampleMargin = static_cast<u32>(
-                std::clamp<u64>(overshootNs + kMinSpinMarginNs, kMinSpinMarginNs, kMaxSpinMarginNs));
-            m_sleepMarginNs = static_cast<u32>((static_cast<u64>(m_sleepMarginNs) * 7ULL + sampleMargin) >> 3U);
-            now = afterSleep;
+            const u64 over = (slept > req) ? (slept - req) : 0ULL;
+            const u32 sample = static_cast<u32>(
+                std::clamp<u64>(over + kMinMarginNs, kMinMarginNs, kMaxMarginNs));
+            m_margin = static_cast<u32>((static_cast<u64>(m_margin) * 7ULL + sample) >> 3);
+            now = after;
         }
 
         const u64 spinStart = now;
-        while (now < targetEndNs) {
+        while (now < end) {
             SdlClock::YieldThread();
             now = SdlClock::NowNs();
         }
-        m_lastSpinNs = static_cast<u32>(std::min<u64>(now - spinStart, 0xFFFFFFFFULL));
+        m_lastSpin = static_cast<u32>(std::min<u64>(now - spinStart, 0xFFFFFFFFULL));
     }
 
-    m_frameStartNs = (now - targetEndNs < m_targetFrameNs) ? targetEndNs : now;
+    m_start = (now - end < m_targetNs) ? end : now;
 }
 
 } // namespace en

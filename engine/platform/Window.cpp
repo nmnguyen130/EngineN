@@ -67,13 +67,14 @@ Result<void, PlatformErrc> Window::SetMode(WindowMode mode, f32 targetRefreshHz)
         if (mode == WindowMode::ExclusiveFullscreen) {
             const SDL_DisplayID dispId = SDL_GetDisplayForWindow(m_window);
             const f32 reqHz = targetRefreshHz > 0.0f ? targetRefreshHz : m_state.refreshHz;
-            if (dispId != 0U && SDL_GetClosestFullscreenDisplayMode(
+            if (dispId != 0U &&
+                SDL_GetClosestFullscreenDisplayMode(
                     dispId, m_state.pixelSize.w, m_state.pixelSize.h, reqHz, true, &closest)) {
                 fsMode = &closest;
             }
         }
-        (void)SDL_SetWindowFullscreenMode(m_window, fsMode);
-        if (!SDL_SetWindowFullscreen(m_window, mode != WindowMode::Windowed)) {
+        if (!SDL_SetWindowFullscreenMode(m_window, fsMode) ||
+            !SDL_SetWindowFullscreen(m_window, mode != WindowMode::Windowed)) {
             return Err(PlatformErrc::FullscreenFailed);
         }
     }
@@ -98,18 +99,16 @@ void Window::SetRelativeMouse(bool enabled) noexcept {
 }
 
 void Window::SetCursorVisible(bool visible) noexcept {
-    if (m_cursorVisible == visible) return;
-    m_cursorVisible = visible;
-    if (m_window) {
-        (void)(visible ? SDL_ShowCursor() : SDL_HideCursor());
+    if (!IsValid() || m_cursorVisible == visible) return;
+    if (!m_window || (visible ? SDL_ShowCursor() : SDL_HideCursor())) {
+        m_cursorVisible = visible;
     }
 }
 
 void Window::SetTextInput(bool enabled) noexcept {
-    if (m_textInputActive == enabled) return;
-    m_textInputActive = enabled;
-    if (m_window) {
-        (void)(enabled ? SDL_StartTextInput(m_window) : SDL_StopTextInput(m_window));
+    if (!IsValid() || m_textInputActive == enabled) return;
+    if (!m_window || (enabled ? SDL_StartTextInput(m_window) : SDL_StopTextInput(m_window))) {
+        m_textInputActive = enabled;
     }
 }
 

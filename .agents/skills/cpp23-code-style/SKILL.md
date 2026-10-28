@@ -1,74 +1,48 @@
 ---
 name: cpp23-code-style
-description: Write, refactor, and review modern C++23 code following clean, human-authored engineering standards. Trigger whenever the user requests C++ or C++23 code generation, refactoring, architecture design, or code reviews. Enforces strict comment hygiene (English only, no ASCII section dividers, concise responsibility/ownership/invariant class docstrings, "why not what" inline comments), proper qualifier usage (constexpr, [[nodiscard]], noexcept), and zero redundant or bloated boilerplate.
+description: Write, refactor, and review C++23 code with clear contracts and invariants. Trigger when the user requests C++ or C++23 code generation, refactoring, architecture design, or code reviews.
 ---
-# C++23 Code Style & Engineering Standards
+# C++23 Code Style
 
-Write idiomatic, production-grade C++23 code that reads like it was crafted by a senior systems/engine programmer, avoiding AI-generated verbosity, decorative comments, and redundant abstractions.
+Write direct, verifiable C++23 systems code with clear contracts, ownership rules, and memory safety.
 
 ## When to Use
 
-- Writing new C++ / C++23 headers, modules, or implementation files
-- Refactoring existing C++ code for readability, performance, or modern standards
-- Reviewing C++ architecture, memory ownership, or API design
+- Writing new C++23 headers or implementation files.
+- Refactoring C++ code for memory safety, ABI layout, or modern standards.
+- Reviewing C++ interfaces, ownership models, and struct invariants.
 
-## Steps & Core Rules
+## Core Rules
 
-### 1. Comment & Documentation Hygiene (English Only)
+### 1. Documentation and Comments (English Only)
 
-All comments and docstrings must be written in clear, concise **English**.
+- **No Decorative Dividers:** Do not use ASCII banner comments (`// ---`, `// ===`, `// ***`). Use class access specifiers and clean file structure instead.
+- **No Meta-Narration:** Never write comments stating what the syntax already says (`// Constructor`, `// Loop over items`, `// Added fix`).
+- **Type Docstrings (Contracts & Invariants):** Before non-trivial classes or structs, write 2 to 3 lines stating:
+  1. **Responsibility:** What concrete role the type fulfills.
+  2. **Ownership:** Lifetime, memory ownership, or thread-safety contract (e.g., value type, non-owning view, move-only handle).
+  3. **Invariant:** Conditions that always hold for valid instances (including size/alignment guarantees where applicable).
+- **Inline Comments (Why, Not What):** Comment only to explain hardware or OS constraints, ABI/alignment rules, overflow guards, or non-obvious edge cases.
 
-- **Zero Decorative Dividers:** Never use ASCII banner comments or section separators such as `// ---`, `// ===`, `// ***`, or `// === Public API ===`. Let clean code structure and access specifiers (`public:`, `private:`) speak for themselves.
-- **No AI-Style Narrration:** Never leave meta-comments like `// Here we implement...`, `// Added as requested`, `// Constructor`, or `// Destructor`.
-- **Class & Subsystem Docstrings:** Write **2 to 4 lines** before significant classes, structs, or subsystems focusing strictly on three pillars:
-  1. **Responsibility:** What concrete problem this type solves.
-  2. **Ownership:** Lifetime expectations, memory ownership, or thread-safety guarantees (e.g., non-owning view, move-only resource handle).
-  3. **Invariants:** Conditions that always hold true for valid instances.
-  - *Skip docstrings* on trivial getters, self-explanatory structs, or standard overrides.
-- **Inline Comments ("The Why, Not The What"):** Never explain *what* the syntax is doing. Only comment to explain hardware/ABI constraints, non-obvious algorithmic trade-offs, math edge cases, or intentional workarounds.
+### 2. Qualifiers and Type Safety
 
-```cpp
-// GOOD: Class docstring (Responsibility, Ownership, Invariants)
-// Manages fixed-timestep simulation ticks decoupled from display framerate.
-// Non-owning utility; caller owns the clock source.
-// Invariant: step_delta_ is strictly positive and accumulator_ never exceeds max_frame_delta_.
-class TimeManager { ... };
+- **`constexpr` and `consteval`:** Mark pure math, value-type operations, bit manipulation, and deterministic state transitions `constexpr`. Use `consteval` only when compile-time evaluation is required (such as literal operators or static lookup tables). Do not mark OS I/O or thread synchronization functions `constexpr`.
+- **`[[nodiscard]]`:** Apply to pure queries, factory functions, bounds-checked readers/writers, and functions returning `std::expected` / `Result`.
+- **`noexcept`:** Apply to functions in `-fno-exceptions` targets and to move operations, destructors, and non-throwing queries. If a `noexcept` boundary wraps a standard library call that can throw when exceptions are enabled (e.g., `std::thread`), guard it so failure returns an error code instead of calling `std::terminate`.
+- **C++23 Standard Types:**
+  - Use `std::expected<T, E>` (`Result<T, E>`) for fallible operations.
+  - Use `std::span<T>` / `std::span<const T>` and `std::string_view` for non-owning buffer and string views.
+  - Use `std::bit_cast` for safe value-representation reinterpretation and `std::to_underlying` for enums.
+  - Decay forwarding references with `std::remove_reference_t<T>` and `std::addressof` when storing callable pointers in thunks.
 
-// GOOD: Inline comment (The Why)
-// Clamp delta to prevent spiral-of-death after debugger pauses or OS window dragging.
-const double frame_time = std::min(raw_delta, max_frame_delta_);
-```
+### 3. Memory Safety and ABI Discipline (KISS)
 
-### 2. Modern C++23 Idioms & Qualifiers
+- **Zero Undefined Behavior:** Guard against integer overflow in index and batch math (use `((count - 1U) / batch) + 1U`), validate enum/index bounds before bit-shifts or array indexing, and use `u8` (sanitized to `0` or `1`) instead of `bool` inside `std::memcpy`-serialized structs.
+- **Explicit Layout Verification:** Verify cache-critical or serialized structs with `static_assert(sizeof(T) == ExpectedBytes)`. Avoid bloating hot structs with unnecessary fields.
+- **Rule of Zero / Rule of Five:** Use value types by default. When wrapping OS handles (`SDL_Window*`, threads, arena slabs), delete copy operations and implement `noexcept` move or explicit `Init`/`Shutdown` lifecycle methods.
 
-Apply qualifiers deliberately based on semantics, not by slapping them onto every declaration blindly.
+## Gotchas
 
-- **`constexpr` / `consteval`:**
-  - Use `constexpr` for pure calculations, math utilities, small value types, lookup tables, and getters whose values can be evaluated at compile-time or help constant folding.
-  - Use `consteval` only when compile-time evaluation is strictly required (e.g., compile-time hashes, format string checks).
-  - Do *not* clutter heavy I/O, OS-wrapping, or stateful runtime subsystem methods with `constexpr`.
-- **`[[nodiscard]]`:**
-  - Apply `[[nodiscard]]` to functions where ignoring the return value is a logic bug, resource leak, or wasted computation: factory functions, `std::expected` / error-returning functions, pure query/math functions, and state checks (`empty()`, `is_valid()`).
-  - Do *not* put `[[nodiscard]]` on mutators that return `*this` for optional chaining or functions with primary side effects.
-- **`noexcept`:**
-  - Mark move constructors, move assignment operators, `swap`, destructors, and simple non-allocating queries/math functions `noexcept`.
-  - Avoid `noexcept` on functions that allocate dynamic memory or call external callbacks unless termination on failure is intentional.
-- **C++23 Features:**
-  - Prefer `std::expected<T, E>` for recoverable errors instead of exceptions or out-parameters.
-  - Prefer `std::span<const T>` and `std::string_view` over raw pointer+length pairs or `const std::vector<T>&` / `const std::string&` parameters.
-  - Use `std::print` / `std::println` instead of `std::cout` / `printf`.
-  - Use Deduced `this` (explicit object parameters) to eliminate `const` / non-`const` accessor duplication when needed.
-  - Use `std::ranges` and views when they improve clarity, or simple range-based `for` loops when ranges pipelines become unreadable.
-
-### 3. Anti-Bloat & Clean Architecture (Zero Redundancy)
-
-- **No Redundant Wrappers or Overloads:** Do not create convenience overloads that merely forward arguments with minor type conversions if a single signature with default parameters, `std::span`, or `std::string_view` suffices.
-- **No Trivial Getters/Setters:** If a type is a passive data aggregate with no invariants, make it a `struct` with public members. Only make members `private` when maintaining a class invariant.
-- **Rule of Zero by Default:** Rely on RAII members (`std::unique_ptr`, `std::vector`, custom handles) and omit custom destructors/copy/move operations. When wrapping raw C/OS resources (e.g., SDL handles, sockets, GPU buffers), enforce the **Rule of Five** explicitly (usually deleting copy and implementing `noexcept` move).
-- **DRY Without Over-Abstraction:** Consolidate duplicated logic into a single private helper or template (or deduced `this` method), but do not invent deep inheritance hierarchies or single-use interface classes.
-
-## Gotchas to Avoid
-
-- **Over-commenting:** If the function name and parameter types already state the intent, write zero comments.
-- **Getter/Setter Const Duplication:** Instead of writing identical `get()` and `get() const` bodies, use C++23 explicit object member functions (`auto&& self`) or keep data simple.
-- **Speculative Boilerplate:** Never generate unrequested `ToString()`, `Serialize()`, or dummy constructors "just in case". Write only what is required for a clean, minimal, working design.
+- Never mutate cached state before verifying that the underlying OS or hardware call succeeded.
+- Never call non-async-signal-safe routines (`std::fopen`, `malloc`, blocking mutex locks) inside a POSIX/C signal handler.
+- Keep headers self-contained and independent of inclusion order.

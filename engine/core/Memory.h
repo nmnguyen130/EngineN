@@ -19,11 +19,16 @@ inline void ZeroAlignedBlocks(u8* base, usize alignedByteCount) noexcept {
 
 template <typename T>
 [[nodiscard]] constexpr T NormalizeLittleEndian(T value) noexcept {
-    if constexpr (std::endian::native == std::endian::big && sizeof(T) > 1U && std::is_integral_v<T>) {
-        return std::byteswap(value);
-    } else {
-        return value;
+    if constexpr (std::endian::native == std::endian::big && sizeof(T) > 1U && std::is_arithmetic_v<T>) {
+        if constexpr (std::is_floating_point_v<T> && sizeof(T) == 4U) {
+            return std::bit_cast<T>(std::byteswap(std::bit_cast<u32>(value)));
+        } else if constexpr (std::is_floating_point_v<T> && sizeof(T) == 8U) {
+            return std::bit_cast<T>(std::byteswap(std::bit_cast<u64>(value)));
+        } else if constexpr (std::is_integral_v<T>) {
+            return std::byteswap(value);
+        }
     }
+    return value;
 }
 
 } // namespace detail

@@ -7,7 +7,6 @@
 #include <cstring>
 
 namespace en {
-
 namespace {
 
 [[nodiscard]] constexpr bool MatchesWindow(u32 targetWinId, u32 eventWinId) noexcept {
@@ -40,8 +39,8 @@ Result<void, PlatformErrc> Platform::Init(
     const FixedString<64> orgBuf(orgName.empty() ? "EngineN" : orgName);
     const FixedString<64> appBuf(appName.empty() ? "EngineN" : appName);
     char* pref = SDL_GetPrefPath(orgBuf.CStr(), appBuf.CStr());
-    const bool prefOk = (pref && m_prefPath.AssignNormalizedDir(pref)) ||
-                        m_prefPath.AssignNormalizedDir("./");
+    const bool prefOk =
+        (pref && m_prefPath.AssignNormalizedDir(pref)) || m_prefPath.AssignNormalizedDir("./");
     if (pref) SDL_free(pref);
 
     if (!prefOk) {
@@ -55,9 +54,7 @@ Result<void, PlatformErrc> Platform::Init(
 
 void Platform::Shutdown() noexcept {
     if (!m_initialized) return;
-
     CloseGamepad(m_gamepadId);
-
     if (!m_headless) {
         (void)SDL_EnableScreenSaver();
         SDL_Quit();
@@ -75,6 +72,10 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 
     SDL_Event ev{};
     while (SDL_PollEvent(&ev)) {
+        // Live focus/density: FocusLost mid-queue must affect later key/mouse events.
+        const bool focused = window.State().focused;
+        const f32 density = window.State().pixelDensity;
+
         switch (ev.type) {
             case SDL_EVENT_QUIT:
             case SDL_EVENT_TERMINATING:
@@ -153,7 +154,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                         static_cast<u16>(ev.key.scancode),
                         ev.type == SDL_EVENT_KEY_DOWN,
                         ev.key.repeat,
-                        window.State().focused,
+                        focused,
                         captured);
                 }
                 break;
@@ -167,8 +168,8 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                         ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN,
                         ev.button.x,
                         ev.button.y,
-                        window.State().pixelDensity,
-                        window.State().focused,
+                        density,
+                        focused,
                         captured);
                 }
                 break;
@@ -181,8 +182,8 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                         ev.motion.y,
                         ev.motion.xrel,
                         ev.motion.yrel,
-                        window.State().pixelDensity,
-                        window.State().focused,
+                        density,
+                        focused,
                         captured);
                 }
                 break;
@@ -194,7 +195,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                         ev.wheel.x,
                         ev.wheel.y,
                         ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED,
-                        window.State().focused,
+                        focused,
                         captured);
                 }
                 break;
@@ -213,7 +214,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                     m_frameEvents.IngestGamepadButton(
                         static_cast<u16>(ev.gbutton.button),
                         ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN,
-                        window.State().focused,
+                        focused,
                         captured);
                 }
                 break;
@@ -223,33 +224,32 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
                     m_frameEvents.IngestGamepadAxis(
                         static_cast<u16>(ev.gaxis.axis),
                         static_cast<i16>(ev.gaxis.value),
-                        window.State().focused,
+                        focused,
                         captured);
                 }
                 break;
 
             case SDL_EVENT_TEXT_INPUT:
                 if (MatchesWindow(targetWinId, ev.text.windowID) && ev.text.text) {
-                    m_frameEvents.IngestTextInput(ev.text.text, window.State().focused);
+                    m_frameEvents.IngestTextInput(ev.text.text, focused);
                 }
                 break;
 
             default:
                 break;
         }
-
-        if (needRefresh) {
-            winFlags |= window.RefreshMetrics();
-            needRefresh = false;
-        }
     }
 
-    if (HasFlag(winFlags, WindowFlags::CloseRequested)) {
-        m_quit = true;
-    }
+    if (needRefresh) winFlags |= window.RefreshMetrics();
+    if (HasFlag(winFlags, WindowFlags::CloseRequested)) m_quit = true;
+
     if (HasFlag(winFlags, WindowFlags::FocusLost | WindowFlags::Minimized)) {
         StopRumble();
-        m_frameEvents.ClearFrameDeltas();
+        // Keep discrete edges; InputPipeline clears held on !focused.
+        m_frameEvents.mouseDx = 0.0f;
+        m_frameEvents.mouseDy = 0.0f;
+        m_frameEvents.wheelX = 0.0f;
+        m_frameEvents.wheelY = 0.0f;
     }
     m_frameEvents.focused = window.State().focused ? 1U : 0U;
     return winFlags;
@@ -258,7 +258,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 bool Platform::OpenGamepad(u32 instanceId) noexcept {
     if (instanceId == 0U) return false;
     if (m_gamepadId == instanceId) return true;
-    if (m_gamepadId != 0U) return false;
+    if (m_gamepadId != 0U) return false; // single-pad
 
     if (!m_headless) {
         SDL_Gamepad* pad = SDL_OpenGamepad(instanceId);
@@ -273,11 +273,8 @@ bool Platform::OpenGamepad(u32 instanceId) noexcept {
 
 void Platform::CloseGamepad(u32 instanceId) noexcept {
     if (instanceId == 0U || m_gamepadId != instanceId) return;
-
     if (m_gamepad) {
-        if (m_rumbling) {
-            (void)SDL_RumbleGamepad(m_gamepad, 0U, 0U, 0U);
-        }
+        if (m_rumbling) (void)SDL_RumbleGamepad(m_gamepad, 0U, 0U, 0U);
         SDL_CloseGamepad(m_gamepad);
         m_gamepad = nullptr;
     }
@@ -298,9 +295,7 @@ bool Platform::RumbleGamepad(u16 lowFreq, u16 highFreq, u32 durationMs) noexcept
 }
 
 void Platform::StopRumble() noexcept {
-    if (m_rumbling && m_gamepad) {
-        (void)SDL_RumbleGamepad(m_gamepad, 0U, 0U, 0U);
-    }
+    if (m_rumbling && m_gamepad) (void)SDL_RumbleGamepad(m_gamepad, 0U, 0U, 0U);
     m_rumbling = false;
 }
 
@@ -320,7 +315,6 @@ Result<usize, PlatformErrc> Platform::ReadFileBuffer(
     const usize fsize = static_cast<usize>(fsizeSigned);
     const usize bytesRead = fsize > 0U ? SDL_ReadIO(io, outBuf.data(), fsize) : 0U;
     (void)SDL_CloseIO(io);
-
     if (bytesRead != fsize) return Err(PlatformErrc::FileIoFailed);
     return bytesRead;
 }
@@ -328,13 +322,21 @@ Result<usize, PlatformErrc> Platform::ReadFileBuffer(
 Result<void, PlatformErrc> Platform::WriteFileAtomic(
     const FilePath& path, std::span<const u8> data) noexcept {
     if (path.Empty()) return Err(PlatformErrc::PathRejected);
+    if (path.View().size() + 40U >= FilePath::Capacity()) return Err(PlatformErrc::PathRejected);
 
-    const std::string_view targetView = path.View();
-    if (targetView.size() + 4U >= FilePath::Capacity()) return Err(PlatformErrc::PathRejected);
-
-    char tempPathBuf[FilePath::Capacity() + 8U]{};
-    std::memcpy(tempPathBuf, targetView.data(), targetView.size());
-    std::memcpy(tempPathBuf + targetView.size(), ".tmp", 5U);
+    static u32 s_atomicSeq{0};
+    const u32 seq = ++s_atomicSeq;
+    char tempPathBuf[FilePath::Capacity() + 48U]{};
+    const int n = std::snprintf(
+        tempPathBuf,
+        sizeof(tempPathBuf),
+        "%s.%llx.%x.tmp",
+        path.CStr(),
+        static_cast<unsigned long long>(SDL_GetTicks()),
+        static_cast<unsigned>(seq));
+    if (n <= 0 || static_cast<usize>(n) >= sizeof(tempPathBuf)) {
+        return Err(PlatformErrc::PathRejected);
+    }
 
     SDL_IOStream* io = SDL_IOFromFile(tempPathBuf, "wb");
     if (!io) return Err(PlatformErrc::FileIoFailed);
@@ -363,11 +365,8 @@ usize Platform::GetClipboardText(std::span<char> outBuf) noexcept {
 
     char* clip = SDL_GetClipboardText();
     if (!clip) return 0U;
-
     const usize copyLen = std::min<usize>(std::strlen(clip), outBuf.size() - 1U);
-    if (copyLen > 0U) {
-        std::memcpy(outBuf.data(), clip, copyLen);
-    }
+    if (copyLen > 0U) std::memcpy(outBuf.data(), clip, copyLen);
     outBuf[copyLen] = '\0';
     SDL_free(clip);
     return copyLen;
@@ -377,7 +376,7 @@ void Platform::ShowErrorBox(
     std::string_view title, std::string_view message, const Window* parent) noexcept {
     const FixedString<128> titleBuf(title);
     const FixedString<512> msgBuf(message);
-    std::fprintf(stderr, "[Platform::ShowErrorBox] %s: %s\n", titleBuf.CStr(), msgBuf.CStr());
+    std::fprintf(stderr, "[Platform] %s: %s\n", titleBuf.CStr(), msgBuf.CStr());
     if (SDL_WasInit(SDL_INIT_VIDEO) != 0U && std::getenv("CI") == nullptr) {
         (void)SDL_ShowSimpleMessageBox(
             SDL_MESSAGEBOX_ERROR,

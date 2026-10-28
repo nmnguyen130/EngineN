@@ -7,22 +7,21 @@
 
 namespace en {
 
-inline constexpr u32 kSimHz = 120U;
-inline constexpr u64 kNsPerSecond = 1'000'000'000ULL;
-inline constexpr u64 kFixedDtNs = kNsPerSecond / kSimHz;
-inline constexpr f32 kFixedDtSec = 1.0f / static_cast<f32>(kSimHz);
+// 120 Hz fixed simulation. Proven for precision platformers / Metroidvania feel.
+inline constexpr u32 kSimHz           = 120U;
+inline constexpr u64 kNsPerSecond     = 1'000'000'000ULL;
+inline constexpr u64 kFixedDtNs       = kNsPerSecond / kSimHz;
+inline constexpr f32 kFixedDtSec      = 1.0f / static_cast<f32>(kSimHz);
 
-// 1440 Hz (12 * 120 Hz) is the least common multiple of standard refresh rates:
-// 30, 40, 48, 60, 72, 80, 90, 120, 144, 160, 180, 240, 360, and 480 Hz.
-inline constexpr u64 kHarmonicSubdivisions = 12ULL;
-inline constexpr u64 kHarmonicHz = static_cast<u64>(kSimHz) * kHarmonicSubdivisions;
-inline constexpr u64 kTickUnits = kNsPerSecond * kHarmonicSubdivisions;
+// 1440 Hz harmonic base = LCM of common refresh rates. Enables exact rational snap.
+inline constexpr u64 kHarmonicSubdiv  = 12ULL;
+inline constexpr u64 kHarmonicHz      = static_cast<u64>(kSimHz) * kHarmonicSubdiv;
+inline constexpr u64 kTickUnits       = kNsPerSecond * kHarmonicSubdiv; // 12e9
 
 inline constexpr u32 kMaxTimeChannels = 8U;
-inline constexpr u8 kGameplayChannelsMask = 0x3FU;
-inline constexpr u32 kMaxFreezeTicks = 3600U;
+inline constexpr u8  kGameplayMask    = 0x3FU; // World..Camera
+inline constexpr u32 kMaxFreezeTicks  = 3600U; // 30 s @ 120 Hz
 
-// 8 simulation time channels: World (0) cascades to gameplay channels (1..5); Ui (6) and Custom (7) are independent.
 enum class TimeChannel : u8 {
     World      = 0,
     Player     = 1,
@@ -37,57 +36,52 @@ enum class TimeChannel : u8 {
 [[nodiscard]] constexpr u8 ChannelIdx(TimeChannel ch) noexcept {
     return static_cast<u8>(ch) & 7U;
 }
-
 [[nodiscard]] constexpr u8 ChannelBit(TimeChannel ch) noexcept {
     return static_cast<u8>(1U << ChannelIdx(ch));
 }
 
 inline namespace literals {
-[[nodiscard]] consteval u32 operator""_f60(unsigned long long frames) noexcept {
-    return static_cast<u32>(frames * 2ULL);
+[[nodiscard]] consteval u32 operator""_f60(unsigned long long f) noexcept {
+    return static_cast<u32>(f * 2ULL); // 60 fps frames → 120 Hz ticks
 }
-[[nodiscard]] consteval u32 operator""_ticks(unsigned long long ticks) noexcept {
-    return static_cast<u32>(ticks);
+[[nodiscard]] consteval u32 operator""_ticks(unsigned long long t) noexcept {
+    return static_cast<u32>(t);
 }
 } // namespace literals
 
+// 64-byte baked scales for one tick (cache line).
 struct alignas(64) BakedTickState {
     std::array<f32, kMaxTimeChannels> scaledDt{};
     std::array<f32, kMaxTimeChannels> effectiveScale{};
 };
 static_assert(sizeof(BakedTickState) == 64);
 
-// Per-channel time modulation state for freeze ticks and smooth time-scale ramps.
+// 16-byte per-channel modulation. Hitstop + smooth ramp.
 struct alignas(16) ChannelModSlot {
     f32 baseScale{1.0f};
-    f32 rampTargetScale{1.0f};
-    u16 hitstopTicks{0};
-    u16 rampHoldTicks{0};
-    u16 rampBlendTicks{0};
-    u16 rampElapsedTicks{0};
+    f32 rampTarget{1.0f};
+    u16 hitstop{0};
+    u16 rampHold{0};
+    u16 rampBlend{0};
+    u16 rampElapsed{0};
 
     constexpr void ClearRamp() noexcept {
-        rampTargetScale = 1.0f;
-        rampHoldTicks = 0U;
-        rampBlendTicks = 0U;
-        rampElapsedTicks = 0U;
+        rampTarget = 1.0f;
+        rampHold = rampBlend = rampElapsed = 0U;
     }
-
-    constexpr void ClearEffects() noexcept {
+    constexpr void Clear() noexcept {
         ClearRamp();
-        hitstopTicks = 0U;
+        hitstop = 0U;
     }
 
-    [[nodiscard]] constexpr f32 EvaluateLocalScale(bool rampActive) const noexcept {
-        if (hitstopTicks > 0U) return 0.0f;
-        if (!rampActive) return baseScale;
-        if (rampElapsedTicks < rampHoldTicks) return baseScale * rampTargetScale;
-        if (rampBlendTicks == 0U) return baseScale;
-        const f32 t = std::clamp(
-            static_cast<f32>(rampElapsedTicks - rampHoldTicks) / static_cast<f32>(rampBlendTicks),
-            0.0f, 1.0f);
-        const f32 smooth = t * t * (3.0f - 2.0f * t);
-        return baseScale * (rampTargetScale + (1.0f - rampTargetScale) * smooth);
+    [[nodiscard]] constexpr f32 LocalScale(bool rampOn) const noexcept {
+        if (hitstop > 0U) return 0.0f;
+        if (!rampOn) return baseScale;
+        if (rampHold > 0U) return baseScale * rampTarget;
+        if (rampBlend == 0U) return baseScale;
+        const f32 t = std::clamp(static_cast<f32>(rampElapsed) / static_cast<f32>(rampBlend), 0.0f, 1.0f);
+        const f32 s = t * t * (3.0f - 2.0f * t); // smoothstep
+        return baseScale * (rampTarget + (1.0f - rampTarget) * s);
     }
 };
 static_assert(sizeof(ChannelModSlot) == 16);
@@ -109,7 +103,7 @@ struct alignas(8) TimeTelemetry {
     u64 totalFrames{0};
     u32 droppedTicks{0};
     u16 ticksLastFrame{0};
-    u16 maxCatchupTicks{8};
+    u16 maxCatchup{8}; // ~66 ms @ 120 Hz — safe default
 };
 static_assert(sizeof(TimeTelemetry) == 24);
 

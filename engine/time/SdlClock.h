@@ -4,7 +4,7 @@
 
 namespace en {
 
-// Monotonic high-resolution clock and thread sleep wrapper backed by SDL3 timer routines.
+// Thin SDL3 monotonic clock + sleep. No sim logic.
 struct SdlClock {
     [[nodiscard]] static u64 NowNs() noexcept;
     static void SleepNs(u64 durationNs) noexcept;

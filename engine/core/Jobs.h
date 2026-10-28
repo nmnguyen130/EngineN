@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -118,12 +119,13 @@ public:
 
     template <typename Callable>
     void ParallelForRange(u32 itemCount, u32 minBatchSize, Callable&& callable) noexcept {
+        using Fn = std::remove_reference_t<Callable>;
         struct Thunk {
-            Callable* fn;
+            Fn* fn;
             static void Run(u32 s, u32 e, u32 t, void* ctx) noexcept {
                 (*static_cast<Thunk*>(ctx)->fn)(s, e, t);
             }
-        } thunk{&callable};
+        } thunk{std::addressof(callable)};
         ParallelFor(itemCount, minBatchSize, &Thunk::Run, &thunk);
     }
 

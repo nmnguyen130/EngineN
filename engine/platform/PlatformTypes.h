@@ -22,27 +22,16 @@ struct alignas(8) Extent2i {
     i32 h{0};
 
     [[nodiscard]] constexpr bool IsValid() const noexcept { return w > 0 && h > 0; }
-
     [[nodiscard]] constexpr f32 AspectRatio() const noexcept {
         return IsValid() ? (static_cast<f32>(w) / static_cast<f32>(h)) : 1.0f;
     }
-
     [[nodiscard]] constexpr bool operator==(const Extent2i&) const noexcept = default;
 };
 static_assert(sizeof(Extent2i) == 8);
 
-enum class WindowMode : u8 {
-    Windowed = 0,
-    Borderless = 1,
-    ExclusiveFullscreen = 2,
-};
+enum class WindowMode : u8 { Windowed, Borderless, ExclusiveFullscreen };
 
-enum class ScaleMode : u8 {
-    Stretch = 0,
-    Letterbox = 1,
-    IntegerScale = 2,
-    Expand = 3,
-};
+enum class ScaleMode : u8 { Stretch, Letterbox, IntegerScale, Expand };
 
 enum class WindowFlags : u8 {
     None = 0,
@@ -66,9 +55,7 @@ struct alignas(8) WindowConfig {
 };
 static_assert(sizeof(WindowConfig) == 32);
 
-// Window and display metrics with high-DPI coordinate conversion and 2D virtual canvas viewport scaling.
-// Value type stored inside Window.
-// Invariant: pixelDensity > 0.0f, displayScale > 0.0f, and refreshHz > 0.0f.
+// Metrics + DPI + virtual-canvas viewport. Invariant: density/scale/hz > 0.
 struct alignas(8) WindowState {
     Extent2i logicalSize{1280, 720};
     Extent2i pixelSize{1280, 720};
@@ -83,49 +70,53 @@ struct alignas(8) WindowState {
     [[nodiscard]] constexpr bool IsPresentable() const noexcept {
         return !suspended && pixelSize.IsValid();
     }
-
     [[nodiscard]] constexpr f32 AspectRatio() const noexcept { return pixelSize.AspectRatio(); }
-    [[nodiscard]] constexpr Vec2 WindowToPixel(Vec2 windowPos) const noexcept { return windowPos * pixelDensity; }
-    [[nodiscard]] constexpr Vec2 PixelToWindow(Vec2 pixelPos) const noexcept {
-        return pixelDensity > 0.0f ? (pixelPos / pixelDensity) : pixelPos;
+
+    [[nodiscard]] constexpr Vec2 WindowToPixel(Vec2 pos) const noexcept {
+        return pos * pixelDensity;
     }
-    [[nodiscard]] constexpr Vec2 PixelToUiLogical(Vec2 pixelPos) const noexcept {
-        return displayScale > 0.0f ? (pixelPos / displayScale) : pixelPos;
+    [[nodiscard]] constexpr Vec2 PixelToWindow(Vec2 pos) const noexcept {
+        return pixelDensity > 0.0f ? (pos / pixelDensity) : pos;
     }
-    [[nodiscard]] constexpr Vec2 UiLogicalToPixel(Vec2 uiPos) const noexcept { return uiPos * displayScale; }
+    [[nodiscard]] constexpr Vec2 PixelToUiLogical(Vec2 pos) const noexcept {
+        return displayScale > 0.0f ? (pos / displayScale) : pos;
+    }
+    [[nodiscard]] constexpr Vec2 UiLogicalToPixel(Vec2 pos) const noexcept {
+        return pos * displayScale;
+    }
 
     [[nodiscard]] constexpr Rect ComputeViewport(
         Extent2i virtualSize, ScaleMode scaleMode = ScaleMode::Letterbox) const noexcept {
         if (!pixelSize.IsValid() || !virtualSize.IsValid()) return {};
-        const f32 pw = static_cast<f32>(pixelSize.w);
-        const f32 ph = static_cast<f32>(pixelSize.h);
-        if (scaleMode == ScaleMode::Stretch) return {0.0f, 0.0f, pw, ph};
+        const f32 pixelW = static_cast<f32>(pixelSize.w);
+        const f32 pixelH = static_cast<f32>(pixelSize.h);
+        if (scaleMode == ScaleMode::Stretch) return {0.0f, 0.0f, pixelW, pixelH};
 
         if (scaleMode == ScaleMode::IntegerScale) {
-            if (const i32 s = std::min(pixelSize.w / virtualSize.w, pixelSize.h / virtualSize.h); s >= 1) {
-                const i32 dw = virtualSize.w * s;
-                const i32 dh = virtualSize.h * s;
+            if (const i32 intScale = std::min(pixelSize.w / virtualSize.w, pixelSize.h / virtualSize.h); intScale >= 1) {
+                const i32 drawW = virtualSize.w * intScale;
+                const i32 drawH = virtualSize.h * intScale;
                 return {
-                    static_cast<f32>((pixelSize.w - dw) / 2),
-                    static_cast<f32>((pixelSize.h - dh) / 2),
-                    static_cast<f32>(dw),
-                    static_cast<f32>(dh),
+                    static_cast<f32>((pixelSize.w - drawW) / 2),
+                    static_cast<f32>((pixelSize.h - drawH) / 2),
+                    static_cast<f32>(drawW),
+                    static_cast<f32>(drawH),
                 };
             }
         }
 
-        const f32 vw = static_cast<f32>(virtualSize.w);
-        const f32 vh = static_cast<f32>(virtualSize.h);
+        const f32 virtW = static_cast<f32>(virtualSize.w);
+        const f32 virtH = static_cast<f32>(virtualSize.h);
         const f32 scale = (scaleMode == ScaleMode::Expand)
-            ? std::max(pw / vw, ph / vh)
-            : std::min(pw / vw, ph / vh);
-        const f32 dstW = static_cast<f32>(static_cast<i32>(vw * scale + 0.5f));
-        const f32 dstH = static_cast<f32>(static_cast<i32>(vh * scale + 0.5f));
+            ? std::max(pixelW / virtW, pixelH / virtH)
+            : std::min(pixelW / virtW, pixelH / virtH);
+        const f32 destW = static_cast<f32>(static_cast<i32>(virtW * scale + 0.5f));
+        const f32 destH = static_cast<f32>(static_cast<i32>(virtH * scale + 0.5f));
         return {
-            static_cast<f32>(static_cast<i32>((pw - dstW) * 0.5f)),
-            static_cast<f32>(static_cast<i32>((ph - dstH) * 0.5f)),
-            dstW,
-            dstH,
+            static_cast<f32>(static_cast<i32>((pixelW - destW) * 0.5f)),
+            static_cast<f32>(static_cast<i32>((pixelH - destH) * 0.5f)),
+            destW,
+            destH,
         };
     }
 
@@ -134,27 +125,30 @@ struct alignas(8) WindowState {
         Extent2i virtualSize,
         ScaleMode scaleMode = ScaleMode::Letterbox,
         bool clampToCanvas = true) const noexcept {
-        const Rect vp = ComputeViewport(virtualSize, scaleMode);
-        if (vp.IsEmpty()) return {};
-        const f32 vw = static_cast<f32>(virtualSize.w);
-        const f32 vh = static_cast<f32>(virtualSize.h);
-        Vec2 virt{(pixelPos.x - vp.x) * (vw / vp.w), (pixelPos.y - vp.y) * (vh / vp.h)};
+        const Rect viewport = ComputeViewport(virtualSize, scaleMode);
+        if (viewport.IsEmpty()) return {};
+        const f32 virtW = static_cast<f32>(virtualSize.w);
+        const f32 virtH = static_cast<f32>(virtualSize.h);
+        Vec2 result{
+            (pixelPos.x - viewport.x) * (virtW / viewport.w),
+            (pixelPos.y - viewport.y) * (virtH / viewport.h),
+        };
         if (clampToCanvas) {
-            virt.x = std::clamp(virt.x, 0.0f, vw);
-            virt.y = std::clamp(virt.y, 0.0f, vh);
+            result.x = std::clamp(result.x, 0.0f, virtW);
+            result.y = std::clamp(result.y, 0.0f, virtH);
         }
-        return virt;
+        return result;
     }
 
     [[nodiscard]] constexpr Vec2 VirtualToPixel(
         Vec2 virtualPos,
         Extent2i virtualSize,
         ScaleMode scaleMode = ScaleMode::Letterbox) const noexcept {
-        const Rect vp = ComputeViewport(virtualSize, scaleMode);
-        if (vp.IsEmpty() || !virtualSize.IsValid()) return {};
+        const Rect viewport = ComputeViewport(virtualSize, scaleMode);
+        if (viewport.IsEmpty() || !virtualSize.IsValid()) return {};
         return {
-            vp.x + virtualPos.x * (vp.w / static_cast<f32>(virtualSize.w)),
-            vp.y + virtualPos.y * (vp.h / static_cast<f32>(virtualSize.h)),
+            viewport.x + virtualPos.x * (viewport.w / static_cast<f32>(virtualSize.w)),
+            viewport.y + virtualPos.y * (viewport.h / static_cast<f32>(virtualSize.h)),
         };
     }
 
@@ -165,7 +159,6 @@ struct alignas(8) WindowState {
         f32 newDisplayScale,
         f32 newRefreshHz) noexcept {
         WindowFlags flags = WindowFlags::None;
-
         if (newLogical.IsValid() && newLogical != logicalSize) {
             logicalSize = newLogical;
             flags |= WindowFlags::Resized;
@@ -174,20 +167,16 @@ struct alignas(8) WindowState {
             pixelSize = newPixel;
             flags |= WindowFlags::Resized;
         }
-
-        const f32 validDensity = newDensity > 0.0f ? newDensity : 1.0f;
-        const f32 validScale = newDisplayScale > 0.0f ? newDisplayScale : validDensity;
-        const f32 validHz = newRefreshHz > 0.0f ? newRefreshHz : 60.0f;
-
-        if (std::abs(validDensity - pixelDensity) > 1e-3f ||
-            std::abs(validScale - displayScale) > 1e-3f ||
-            std::abs(validHz - refreshHz) > 1e-2f) {
+        const f32 density = newDensity > 0.0f ? newDensity : 1.0f;
+        const f32 scale = newDisplayScale > 0.0f ? newDisplayScale : density;
+        const f32 hz = newRefreshHz > 0.0f ? newRefreshHz : 60.0f;
+        if (std::abs(density - pixelDensity) > 1e-3f || std::abs(scale - displayScale) > 1e-3f ||
+            std::abs(hz - refreshHz) > 1e-2f) {
             flags |= WindowFlags::DisplayChanged;
         }
-
-        pixelDensity = validDensity;
-        displayScale = validScale;
-        refreshHz = validHz;
+        pixelDensity = density;
+        displayScale = scale;
+        refreshHz = hz;
         return flags;
     }
 
@@ -228,26 +217,20 @@ enum class EventCapture : u8 {
 };
 consteval bool enable_bitmask_operators(EventCapture) { return true; }
 
-enum class InputEventKind : u8 {
-    Key = 0,
-    MouseButton = 1,
-    GamepadButton = 2,
-    GamepadAxis = 3,
-};
+enum class InputEventKind : u8 { Key = 0, MouseButton = 1, GamepadButton = 2, GamepadAxis = 3 };
 
-// Packed 4-byte discrete physical input event record for single-player controller architecture.
-// Bits [0..13] = device code, bits [14..15] = InputEventKind.
-// Invariant: GamepadAxis values are clamped to [-32767, 32767] for symmetric float normalization.
+// 4B packed event. code[0..13] | kind[14..15]. Axis clamped to [-32767, 32767].
 struct alignas(4) PlatformInputEvent {
     u16 packedHeader{0};
     i16 value{0};
 
     [[nodiscard]] static constexpr PlatformInputEvent Make(
         InputEventKind kind, u16 code, i16 val) noexcept {
-        const u16 hdr = static_cast<u16>((code & 0x3FFFU) | (static_cast<u16>(kind) << 14U));
-        return {hdr, val};
+        return {
+            static_cast<u16>((code & 0x3FFFU) | (static_cast<u16>(kind) << 14U)),
+            val,
+        };
     }
-
     [[nodiscard]] constexpr u16 Code() const noexcept { return packedHeader & 0x3FFFU; }
     [[nodiscard]] constexpr InputEventKind Kind() const noexcept {
         return static_cast<InputEventKind>((packedHeader >> 14U) & 0x3U);
@@ -257,8 +240,7 @@ struct alignas(4) PlatformInputEvent {
 };
 static_assert(sizeof(PlatformInputEvent) == 4);
 
-// Coalesced per-frame input and UTF-8 text batch.
-// Invariant: mouseX/Y/Dx/Dy are in physical pixel space, and each gamepad axis occupies at most 1 slot.
+// One frame batch. Pixel-space mouse. Axis coalesce; key/button releases never dropped when full.
 struct alignas(16) PlatformFrameEvents {
     static constexpr usize kMaxTextBytes = 31;
     static constexpr usize kMaxEvents = 49;
@@ -289,23 +271,21 @@ struct alignas(16) PlatformFrameEvents {
     }
 
     constexpr void PushEvent(InputEventKind kind, u16 code, i16 value) noexcept {
-        // Clamp INT16_MIN (-32768) to -32767 so downstream division by 32767.0f stays within [-1.0f, 1.0f].
-        const i16 clampedVal = (kind == InputEventKind::GamepadAxis && value == -32768) ? i16{-32767} : value;
-        const PlatformInputEvent ev = PlatformInputEvent::Make(kind, code, clampedVal);
+        const i16 clamped =
+            (kind == InputEventKind::GamepadAxis && value == -32768) ? i16{-32767} : value;
+        const PlatformInputEvent ev = PlatformInputEvent::Make(kind, code, clamped);
 
         if (kind == InputEventKind::GamepadAxis) {
             for (u8 i = 0U; i < eventCount; ++i) {
                 if (events[i].packedHeader == ev.packedHeader) {
-                    events[i].value = clampedVal;
+                    events[i].value = clamped;
                     return;
                 }
             }
         } else {
             for (u8 i = eventCount; i > 0U; --i) {
                 if (events[i - 1U].packedHeader == ev.packedHeader) {
-                    if (events[i - 1U].value == clampedVal) {
-                        return;
-                    }
+                    if (events[i - 1U].value == clamped) return;
                     break;
                 }
             }
@@ -313,6 +293,25 @@ struct alignas(16) PlatformFrameEvents {
 
         if (eventCount < kMaxEvents) {
             events[eventCount++] = ev;
+            return;
+        }
+
+        // Full: never drop a discrete release (would stick inputs).
+        if (kind != InputEventKind::GamepadAxis && clamped == 0) {
+            for (u8 i = eventCount; i > 0U; --i) {
+                if (events[i - 1U].packedHeader == ev.packedHeader) {
+                    events[i - 1U].value = 0;
+                    return;
+                }
+            }
+            for (u8 i = eventCount; i > 0U; --i) {
+                if (events[i - 1U].Kind() == InputEventKind::GamepadAxis ||
+                    events[i - 1U].value != 0) {
+                    events[i - 1U] = ev;
+                    return;
+                }
+            }
+            events[kMaxEvents - 1U] = ev;
         }
     }
 
@@ -332,13 +331,13 @@ struct alignas(16) PlatformFrameEvents {
         f32 pixelDensity,
         bool windowFocused,
         EventCapture capture) noexcept {
-        const f32 d = pixelDensity > 0.0f ? pixelDensity : 1.0f;
-        const bool passMouse = windowFocused && !HasFlag(capture, EventCapture::Mouse);
-        if (passMouse) {
-            mouseX = logicalX * d;
-            mouseY = logicalY * d;
+        const f32 density = pixelDensity > 0.0f ? pixelDensity : 1.0f;
+        const bool acceptMouse = windowFocused && !HasFlag(capture, EventCapture::Mouse);
+        if (acceptMouse) {
+            mouseX = logicalX * density;
+            mouseY = logicalY * density;
         }
-        if (!down || passMouse) {
+        if (!down || acceptMouse) {
             PushEvent(InputEventKind::MouseButton, button, down ? i16{1} : i16{0});
         }
     }
@@ -352,20 +351,24 @@ struct alignas(16) PlatformFrameEvents {
         bool windowFocused,
         EventCapture capture) noexcept {
         if (windowFocused && !HasFlag(capture, EventCapture::Mouse)) {
-            const f32 d = pixelDensity > 0.0f ? pixelDensity : 1.0f;
-            mouseX = logicalX * d;
-            mouseY = logicalY * d;
-            mouseDx += logicalDx * d;
-            mouseDy += logicalDy * d;
+            const f32 density = pixelDensity > 0.0f ? pixelDensity : 1.0f;
+            mouseX = logicalX * density;
+            mouseY = logicalY * density;
+            mouseDx += logicalDx * density;
+            mouseDy += logicalDy * density;
         }
     }
 
     constexpr void IngestMouseWheel(
-        f32 wx, f32 wy, bool flipped, bool windowFocused, EventCapture capture) noexcept {
+        f32 wheelDeltaX,
+        f32 wheelDeltaY,
+        bool flipped,
+        bool windowFocused,
+        EventCapture capture) noexcept {
         if (windowFocused && !HasFlag(capture, EventCapture::Mouse)) {
             const f32 sign = flipped ? -1.0f : 1.0f;
-            wheelX += wx * sign;
-            wheelY += wy * sign;
+            wheelX += wheelDeltaX * sign;
+            wheelY += wheelDeltaY * sign;
         }
     }
 
@@ -378,14 +381,9 @@ struct alignas(16) PlatformFrameEvents {
         const usize avail = (textLen < kMaxTextBytes) ? (kMaxTextBytes - textLen) : 0U;
         usize toCopy = std::min<usize>(validLen, avail);
         if (toCopy < validLen) {
-            while (toCopy > 0U && (static_cast<u8>(utf8[toCopy]) & 0xC0U) == 0x80U) {
-                --toCopy;
-            }
+            while (toCopy > 0U && (static_cast<u8>(utf8[toCopy]) & 0xC0U) == 0x80U) --toCopy;
         }
-
-        for (usize i = 0U; i < toCopy; ++i) {
-            textInput[textLen++] = utf8[i];
-        }
+        for (usize i = 0U; i < toCopy; ++i) textInput[textLen++] = utf8[i];
         textInput[textLen] = '\0';
     }
 
@@ -403,18 +401,14 @@ struct alignas(16) PlatformFrameEvents {
         }
     }
 
-    constexpr void IngestGamepadDisconnect() noexcept {
-        padDisconnected = 1U;
-    }
+    constexpr void IngestGamepadDisconnect() noexcept { padDisconnected = 1U; }
 
     [[nodiscard]] constexpr std::span<const PlatformInputEvent> Events() const noexcept {
         return {events.data(), eventCount};
     }
-
     [[nodiscard]] constexpr std::string_view TextView() const noexcept {
         return {textInput.data(), textLen};
     }
-
     [[nodiscard]] constexpr bool HasMouseWheel() const noexcept {
         return wheelX != 0.0f || wheelY != 0.0f;
     }

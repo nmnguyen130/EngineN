@@ -1,38 +1,54 @@
 ---
 name: enginen-architecture
-description: Architect, refactor, and build C++23 client games and subsystems on top of EngineN. Trigger whenever the user mentions EngineN, client game layers, SceneDirector, GameplayPolicyTable, AppHooks, or any EngineN subsystem (platform, input, time, assets, renderer, world, physics, gameplay, audio, debug, framework).
+description: Architect, refactor, and build C++23 subsystems and client games on EngineN. Trigger whenever the user mentions EngineN, Target Architecture Flow, or any EngineN subsystem (core, time, platform, input).
 ---
-# EngineN Architecture & Client Game Guide
+# EngineN Architecture
 
-Provide architectural continuity, strict two-layer boundary enforcement, and inter-subsystem communication rules for the locked EngineN runtime and client games built on top of it.
+Enforce subsystem boundaries, data contracts, and runtime invariants across EngineN's foundational layers (`core`, `time`, `platform`, `input`).
 
 ## When to Use
 
-- Building or extending a C++23 client game on top of EngineN (`AppHooks`, `StateLayerDesc`, `GameplayPolicyTable`, `SceneTransitionDesc`).
-- Inspecting, integrating, or maintaining any of the locked EngineN subsystems (`core`, `time`, `platform`, `input`, `renderer`, `assets`, `world`, `physics`, `gameplay`, `audio`, `debug`, `framework`).
+- Refactoring, inspecting, or testing EngineN's foundational subsystems (`engine/core`, `engine/time`, `engine/platform`, `engine/input`).
+- Aligning foundational subsystems with the Target Architecture Flow.
 
-## Reference Context Files (Load On-Demand Only)
+## Target Architecture Flow
 
-All subsystem specifications are locked in `references/`. To save context tokens, load only the reference files relevant to the current task using `skills:get_skill_resources`:
+1. **BOOT:**
+   `Diagnostics` (sink + `CrashHandler`) -> `SDL_Init` (`VIDEO | GAMEPAD | AUDIO`) -> Mount `.enpak` & `JobSystem::Init` -> Load settings/save (CRC32 check) -> Title / Continue.
+2. **FRAME (`Application::Run`):**
+   `Platform::Pump` -> Lifecycle (skip render when `!window.State().IsPresentable()`) -> `while (SimStepView step = time.PollTick())` (120 Hz fixed):
+     - `InputPipeline::PollTick` -> `ActionBuffer::Feed` -> `World::BeginTick`
+     - `if (!step.IsFrozen(channel))`: Game Hooks (AI, Timers) -> Gameplay (Hitboxes -> Policy -> Game HP) -> `PhysicsSystem::Step(singleDt)`
+     - `World::EndTick` -> `CueRouter` (`AudioCommandRing` / VFX / Camera)
+   -> `WorldExtractor` (per-channel alpha interpolation) -> `Renderer::Submit` -> Present
+   -> `AudioDevice::Pull` (independent audio thread).
+3. **PERSIST:**
+   Checkpoint / Exit -> `SaveSystem` + `WorldSnapshot` (header + payload CRC32, atomic write via temp file + rename, deterministic reload).
+4. **ASSETS:**
+   Cooked `.enpak` -> Transactional mount -> Async upload / Touch on draw -> LRU evict -> reloadable from pack.
 
-- `references/Time_Context.md` — **Locked (`time/`):** 2-layer architecture (`TimeTypes.h`, `TimePipeline.h` 100% `constexpr` Layer 1 + `SdlClock.h/.cpp` SDL3 Layer 2), 256B 4-cache-line `TimePipeline`, 1440 Hz LCM harmonic VSync snapping (30..480 Hz including 90/144/180/360 Hz), VRR EWMA jitter filter, 64B `BakedTickState` at Cache Line 0, 16B `ChannelModSlot`, C1 Hermite `RequestTimeRamp`, true pause vs gameplay freeze, 32B adaptive `FramePacer`.
-- `references/Platform_Context.md` — **Locked (`platform/`):** 2-layer architecture (`PlatformTypes.h` 100% `constexpr` Layer 1 + `Window.h/.cpp`, `Platform.h/.cpp` SDL3 Layer 2), 64B `Window` (`WindowState` `32B` at offset 0 with High-DPI coordinate transforms, `ScaleMode` 2D virtual canvas viewport scaler `ComputeViewport` / `PixelToVirtual` / `VirtualToPixel`, `CursorShape`, `WarpMouse`, `SetAspectRatioLock`, `Flash`, `SafeAreaPixels`), 16B branchless `EventTap`, 4B `PowerInfo`, 4B `PlatformInputEvent`, 256B `PlatformFrameEvents` (key-repeat & duplicate-edge suppression, anti-sticking filter, immediate High-DPI 8000 Hz mouse scaling, UTF-8 `textInput[32]`, interleaved multi-axis coalescing, mid-frame pad disconnect purge), 1856B (29 cache lines, 0B padding) `Platform` with Cache Line 0 bitmask gamepad SoA, screen sleep inhibitor, and bitmask-accelerated `FileWatcher`.
-- `references/Input_Context.md` — **Locked (`input/`):** 100% `constexpr` header-only (`InputTypes.h`, `ActionBuffer.h`, `InputPipeline.h`), zero `platform/` includes, zero compiler padding holes across all structs (`4B` `InputSource` with Schmitt-trigger virtual axis/trigger buttons `PadTrigger`/`PadAxisButton`, `32B` `alignas(32)` `AxisBinding` with primary+alternate digital SOCD pairs and `outerDeadzone`, `384B` 6-cache-line `InputMap`, `64B` `TickInput` with Unreal Enhanced Input triggers `HeldOneShot`/`TapReleased`/`Pulsed`/`ChargeRatio`/`WasChargedRelease` and `StickNumpad`, `64B` `FrameInput` with 18B UTF-8 `TextView()`, `64B` `ActionBuffer` with release-gated double-tap and 11-entry Numpad motion/charge ring buffer `CheckMotion`/`ConsumeMotion`/`CheckChargeMotion`, `640B` 10-cache-line `InputPipeline` with multi-binding edge deduplication, Schmitt-trigger analog hysteresis, and `> 2.0px` mouse switch hysteresis).
-- `references/Renderer_Context.md` — **Locked (`renderer/`):** `RendererTypes.h`, `RenderList.h/.cpp`, `Renderer.h/.cpp` (zero `platform/` or `assets/` header coupling via `ViewportExtent`, `1,328,256B` 20,754-cache-line L2/L3-resident `RenderList` with `kMaxQuads = 16384` and 0B padding, 64B corner-offset `PreparedQuad`, 80B pivot-aware `QuadCmd`, separated `kSortStateMask`/`kBatchStateMask` single-pass active-byte radix sort, true 3x3 9-slice UV patch generator, 16B lazy high-water `TextureSlot` with intrusive freelist, 4 premultiplied blend modes, and state-diffed `Submit()`).
-- `references/Assets_Context.md` — **Locked (`assets/`):** `AssetTypes.h`, `AssetBank.h/.cpp`, `AssetSystem.h/.cpp` (zero `platform/` includes, `0` `using` type aliases, `0B` padding across all structs, `8B` `AssetId`, `4B` concrete handles, `2B` `UnitPivotU16`, `32B` `SpriteFrame` & `CookedAtlasSpriteEntry`, `16B` `TextureRecord` / `BlobRecord` [with embedded `generation` + `version`] / `AudioRecord` / `SlotMeta` / `FreePayloadBlock`, `8B` `AtlasRecord`, `256B` 4-cache-line `AssetBank` with coalescing payload sub-allocator & tail rewind `AllocatePayloadSlice`/`FreePayloadSlice`, `CommitGridAtlas`, upfront `EnsurePayloadSlot` reservation for immediate streaming handles, LRU VRAM eviction `EvictLruToVramBudget`, hash-chain LZ4 `CompressLz4`/`DecompressLz4`, on-demand `SDL_IOStream` range-streaming `MountPackFile`, automatic `EnPakEntry::BackingTexture()` resolution, 48B `VfsTocSlot`, 16B `PendingJob`).
-- `references/World_Context.md` — **Locked (`world/`):** `WorldTypes.h`, `ComponentPool.h`, `TransformSolver.h/.cpp`, `World.h/.cpp`, `WorldExtractor.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, `192B` 3-cache-line `World` with intrusive FIFO entity freelist & direct `RawComponentPool* m_pools` array, `64B` 1-cache-line `TransformSolver` with unified `TraverseSubtree`, `InverseCombineParentChild` world-transform preservation, and zero-rotation fast-path, `32B` `RawComponentPool` & `ComponentPool<T>` with full subtree `CloneEntity` & multi-level `SerializePrefabTemplate`, `Each<>` & range-based `View<>`, immediate-handle `DeferSpawn`, cascading `Destroy`, and stationary sprite bypass in `WorldExtractor`).
-- `references/Physics_Context.md` — **Locked (`physics/` v2):** `PhysicsTypes.h`, `Narrowphase2D.h/.cpp`, `SpatialIndex2D.h/.cpp`, `DynamicsSolver2D.h/.cpp`, `PhysicsSystem.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, zero game-specific bloat, `192B` 3-cache-line `PhysicsSystem`, `64B` 1-cache-line `SpatialIndex2D` with O(N) cell-bucket broadphase & `ShapeKind2D::Segment` arbitrary terrain edges, `64B` 2-point Sutherland-Hodgman `ContactManifold2D` with warm-starting & positive-gap Speculative Contacts `BulletCCD`, Box2D v3 Soft-Step rotational ($r \times n$) & linear TGS solver, `32B` `RigidBody2D`, `CharacterMotor2D`, & `DistanceJoint2D` harmonic springs/rods, `24B` `Collider2D`, unified `BodyType2D::Kinematic` platform carriers, and 3-iteration `MoveAndSlide`).
-- `references/Gameplay_Context.md` — **Locked (`gameplay/` v2):** `GameplayTypes.h`, `MotionSolver2D.h/.cpp`, `StateAndCombatSolver2D.h/.cpp`, `CameraDirector2D.h/.cpp`, `GameplayPipeline.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, `640B` 10-cache-line `GameplayPipeline`, `32B` `MotionStack2D` with separated `currentWalkVx`/`impulseVx`/`pendingLaunchVy`, `TryExecuteJump` coyote/wall jump, variable jump cut, & soft character pushboxes, `16B` `StateMachine2D` with per-entity `hitstopTicks` freeze, action buffering, automatic `SpriteAnimator2D` clip sync, & `"ERIG"` v1 directives, `32B` `HitboxRig2D` with single-pass active-attacker O(1) SplitMix Bloom filter, directional parry, auto-iframes, & Clash arbitration, `16B` `DamageReceiver2D` & 3-ray `SafeAnchor2D`, `64B` `CameraController2D` with Padé critically damped spring, deadzone, room confiner, and drift-free kick/trauma).
-- `references/Audio_Context.md` — **Locked (`audio/` v2):** `AudioTypes.h`, `AudioMixer.h/.cpp`, `AudioSystem.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, zero cross-subsystem header includes, `64B` 1-cache-line `AudioMixer`, true stereo & mono 4-point Catmull-Rom Hermite cubic resampler `InterpolateHermite4` + unified Cytomic SVF `StepCytomicSvf`, seamless sample-accurate loop points `loopStartFrame`, O(1) Virtual Voice virtualization `m_virtualVoicesMask` for out-of-earshot looping emitters, in-place stolen-voice & music-deck crossfade tails, Stereo Schroeder/Freeverb Aux Reverb `SetReverbParams`, sidechain envelope ducking + Padé `[3/2]` soft-clipping limiter, `128B` 2-cache-line `AudioSystem`, `32B` `MainVoiceTracker` with persistent `instanceGain_q14`/`instancePitch_q12`, near-field spatial spread inside `minDist`, `UpdateEmitterTransform`, and `PollReleasableScopeMask()`).
-- `references/Debug_Context.md` — **Locked (`debug/` v2):** `DebugTypes.h`, `DebugBatcher.h/.cpp`, `DebugInspector.h/.cpp`, `DebugProfilerAndConsole.h/.cpp`, `DebugSystem.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, zero release overhead when `EN_ENABLE_DEBUG_TOOLS == 0`, zero `Renderer.h` or `<SDL3/SDL_*.h>` dependencies via `kWhiteTexture` and `kBuiltinFontTexture`, `16B` `DebugBatcher`, `288B` 2-level bitmask `DebugShapePool`, `16B` 1-hop `DebugInspector` with state-colored colliders, `DistanceJoint2D` springs, `SpatialBroadphase` tilemap/proxies, 2D stick-gate `InputViewerHud`, & 64-tick `ActorTickRecord` flight scrubber, `160B` O(1) bucket-percentile `DebugProfiler` with `PlotValue` 64-sample `WatchPlotTrack` sparklines, `2752B` Fibonacci open-addressed `DebugConsole` with `ClearLogs`/`ListAllCVars`, and `64B` 1-cache-line `DebugSystem` with `8B` `DebugLoopDirectives`).
-- `references/Framework_Context.md` — **Locked (`framework/` v2):** `FrameworkTypes.h`, `SceneDirector.h/.cpp`, `Application.h/.cpp` (`0` `using` type aliases, `0B` padding across all structs, `64B` `SimContext` / `RenderContext` / `SceneLoadContext` / `SceneTransitionDesc` / `FrameAuditDigest` / `AppHooks`, `48B` `StateLayerDesc`, `16B` `CookedSceneManifestHeader` [with `ComputeSceneManifestChecksum`] & `CookedSceneAssetEntry`, `576B` 9-cache-line SoA `SceneDirector` with Cache Line 0 bitmasks, `HasState`/`TopStateId`/`ReloadActiveScene`, single-pass top-down `RebakeStackMasks()`, safe frame-barrier command queue `CommitSafeFramePoint`, `FullReset` vs `RoomSwap` [auto-purging transient `Lifetime2D` & `kRoomTransientCategoryBit` entities], automatic `TransitionMusic`, & screen-space wipes, `96B` `ApplicationConfig`, and `64B` 1-cache-line `Application` coordinator with reversible modal `PauseSimClock`, `BindReplayStream` deterministic input recording/playback, `RequestStateReset()` handling, and `StepHeadless` orchestration).
+## Foundational Contracts & Invariants
 
-## Core Engine Invariants
+- **Build & Runtime Contract:** C++23 (`-fno-exceptions`, `-fno-rtti`), zero heap allocations on hot frame/tick paths after `Init()`, and zero virtual dispatch.
+- **Two-Layer Subsystem Boundary:**
+  - **Layer 1 (Pure C++23):** Deterministic data structures and state machines (`TimeTypes.h`, `TimePipeline.h`, `PlatformTypes.h`, `input/*.h`) with zero `<SDL3/...>` or OS header dependencies. Testable at compile time (`consteval`) and in headless CI via `ComputeAuditHash()`.
+  - **Layer 2 (Hardware/OS Adapter):** Confines `<SDL3/...>` and OS system calls strictly to `.cpp` implementation files (`SdlClock.cpp`, `Window.cpp`, `Platform.cpp`, `Diagnostics.cpp`).
+- **Dependency Direction:**
+  - `core/` has zero engine dependencies.
+  - `time/` depends only on `core/`.
+  - `platform/` depends only on `core/`.
+  - `input/` depends only on `core/` (never includes `platform/` headers; ingests `PlatformFrameEvents` via template interface).
 
-1. **C++23 Data-Oriented Design:** Zero heap allocation after `Init()`, `-fno-exceptions`, `-fno-rtti`, zero virtual dispatch (function-pointer tables only), strict two-layer separation (Layer 1 pure C++23 testable in headless CI via `ComputeAuditHash()`, Layer 2 thin SDL3/hardware coordinator with `<SDL3/SDL_*.h>` strictly confined to `.cpp`).
-2. **Inversion of Control:** Client code never writes a main loop or invokes `World::BeginTick` / `Renderer::Submit` directly. `en::Application` drives the runtime and invokes client callbacks via `AppHooks`, `StateLayerDesc`, `GameplayPolicyTable`, and `SceneTransitionDesc`.
-3. **Structural ECS & Physics Rules:**
-   - Inside `onSimTick` or gameplay policy callbacks, always use `world.DeferDestroy()`, `world.DeferEmplace()`, and `world.DeferRemove()` while iterating pools/views (flushed deterministically at `World::EndTick()`).
-   - Built-in `world` components use `kTypeId` in `[1..7]`, `physics` components (`Collider2D`, `RigidBody2D`, `CharacterMotor2D`, `DistanceJoint2D`) use `kTypeId` in `[8..11]`, `gameplay` components (`MotionStack2D`, `StateMachine2D`, `HitboxRig2D`, `DamageReceiver2D`, `SafeAnchor2D`, `CameraController2D`) use `kTypeId` in `[16..21]`, and custom client components use `kTypeId` in `[24..63]`.
-   - Prefer direct dense pool iteration (`world.GetPool<T>()`) + 1-hop sibling lookup (`world.GetComponentMaskByIndex(idx)` + `pool.DirectAtEntityIndex(idx)`) over repeated `world.TryGet<T>()` calls.
-   - Never branch on asset readiness in hot paths; `AssetBank` resolves unready handles branchlessly to Slot 0 fallbacks.
+## Reference Context Files (Contracts & Invariants)
+
+Load only the reference files needed for the active task via `get_skill_resources`:
+
+- `references/Core_Context.md` — `engine/core/`: `Types.h`, `Math.h`, `Memory.h`, `Containers.h`, `Diagnostics.h/.cpp`, `Jobs.h/.cpp`.
+- `references/Time_Context.md` — `engine/time/`: `TimeTypes.h`, `TimePipeline.h`, `SdlClock.h/.cpp`.
+- `references/Platform_Context.md` — `engine/platform/`: `PlatformTypes.h`, `Window.h/.cpp`, `Platform.h/.cpp`.
+- `references/Input_Context.md` — `engine/input/`: `InputTypes.h`, `ActionBuffer.h`, `InputPipeline.h`.
+
+## Gotchas
+
+- Respect subsystem scope constraints when refactoring: only touch `core`, `time`, `platform`, and `input` unless explicitly instructed otherwise.
+- Keep `SimStepView` at `32B` (`alignas(32)`): advance channel modulation at the start of the next tick (`FlushPendingAdvance`) rather than rebaking `m_bakedTick` before returning the current tick's view.

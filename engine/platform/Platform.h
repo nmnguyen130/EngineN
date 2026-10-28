@@ -6,9 +6,8 @@ struct SDL_Gamepad;
 
 namespace en {
 
-// OS platform coordinator managing SDL3 lifecycle, coalesced event pumping, single gamepad, and file I/O.
-// Non-copyable owner of SDL3 subsystem initialization and active gamepad handle.
-// Invariant: m_gamepadId != 0U iff a controller is connected.
+// SDL3 owner: init, one window pump, one gamepad, paths, atomic file IO.
+// Invariant: m_gamepadId != 0 iff a controller is connected (or headless slot).
 class alignas(16) Platform {
 public:
     Platform() noexcept = default;
@@ -26,6 +25,7 @@ public:
     [[nodiscard]] constexpr bool IsInitialized() const noexcept { return m_initialized; }
     [[nodiscard]] constexpr bool IsHeadless() const noexcept { return m_headless; }
 
+    // Drain SDL queue -> Window lifecycle + FrameEvents. Returns coalesced window flags.
     WindowFlags Pump(Window& window, EventCapture captured = EventCapture::None) noexcept;
 
     template <typename InputSinkT>
@@ -36,32 +36,29 @@ public:
         return flags;
     }
 
-    [[nodiscard]] constexpr PlatformFrameEvents& FrameEvents() noexcept { return m_frameEvents; }
-    [[nodiscard]] constexpr const PlatformFrameEvents& FrameEvents() const noexcept { return m_frameEvents; }
+    [[nodiscard]] constexpr const PlatformFrameEvents& FrameEvents() const noexcept {
+        return m_frameEvents;
+    }
 
     [[nodiscard]] constexpr bool ShouldQuit() const noexcept { return m_quit; }
     constexpr void RequestQuit() noexcept { m_quit = true; }
 
-    bool OpenGamepad(u32 instanceId) noexcept;
-    void CloseGamepad(u32 instanceId) noexcept;
     [[nodiscard]] constexpr bool HasGamepad() const noexcept { return m_gamepadId != 0U; }
-    [[nodiscard]] constexpr bool IsGamepadRumbling() const noexcept { return m_rumbling; }
-
     bool RumbleGamepad(u16 lowFreq, u16 highFreq, u32 durationMs) noexcept;
     void StopRumble() noexcept;
 
-    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveAsset(std::string_view rel) const noexcept {
+    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveAsset(
+        std::string_view rel) const noexcept {
         FilePath out{};
         if (!m_basePath.Resolve(rel, out)) return Err(PlatformErrc::PathRejected);
         return out;
     }
-
-    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveUser(std::string_view rel) const noexcept {
+    [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveUser(
+        std::string_view rel) const noexcept {
         FilePath out{};
         if (!m_prefPath.Resolve(rel, out)) return Err(PlatformErrc::PathRejected);
         return out;
     }
-
     [[nodiscard]] constexpr std::string_view BasePath() const noexcept { return m_basePath.View(); }
     [[nodiscard]] constexpr std::string_view PrefPath() const noexcept { return m_prefPath.View(); }
 
@@ -76,6 +73,9 @@ public:
         std::string_view title, std::string_view message, const Window* parent = nullptr) noexcept;
 
 private:
+    bool OpenGamepad(u32 instanceId) noexcept;
+    void CloseGamepad(u32 instanceId) noexcept;
+
     PlatformFrameEvents m_frameEvents{};
     FilePath m_basePath{};
     FilePath m_prefPath{};

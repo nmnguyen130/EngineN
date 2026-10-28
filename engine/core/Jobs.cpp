@@ -21,10 +21,21 @@ bool JobSystem::Init(u32 workerThreads) noexcept {
         const u32 hw = std::thread::hardware_concurrency();
         workerThreads = (hw > 1U) ? (hw - 1U) : 1U;
     }
-    m_workerCount = std::min(workerThreads, kMaxWorkers);
-    for (u32 i = 0; i < m_workerCount; ++i) {
+    const u32 targetWorkers = std::min(workerThreads, kMaxWorkers);
+    m_workerCount = 0U;
+    for (u32 i = 0; i < targetWorkers; ++i) {
         const u32 queueIdx = i + 1U;
+#if defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+        try {
+            m_workers[i] = std::thread([this, queueIdx]() noexcept { WorkerLoop(queueIdx); });
+        } catch (...) {
+            Shutdown();
+            return false;
+        }
+#else
         m_workers[i] = std::thread([this, queueIdx]() noexcept { WorkerLoop(queueIdx); });
+#endif
+        m_workerCount = i + 1U;
     }
     return true;
 }
@@ -90,7 +101,7 @@ void JobSystem::ParallelFor(u32 itemCount, u32 minBatchSize, ParallelTaskFn fn, 
         return;
     }
     const u32 batchSize = std::max(1U, minBatchSize);
-    const u32 totalBatches = (itemCount + batchSize - 1U) / batchSize;
+    const u32 totalBatches = ((itemCount - 1U) / batchSize) + 1U;
     const u32 callerQueueIdx = ResolveCallerQueueIndex();
 
     if (m_workerCount == 0U || totalBatches == 1U || g_tlsOwnerSystem != this) {
@@ -119,7 +130,7 @@ void JobSystem::ParallelFor(u32 itemCount, u32 minBatchSize, ParallelTaskFn fn, 
     u32 pushedCount = 0U;
     for (u32 b = 1U; b < totalBatches; ++b) {
         const u32 start = b * batchSize;
-        const u32 end = std::min(start + batchSize, itemCount);
+        const u32 end = (itemCount - start > batchSize) ? (start + batchSize) : itemCount;
         const JobItem item{fn, userCtx, start, end, batchSlot, 0U};
 
         m_inFlightJobs.fetch_add(1U, std::memory_order_release);

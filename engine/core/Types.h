@@ -8,24 +8,23 @@
 #include <cstdint>
 #include <expected>
 #include <span>
-#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 
 namespace en {
 
-using u8 = std::uint8_t;
-using u16 = std::uint16_t;
-using u32 = std::uint32_t;
-using u64 = std::uint64_t;
-using i8 = std::int8_t;
-using i16 = std::int16_t;
-using i32 = std::int32_t;
-using i64 = std::int64_t;
+using u8    = std::uint8_t;
+using u16   = std::uint16_t;
+using u32   = std::uint32_t;
+using u64   = std::uint64_t;
+using i8    = std::int8_t;
+using i16   = std::int16_t;
+using i32   = std::int32_t;
+using i64   = std::int64_t;
 using usize = std::size_t;
-using f32 = float;
-using f64 = double;
+using f32   = float;
+using f64   = double;
 
 template <typename T, typename E>
 using Result = std::expected<T, E>;
@@ -74,16 +73,19 @@ template <BitmaskEnum E>
     return (std::to_underlying(value) & std::to_underlying(flag)) != 0;
 }
 
-// Clamps inputs above 2^31 because std::bit_ceil is undefined when the result overflows u32.
+// Next power of two. Returns 0 when the result does not fit in u32.
 [[nodiscard]] constexpr u32 NextPow2(u32 value) noexcept {
-    if (value <= 1U) {
-        return 1U;
-    }
-    return (value > 0x80000000U) ? 0x80000000U : std::bit_ceil(value);
+    if (value <= 1U) return 1U;
+    if (value > 0x80000000U) return 0U;
+    return std::bit_ceil(value);
 }
 
+// `alignment` must be a non-zero power of two. Returns 0 on invalid alignment or overflow.
 [[nodiscard]] constexpr usize AlignUp(usize value, usize alignment) noexcept {
-    return (value + alignment - 1U) & ~(alignment - 1U);
+    if (alignment == 0U || !std::has_single_bit(alignment)) return 0U;
+    const usize mask = alignment - 1U;
+    if (value > ~mask) return 0U;
+    return (value + mask) & ~mask;
 }
 
 [[nodiscard]] constexpr u64 Mix64(u64 x) noexcept {
@@ -115,7 +117,7 @@ inline constexpr auto kCrc32Table = BuildCrc32Table();
 
 } // namespace detail
 
-// IEEE 802.3 CRC32 checksum supporting incremental chaining via previousCrc.
+// IEEE 802.3 CRC32. Supports incremental chaining via previousCrc.
 [[nodiscard]] constexpr u32 ComputeCrc32(std::span<const u8> bytes, u32 previousCrc = 0U) noexcept {
     u32 crc = ~previousCrc;
     for (const u8 b : bytes) {
@@ -124,9 +126,9 @@ inline constexpr auto kCrc32Table = BuildCrc32Table();
     return ~crc;
 }
 
-// Case-insensitive, slash-normalized 64-bit FNV-1a identifier for engine symbols and asset paths.
-// Value type; owns no external memory.
-// Invariant: empty strings map to 0, backslashes fold to '/', and ASCII uppercase folds to lowercase.
+
+// Case-insensitive, slash-normalized 64-bit FNV-1a for symbols and asset paths.
+// Empty → 0. Backslash → '/', ASCII upper → lower.
 struct alignas(8) StringId {
     u64 value{0};
 
@@ -134,9 +136,7 @@ struct alignas(8) StringId {
     constexpr explicit StringId(u64 raw) noexcept : value(raw) {}
 
     [[nodiscard]] static constexpr StringId Hash(std::string_view str) noexcept {
-        if (str.empty()) {
-            return StringId{0};
-        }
+        if (str.empty()) return StringId{0};
         u64 h = 0xCBF29CE484222325ULL;
         for (const char ch : str) {
             char norm = (ch == '\\') ? '/' : ch;
@@ -152,6 +152,7 @@ struct alignas(8) StringId {
     [[nodiscard]] constexpr bool IsValid() const noexcept { return value != 0; }
     [[nodiscard]] constexpr auto operator<=>(const StringId&) const noexcept = default;
 };
+static_assert(std::endian::native == std::endian::little, "Engine core requires little-endian");
 static_assert(sizeof(StringId) == 8);
 
 inline namespace literals {
@@ -160,9 +161,7 @@ inline namespace literals {
 }
 } // namespace literals
 
-// Type-tagged 32-bit generational handle for slot-managed resources.
-// Value type; default-constructed handle has generation == 0 (invalid sentinel).
-// Invariant: IsValid() holds iff generation != 0.
+// Type-tagged 32-bit generational handle. generation == 0 is invalid.
 template <typename Tag>
 struct alignas(4) Handle {
     u16 index{0};
@@ -185,9 +184,8 @@ struct alignas(4) Handle {
 };
 static_assert(sizeof(Handle<void>) == 4);
 
-// Fixed-capacity stack string with transactional virtual path resolution.
-// Value type with 2-byte alignment so embedding inside structs avoids alignment holes.
-// Invariant: sizeof(FixedString<N>) == N, m_buf[m_len] == '\0', and failed operations leave state unchanged.
+// Fixed-capacity stack string. sizeof(FixedString<N>) == N.
+// Failed ops leave the object unchanged.
 template <usize CapacityBytes>
     requires (CapacityBytes >= 8 && CapacityBytes <= 65536 && (CapacityBytes % 2U) == 0U)
 class alignas(2) FixedString {
@@ -201,40 +199,37 @@ public:
     }
 
     constexpr bool Assign(std::string_view sv) noexcept {
-        if (sv.size() > kMaxLength || sv.contains('\0')) {
-            return false;
+        if (sv.size() > kMaxLength || sv.contains('\0')) return false;
+        if (!sv.empty()) {
+            std::char_traits<char>::move(m_buf.data(), sv.data(), sv.size());
         }
-        m_len = 0;
-        return Append(sv);
+        m_len = static_cast<u16>(sv.size());
+        m_buf[m_len] = '\0';
+        return true;
     }
 
-    constexpr bool Append(std::string_view sv) noexcept {
+    [[nodiscard]] constexpr bool Append(std::string_view sv) noexcept {
         if (m_len > kMaxLength || sv.size() > (kMaxLength - m_len) || sv.contains('\0')) {
             return false;
         }
         if (!sv.empty()) {
-            std::char_traits<char>::copy(m_buf.data() + m_len, sv.data(), sv.size());
+            std::char_traits<char>::move(m_buf.data() + m_len, sv.data(), sv.size());
             m_len = static_cast<u16>(m_len + sv.size());
         }
         m_buf[m_len] = '\0';
         return true;
     }
 
-    constexpr bool AssignNormalizedDir(std::string_view sv) noexcept {
-        if (sv.empty() || sv.size() > kMaxLength) {
-            return false;
-        }
+    // Normalize separators and ensure trailing '/'. Rejects control chars.
+    [[nodiscard]] constexpr bool AssignNormalizedDir(std::string_view sv) noexcept {
+        if (sv.empty() || sv.size() > kMaxLength) return false;
         FixedString candidate{};
         for (const char c : sv) {
-            if (static_cast<u8>(c) < 0x20U || static_cast<u8>(c) == 0x7FU) {
-                return false;
-            }
+            if (static_cast<u8>(c) < 0x20U || static_cast<u8>(c) == 0x7FU) return false;
             candidate.m_buf[candidate.m_len++] = (c == '\\') ? '/' : c;
         }
         if (candidate.m_buf[candidate.m_len - 1U] != '/') {
-            if (candidate.m_len >= kMaxLength) {
-                return false;
-            }
+            if (candidate.m_len >= kMaxLength) return false;
             candidate.m_buf[candidate.m_len++] = '/';
         }
         candidate.m_buf[candidate.m_len] = '\0';
@@ -242,7 +237,7 @@ public:
         return true;
     }
 
-    // Joins a relative path onto this directory while rejecting "..", ".", empty segments, and drive colons.
+    // Join relative path. Rejects "..", ".", empty segments, drive colons, absolute paths.
     [[nodiscard]] constexpr bool Resolve(std::string_view rel, FixedString& out) const noexcept {
         if (rel.empty() || rel.front() == '/' || rel.front() == '\\' ||
             rel.back() == '/' || rel.back() == '\\' || m_len >= kMaxLength) {
@@ -262,27 +257,19 @@ public:
         usize dotCount = 0;
         for (const char c : rel) {
             const u8 byte = static_cast<u8>(c);
-            if (byte < 0x20U || byte == 0x7FU || c == ':') {
-                return false;
-            }
+            if (byte < 0x20U || byte == 0x7FU || c == ':') return false;
             const char norm = (c == '\\') ? '/' : c;
             if (norm == '/') {
-                if (segLen == 0 || (dotCount == segLen && segLen <= 2U)) {
-                    return false;
-                }
+                if (segLen == 0 || (dotCount == segLen && segLen <= 2U)) return false;
                 segLen = 0;
                 dotCount = 0;
             } else {
                 ++segLen;
-                if (norm == '.') {
-                    ++dotCount;
-                }
+                if (norm == '.') ++dotCount;
             }
             candidate.m_buf[candidate.m_len++] = norm;
         }
-        if (segLen == 0 || (dotCount == segLen && segLen <= 2U)) {
-            return false;
-        }
+        if (segLen == 0 || (dotCount == segLen && segLen <= 2U)) return false;
         candidate.m_buf[candidate.m_len] = '\0';
         out = candidate;
         return true;
@@ -312,23 +299,16 @@ private:
 };
 static_assert(sizeof(FixedString<256>) == 256);
 
-// Deterministic 64-bit SplitMix pseudo-random generator with Lemire unbiased bounded sampling.
-// Value type; 8-byte state.
-// Invariant: m_state != 0.
+// Deterministic 64-bit SplitMix + Lemire unbiased bounded sampling.
 class alignas(8) Rng64 {
 public:
     static constexpr u64 kDefaultSeed = 0x853C49E6748FEA9BULL;
 
-    constexpr explicit Rng64(u64 seed = kDefaultSeed) noexcept
-        : m_state(seed != 0ULL ? seed : kDefaultSeed) {}
+    constexpr explicit Rng64(u64 seed = kDefaultSeed) noexcept : m_state(seed) {}
 
     [[nodiscard]] constexpr u64 NextU64() noexcept {
-        const u64 prev = m_state;
         m_state += 0x9E3779B97F4A7C15ULL;
-        if (m_state == 0ULL) {
-            m_state = kDefaultSeed;
-        }
-        return Mix64(prev);
+        return Mix64(m_state);
     }
 
     [[nodiscard]] constexpr u32 NextU32() noexcept {
@@ -340,9 +320,7 @@ public:
     }
 
     [[nodiscard]] constexpr u32 NextBoundedU32(u32 bound) noexcept {
-        if (bound <= 1U) {
-            return 0U;
-        }
+        if (bound <= 1U) return 0U;
         const u32 threshold = (0U - bound) % bound;
         for (;;) {
             const u64 product = static_cast<u64>(NextU32()) * static_cast<u64>(bound);
@@ -357,14 +335,12 @@ public:
     }
 
     [[nodiscard]] constexpr i32 RangeI32(i32 lo, i32 hi) noexcept {
-        if (hi <= lo) {
-            return lo;
-        }
+        if (hi <= lo) return lo;
         const u64 span = static_cast<u64>(static_cast<i64>(hi) - static_cast<i64>(lo));
         if (span >= 0xFFFFFFFFULL) {
-            return static_cast<i32>(NextU32());
+            return std::bit_cast<i32>(NextU32());
         }
-        return static_cast<i32>(static_cast<i64>(lo) + NextBoundedU32(static_cast<u32>(span + 1ULL)));
+        return static_cast<i32>(static_cast<i64>(lo) + static_cast<i64>(NextBoundedU32(static_cast<u32>(span + 1ULL))));
     }
 
     [[nodiscard]] constexpr u64 State() const noexcept { return m_state; }
