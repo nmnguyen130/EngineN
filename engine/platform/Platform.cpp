@@ -20,7 +20,7 @@ Result<void, PlatformErrc> Platform::Init(
     Shutdown();
     m_headless = headless;
     m_quit = false;
-    m_frameEvents.ClearFrameDeltas();
+    m_events.ClearFrameDeltas();
 
     if (!headless) {
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
@@ -30,8 +30,7 @@ Result<void, PlatformErrc> Platform::Init(
     }
 
     const char* base = SDL_GetBasePath();
-    if (!m_basePath.AssignNormalizedDir(base ? base : "./") &&
-        !m_basePath.AssignNormalizedDir("./")) {
+    if (!NormalizeDir(base ? base : "./", m_basePath) && !NormalizeDir("./", m_basePath)) {
         if (!headless) SDL_Quit();
         return Err(PlatformErrc::PathRejected);
     }
@@ -40,7 +39,7 @@ Result<void, PlatformErrc> Platform::Init(
     const FixedString<64> appBuf(appName.empty() ? "EngineN" : appName);
     char* pref = SDL_GetPrefPath(orgBuf.CStr(), appBuf.CStr());
     const bool prefOk =
-        (pref && m_prefPath.AssignNormalizedDir(pref)) || m_prefPath.AssignNormalizedDir("./");
+        (pref && NormalizeDir(pref, m_prefPath)) || NormalizeDir("./", m_prefPath);
     if (pref) SDL_free(pref);
 
     if (!prefOk) {
@@ -63,7 +62,7 @@ void Platform::Shutdown() noexcept {
 }
 
 WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
-    m_frameEvents.ClearFrameDeltas();
+    m_events.ClearFrameDeltas();
     if (!m_initialized || m_headless) return WindowFlags::None;
 
     WindowFlags winFlags = WindowFlags::None;
@@ -72,18 +71,17 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 
     SDL_Event ev{};
     while (SDL_PollEvent(&ev)) {
-        // Live focus/density: FocusLost mid-queue must affect later key/mouse events.
         const bool focused = window.State().focused;
         const f32 density = window.State().pixelDensity;
 
         switch (ev.type) {
             case SDL_EVENT_QUIT:
             case SDL_EVENT_TERMINATING:
-                window.ApplyLifecycleEvent(WindowFlags::CloseRequested, winFlags, needRefresh);
+                window.State().ApplyLifecycleEvent(WindowFlags::CloseRequested, winFlags, needRefresh);
                 break;
 
             case SDL_EVENT_WILL_ENTER_BACKGROUND:
-                window.ApplyLifecycleEvent(
+                window.State().ApplyLifecycleEvent(
                     WindowFlags::Minimized | WindowFlags::FocusLost, winFlags, needRefresh);
                 break;
 
@@ -92,19 +90,19 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
             case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
             case SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED:
-                window.ApplyLifecycleEvent(WindowFlags::DisplayChanged, winFlags, needRefresh);
+                window.State().ApplyLifecycleEvent(WindowFlags::DisplayChanged, winFlags, needRefresh);
                 break;
 
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(WindowFlags::CloseRequested, winFlags, needRefresh);
+                    window.State().ApplyLifecycleEvent(WindowFlags::CloseRequested, winFlags, needRefresh);
                 }
                 break;
 
             case SDL_EVENT_WINDOW_RESIZED:
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(WindowFlags::Resized, winFlags, needRefresh);
+                    window.State().ApplyLifecycleEvent(WindowFlags::Resized, winFlags, needRefresh);
                 }
                 break;
 
@@ -113,7 +111,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
             case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(
+                    window.State().ApplyLifecycleEvent(
                         WindowFlags::Resized | WindowFlags::DisplayChanged, winFlags, needRefresh);
                 }
                 break;
@@ -122,7 +120,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_WINDOW_HIDDEN:
             case SDL_EVENT_WINDOW_OCCLUDED:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(
+                    window.State().ApplyLifecycleEvent(
                         WindowFlags::Minimized | WindowFlags::FocusLost, winFlags, needRefresh);
                 }
                 break;
@@ -131,26 +129,26 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_WINDOW_SHOWN:
             case SDL_EVENT_WINDOW_EXPOSED:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(WindowFlags::Restored, winFlags, needRefresh);
+                    window.State().ApplyLifecycleEvent(WindowFlags::Restored, winFlags, needRefresh);
                 }
                 break;
 
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(WindowFlags::FocusGained, winFlags, needRefresh);
+                    window.State().ApplyLifecycleEvent(WindowFlags::FocusGained, winFlags, needRefresh);
                 }
                 break;
 
             case SDL_EVENT_WINDOW_FOCUS_LOST:
                 if (MatchesWindow(targetWinId, ev.window.windowID)) {
-                    window.ApplyLifecycleEvent(WindowFlags::FocusLost, winFlags, needRefresh);
+                    window.State().ApplyLifecycleEvent(WindowFlags::FocusLost, winFlags, needRefresh);
                 }
                 break;
 
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP:
                 if (MatchesWindow(targetWinId, ev.key.windowID)) {
-                    m_frameEvents.IngestKey(
+                    m_events.IngestKey(
                         static_cast<u16>(ev.key.scancode),
                         ev.type == SDL_EVENT_KEY_DOWN,
                         ev.key.repeat,
@@ -163,7 +161,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_MOUSE_BUTTON_UP:
                 if (ev.button.which != SDL_TOUCH_MOUSEID &&
                     MatchesWindow(targetWinId, ev.button.windowID)) {
-                    m_frameEvents.IngestMouseButton(
+                    m_events.IngestMouseButton(
                         static_cast<u16>(ev.button.button),
                         ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN,
                         ev.button.x,
@@ -177,7 +175,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_MOUSE_MOTION:
                 if (ev.motion.which != SDL_TOUCH_MOUSEID &&
                     MatchesWindow(targetWinId, ev.motion.windowID)) {
-                    m_frameEvents.IngestMouseMotion(
+                    m_events.IngestMouseMotion(
                         ev.motion.x,
                         ev.motion.y,
                         ev.motion.xrel,
@@ -191,7 +189,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_MOUSE_WHEEL:
                 if (ev.wheel.which != SDL_TOUCH_MOUSEID &&
                     MatchesWindow(targetWinId, ev.wheel.windowID)) {
-                    m_frameEvents.IngestMouseWheel(
+                    m_events.IngestMouseWheel(
                         ev.wheel.x,
                         ev.wheel.y,
                         ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED,
@@ -211,7 +209,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
             case SDL_EVENT_GAMEPAD_BUTTON_UP:
                 if (ev.gbutton.which == m_gamepadId && m_gamepadId != 0U) {
-                    m_frameEvents.IngestGamepadButton(
+                    m_events.IngestGamepadButton(
                         static_cast<u16>(ev.gbutton.button),
                         ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN,
                         focused,
@@ -221,7 +219,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 
             case SDL_EVENT_GAMEPAD_AXIS_MOTION:
                 if (ev.gaxis.which == m_gamepadId && m_gamepadId != 0U) {
-                    m_frameEvents.IngestGamepadAxis(
+                    m_events.IngestGamepadAxis(
                         static_cast<u16>(ev.gaxis.axis),
                         static_cast<i16>(ev.gaxis.value),
                         focused,
@@ -231,7 +229,7 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 
             case SDL_EVENT_TEXT_INPUT:
                 if (MatchesWindow(targetWinId, ev.text.windowID) && ev.text.text) {
-                    m_frameEvents.IngestTextInput(ev.text.text, focused);
+                    m_events.IngestTextInput(ev.text.text, focused);
                 }
                 break;
 
@@ -245,20 +243,19 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
 
     if (HasFlag(winFlags, WindowFlags::FocusLost | WindowFlags::Minimized)) {
         StopRumble();
-        // Keep discrete edges; InputPipeline clears held on !focused.
-        m_frameEvents.mouseDx = 0.0f;
-        m_frameEvents.mouseDy = 0.0f;
-        m_frameEvents.wheelX = 0.0f;
-        m_frameEvents.wheelY = 0.0f;
+        m_events.mouseDx = 0.0f;
+        m_events.mouseDy = 0.0f;
+        m_events.wheelX = 0.0f;
+        m_events.wheelY = 0.0f;
     }
-    m_frameEvents.focused = window.State().focused ? 1U : 0U;
+    m_events.focused = window.State().focused ? 1U : 0U;
     return winFlags;
 }
 
 bool Platform::OpenGamepad(u32 instanceId) noexcept {
     if (instanceId == 0U) return false;
     if (m_gamepadId == instanceId) return true;
-    if (m_gamepadId != 0U) return false; // single-pad
+    if (m_gamepadId != 0U) return false;
 
     if (!m_headless) {
         SDL_Gamepad* pad = SDL_OpenGamepad(instanceId);
@@ -280,7 +277,7 @@ void Platform::CloseGamepad(u32 instanceId) noexcept {
     }
     m_gamepadId = 0U;
     m_rumbling = false;
-    m_frameEvents.IngestGamepadDisconnect();
+    m_events.IngestGamepadDisconnect();
 }
 
 bool Platform::RumbleGamepad(u16 lowFreq, u16 highFreq, u32 durationMs) noexcept {
@@ -299,7 +296,7 @@ void Platform::StopRumble() noexcept {
     m_rumbling = false;
 }
 
-Result<usize, PlatformErrc> Platform::ReadFileBuffer(
+Result<usize, PlatformErrc> Platform::ReadFile(
     const FilePath& path, std::span<u8> outBuf) noexcept {
     if (path.Empty()) return Err(PlatformErrc::PathRejected);
 

@@ -7,21 +7,21 @@ namespace {
 
 consteval std::array<u16, RenderList::kChunkQuads * 6U> MakeIndices() noexcept {
     std::array<u16, RenderList::kChunkQuads * 6U> t{};
-    for (u32 q = 0; q < RenderList::kChunkQuads; ++q) {
-        const u16 b = static_cast<u16>(q * 4);
-        const u32 i = q * 6;
-        t[i + 0] = b + 0; t[i + 1] = b + 1; t[i + 2] = b + 2;
-        t[i + 3] = b + 0; t[i + 4] = b + 2; t[i + 5] = b + 3;
+    for (u32 q = 0U; q < RenderList::kChunkQuads; ++q) {
+        const u16 b = static_cast<u16>(q * 4U);
+        const u32 i = q * 6U;
+        t[i + 0U] = b + 0U; t[i + 1U] = b + 1U; t[i + 2U] = b + 2U;
+        t[i + 3U] = b + 0U; t[i + 4U] = b + 2U; t[i + 5U] = b + 3U;
     }
     return t;
 }
-inline constexpr auto kIdx = MakeIndices();
+inline constexpr auto kQuadIndices = MakeIndices();
 
 } // namespace
 
 void RenderList::Push(const QuadCmd& cmd) noexcept {
     const u8 pass = cmd.pass & 0x03U;
-    if ((m_enabledPassMask & (1U << pass)) == 0 || cmd.size.x <= 0.0f || cmd.size.y <= 0.0f ||
+    if ((m_enabledPassMask & (1U << pass)) == 0U || cmd.size.x <= 0.0f || cmd.size.y <= 0.0f ||
         cmd.color.a <= 0.0f) {
         ++m_stats.culled;
         return;
@@ -42,7 +42,7 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
     const f32 scale = cam.screenSpace ? cam.zoom : cam.Scale();
     const f32 ySign = (!cam.screenSpace && cam.yUp) ? -1.0f : 1.0f;
 
-    f32 cx, cy;
+    f32 cx = 0.0f, cy = 0.0f;
     if (cam.screenSpace) {
         cx = cmd.center.x * scale;
         cy = cmd.center.y * scale;
@@ -55,7 +55,7 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
     f32 hh = cmd.size.y * scale * 0.5f;
     const f32 s = cmd.sinRot * ySign;
     f32 hxX = hw * cmd.cosRot, hxY = hw * s;
-    f32 hyX = -hh * s,       hyY = hh * cmd.cosRot;
+    f32 hyX = -hh * s,         hyY = hh * cmd.cosRot;
 
     if (cmd.pivot.x != 0.5f || cmd.pivot.y != 0.5f) {
         const f32 px = 1.0f - 2.0f * cmd.pivot.x;
@@ -64,14 +64,13 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
         cy += px * hxY + py * hyY;
     }
 
-    // Pixel snap: center always; size when axis-aligned (no rotation).
     if (cmd.pixelSnap || m_pixelSnap) {
         cx = std::floor(cx + 0.5f);
         cy = std::floor(cy + 0.5f);
         if (cmd.sinRot == 0.0f && cmd.cosRot == 1.0f) {
             hw = std::floor(cmd.size.x * scale + 0.5f) * 0.5f;
             hh = std::floor(cmd.size.y * scale + 0.5f) * 0.5f;
-            hxX = hw; hxY = 0.0f;
+            hxX = hw;   hxY = 0.0f;
             hyX = 0.0f; hyY = hh * ySign;
         }
     }
@@ -79,7 +78,6 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
     const f32 d0x = hxX + hyX, d0y = hxY + hyY;
     const f32 d1x = hxX - hyX, d1y = hxY - hyY;
 
-    // Frustum vs scissor AABB
     const f32 ax = std::max(std::abs(d0x), std::abs(d1x));
     const f32 ay = std::max(std::abs(d0y), std::abs(d1y));
     const f32 x0 = std::max(0.0f, cam.scissor.x * vw);
@@ -94,7 +92,7 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
     const u16 idx = static_cast<u16>(m_stats.submitted++);
     const TextureHandle tex = cmd.texture.IsValid() ? cmd.texture : kWhiteTexture;
     const u64 key = SortKey::Pack(cmd, tex.index, idx);
-    if (idx > 0 && key < m_lastKey) m_monotonic = false;
+    if (idx > 0U && key < m_lastKey) m_monotonic = false;
     m_lastKey = key;
     m_keys[idx] = key;
 
@@ -173,11 +171,11 @@ void RenderList::PushCircle(Vec2 center, f32 radius, u32 segs, f32 thick, Color 
     const u32 n = std::clamp(segs, 6U, 64U);
     const f32 step = kTwoPi / static_cast<f32>(n);
     Vec2 prev{center.x + radius, center.y};
-    for (u32 i = 1; i <= n; ++i) {
+    for (u32 i = 1U; i <= n; ++i) {
         f32 co = 1.0f, si = 0.0f;
         FastSinCos(static_cast<f32>(i) * step, co, si);
         const Vec2 cur{center.x + co * radius, center.y + si * radius};
-        PushLine(prev, cur, thick, c, pass, layer, 32768, view);
+        PushLine(prev, cur, thick, c, pass, layer, 32768U, view);
         prev = cur;
     }
 }
@@ -201,17 +199,17 @@ void RenderList::PushNine(const NineSlice& n, u8 pass, u8 layer, u8 view) noexce
         .color = n.color, .texture = n.texture.IsValid() ? n.texture : kWhiteTexture,
         .depth = n.depth, .pass = pass, .layer = layer, .view = view, .blend = n.blend,
     };
-    for (u32 row = 0; row < 3; ++row) {
-        const f32 py = yr[row], ph = yr[row + 1] - py;
+    for (u32 row = 0U; row < 3U; ++row) {
+        const f32 py = yr[row], ph = yr[row + 1U] - py;
         if (ph <= 1e-4f) continue;
-        const f32 vy = vr[row], vh = vr[row + 1] - vy;
-        for (u32 col = 0; col < 3; ++col) {
-            if (row == 1 && col == 1 && !n.center) continue;
-            const f32 px = xc[col], pw = xc[col + 1] - px;
+        const f32 vy = vr[row], vh = vr[row + 1U] - vy;
+        for (u32 col = 0U; col < 3U; ++col) {
+            if (row == 1U && col == 1U && !n.center) continue;
+            const f32 px = xc[col], pw = xc[col + 1U] - px;
             if (pw <= 1e-4f) continue;
             q.center = {px + pw * 0.5f, py + ph * 0.5f};
             q.size = {pw, ph};
-            q.uv = {uc[col], vy, uc[col + 1] - uc[col], vh};
+            q.uv = {uc[col], vy, uc[col + 1U] - uc[col], vh};
             Push(q);
         }
     }
@@ -223,8 +221,11 @@ void RenderList::PushText(Vec2 pos, std::string_view text, Color c, f32 scale,
     const f32 qs = 16.0f * scale;
     const f32 adv = 12.0f * scale;
     f32 x = pos.x, y = pos.y;
-    QuadCmd q{.size = {qs, qs}, .color = c, .texture = font, .pass = pass, .layer = layer, .view = view};
-    for (char ch : text) {
+    QuadCmd q{
+        .size = {qs, qs}, .color = c, .texture = font,
+        .pass = pass, .layer = layer, .view = view,
+    };
+    for (const char ch : text) {
         if (ch == '\n') {
             x = pos.x;
             y += qs * 1.15f;
@@ -251,12 +252,14 @@ void RenderList::Compile() noexcept {
     if (m_compiled) return;
     m_compiled = true;
     const u32 n = m_stats.submitted;
-    if (n == 0) return;
+    if (n == 0U) return;
 
-    if (!m_monotonic && n > 1) std::sort(m_keys.begin(), m_keys.begin() + n);
+    if (!m_monotonic && n > 1U) {
+        std::sort(m_keys.begin(), m_keys.begin() + n);
+    }
 
-    u32 bi = 0;
-    auto emit = [&](u32 start, u32 end, u64 state) noexcept {
+    u32 bi = 0U;
+    const auto emit = [&](u32 start, u32 end, u64 state) noexcept {
         if (bi >= kMaxBatches) {
             m_stats.dropped += (end - start);
             return;
@@ -264,24 +267,23 @@ void RenderList::Compile() noexcept {
         const PreparedQuad& q = m_quads[SortKey::Idx(m_keys[start])];
         m_batches[bi++] = DrawBatch{
             .texture = q.texture,
-            .first = static_cast<u16>(start),
-            .count = static_cast<u16>(end - start),
-            .pass = SortKey::Pass(state),
-            .view = SortKey::View(state),
-            .blend = SortKey::Blend(state),
+            .first   = static_cast<u16>(start),
+            .count   = static_cast<u16>(end - start),
+            .pass    = SortKey::Pass(state),
+            .view    = SortKey::View(state),
+            .blend   = SortKey::Blend(state),
         };
     };
 
+    // SortKey::kBatchStateMask includes Pass, Blend, View, and 14-bit TextureIndex,
+    // so batch boundaries are detected purely from contiguous 64-bit keys without touching m_quads.
     u64 state = m_keys[0] & SortKey::kBatchStateMask;
-    u32 start = 0;
-    TextureHandle cur = m_quads[SortKey::Idx(m_keys[0])].texture;
-    for (u32 i = 1; i < n; ++i) {
+    u32 start = 0U;
+    for (u32 i = 1U; i < n; ++i) {
         const u64 s = m_keys[i] & SortKey::kBatchStateMask;
-        const TextureHandle t = m_quads[SortKey::Idx(m_keys[i])].texture;
-        if (s != state || t != cur) {
+        if (s != state) {
             emit(start, i, state);
             state = s;
-            cur = t;
             start = i;
         }
     }
@@ -291,20 +293,20 @@ void RenderList::Compile() noexcept {
 
 void RenderList::Expand(u32 first, u32 count, std::span<Vertex2D> out) const noexcept {
     const u32 end = std::min(first + count, m_stats.submitted);
-    usize v = 0;
-    for (u32 i = first; i < end && v + 4 <= out.size(); ++i) {
+    usize v = 0U;
+    for (u32 i = first; i < end && v + 4U <= out.size(); ++i) {
         const PreparedQuad& q = m_quads[SortKey::Idx(m_keys[i])];
-        out[v + 0] = {q.cx - q.d0x, q.cy - q.d0y, q.r, q.g, q.b, q.a, q.u0, q.v0};
-        out[v + 1] = {q.cx + q.d1x, q.cy + q.d1y, q.r, q.g, q.b, q.a, q.u1, q.v0};
-        out[v + 2] = {q.cx + q.d0x, q.cy + q.d0y, q.r, q.g, q.b, q.a, q.u1, q.v1};
-        out[v + 3] = {q.cx - q.d1x, q.cy - q.d1y, q.r, q.g, q.b, q.a, q.u0, q.v1};
-        v += 4;
+        out[v + 0U] = {q.cx - q.d0x, q.cy - q.d0y, q.r, q.g, q.b, q.a, q.u0, q.v0};
+        out[v + 1U] = {q.cx + q.d1x, q.cy + q.d1y, q.r, q.g, q.b, q.a, q.u1, q.v0};
+        out[v + 2U] = {q.cx + q.d0x, q.cy + q.d0y, q.r, q.g, q.b, q.a, q.u1, q.v1};
+        out[v + 3U] = {q.cx - q.d1x, q.cy - q.d1y, q.r, q.g, q.b, q.a, q.u0, q.v1};
+        v += 4U;
     }
 }
 
 std::span<const u16> RenderList::Indices(u32 count) noexcept {
     const u32 n = std::min(count, kChunkQuads);
-    return {kIdx.data(), static_cast<usize>(n) * 6U};
+    return {kQuadIndices.data(), static_cast<usize>(n) * 6U};
 }
 
 } // namespace en

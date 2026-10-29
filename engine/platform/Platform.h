@@ -6,9 +6,8 @@ struct SDL_Gamepad;
 
 namespace en {
 
-// SDL3 owner: init, one window pump, one gamepad, paths, atomic file IO.
-// Invariant: m_gamepadId != 0 iff a controller is connected (or headless slot).
-class alignas(16) Platform {
+// SDL3 platform runtime managing event pumping, gamepad lifecycle, paths, and atomic file I/O.
+class Platform {
 public:
     Platform() noexcept = default;
     ~Platform() noexcept { Shutdown(); }
@@ -25,20 +24,17 @@ public:
     [[nodiscard]] constexpr bool IsInitialized() const noexcept { return m_initialized; }
     [[nodiscard]] constexpr bool IsHeadless() const noexcept { return m_headless; }
 
-    // Drain SDL queue -> Window lifecycle + FrameEvents. Returns coalesced window flags.
     WindowFlags Pump(Window& window, EventCapture captured = EventCapture::None) noexcept;
 
-    template <typename InputSinkT>
+    template <typename InputSystemT>
     WindowFlags Pump(
-        Window& window, InputSinkT& input, EventCapture captured = EventCapture::None) noexcept {
+        Window& window, InputSystemT& input, EventCapture captured = EventCapture::None) noexcept {
         const WindowFlags flags = Pump(window, captured);
-        input.IngestPlatformFrame(m_frameEvents);
+        (void)input.Ingest(m_events);
         return flags;
     }
 
-    [[nodiscard]] constexpr const PlatformFrameEvents& FrameEvents() const noexcept {
-        return m_frameEvents;
-    }
+    [[nodiscard]] constexpr const FrameEvents& Events() const noexcept { return m_events; }
 
     [[nodiscard]] constexpr bool ShouldQuit() const noexcept { return m_quit; }
     constexpr void RequestQuit() noexcept { m_quit = true; }
@@ -50,19 +46,19 @@ public:
     [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveAsset(
         std::string_view rel) const noexcept {
         FilePath out{};
-        if (!m_basePath.Resolve(rel, out)) return Err(PlatformErrc::PathRejected);
+        if (!ResolvePath(m_basePath, rel, out)) return Err(PlatformErrc::PathRejected);
         return out;
     }
     [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveUser(
         std::string_view rel) const noexcept {
         FilePath out{};
-        if (!m_prefPath.Resolve(rel, out)) return Err(PlatformErrc::PathRejected);
+        if (!ResolvePath(m_prefPath, rel, out)) return Err(PlatformErrc::PathRejected);
         return out;
     }
     [[nodiscard]] constexpr std::string_view BasePath() const noexcept { return m_basePath.View(); }
     [[nodiscard]] constexpr std::string_view PrefPath() const noexcept { return m_prefPath.View(); }
 
-    [[nodiscard]] static Result<usize, PlatformErrc> ReadFileBuffer(
+    [[nodiscard]] static Result<usize, PlatformErrc> ReadFile(
         const FilePath& path, std::span<u8> outBuf) noexcept;
     [[nodiscard]] static Result<void, PlatformErrc> WriteFileAtomic(
         const FilePath& path, std::span<const u8> data) noexcept;
@@ -76,15 +72,15 @@ private:
     bool OpenGamepad(u32 instanceId) noexcept;
     void CloseGamepad(u32 instanceId) noexcept;
 
-    PlatformFrameEvents m_frameEvents{};
-    FilePath m_basePath{};
-    FilePath m_prefPath{};
+    FrameEvents  m_events{};
+    FilePath     m_basePath{};
+    FilePath     m_prefPath{};
     SDL_Gamepad* m_gamepad{nullptr};
-    u32 m_gamepadId{0};
-    bool m_initialized{false};
-    bool m_quit{false};
-    bool m_headless{false};
-    bool m_rumbling{false};
+    u32          m_gamepadId{0};
+    bool         m_initialized{false};
+    bool         m_quit{false};
+    bool         m_headless{false};
+    bool         m_rumbling{false};
 };
 static_assert(sizeof(Platform) == 784);
 

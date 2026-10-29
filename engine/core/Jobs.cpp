@@ -3,27 +3,25 @@
 #include <algorithm>
 
 namespace en {
-
 namespace {
-thread_local u32 g_tlsQueueIndex = 0U;
-thread_local const JobSystem* g_tlsOwnerSystem = nullptr;
+thread_local u32 g_tlsQueueIdx = 0U;
+thread_local const JobSystem* g_tlsOwner = nullptr;
 } // namespace
 
 bool JobSystem::Init(u32 workerThreads) noexcept {
     Shutdown();
-    m_inFlightJobs.store(0U, std::memory_order_relaxed);
-    m_nextCounterSlot.store(0U, std::memory_order_relaxed);
+    m_inFlight.store(0U, std::memory_order_relaxed);
     m_stop.store(false, std::memory_order_relaxed);
-    g_tlsOwnerSystem = this;
-    g_tlsQueueIndex = 0U;
+    g_tlsOwner = this;
+    g_tlsQueueIdx = 0U;
 
     if (workerThreads == 0U) {
         const u32 hw = std::thread::hardware_concurrency();
         workerThreads = (hw > 1U) ? (hw - 1U) : 1U;
     }
-    const u32 targetWorkers = std::min(workerThreads, kMaxWorkers);
+    const u32 target = std::min(workerThreads, kMaxWorkers);
     m_workerCount = 0U;
-    for (u32 i = 0; i < targetWorkers; ++i) {
+    for (u32 i = 0U; i < target; ++i) {
         const u32 queueIdx = i + 1U;
 #if defined(__EXCEPTIONS) || defined(_CPPUNWIND)
         try {
@@ -47,7 +45,7 @@ void JobSystem::Shutdown() noexcept {
             m_stop.store(true, std::memory_order_release);
         }
         m_wakeCv.notify_all();
-        for (u32 i = 0; i < m_workerCount; ++i) {
+        for (u32 i = 0U; i < m_workerCount; ++i) {
             if (m_workers[i].joinable()) {
                 m_workers[i].join();
             }
@@ -57,30 +55,27 @@ void JobSystem::Shutdown() noexcept {
     for (auto& dq : m_deques) {
         dq.Clear();
     }
-    for (auto& c : m_batchCounters) {
-        c.remaining.store(0U, std::memory_order_relaxed);
-    }
-    m_inFlightJobs.store(0U, std::memory_order_relaxed);
+    m_inFlight.store(0U, std::memory_order_relaxed);
 }
 
-u32 JobSystem::ResolveCallerQueueIndex() const noexcept {
-    return (g_tlsOwnerSystem == this && g_tlsQueueIndex <= m_workerCount) ? g_tlsQueueIndex : 0U;
+u32 JobSystem::CallerQueueIndex() const noexcept {
+    return (g_tlsOwner == this && g_tlsQueueIdx <= m_workerCount) ? g_tlsQueueIdx : 0U;
 }
 
-void JobSystem::ExecuteJobItem(const JobItem& item, u32 threadIdx) noexcept {
-    if (item.fn != nullptr) {
+void JobSystem::RunItem(const JobItem& item, u32 threadIdx) noexcept {
+    if (item.fn) {
         item.fn(item.startIdx, item.endIdx, threadIdx, item.userCtx);
     }
-    if (item.batchSlot < m_batchCounters.size()) {
-        m_batchCounters[item.batchSlot].remaining.fetch_sub(1U, std::memory_order_acq_rel);
+    if (item.counter) {
+        item.counter->fetch_sub(1U, std::memory_order_acq_rel);
     }
 }
 
 bool JobSystem::ExecuteOneJob(u32 callerQueueIdx) noexcept {
     JobItem item{};
     if (m_deques[callerQueueIdx].PopBottom(item)) {
-        m_inFlightJobs.fetch_sub(1U, std::memory_order_acq_rel);
-        ExecuteJobItem(item, callerQueueIdx);
+        m_inFlight.fetch_sub(1U, std::memory_order_acq_rel);
+        RunItem(item, callerQueueIdx);
         return true;
     }
 
@@ -88,90 +83,70 @@ bool JobSystem::ExecuteOneJob(u32 callerQueueIdx) noexcept {
     for (u32 offset = 1U; offset < totalQueues; ++offset) {
         const u32 victim = (callerQueueIdx + offset) % totalQueues;
         if (m_deques[victim].StealTop(item)) {
-            m_inFlightJobs.fetch_sub(1U, std::memory_order_acq_rel);
-            ExecuteJobItem(item, callerQueueIdx);
+            m_inFlight.fetch_sub(1U, std::memory_order_acq_rel);
+            RunItem(item, callerQueueIdx);
             return true;
         }
     }
     return false;
 }
 
-void JobSystem::ParallelFor(u32 itemCount, u32 minBatchSize, ParallelTaskFn fn, void* userCtx) noexcept {
-    if (itemCount == 0U || fn == nullptr) {
-        return;
-    }
+void JobSystem::ParallelFor(u32 itemCount, u32 minBatchSize, TaskFn fn, void* userCtx) noexcept {
+    if (itemCount == 0U || !fn) return;
+
     const u32 batchSize = std::max(1U, minBatchSize);
     const u32 totalBatches = ((itemCount - 1U) / batchSize) + 1U;
-    const u32 callerQueueIdx = ResolveCallerQueueIndex();
+    const u32 callerIdx = CallerQueueIndex();
 
-    if (m_workerCount == 0U || totalBatches == 1U || g_tlsOwnerSystem != this) {
-        fn(0U, itemCount, callerQueueIdx, userCtx);
+    if (m_workerCount == 0U || totalBatches == 1U || g_tlsOwner != this) {
+        fn(0U, itemCount, callerIdx, userCtx);
         return;
     }
 
-    const u32 counterCount = static_cast<u32>(m_batchCounters.size());
-    const u32 baseSlot = m_nextCounterSlot.fetch_add(1U, std::memory_order_relaxed);
-    u32 batchSlot = counterCount;
-    for (u32 probe = 0U; probe < counterCount; ++probe) {
-        const u32 idx = (baseSlot + probe) % counterCount;
-        u32 expected = 0U;
-        if (m_batchCounters[idx].remaining.compare_exchange_strong(
-                expected, totalBatches, std::memory_order_acq_rel)) {
-            batchSlot = idx;
-            break;
-        }
-    }
+    alignas(64) std::atomic<u32> remaining{totalBatches};
+    u32 pushed = 0U;
 
-    if (batchSlot >= counterCount) {
-        fn(0U, itemCount, callerQueueIdx, userCtx);
-        return;
-    }
-
-    u32 pushedCount = 0U;
     for (u32 b = 1U; b < totalBatches; ++b) {
         const u32 start = b * batchSize;
         const u32 end = (itemCount - start > batchSize) ? (start + batchSize) : itemCount;
-        const JobItem item{fn, userCtx, start, end, batchSlot, 0U};
+        const JobItem item{fn, userCtx, &remaining, start, end};
 
-        m_inFlightJobs.fetch_add(1U, std::memory_order_release);
-        if (m_deques[callerQueueIdx].PushBottom(item)) {
-            ++pushedCount;
+        m_inFlight.fetch_add(1U, std::memory_order_release);
+        if (m_deques[callerIdx].PushBottom(item)) {
+            ++pushed;
         } else {
-            m_inFlightJobs.fetch_sub(1U, std::memory_order_relaxed);
-            ExecuteJobItem(item, callerQueueIdx);
+            m_inFlight.fetch_sub(1U, std::memory_order_relaxed);
+            RunItem(item, callerIdx);
         }
     }
 
-    if (pushedCount > 0U) {
+    if (pushed > 0U) {
         std::lock_guard lock(m_wakeMutex);
         m_wakeCv.notify_all();
     }
 
-    ExecuteJobItem({fn, userCtx, 0U, std::min(batchSize, itemCount), batchSlot, 0U}, callerQueueIdx);
+    RunItem({fn, userCtx, &remaining, 0U, std::min(batchSize, itemCount)}, callerIdx);
 
-    while (m_batchCounters[batchSlot].remaining.load(std::memory_order_acquire) > 0U) {
-        if (!ExecuteOneJob(callerQueueIdx)) {
+    while (remaining.load(std::memory_order_acquire) > 0U) {
+        if (!ExecuteOneJob(callerIdx)) {
             std::this_thread::yield();
         }
     }
 }
 
 void JobSystem::WorkerLoop(u32 queueIdx) noexcept {
-    g_tlsOwnerSystem = this;
-    g_tlsQueueIndex = queueIdx;
+    g_tlsOwner = this;
+    g_tlsQueueIdx = queueIdx;
 
     for (;;) {
-        while (ExecuteOneJob(queueIdx)) {
-        }
+        while (ExecuteOneJob(queueIdx)) {}
 
         std::unique_lock lock(m_wakeMutex);
         m_wakeCv.wait(lock, [this]() noexcept {
             return m_stop.load(std::memory_order_acquire) ||
-                   m_inFlightJobs.load(std::memory_order_acquire) > 0U;
+                   m_inFlight.load(std::memory_order_acquire) > 0U;
         });
-        if (m_stop.load(std::memory_order_acquire)) {
-            return;
-        }
+        if (m_stop.load(std::memory_order_acquire)) return;
     }
 }
 

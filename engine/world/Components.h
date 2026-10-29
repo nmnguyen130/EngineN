@@ -1,12 +1,12 @@
 #pragma once
 
 #include "assets/AssetTypes.h"
-#include "time/TimePipeline.h"
+#include "time/TimeTypes.h"
 
 namespace en {
 
-// Generational id. Valid iff index != 0 && generation != 0.
-struct alignas(4) EntityId {
+// Generational entity identifier. Valid iff index != 0 && generation != 0.
+struct EntityId {
     u16 index{0};
     u16 generation{0};
 
@@ -27,9 +27,9 @@ struct alignas(4) EntityId {
 static_assert(sizeof(EntityId) == 4);
 
 inline constexpr EntityId kNullEntity{0U, 0U};
-inline constexpr u16 kInvalidDenseIndex = 0xFFFFU;
-inline constexpr usize kMaxComponentTypes = 64U;
-inline constexpr usize kMaxHierarchyDepth = 32U;
+inline constexpr u16      kInvalidDenseIndex = 0xFFFFU;
+inline constexpr usize    kMaxComponentTypes = 64U;
+inline constexpr usize    kMaxHierarchyDepth = 32U;
 
 template <typename T>
 concept Component = std::is_trivially_copyable_v<T> &&
@@ -61,7 +61,7 @@ enum class WorldErrc : u8 {
     CorruptedPrefab,
 };
 
-struct alignas(4) WorldConfig {
+struct WorldConfig {
     u16 maxEntities{4096};
     u16 defaultPoolCapacity{4096};
     u32 commandBufferBytes{131072};
@@ -69,7 +69,7 @@ struct alignas(4) WorldConfig {
 };
 static_assert(sizeof(WorldConfig) == 12);
 
-struct alignas(4) LocalTransform2D {
+struct LocalTransform2D {
     static constexpr u8 kTypeId = 0;
     f32 x{0.0f};
     f32 y{0.0f};
@@ -80,7 +80,7 @@ struct alignas(4) LocalTransform2D {
 };
 static_assert(sizeof(LocalTransform2D) == 24);
 
-struct alignas(4) PrevWorldSnapshot2D {
+struct PrevWorldSnapshot2D {
     f32 x{0.0f};
     f32 y{0.0f};
     f32 scaleX{1.0f};
@@ -90,7 +90,7 @@ struct alignas(4) PrevWorldSnapshot2D {
 };
 static_assert(sizeof(PrevWorldSnapshot2D) == 24);
 
-struct alignas(32) WorldTransform2D {
+struct WorldTransform2D {
     f32 x{0.0f};
     f32 y{0.0f};
     f32 scaleX{1.0f};
@@ -116,16 +116,16 @@ struct alignas(32) WorldTransform2D {
 };
 static_assert(sizeof(WorldTransform2D) == 32);
 
-struct alignas(4) EntitySpawnDesc {
+struct EntitySpawnDesc {
     LocalTransform2D local{};
-    EntityId parent{kNullEntity};
-    TimeChannel timeChannel{TimeChannel::World};
-    bool keepWorldTransform{false};
-    u16 userFlags{0};
+    EntityId         parent{kNullEntity};
+    TimeChannel      timeChannel{TimeChannel::World};
+    bool             keepWorldTransform{false};
+    u16              userFlags{0};
 };
 static_assert(sizeof(EntitySpawnDesc) == 32);
 
-struct alignas(16) Velocity2D {
+struct Velocity2D {
     static constexpr u8 kTypeId = 1;
     f32 vx{0.0f};
     f32 vy{0.0f};
@@ -134,16 +134,16 @@ struct alignas(16) Velocity2D {
 };
 static_assert(sizeof(Velocity2D) == 16);
 
-// flags: [0]visible [1]flipX [2]flipY [3]ySort [4..5]blend [6..7]viewSlot
-struct alignas(32) Sprite2D {
+// Packed flags: [0]visible [1]flipX [2]flipY [3]ySort [4..5]blend [6..7]viewSlot.
+struct Sprite2D {
     static constexpr u8 kTypeId = 2;
-    Color tint{1.0f, 1.0f, 1.0f, 1.0f};
-    f32 width{1.0f};
-    f32 height{1.0f};
+    Color        tint{1.0f, 1.0f, 1.0f, 1.0f};
+    f32          width{1.0f};
+    f32          height{1.0f};
     SpriteHandle sprite{0U, 1U};
-    u16 baseDepth{32768U};
-    u8 layer{10U};
-    u8 flags{1U};
+    u16          baseDepth{32768U};
+    u8           layer{10U};
+    u8           flags{1U};
 
     [[nodiscard]] constexpr bool Visible() const noexcept { return (flags & 0x01U) != 0U; }
     [[nodiscard]] constexpr bool FlipX() const noexcept { return (flags & 0x02U) != 0U; }
@@ -177,65 +177,65 @@ struct alignas(32) Sprite2D {
 };
 static_assert(sizeof(Sprite2D) == 32);
 
-struct alignas(16) SpriteAnimator2D {
+struct SpriteAnimator2D {
     static constexpr u8 kTypeId = 3;
     AtlasHandle atlas{};
-    u16 firstFrame{0};
-    u16 frameCount{1};
-    u16 currentFrame{0};
-    u16 ticksPerFrame{6};
-    u16 tickAccum{0};
-    bool loop{true};
-    bool playing{true};
+    u16         firstFrame{0};
+    u16         frameCount{1};
+    u16         currentFrame{0};
+    u16         ticksPerFrame{6};
+    u16         tickAccum{0};
+    bool        loop{true};
+    bool        playing{true};
 };
 static_assert(sizeof(SpriteAnimator2D) == 16);
 
-struct alignas(32) CameraRig2D {
+struct CameraRig2D {
     static constexpr u8 kTypeId = 4;
     Rect viewport{0.0f, 0.0f, 1.0f, 1.0f};
-    f32 zoom{1.0f};
-    f32 pixelsPerMeter{48.0f};
-    f32 trauma{0.0f};
-    u8 viewSlot{0};
-    u8 passId{0};
+    f32  zoom{1.0f};
+    f32  pixelsPerMeter{48.0f};
+    f32  trauma{0.0f};
+    u8   viewSlot{0};
+    u8   passId{0};
     bool screenSpace{false};
     bool active{true};
 };
 static_assert(sizeof(CameraRig2D) == 32);
 
-struct alignas(16) Lifetime2D {
+struct Lifetime2D {
     static constexpr u8 kTypeId = 5;
-    u32 remainingTicks{60};
-    u32 initialTicks{60};
-    f32 alphaScale{1.0f};
+    u32  remainingTicks{60};
+    u32  initialTicks{60};
+    f32  alphaScale{1.0f};
     bool fadeSpriteAlpha{false};
     bool active{true};
-    u16 userTag{0};
+    u16  userTag{0};
 };
 static_assert(sizeof(Lifetime2D) == 16);
 
-struct alignas(32) PointLight2D {
+struct PointLight2D {
     static constexpr u8 kTypeId = 6;
     Color color{1.0f, 0.9f, 0.7f, 1.0f};
-    f32 radius{4.0f};
-    f32 intensity{1.0f};
-    f32 pulseSpeed{0.0f};
-    f32 pulsePhase{0.0f};
+    f32   radius{4.0f};
+    f32   intensity{1.0f};
+    f32   pulseSpeed{0.0f};
+    f32   pulsePhase{0.0f};
 };
 static_assert(sizeof(PointLight2D) == 32);
 
-struct alignas(16) Tag2D {
+struct Tag2D {
     static constexpr u8 kTypeId = 7;
     StringId name{};
-    u32 categoryMask{0};
-    u32 userData{0};
+    u32      categoryMask{0};
+    u32      userData{0};
 };
 static_assert(sizeof(Tag2D) == 16);
 
-inline constexpr u32 kCookedPrefabMagic = 0x42465045U; // 'EPFB'
-inline constexpr u32 kWorldSnapshotMagic = 0x504E5357U; // 'WSNP'
+inline constexpr u32 kCookedPrefabMagic  = 0x42465045U;
+inline constexpr u32 kWorldSnapshotMagic = 0x504E5357U;
 
-struct alignas(16) CookedPrefabHeader {
+struct CookedPrefabHeader {
     u32 magic{kCookedPrefabMagic};
     u16 version{1};
     u16 entityCount{0};
@@ -244,16 +244,16 @@ struct alignas(16) CookedPrefabHeader {
 };
 static_assert(sizeof(CookedPrefabHeader) == 16);
 
-struct alignas(8) CookedPrefabEntityRecord {
+struct CookedPrefabEntityRecord {
     LocalTransform2D local{};
-    i16 parentEntityIndex{-1};
-    u8 timeChannel{0};
-    u8 componentCount{0};
-    u32 entityFlags{0};
+    i16              parentEntityIndex{-1};
+    u8               timeChannel{0};
+    u8               componentCount{0};
+    u32              entityFlags{0};
 };
 static_assert(sizeof(CookedPrefabEntityRecord) == 32);
 
-struct alignas(16) WorldSnapshotHeader {
+struct WorldSnapshotHeader {
     u32 magic{kWorldSnapshotMagic};
     u16 version{1};
     u16 entityCount{0};

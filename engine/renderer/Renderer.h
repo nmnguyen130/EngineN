@@ -13,31 +13,31 @@ class Window;
 
 struct RendererConfig {
     PresentMode presentMode{PresentMode::VSync};
-    bool headless{false};
+    bool        headless{false};
 };
 static_assert(sizeof(RendererConfig) == 2);
 
-// SDL3 backend + generational texture pool (slot 0 = permanent 1x1 white).
-class alignas(64) Renderer {
+// SDL3 2D rendering backend and generational GPU texture pool (slot 0 = permanent 1x1 white).
+class Renderer {
 public:
     static constexpr u32 kMaxTextures = 512;
     static constexpr u16 kInvalidSlot = 0xFFFFU;
-    static constexpr u8 kSlotOccupied = 1U << 0;
-    static constexpr u8 kSlotRenderTarget = 1U << 1;
+    static constexpr u8  kSlotOccupied = 1U << 0;
+    static constexpr u8  kSlotRenderTarget = 1U << 1;
 
-    struct alignas(16) Slot {
+    struct Slot {
         SDL_Texture* texture{nullptr};
-        u16 width{kInvalidSlot}; // free-list next when empty
-        u16 height{0};
-        u16 generation{1};
-        u8 flags{0};
-        u8 reserved{0};
+        u16          width{kInvalidSlot};
+        u16          height{0};
+        u16          generation{1};
+        u8           flags{0};
+        u8           pad{0};
 
         [[nodiscard]] constexpr bool Occupied() const noexcept {
-            return (flags & kSlotOccupied) != 0;
+            return (flags & kSlotOccupied) != 0U;
         }
         [[nodiscard]] constexpr bool IsRenderTarget() const noexcept {
-            return (flags & kSlotRenderTarget) != 0;
+            return (flags & kSlotRenderTarget) != 0U;
         }
     };
     static_assert(sizeof(Slot) == 16);
@@ -95,17 +95,17 @@ private:
     void BindRenderTarget(u16 slot) noexcept;
 
     SDL_Renderer* m_sdl{nullptr};
-    RenderStats m_stats{};
-    u16 m_highWater{0};
-    u16 m_freeHead{kInvalidSlot};
-    u16 m_liveCount{0};
-    u16 m_activeTarget{0};
-    PresentMode m_presentMode{PresentMode::VSync};
-    bool m_initialized{false};
+    RenderStats   m_stats{};
+    u16           m_highWater{0};
+    u16           m_freeHead{kInvalidSlot};
+    u16           m_liveCount{0};
+    u16           m_activeTarget{0};
+    PresentMode   m_presentMode{PresentMode::VSync};
+    bool          m_initialized{false};
 
-    alignas(64) std::array<Slot, kMaxTextures> m_slots{};
-    alignas(64) std::array<Vertex2D, RenderList::kChunkQuads * 4U> m_verts{};
+    std::array<Slot, kMaxTextures>                      m_slots{};
+    std::array<Vertex2D, RenderList::kChunkQuads * 4U>  m_verts{};
 };
-static_assert(sizeof(Renderer) == 73792);
+static_assert(sizeof(Renderer) == 73768);
 
 } // namespace en

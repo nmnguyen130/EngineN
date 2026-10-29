@@ -10,9 +10,9 @@ Result<void, PlatformErrc> Window::Create(const WindowConfig& cfg, bool headless
 
     m_state = WindowState{
         .logicalSize = cfg.size,
-        .pixelSize = cfg.size,
-        .refreshHz = cfg.targetRefreshHz > 0.0f ? cfg.targetRefreshHz : 60.0f,
-        .mode = cfg.mode,
+        .pixelSize   = cfg.size,
+        .refreshHz   = cfg.targetRefreshHz > 0.0f ? cfg.targetRefreshHz : 60.0f,
+        .mode        = cfg.mode,
     };
     m_cursorVisible = true;
     m_textInputActive = false;
@@ -35,7 +35,7 @@ Result<void, PlatformErrc> Window::Create(const WindowConfig& cfg, bool headless
     m_windowId = winId != 0U ? winId : 1U;
 
     if (cfg.mode == WindowMode::ExclusiveFullscreen) {
-        if (const auto res = SetMode(WindowMode::ExclusiveFullscreen, cfg.targetRefreshHz); !res.has_value()) {
+        if (const auto res = SetMode(WindowMode::ExclusiveFullscreen, cfg.targetRefreshHz); !res) {
             Destroy();
             return res;
         }

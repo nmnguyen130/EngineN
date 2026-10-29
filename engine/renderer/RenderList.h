@@ -4,41 +4,46 @@
 
 namespace en {
 
-// 2D quad command buffer providing frustum culling, key sorting, and state batching.
-// Invariant: zero runtime allocations, fixed inline storage, 64-byte cache alignment.
-class alignas(64) RenderList {
+// 2D quad command list with frustum culling, 64-bit sort-key ordering, and state batching.
+// Value type with fixed inline storage and zero runtime allocations.
+class RenderList {
 public:
     static constexpr u32 kMaxQuads = 4096;
     static constexpr u32 kMaxBatches = 256;
     static constexpr u32 kChunkQuads = 512;
-    static constexpr u8 kMaxPasses = 4;
-    static constexpr u8 kMaxViews = 8;
-    static constexpr u8 kHudViewSlot = 7;
+    static constexpr u8  kMaxPasses = 4;
+    static constexpr u8  kMaxViews = 8;
+    static constexpr u8  kHudViewSlot = 7;
 
     constexpr RenderList() noexcept { Reset({1280, 720}); }
 
     constexpr void Reset(Viewport vp = {1280, 720}) noexcept {
         if (vp.Valid()) m_viewport = vp;
-        m_lastKey = 0;
+        m_lastKey = 0ULL;
         m_stats = {};
-        m_enabledPassMask = 0x0F;
-        m_clearPassMask = 0x01;
+        m_enabledPassMask = 0x0FU;
+        m_clearPassMask = 0x01U;
         m_monotonic = true;
         m_compiled = false;
         m_pixelSnap = false;
-        for (u8 i = 0; i < kMaxPasses; ++i)
-            m_passes[i] = PassDesc{.clear = (i == 0)};
-        for (u8 i = 0; i < kMaxViews; ++i)
+        for (u8 i = 0U; i < kMaxPasses; ++i) {
+            m_passes[i] = PassDesc{.clear = (i == 0U)};
+        }
+        for (u8 i = 0U; i < kMaxViews; ++i) {
             m_views[i] = Camera2D{.screenSpace = (i == kHudViewSlot)};
+        }
     }
 
     constexpr void SetPass(u8 id, const PassDesc& d) noexcept {
         if (id >= kMaxPasses) return;
         m_passes[id] = d;
         const u8 bit = static_cast<u8>(1U << id);
-        m_enabledPassMask = d.enabled ? static_cast<u8>(m_enabledPassMask | bit) : static_cast<u8>(m_enabledPassMask & ~bit);
-        m_clearPassMask = (d.enabled && d.clear) ? static_cast<u8>(m_clearPassMask | bit)
-                                             : static_cast<u8>(m_clearPassMask & ~bit);
+        m_enabledPassMask = d.enabled
+            ? static_cast<u8>(m_enabledPassMask | bit)
+            : static_cast<u8>(m_enabledPassMask & ~bit);
+        m_clearPassMask = (d.enabled && d.clear)
+            ? static_cast<u8>(m_clearPassMask | bit)
+            : static_cast<u8>(m_clearPassMask & ~bit);
     }
 
     constexpr void SetView(u8 slot, const Camera2D& cam) noexcept {
@@ -79,18 +84,18 @@ public:
         const f32 qs = 16.0f * scale;
         const f32 adv = 12.0f * scale;
         const f32 line = qs * 1.15f;
-        f32 maxW = 0, cur = 0;
-        u32 lines = 1;
-        for (char ch : text) {
+        f32 maxW = 0.0f, cur = 0.0f;
+        u32 lines = 1U;
+        for (const char ch : text) {
             if (ch == '\n') {
                 maxW = std::max(maxW, cur);
-                cur = 0;
+                cur = 0.0f;
                 ++lines;
             } else if ((static_cast<u8>(ch) & 0xC0U) != 0x80U) {
                 cur += adv;
             }
         }
-        return {std::max(maxW, cur), static_cast<f32>(lines - 1) * line + qs};
+        return {std::max(maxW, cur), static_cast<f32>(lines - 1U) * line + qs};
     }
 
     void Compile() noexcept;
@@ -114,21 +119,20 @@ public:
     }
 
 private:
-    u64 m_lastKey{0};
-    Viewport m_viewport{1280, 720};
+    u64         m_lastKey{0};
+    Viewport    m_viewport{1280, 720};
     RenderStats m_stats{};
-    u8 m_enabledPassMask{0x0F};
-    u8 m_clearPassMask{0x01};
-    bool m_monotonic{true};
-    bool m_compiled{false};
-    bool m_pixelSnap{false};
+    u8          m_enabledPassMask{0x0F};
+    u8          m_clearPassMask{0x01};
+    bool        m_monotonic{true};
+    bool        m_compiled{false};
+    bool        m_pixelSnap{false};
 
-    std::array<PassDesc, kMaxPasses> m_passes{};
-    std::array<Camera2D, kMaxViews> m_views{};
-    std::array<DrawBatch, kMaxBatches> m_batches{};
-    alignas(64) std::array<u64, kMaxQuads> m_keys{};
-    alignas(64) std::array<PreparedQuad, kMaxQuads> m_quads{};
+    std::array<PassDesc, kMaxPasses>               m_passes{};
+    std::array<Camera2D, kMaxViews>                m_views{};
+    std::array<DrawBatch, kMaxBatches>             m_batches{};
+    std::array<u64, kMaxQuads>          m_keys{};
+    std::array<PreparedQuad, kMaxQuads> m_quads{};
 };
-// ~282 KB fixed storage
 
 } // namespace en

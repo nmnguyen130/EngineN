@@ -1,19 +1,9 @@
-#include "world/WorldExtractor.h"
+#include "world/WorldSystems.h"
 
 namespace en {
 
-namespace {
-
-[[nodiscard]] constexpr f32 Lerp(f32 a, f32 b, f32 t) noexcept {
-    return a + (b - a) * t;
-}
-
-} // namespace
-
-void WorldExtractor::StepAmbientVelocities(World& world, const SimStepView& step) noexcept {
-    if ((world.RegisteredPoolsMask() & (1ULL << Velocity2D::kTypeId)) == 0ULL) {
-        return;
-    }
+void WorldSystems::StepVelocities(World& world, const TickStep& step) noexcept {
+    if ((world.RegisteredPoolsMask() & (1ULL << Velocity2D::kTypeId)) == 0ULL) return;
     auto& velPool = world.GetPool<Velocity2D>();
     const auto entities = velPool.Entities();
     auto vels = velPool.Components();
@@ -21,9 +11,7 @@ void WorldExtractor::StepAmbientVelocities(World& world, const SimStepView& step
     for (usize i = 0U; i < entities.size(); ++i) {
         const u16 idx = entities[i].index;
         const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx));
-        if (step.IsFrozen(ch)) {
-            continue;
-        }
+        if (step.IsFrozen(ch)) continue;
         const f32 dt = step.Dt(ch);
         Velocity2D& vel = vels[i];
         if (vel.linearDamping > 0.0f) {
@@ -38,7 +26,7 @@ void WorldExtractor::StepAmbientVelocities(World& world, const SimStepView& step
     }
 }
 
-void WorldExtractor::StepVisualsAndLifetimes(World& world, const SimStepView& step) noexcept {
+void WorldSystems::StepVisualsAndLifetimes(World& world, const TickStep& step) noexcept {
     const u64 regMask = world.RegisteredPoolsMask();
     if ((regMask & (1ULL << SpriteAnimator2D::kTypeId)) != 0ULL) {
         auto& animPool = world.GetPool<SpriteAnimator2D>();
@@ -46,13 +34,9 @@ void WorldExtractor::StepVisualsAndLifetimes(World& world, const SimStepView& st
         auto anims = animPool.Components();
         for (usize i = 0U; i < entities.size(); ++i) {
             SpriteAnimator2D& anim = anims[i];
-            if (!anim.playing || anim.frameCount <= 1U) {
-                continue;
-            }
+            if (!anim.playing || anim.frameCount <= 1U) continue;
             const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(entities[i].index));
-            if (step.IsFrozen(ch)) {
-                continue;
-            }
+            if (step.IsFrozen(ch)) continue;
             if (++anim.tickAccum >= std::max<u16>(1U, anim.ticksPerFrame)) {
                 anim.tickAccum = 0U;
                 if (anim.currentFrame + 1U < anim.frameCount) {
@@ -73,19 +57,14 @@ void WorldExtractor::StepVisualsAndLifetimes(World& world, const SimStepView& st
         auto lives = lifePool.Components();
         for (usize i = 0U; i < entities.size(); ++i) {
             Lifetime2D& life = lives[i];
-            if (!life.active) {
-                continue;
-            }
+            if (!life.active) continue;
             const EntityId id = entities[i];
             const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(id.index));
-            if (step.IsFrozen(ch)) {
-                continue;
-            }
-            if (life.remainingTicks > 0U) {
-                --life.remainingTicks;
-            }
+            if (step.IsFrozen(ch)) continue;
+            if (life.remainingTicks > 0U) --life.remainingTicks;
             if (life.fadeSpriteAlpha && life.initialTicks > 0U) {
-                life.alphaScale = static_cast<f32>(life.remainingTicks) / static_cast<f32>(life.initialTicks);
+                life.alphaScale =
+                    static_cast<f32>(life.remainingTicks) / static_cast<f32>(life.initialTicks);
                 if ((world.GetComponentMaskByIndex(id.index) & (1ULL << Sprite2D::kTypeId)) != 0ULL) {
                     spritePool.DirectAtEntityIndex(id.index).tint.a = life.alphaScale;
                 }
@@ -110,13 +89,12 @@ void WorldExtractor::StepVisualsAndLifetimes(World& world, const SimStepView& st
     }
 }
 
-void WorldExtractor::Extract(
+void WorldSystems::ExtractRender(
     const World& world,
     const AssetBank& assetBank,
-    const RenderTimeView& timeView,
+    const RenderStep& renderStep,
     RenderList& outRenderList,
     f32 defaultPixelsPerMeter) noexcept {
-    // Always initialize view 0 with default world camera so a camera in a later slot never leaves view 0 unset.
     Camera2D defaultCam{};
     defaultCam.pixelsPerMeter = defaultPixelsPerMeter;
     defaultCam.yUp = true;
@@ -127,13 +105,11 @@ void WorldExtractor::Extract(
         const auto& camPool = world.GetPool<CameraRig2D>();
         const auto camEntities = camPool.Entities();
         const auto camRigs = camPool.Components();
-        const f32 camAlpha = timeView.Alpha(TimeChannel::Camera);
+        const f32 camAlpha = renderStep.Alpha(TimeChannel::Camera);
 
         for (usize i = 0U; i < camEntities.size(); ++i) {
             const CameraRig2D& rig = camRigs[i];
-            if (!rig.active || rig.viewSlot >= RenderList::kMaxViews) {
-                continue;
-            }
+            if (!rig.active || rig.viewSlot >= RenderList::kMaxViews) continue;
             const u16 idx = camEntities[i].index;
             const WorldTransform2D& wt = world.GetWorldByIndex(idx);
             const PrevWorldSnapshot2D& prev = world.GetPrevWorldByIndex(idx);
@@ -148,9 +124,8 @@ void WorldExtractor::Extract(
             cam.yUp = !rig.screenSpace;
             if (rig.trauma > 0.0f) {
                 const f32 traumaSq = rig.trauma * rig.trauma;
-                const f32 t = static_cast<f32>(timeView.tickIndex) * 0.05f;
-                f32 c = 1.0f;
-                f32 s = 0.0f;
+                const f32 t = static_cast<f32>(renderStep.tick) * 0.05f;
+                f32 c = 1.0f, s = 0.0f;
                 FastSinCos(t * 17.0f, c, s);
                 cam.cx += s * (0.5f * traumaSq);
                 FastSinCos(t * 29.0f, c, s);
@@ -170,9 +145,7 @@ void WorldExtractor::Extract(
 
         for (usize i = 0U; i < spriteEntities.size(); ++i) {
             const Sprite2D& sp = sprites[i];
-            if (!sp.Visible()) {
-                continue;
-            }
+            if (!sp.Visible()) continue;
 
             const u16 idx = spriteEntities[i].index;
             const WorldTransform2D& wt = world.GetWorldByIndex(idx);
@@ -186,7 +159,8 @@ void WorldExtractor::Extract(
 
             if ((movedWords[idx >> 6U] & (1ULL << (idx & 63U))) != 0ULL) {
                 const PrevWorldSnapshot2D& pv = world.GetPrevWorldByIndex(idx);
-                const f32 alpha = timeView.Alpha(static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx)));
+                const f32 alpha = renderStep.Alpha(
+                    static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx)));
                 rx = Lerp(pv.x, wt.x, alpha);
                 ry = Lerp(pv.y, wt.y, alpha);
                 sx = Lerp(pv.scaleX, wt.scaleX, alpha);
@@ -210,24 +184,24 @@ void WorldExtractor::Extract(
 
             const i32 depthOffset = static_cast<i32>(rDepth * 100.0f);
             const u16 resolvedDepth = sp.YSort()
-                                          ? SortKey::YDepth(ry + rDepth)
-                                          : static_cast<u16>(std::clamp(static_cast<i32>(sp.baseDepth) + depthOffset, 0, 65535));
+                ? SortKey::YDepth(ry + rDepth)
+                : static_cast<u16>(std::clamp(static_cast<i32>(sp.baseDepth) + depthOffset, 0, 65535));
 
             outRenderList.Push({
-                .center = {rx, ry},
-                .size = {sp.width * sx, sp.height * sy},
-                .pivot = framePtr->pivot,
-                .cosRot = c,
-                .sinRot = s,
-                .uv = framePtr->uv,
-                .color = sp.tint,
+                .center  = {rx, ry},
+                .size    = {sp.width * sx, sp.height * sy},
+                .pivot   = framePtr->pivot,
+                .cosRot  = c,
+                .sinRot  = s,
+                .uv      = framePtr->uv,
+                .color   = sp.tint,
                 .texture = framePtr->gpuTexture,
-                .depth = resolvedDepth,
-                .layer = sp.layer,
-                .view = sp.ViewSlot(),
-                .blend = sp.Blend(),
-                .flipX = sp.FlipX(),
-                .flipY = sp.FlipY(),
+                .depth   = resolvedDepth,
+                .layer   = sp.layer,
+                .view    = sp.ViewSlot(),
+                .blend   = sp.Blend(),
+                .flipX   = sp.FlipX(),
+                .flipY   = sp.FlipY(),
             });
         }
     }
@@ -239,24 +213,22 @@ void WorldExtractor::Extract(
 
         for (usize i = 0U; i < lightEntities.size(); ++i) {
             const PointLight2D& light = lights[i];
-            if (light.intensity <= 0.0f || light.radius <= 0.0f) {
-                continue;
-            }
+            if (light.intensity <= 0.0f || light.radius <= 0.0f) continue;
             const u16 idx = lightEntities[i].index;
             const WorldTransform2D& wt = world.GetWorldByIndex(idx);
             f32 lx = wt.x;
             f32 ly = wt.y;
             if ((movedWords[idx >> 6U] & (1ULL << (idx & 63U))) != 0ULL) {
                 const PrevWorldSnapshot2D& pv = world.GetPrevWorldByIndex(idx);
-                const f32 alpha = timeView.Alpha(static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx)));
+                const f32 alpha = renderStep.Alpha(
+                    static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx)));
                 lx = Lerp(pv.x, wt.x, alpha);
                 ly = Lerp(pv.y, wt.y, alpha);
             }
 
             f32 pulse = 1.0f;
             if (light.pulseSpeed != 0.0f) {
-                f32 c = 1.0f;
-                f32 s = 0.0f;
+                f32 c = 1.0f, s = 0.0f;
                 FastSinCos(light.pulsePhase, c, s);
                 pulse = 0.85f + 0.15f * s;
             }
@@ -264,17 +236,17 @@ void WorldExtractor::Extract(
             const f32 intensity = light.intensity * pulse;
 
             outRenderList.Push({
-                .center = {lx, ly},
-                .size = {diameter, diameter},
-                .color = {
+                .center  = {lx, ly},
+                .size    = {diameter, diameter},
+                .color   = {
                     light.color.r * intensity,
                     light.color.g * intensity,
                     light.color.b * intensity,
                     light.color.a * intensity,
                 },
                 .texture = kWhiteTexture,
-                .layer = 200U,
-                .blend = BlendMode::Additive,
+                .layer   = 200U,
+                .blend   = BlendMode::Additive,
             });
         }
     }

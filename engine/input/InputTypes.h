@@ -2,28 +2,30 @@
 
 #include "core/Math.h"
 
-#include <array>
-#include <cstring>
+#include <algorithm>
 #include <initializer_list>
-#include <span>
-#include <string_view>
 
 namespace en {
 
-inline constexpr usize kMaxActions = 16;
-inline constexpr usize kMaxAxes = 4;
-inline constexpr usize kMaxBindingsPerSlot = 4;
-inline constexpr f32 kInvAxisMax = 1.0f / 32767.0f;
+inline constexpr usize kMaxActions            = 16U;
+inline constexpr usize kMaxAxes               = 4U;
+inline constexpr usize kBindingsPerAction     = 4U;
+inline constexpr f32   kInvAxisMax            = 1.0f / 32767.0f;
 
-// Virtual pad buttons [20..31] via Schmitt on axes [0..5].
-inline constexpr u16 kPadVirtualButtonBase = 20U;
-inline constexpr i16 kAxisPressThreshold = 18000;
-inline constexpr i16 kAxisReleaseThreshold = 12000;
+// Virtual gamepad buttons [20..31] driven by Schmitt-trigger hysteresis on axes [0..5].
+inline constexpr u16   kPadVirtualButtonBase  = 20U;
+inline constexpr i16   kAxisPressThreshold    = 18000;
+inline constexpr i16   kAxisReleaseThreshold  = 12000;
 
-enum class InputDevice : u8 { None, Keyboard, Mouse, Gamepad };
+enum class InputDevice : u8 {
+    None     = 0,
+    Keyboard = 1,
+    Mouse    = 2,
+    Gamepad  = 3,
+};
 
-// Physical source. IsValid() gates all bit access.
-struct alignas(2) InputSource {
+// 2-byte bit-packed physical input source: code[0..13] | (device << 14).
+struct InputSource {
     u16 packed{0};
 
     [[nodiscard]] static constexpr InputSource Make(InputDevice dev, u16 code) noexcept {
@@ -35,16 +37,16 @@ struct alignas(2) InputSource {
     [[nodiscard]] static constexpr InputSource Mouse(u16 button) noexcept {
         return Make(InputDevice::Mouse, button);
     }
-    [[nodiscard]] static constexpr InputSource Pad(u16 button) noexcept {
+    [[nodiscard]] static constexpr InputSource PadBtn(u16 button) noexcept {
         return Make(InputDevice::Gamepad, button);
     }
-    [[nodiscard]] static constexpr InputSource PadAxisButton(u8 axisIdx, bool positive = true) noexcept {
+    [[nodiscard]] static constexpr InputSource PadAxis(u8 axisIdx, bool positive = true) noexcept {
         if (axisIdx >= 6U) return {};
         return Make(InputDevice::Gamepad,
             static_cast<u16>(kPadVirtualButtonBase + axisIdx * 2U + (positive ? 1U : 0U)));
     }
     [[nodiscard]] static constexpr InputSource PadTrigger(bool right) noexcept {
-        return PadAxisButton(right ? 5U : 4U, true);
+        return PadAxis(right ? 5U : 4U, true);
     }
 
     [[nodiscard]] constexpr InputDevice Device() const noexcept {
@@ -65,19 +67,19 @@ struct alignas(2) InputSource {
 };
 static_assert(sizeof(InputSource) == 2);
 
-// Digital pair + alt (LIW / Neutral SOCD) + optional analog stick/trigger.
-struct alignas(4) AxisBinding {
-    static constexpr u8 kFlagInvert = 1U << 0;
+// 16-byte axis binding supporting primary/alternate digital pairs, SOCD mode, and analog stick.
+struct AxisBinding {
+    static constexpr u8 kFlagInvert      = 1U << 0;
     static constexpr u8 kFlagNeutralSocd = 1U << 1;
 
     InputSource neg{};
     InputSource pos{};
     InputSource altNeg{};
     InputSource altPos{};
-    f32 deadzone{0.15f};
-    u8 gamepadAxis{0xFFU}; // 0..5, or 0xFF = none
-    u8 flags{0};           // kFlagInvert | kFlagNeutralSocd
-    std::array<u8, 2> reserved{};
+    f32         deadzone{0.15f};
+    u8          gamepadAxis{0xFFU};
+    u8          flags{0};
+    u16         pad{0};
 
     [[nodiscard]] constexpr bool Invert() const noexcept { return (flags & kFlagInvert) != 0U; }
     [[nodiscard]] constexpr bool NeutralSocd() const noexcept {
@@ -99,35 +101,35 @@ struct alignas(4) AxisBinding {
         if (!altPos.IsValid()) altPos = {};
         if (!(deadzone >= 0.0f && deadzone <= 0.90f)) deadzone = 0.15f;
         flags &= static_cast<u8>(kFlagInvert | kFlagNeutralSocd);
-        reserved.fill(0);
+        pad = 0U;
         if (gamepadAxis >= 6U) gamepadAxis = 0xFFU;
     }
 };
 static_assert(sizeof(AxisBinding) == 16);
-static_assert(alignof(AxisBinding) == 4);
 
-// Binding table. Sanitize on write and deserialize. POD memcpy-safe.
-class alignas(16) InputMap {
+// 192-byte POD binding table with sanitized binary serialization.
+class InputMap {
 public:
-    static constexpr usize kSerializedSize = 192;
+    static constexpr usize kSerializedSize = 192U;
 
     constexpr void Clear() noexcept {
-        for (auto& s : m_actions) s.fill(InputSource{});
-        m_axes.fill(AxisBinding{});
+        m_actions = {};
+        m_axes = {};
     }
 
     constexpr InputMap& BindSlot(u8 action, u8 slot, InputSource src) noexcept {
-        if (slot < kMaxBindingsPerSlot)
+        if (slot < kBindingsPerAction) {
             m_actions[action & 0x0FU][slot] = src.IsValid() ? src : InputSource{};
+        }
         return *this;
     }
 
     constexpr InputMap& Bind(u8 action, std::initializer_list<InputSource> sources) noexcept {
         auto& slots = m_actions[action & 0x0FU];
         slots.fill(InputSource{});
-        u8 i = 0;
+        u8 i = 0U;
         for (const InputSource s : sources) {
-            if (i >= kMaxBindingsPerSlot) break;
+            if (i >= kBindingsPerAction) break;
             if (s.IsValid()) slots[i++] = s;
         }
         return *this;
@@ -144,8 +146,8 @@ public:
         return *this;
     }
 
-    [[nodiscard]] constexpr std::span<const InputSource, kMaxBindingsPerSlot>
-    Bindings(u8 action) const noexcept {
+    [[nodiscard]] constexpr std::span<const InputSource, kBindingsPerAction>
+    Action(u8 action) const noexcept {
         return m_actions[action & 0x0FU];
     }
 
@@ -164,27 +166,30 @@ public:
         if (in.size() < kSerializedSize) return false;
         std::memcpy(m_actions.data(), in.data(), sizeof(m_actions));
         std::memcpy(m_axes.data(), in.data() + sizeof(m_actions), sizeof(m_axes));
-        for (auto& slots : m_actions)
-            for (InputSource& s : slots)
+        for (auto& slots : m_actions) {
+            for (InputSource& s : slots) {
                 if (!s.IsValid()) s = {};
+            }
+        }
         for (AxisBinding& a : m_axes) a.Sanitize();
         return true;
     }
 
 private:
-    std::array<std::array<InputSource, kMaxBindingsPerSlot>, kMaxActions> m_actions{};
-    std::array<AxisBinding, kMaxAxes> m_axes{};
+    std::array<std::array<InputSource, kBindingsPerAction>, kMaxActions> m_actions{};
+    std::array<AxisBinding, kMaxAxes>                                    m_axes{};
 };
 static_assert(sizeof(InputMap) == 192);
 
-// 120 Hz sim snapshot. heldTicks retains final duration on the release tick.
-struct alignas(16) TickInput {
-    u64 tick{0};
-    u16 held{0};
-    u16 pressed{0};
-    u16 released{0};
-    u16 retriggered{0};
-    std::array<f32, kMaxAxes> axis{};
+// 64-byte 120 Hz simulation input snapshot.
+// heldTicks[i] retains the final hold duration on the release tick for TapReleased() queries.
+struct TickInput {
+    u64                          tick{0};
+    u16                          held{0};
+    u16                          pressed{0};
+    u16                          released{0};
+    u16                          retriggered{0};
+    std::array<f32, kMaxAxes>    axes{};
     std::array<u16, kMaxActions> heldTicks{};
 
     [[nodiscard]] constexpr bool Held(u8 a) const noexcept {
@@ -196,65 +201,50 @@ struct alignas(16) TickInput {
     [[nodiscard]] constexpr bool Released(u8 a) const noexcept {
         return (released & (1U << (a & 0x0FU))) != 0U;
     }
-    [[nodiscard]] constexpr u16 HeldTicks(u8 a) const noexcept { return heldTicks[a & 0x0FU]; }
-    [[nodiscard]] constexpr f32 Axis(u8 ax) const noexcept { return axis[ax & 3U]; }
+    [[nodiscard]] constexpr u16 HeldTicks(u8 a) const noexcept {
+        return heldTicks[a & 0x0FU];
+    }
+    [[nodiscard]] constexpr f32 Axis(u8 ax) const noexcept {
+        return axes[ax & 3U];
+    }
 
-    // Short tap release (variable jump cut).
-    [[nodiscard]] constexpr bool TapReleased(u8 a, u16 maxTicks = 12) const noexcept {
+    [[nodiscard]] constexpr bool TapReleased(u8 a, u16 maxTicks = 12U) const noexcept {
         const u8 i = a & 0x0FU;
         const u16 b = static_cast<u16>(1U << i);
         return (released & b) != 0U && (held & b) == 0U &&
                heldTicks[i] > 0U && heldTicks[i] <= maxTicks;
     }
 
-    // Charge beam / hold ratio in [0, 1].
-    [[nodiscard]] constexpr f32 ChargeRatio(u8 a, u16 fullTicks = 30) const noexcept {
+    [[nodiscard]] constexpr f32 ChargeRatio(u8 a, u16 fullTicks = 30U) const noexcept {
         if (fullTicks == 0U) return 1.0f;
         const u8 i = a & 0x0FU;
         if ((held & (1U << i)) == 0U) return 0.0f;
         return std::clamp(static_cast<f32>(heldTicks[i]) / static_cast<f32>(fullTicks), 0.0f, 1.0f);
     }
 
-    [[nodiscard]] Vec2 Stick(u8 x = 0, u8 y = 1) const noexcept {
-        Vec2 v{Axis(x), Axis(y)};
+    [[nodiscard]] Vec2 Stick(u8 x = 0U, u8 y = 1U) const noexcept {
+        const Vec2 v{Axis(x), Axis(y)};
         const f32 lenSq = v.LengthSq();
-        if (lenSq > 1.0f) {
-            const f32 inv = 1.0f / std::sqrt(lenSq);
-            v.x *= inv;
-            v.y *= inv;
-        }
-        return v;
-    }
-
-    // 8-way snap (grid / tank controls).
-    [[nodiscard]] static constexpr IVec2 Snap8(Vec2 raw, f32 dz = 0.25f) noexcept {
-        if (!(dz >= 0.0f)) dz = 0.25f;
-        if (raw.LengthSq() <= dz * dz) return {0, 0};
-        constexpr f32 t = 0.41421356f; // tan(22.5 deg)
-        const f32 ax = std::abs(raw.x), ay = std::abs(raw.y);
-        return {
-            (ax > ay * t) ? (raw.x >= 0.0f ? 1 : -1) : 0,
-            (ay > ax * t) ? (raw.y >= 0.0f ? 1 : -1) : 0,
-        };
+        return (lenSq > 1.0f) ? (v * (1.0f / std::sqrt(lenSq))) : v;
     }
 };
 static_assert(sizeof(TickInput) == 64);
 
-// Render-rate UI snapshot.
-struct alignas(16) FrameInput {
-    static constexpr usize kMaxTextBytes = 20;
+// 64-byte render-frame UI and cursor snapshot.
+struct FrameInput {
+    static constexpr usize kMaxTextBytes = 20U;
 
-    u64 frameIndex{0};
-    Vec2 mousePos{};
-    Vec2 mouseDelta{};
-    Vec2 mouseWheel{};
-    u16 held{0};
-    u16 pressed{0};
-    u16 released{0};
-    InputSource lastPressed{};
-    InputDevice activeDevice{InputDevice::Keyboard};
-    bool hasFocus{true};
-    u8 textLen{0};
+    u64                                  frameIndex{0};
+    Vec2                                 mousePos{};
+    Vec2                                 mouseDelta{};
+    Vec2                                 wheel{};
+    u16                                  held{0};
+    u16                                  pressed{0};
+    u16                                  released{0};
+    InputSource                          lastPressed{};
+    InputDevice                          activeDevice{InputDevice::Keyboard};
+    bool                                 hasFocus{true};
+    u8                                   textLen{0};
     std::array<char, kMaxTextBytes + 1U> textInput{};
 
     [[nodiscard]] constexpr bool Held(u8 a) const noexcept {

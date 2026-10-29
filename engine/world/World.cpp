@@ -1,15 +1,15 @@
 #include "world/World.h"
 
 #include "assets/AssetBank.h"
-#include "core/Diagnostics.h"
+#include "core/Log.h"
+#include "core/Serialization.h"
 
 namespace en {
-
 namespace {
 
 [[nodiscard]] bool VerifyPacketCrc32(std::span<const u8> bytes, u32 expectedCrc) noexcept {
-    const u32 hdrCrc = ComputeCrc32(bytes.subspan(0U, 12U));
-    return ComputeCrc32(bytes.subspan(16U), hdrCrc) == expectedCrc;
+    const u32 hdrCrc = Crc32(bytes.subspan(0U, 12U));
+    return Crc32(bytes.subspan(16U), hdrCrc) == expectedCrc;
 }
 
 template <typename HeaderT>
@@ -18,18 +18,14 @@ usize StampPacketCrc32(
     usize totalBytes,
     HeaderT& hdr,
     u32& crcField) noexcept {
-    const u32 hdrCrc = ComputeCrc32({outBuffer.data(), 12U});
-    crcField = ComputeCrc32(
+    const u32 hdrCrc = Crc32({outBuffer.data(), 12U});
+    crcField = Crc32(
         {outBuffer.data() + sizeof(HeaderT), totalBytes - sizeof(HeaderT)}, hdrCrc);
     std::memcpy(outBuffer.data(), &hdr, sizeof(HeaderT));
     return totalBytes;
 }
 
 } // namespace
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     Shutdown();
@@ -42,12 +38,12 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     }
 
     const usize wordCount = (static_cast<usize>(cfg.maxEntities) + 63U) >> 6U;
-    auto poolsSpan = m_arena.Carve<RawComponentPool>(kMaxComponentTypes);
-    auto maskSpan = m_arena.Carve<u64>(cfg.maxEntities);
-    auto bitSpan = m_arena.Carve<u64>(wordCount * 2U);
-    auto genSpan = m_arena.Carve<u16>(cfg.maxEntities);
-    auto chSpan = m_arena.Carve<u8>(cfg.maxEntities);
-    auto cmdSpan = m_arena.Carve<u8>(cfg.commandBufferBytes);
+    auto poolsSpan = m_arena.Alloc<RawSparseSet>(kMaxComponentTypes);
+    auto maskSpan  = m_arena.Alloc<u64>(cfg.maxEntities);
+    auto bitSpan   = m_arena.Alloc<u64>(wordCount);
+    auto genSpan   = m_arena.Alloc<u16>(cfg.maxEntities);
+    auto chSpan    = m_arena.Alloc<u8>(cfg.maxEntities);
+    auto cmdSpan   = m_arena.Alloc<u8>(cfg.commandBufferBytes);
 
     if (poolsSpan.empty() || maskSpan.empty() || bitSpan.empty() || genSpan.empty() ||
         chSpan.empty() || cmdSpan.empty() || !m_transforms.Init(m_arena, cfg.maxEntities)) {
@@ -55,17 +51,16 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
         return Err(WorldErrc::OutOfMemory);
     }
 
-    m_pools = poolsSpan.data();
+    m_pools          = poolsSpan.data();
     m_componentMasks = maskSpan.data();
-    m_aliveWords = bitSpan.data();
-    m_teleportedWords = m_aliveWords + wordCount;
-    m_generations = genSpan.data();
-    m_timeChannels = chSpan.data();
-    m_cmdTape = cmdSpan.data();
+    m_aliveWords     = bitSpan.data();
+    m_generations    = genSpan.data();
+    m_timeChannels   = chSpan.data();
+    m_cmdTape        = cmdSpan.data();
 
-    m_maxEntities = cfg.maxEntities;
+    m_maxEntities    = cfg.maxEntities;
     m_defaultPoolCap = cfg.defaultPoolCapacity;
-    m_cmdCapacity = cfg.commandBufferBytes;
+    m_cmdCapacity    = cfg.commandBufferBytes;
     m_aliveWordCount = static_cast<u16>(wordCount);
 
     if (!RegisterComponentPool<Velocity2D>() || !RegisterComponentPool<Sprite2D>() ||
@@ -80,35 +75,32 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
 
 void World::Shutdown() noexcept {
     m_arena.Shutdown();
-    m_generations = nullptr;
-    m_componentMasks = nullptr;
-    m_timeChannels = nullptr;
-    m_aliveWords = nullptr;
-    m_pools = nullptr;
+    m_generations         = nullptr;
+    m_componentMasks      = nullptr;
+    m_timeChannels        = nullptr;
+    m_aliveWords          = nullptr;
+    m_pools               = nullptr;
     m_registeredPoolsMask = 0ULL;
-    m_aliveCount = 0U;
-    m_maxEntities = 0U;
-    m_maxAllocatedIndex = 0U;
-    m_nextFreshSlot = 1U;
-    m_freeHead = kInvalidDenseIndex;
-    m_freeTail = kInvalidDenseIndex;
-    m_defaultPoolCap = 0U;
-    m_transforms = {};
-    m_cmdTape = nullptr;
-    m_teleportedWords = nullptr;
-    m_cmdCapacity = 0U;
-    m_cmdWriteOffset = 0U;
-    m_tickCount = 0U;
-    m_aliveWordCount = 0U;
-    m_pendingCmdCount = 0U;
-    m_spawnedTotalCount = 0ULL;
+    m_aliveCount          = 0U;
+    m_maxEntities         = 0U;
+    m_maxAllocatedIndex   = 0U;
+    m_nextFreshSlot       = 1U;
+    m_freeHead            = kInvalidDenseIndex;
+    m_freeTail            = kInvalidDenseIndex;
+    m_defaultPoolCap      = 0U;
+    m_transforms          = {};
+    m_cmdTape             = nullptr;
+    m_cmdCapacity         = 0U;
+    m_cmdWriteOffset      = 0U;
+    m_tickCount           = 0U;
+    m_aliveWordCount      = 0U;
+    m_pendingCmdCount     = 0U;
+    m_spawnedTotalCount   = 0ULL;
     m_destroyedTotalCount = 0ULL;
 }
 
 void World::Clear() noexcept {
-    if (m_maxEntities == 0U) {
-        return;
-    }
+    if (m_maxEntities == 0U) return;
     for (u64 mask = m_registeredPoolsMask; mask != 0ULL; mask &= (mask - 1ULL)) {
         m_pools[std::countr_zero(mask)].Clear();
     }
@@ -117,26 +109,19 @@ void World::Clear() noexcept {
     std::fill_n(m_generations, limit, u16{0});
     std::fill_n(m_componentMasks, limit, 0ULL);
     std::fill_n(m_timeChannels, limit, u8{0});
-
-    const usize activeWords = ActiveWordCount();
-    std::fill_n(m_aliveWords, activeWords, 0ULL);
-    std::fill_n(m_teleportedWords, activeWords, 0ULL);
+    std::fill_n(m_aliveWords, ActiveWordCount(), 0ULL);
 
     m_transforms.Clear(m_maxAllocatedIndex);
     m_maxAllocatedIndex = 0U;
-    m_nextFreshSlot = 1U;
-    m_freeHead = kInvalidDenseIndex;
-    m_freeTail = kInvalidDenseIndex;
-    m_aliveCount = 0U;
-    m_cmdWriteOffset = 0U;
-    m_pendingCmdCount = 0U;
+    m_nextFreshSlot     = 1U;
+    m_freeHead          = kInvalidDenseIndex;
+    m_freeTail          = kInvalidDenseIndex;
+    m_aliveCount        = 0U;
+    m_cmdWriteOffset    = 0U;
+    m_pendingCmdCount   = 0U;
 }
 
-// ---------------------------------------------------------------------------
-// Entity allocation / free list
-// ---------------------------------------------------------------------------
-
-// Free-list packed into m_componentMasks while dead: low16 = next free, mid16 = next generation.
+// Dead entity slots pack the FIFO free-list link into low 16 bits and next generation into bits 16..30 of m_componentMasks.
 void World::PushFreeSlot(u16 idx, u16 nextGen) noexcept {
     m_componentMasks[idx] =
         static_cast<u64>(kInvalidDenseIndex) | (static_cast<u64>(nextGen) << 16U);
@@ -150,21 +135,15 @@ void World::PushFreeSlot(u16 idx, u16 nextGen) noexcept {
 }
 
 Result<EntityId, WorldErrc> World::Spawn(const EntitySpawnDesc& desc) noexcept {
-    if (m_maxEntities == 0U) {
-        return Err(WorldErrc::InvalidConfig);
-    }
+    if (m_maxEntities == 0U) return Err(WorldErrc::InvalidConfig);
 
     u16 parentIdx = kInvalidDenseIndex;
     if (desc.parent.IsValid()) {
-        if (!IsAlive(desc.parent)) {
-            return Err(WorldErrc::DeadEntity);
-        }
+        if (!IsAlive(desc.parent)) return Err(WorldErrc::DeadEntity);
         parentIdx = desc.parent.index;
         usize depth = 1U;
         for (u16 anc = parentIdx; anc != kInvalidDenseIndex; anc = m_transforms.ParentOf(anc)) {
-            if (++depth > kMaxHierarchyDepth) {
-                return Err(WorldErrc::HierarchyDepthExceeded);
-            }
+            if (++depth > kMaxHierarchyDepth) return Err(WorldErrc::HierarchyDepthExceeded);
         }
     }
 
@@ -174,27 +153,19 @@ Result<EntityId, WorldErrc> World::Spawn(const EntitySpawnDesc& desc) noexcept {
         idx = m_freeHead;
         const u64 packed = m_componentMasks[idx];
         m_freeHead = static_cast<u16>(packed & 0xFFFFU);
-        if (m_freeHead == kInvalidDenseIndex) {
-            m_freeTail = kInvalidDenseIndex;
-        }
+        if (m_freeHead == kInvalidDenseIndex) m_freeTail = kInvalidDenseIndex;
         gen = static_cast<u16>((packed >> 16U) & 0x7FFFU);
-        if (gen == 0U) {
-            gen = 1U;
-        }
+        if (gen == 0U) gen = 1U;
     } else {
-        if (m_nextFreshSlot >= m_maxEntities) {
-            return Err(WorldErrc::EntityCapacityReached);
-        }
+        if (m_nextFreshSlot >= m_maxEntities) return Err(WorldErrc::EntityCapacityReached);
         idx = m_nextFreshSlot++;
     }
 
     m_maxAllocatedIndex = std::max(m_maxAllocatedIndex, idx);
-    m_generations[idx] = gen;
+    m_generations[idx]    = gen;
     m_componentMasks[idx] = 0ULL;
-    m_timeChannels[idx] = static_cast<u8>(desc.timeChannel);
-    const u64 bit = (1ULL << (idx & 63U));
-    m_aliveWords[idx >> 6U] |= bit;
-    m_teleportedWords[idx >> 6U] &= ~bit;
+    m_timeChannels[idx]   = static_cast<u8>(desc.timeChannel);
+    m_aliveWords[idx >> 6U] |= (1ULL << (idx & 63U));
     ++m_aliveCount;
     ++m_spawnedTotalCount;
 
@@ -208,11 +179,8 @@ void World::DestroySingleSlot(EntityId id) noexcept {
         m_pools[std::countr_zero(mask)].RemoveUnchecked(id);
     }
     m_transforms.UnlinkSlot(idx, m_maxEntities);
-    const u64 bit = (1ULL << (idx & 63U));
-    m_aliveWords[idx >> 6U] &= ~bit;
-    m_teleportedWords[idx >> 6U] &= ~bit;
+    m_aliveWords[idx >> 6U] &= ~(1ULL << (idx & 63U));
 
-    // Generation wraps 1..0x7FFF (bit 15 reserved for physics tile sentinels).
     const u16 rawNext = static_cast<u16>((id.generation + 1U) & 0x7FFFU);
     m_generations[idx] = 0U;
     PushFreeSlot(idx, (rawNext == 0U) ? 1U : rawNext);
@@ -222,9 +190,7 @@ void World::DestroySingleSlot(EntityId id) noexcept {
 }
 
 bool World::Destroy(EntityId id, bool destroyChildren) noexcept {
-    if (!IsAlive(id)) {
-        return false;
-    }
+    if (!IsAlive(id)) return false;
     if (!destroyChildren || m_transforms.FirstChildOf(id.index) == kInvalidDenseIndex) {
         DestroySingleSlot(id);
         return true;
@@ -245,17 +211,11 @@ bool World::Destroy(EntityId id, bool destroyChildren) noexcept {
         if (m_generations[cur] != 0U) {
             DestroySingleSlot({cur, m_generations[cur]});
         }
-        if (cur == rootIdx) {
-            break;
-        }
+        if (cur == rootIdx) break;
         cur = (nextSib != kInvalidDenseIndex) ? nextSib : parent;
     }
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Clone / subtree
-// ---------------------------------------------------------------------------
 
 usize World::CollectSubtree(
     u16 rootIdx,
@@ -271,9 +231,7 @@ usize World::CollectSubtree(
     usize count = 0U;
     bool overflow = false;
     m_transforms.TraverseSubtree(rootIdx, m_maxEntities, [&](u16 cur) noexcept {
-        if (m_generations[cur] == 0U) {
-            return;
-        }
+        if (m_generations[cur] == 0U) return;
         if (count >= outNodes.size()) {
             overflow = true;
             return;
@@ -299,18 +257,14 @@ Result<EntityId, WorldErrc> World::CloneEntity(
     EntityId source,
     const LocalTransform2D& overrideLocal,
     bool cloneChildren) noexcept {
-    if (!IsAlive(source)) {
-        return Err(WorldErrc::DeadEntity);
-    }
+    if (!IsAlive(source)) return Err(WorldErrc::DeadEntity);
 
     constexpr usize kMaxSubtree = 512U;
-    std::array<u16, kMaxSubtree> srcNodes{};
-    std::array<i16, kMaxSubtree> parentMap{};
+    std::array<u16, kMaxSubtree>      srcNodes{};
+    std::array<i16, kMaxSubtree>      parentMap{};
     std::array<EntityId, kMaxSubtree> cloned{};
     const usize nodeCount = CollectSubtree(source.index, cloneChildren, srcNodes, parentMap);
-    if (nodeCount == 0U) {
-        return Err(WorldErrc::EntityCapacityReached);
-    }
+    if (nodeCount == 0U) return Err(WorldErrc::EntityCapacityReached);
 
     for (usize n = 0U; n < nodeCount; ++n) {
         const u16 srcIdx = srcNodes[n];
@@ -325,9 +279,7 @@ Result<EntityId, WorldErrc> World::CloneEntity(
 
         auto cloneRes = Spawn(desc);
         if (!cloneRes) {
-            for (usize k = n; k > 0U; --k) {
-                DestroySingleSlot(cloned[k - 1U]);
-            }
+            for (usize k = n; k > 0U; --k) DestroySingleSlot(cloned[k - 1U]);
             return cloneRes;
         }
         cloned[n] = *cloneRes;
@@ -335,9 +287,7 @@ Result<EntityId, WorldErrc> World::CloneEntity(
         for (u64 mask = m_componentMasks[srcIdx]; mask != 0ULL; mask &= (mask - 1ULL)) {
             const u8 tid = static_cast<u8>(std::countr_zero(mask));
             if (!m_pools[tid].CloneFromEntityIndex(*cloneRes, srcIdx)) {
-                for (usize k = n + 1U; k > 0U; --k) {
-                    DestroySingleSlot(cloned[k - 1U]);
-                }
+                for (usize k = n + 1U; k > 0U; --k) DestroySingleSlot(cloned[k - 1U]);
                 return Err(WorldErrc::PoolCapacityReached);
             }
             m_componentMasks[cloneRes->index] |= (1ULL << tid);
@@ -345,10 +295,6 @@ Result<EntityId, WorldErrc> World::CloneEntity(
     }
     return cloned[0];
 }
-
-// ---------------------------------------------------------------------------
-// Component helpers / commands
-// ---------------------------------------------------------------------------
 
 bool World::WriteEntityComponents(BinaryWriter& writer, u16 idx) const noexcept {
     for (u64 m = m_componentMasks[idx]; m != 0ULL; m &= (m - 1ULL)) {
@@ -374,9 +320,7 @@ bool World::EmplaceRawByTypeId(
     if (expectedElemBytes != 0U && expectedElemBytes != m_pools[typeId].ElemBytes()) {
         return false;
     }
-    if (!m_pools[typeId].EmplaceRaw(id, rawData)) {
-        return false;
-    }
+    if (!m_pools[typeId].EmplaceRaw(id, rawData)) return false;
     m_componentMasks[id.index] |= (1ULL << typeId);
     return true;
 }
@@ -437,9 +381,7 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
                 if (!EmplaceRawByTypeId(id, tidOrFlag, payload, payloadBytes) &&
                     firstErr == WorldErrc::None) {
                     firstErr = WorldErrc::PoolCapacityReached;
-                    Logger::Log(
-                        LogLevel::Warn, "world/cmd"_sid,
-                        "Deferred Emplace failed during FlushCommands");
+                    Log::Warn("world/cmd"_sid, "Deferred Emplace failed during FlushCommands");
                 }
                 break;
             case CmdKind::Remove:
@@ -453,19 +395,13 @@ Result<void, WorldErrc> World::FlushCommands() noexcept {
                 if (auto r = SetParent(id, auxId, tidOrFlag != 0U);
                     !r && firstErr == WorldErrc::None) {
                     firstErr = r.error();
-                    Logger::Log(
-                        LogLevel::Warn, "world/cmd"_sid,
-                        "Deferred SetParent failed during FlushCommands");
+                    Log::Warn("world/cmd"_sid, "Deferred SetParent failed during FlushCommands");
                 }
                 break;
         }
     }
     return (firstErr == WorldErrc::None) ? Result<void, WorldErrc>{} : Err(firstErr);
 }
-
-// ---------------------------------------------------------------------------
-// Prefab
-// ---------------------------------------------------------------------------
 
 Result<EntityId, WorldErrc> World::InstantiatePrefab(
     const AssetBank& bank,
@@ -488,9 +424,7 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
 
     std::array<EntityId, 512> spawned{};
     const auto rollback = [&](u16 count) noexcept {
-        for (u16 k = count; k > 0U; --k) {
-            DestroySingleSlot(spawned[k - 1U]);
-        }
+        for (u16 k = count; k > 0U; --k) DestroySingleSlot(spawned[k - 1U]);
         std::fill_n(
             outSpawnedEntities.data(),
             std::min<usize>(count, outSpawnedEntities.size()), kNullEntity);
@@ -519,9 +453,7 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
             return entRes;
         }
         spawned[i] = *entRes;
-        if (i < outSpawnedEntities.size()) {
-            outSpawnedEntities[i] = *entRes;
-        }
+        if (i < outSpawnedEntities.size()) outSpawnedEntities[i] = *entRes;
 
         parsedComponentRecords += rec.componentCount;
         for (u8 c = 0U; c < rec.componentCount; ++c) {
@@ -555,17 +487,13 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
 Result<usize, WorldErrc> World::SerializePrefabTemplate(
     EntityId rootEntity,
     std::span<u8> outBuffer) const noexcept {
-    if (!IsAlive(rootEntity)) {
-        return Err(WorldErrc::DeadEntity);
-    }
+    if (!IsAlive(rootEntity)) return Err(WorldErrc::DeadEntity);
 
     constexpr usize kMaxPrefabNodes = 512U;
     std::array<u16, kMaxPrefabNodes> nodes{};
     std::array<i16, kMaxPrefabNodes> parentMap{};
     const usize nodeCount = CollectSubtree(rootEntity.index, true, nodes, parentMap);
-    if (nodeCount == 0U) {
-        return Err(WorldErrc::EntityCapacityReached);
-    }
+    if (nodeCount == 0U) return Err(WorldErrc::EntityCapacityReached);
 
     BinaryWriter writer(outBuffer);
     u32 totalComponentRecords = 0U;
@@ -580,9 +508,7 @@ Result<usize, WorldErrc> World::SerializePrefabTemplate(
         totalComponentRecords,
         0U,
     };
-    if (!writer.Write(hdr)) {
-        return Err(WorldErrc::OutOfMemory);
-    }
+    if (!writer.Write(hdr)) return Err(WorldErrc::OutOfMemory);
 
     for (usize n = 0U; n < nodeCount; ++n) {
         const u16 idx = nodes[n];
@@ -600,18 +526,11 @@ Result<usize, WorldErrc> World::SerializePrefabTemplate(
     return StampPacketCrc32(outBuffer, writer.Offset(), hdr, hdr.schemaCrc32);
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot
-// ---------------------------------------------------------------------------
-
 usize World::RequiredSnapshotBytes() const noexcept {
-    if (m_maxEntities == 0U) {
-        return sizeof(WorldSnapshotHeader);
-    }
+    if (m_maxEntities == 0U) return sizeof(WorldSnapshotHeader);
     usize total = sizeof(WorldSnapshotHeader);
     ForEachAliveSlot([&](u16 idx) noexcept {
-        total += sizeof(EntityId) + sizeof(LocalTransform2D) + sizeof(u16) + sizeof(u8) +
-                 sizeof(u8);
+        total += sizeof(EntityId) + sizeof(LocalTransform2D) + sizeof(u16) + sizeof(u8) + sizeof(u8);
         for (u64 mask = m_componentMasks[idx]; mask != 0ULL; mask &= (mask - 1ULL)) {
             total += sizeof(u8) + sizeof(u16) + m_pools[std::countr_zero(mask)].ElemBytes();
         }
@@ -620,9 +539,7 @@ usize World::RequiredSnapshotBytes() const noexcept {
 }
 
 Result<usize, WorldErrc> World::SerializeWorldSnapshot(std::span<u8> outBuffer) const noexcept {
-    if (m_maxEntities == 0U || m_aliveCount == 0U) {
-        return Err(WorldErrc::InvalidConfig);
-    }
+    if (m_maxEntities == 0U || m_aliveCount == 0U) return Err(WorldErrc::InvalidConfig);
     BinaryWriter writer(outBuffer);
 
     WorldSnapshotHeader hdr{
@@ -632,15 +549,11 @@ Result<usize, WorldErrc> World::SerializeWorldSnapshot(std::span<u8> outBuffer) 
         m_tickCount,
         0U,
     };
-    if (!writer.Write(hdr)) {
-        return Err(WorldErrc::OutOfMemory);
-    }
+    if (!writer.Write(hdr)) return Err(WorldErrc::OutOfMemory);
 
     bool ok = true;
     ForEachAliveSlot([&](u16 idx) noexcept {
-        if (!ok) {
-            return;
-        }
+        if (!ok) return;
         const EntityId id{idx, m_generations[idx]};
         const u16 parentIdx = m_transforms.ParentOf(idx);
         const u8 ch = m_timeChannels[idx];
@@ -652,19 +565,13 @@ Result<usize, WorldErrc> World::SerializeWorldSnapshot(std::span<u8> outBuffer) 
             ok = false;
         }
     });
-    if (!ok) {
-        return Err(WorldErrc::OutOfMemory);
-    }
+    if (!ok) return Err(WorldErrc::OutOfMemory);
     return StampPacketCrc32(outBuffer, writer.Offset(), hdr, hdr.payloadCrc32);
 }
 
 Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBuffer) noexcept {
-    if (m_maxEntities == 0U) {
-        return Err(WorldErrc::InvalidConfig);
-    }
-    if (inBuffer.size() < sizeof(WorldSnapshotHeader)) {
-        return Err(WorldErrc::CorruptedPrefab);
-    }
+    if (m_maxEntities == 0U) return Err(WorldErrc::InvalidConfig);
+    if (inBuffer.size() < sizeof(WorldSnapshotHeader)) return Err(WorldErrc::CorruptedPrefab);
 
     BinaryReader reader(inBuffer);
     WorldSnapshotHeader hdr{};
@@ -693,13 +600,13 @@ Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBu
             return Err(WorldErrc::CorruptedPrefab);
         }
 
-        m_generations[id.index] = id.generation;
+        m_generations[id.index]    = id.generation;
         m_componentMasks[id.index] = 0ULL;
-        m_timeChannels[id.index] = ch;
+        m_timeChannels[id.index]   = ch;
         m_aliveWords[id.index >> 6U] |= (1ULL << (id.index & 63U));
         ++m_aliveCount;
         m_maxAllocatedIndex = std::max(m_maxAllocatedIndex, id.index);
-        m_nextFreshSlot = std::max(m_nextFreshSlot, static_cast<u16>(id.index + 1U));
+        m_nextFreshSlot     = std::max(m_nextFreshSlot, static_cast<u16>(id.index + 1U));
         m_transforms.LinkLoadedSlot(id.index, loc, parentIdx);
 
         for (u8 c = 0U; c < compCount; ++c) {
@@ -742,8 +649,7 @@ Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBu
             }
             if (anc == s || ++depth > kMaxHierarchyDepth) {
                 Clear();
-                return Err(
-                    anc == s ? WorldErrc::HierarchyCycle : WorldErrc::HierarchyDepthExceeded);
+                return Err(anc == s ? WorldErrc::HierarchyCycle : WorldErrc::HierarchyDepthExceeded);
             }
         }
     }
@@ -757,10 +663,10 @@ Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBu
 u64 World::ComputeAuditHash() const noexcept {
     u64 h = Mix64(static_cast<u64>(m_aliveCount) | (static_cast<u64>(m_maxAllocatedIndex) << 32U));
     ForEachAliveSlot([&](u16 i) noexcept {
-        h = HashCombine64(
+        h = HashCombine(
             h, m_componentMasks[i] ^ (static_cast<u64>(m_generations[i]) << 48U));
         const WorldTransform2D& wt = m_transforms.World(i);
-        h = HashCombine64(
+        h = HashCombine(
             h,
             static_cast<u64>(std::bit_cast<u32>(wt.x)) |
                 (static_cast<u64>(std::bit_cast<u32>(wt.y)) << 32U));

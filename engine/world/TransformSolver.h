@@ -1,16 +1,15 @@
 #pragma once
 
 #include "core/Memory.h"
-#include "world/WorldTypes.h"
+#include "world/Components.h"
 
 namespace en {
 
-// LCRS hierarchy + world transform solver. Arena-backed, non-owning.
-// No PrevSibling: O(siblings) unlink is fine for Metroidvania fan-out.
-// moved bit clear => prev == world.ToSnapshot(). Frozen channels skip prev write.
-class alignas(64) TransformSolver {
+// Left-child right-sibling (LCRS) transform hierarchy and world-matrix solver over Arena memory.
+// Non-owning view; Invariant: moved bit clear implies m_prev[i] == m_world[i].ToSnapshot().
+class TransformSolver {
 public:
-    [[nodiscard]] bool Init(AlignedArena& arena, u16 maxEntities) noexcept;
+    [[nodiscard]] bool Init(Arena& arena, u16 maxEntities) noexcept;
     void Clear(u16 maxAllocatedIndex) noexcept;
 
     void InitializeSlot(
@@ -47,9 +46,7 @@ public:
 
     template <typename Fn>
     constexpr void TraverseSubtree(u16 rootIdx, u16 maxEntities, Fn&& fn) const noexcept {
-        if (rootIdx == 0U || rootIdx >= maxEntities) {
-            return;
-        }
+        if (rootIdx == 0U || rootIdx >= maxEntities) return;
         u16 cur = rootIdx;
         for (;;) {
             fn(cur);
@@ -61,9 +58,7 @@ public:
             while (cur != rootIdx && m_nextSibling[cur] == kInvalidDenseIndex) {
                 cur = m_parent[cur];
             }
-            if (cur == rootIdx) {
-                break;
-            }
+            if (cur == rootIdx) break;
             cur = m_nextSibling[cur];
         }
     }
@@ -139,14 +134,14 @@ private:
     void ResolveDirtyChain(u16 idx, u16 maxEntities = kInvalidDenseIndex) noexcept;
     void EvaluateDirtySubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
-    LocalTransform2D* m_local{nullptr};
-    WorldTransform2D* m_world{nullptr};
+    LocalTransform2D*    m_local{nullptr};
+    WorldTransform2D*    m_world{nullptr};
     PrevWorldSnapshot2D* m_prev{nullptr};
-    u16* m_parent{nullptr};
-    u16* m_firstChild{nullptr};
-    u16* m_nextSibling{nullptr};
-    u64* m_dirtyWords{nullptr};
-    u64* m_movedWords{nullptr};
+    u16*                 m_parent{nullptr};
+    u16*                 m_firstChild{nullptr};
+    u16*                 m_nextSibling{nullptr};
+    u64*                 m_dirtyWords{nullptr};
+    u64*                 m_movedWords{nullptr};
 };
 static_assert(sizeof(TransformSolver) == 64);
 

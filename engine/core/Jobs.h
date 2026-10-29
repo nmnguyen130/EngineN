@@ -25,9 +25,7 @@ public:
     [[nodiscard]] bool PushBottom(const T& item) noexcept {
         const i64 b = m_bottom.load(std::memory_order_relaxed);
         const i64 t = m_top.load(std::memory_order_acquire);
-        if (b - t >= static_cast<i64>(CapacityPow2)) {
-            return false;
-        }
+        if (b - t >= static_cast<i64>(CapacityPow2)) return false;
         m_buffer[static_cast<usize>(b) & kMask] = item;
         std::atomic_thread_fence(std::memory_order_release);
         m_bottom.store(b + 1, std::memory_order_relaxed);
@@ -45,9 +43,8 @@ public:
             return false;
         }
         outItem = m_buffer[static_cast<usize>(b) & kMask];
-        if (t != b) {
-            return true;
-        }
+        if (t != b) return true;
+
         const bool won = m_top.compare_exchange_strong(
             t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed);
         m_bottom.store(b + 1, std::memory_order_relaxed);
@@ -58,9 +55,7 @@ public:
         i64 t = m_top.load(std::memory_order_acquire);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const i64 b = m_bottom.load(std::memory_order_acquire);
-        if (t >= b) {
-            return false;
-        }
+        if (t >= b) return false;
         outItem = m_buffer[static_cast<usize>(t) & kMask];
         return m_top.compare_exchange_strong(
             t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed);
@@ -85,24 +80,23 @@ private:
     std::array<T, CapacityPow2> m_buffer{};
 };
 
-// Multi-threaded work-stealing batch dispatcher with help-while-waiting and single-thread fallback.
-// Non-copyable owner of worker threads; uses fixed per-thread deques and batch-counter slots allocated inline.
+// Work-stealing parallel batch dispatcher with help-while-waiting and single-thread fallback.
+// Non-copyable owner of worker threads; uses stack-resident completion counters for zero-allocation nesting.
 // Invariant: m_workerCount <= kMaxWorkers; queue 0 belongs to the main thread and 1..N to workers.
-class alignas(64) JobSystem {
+class JobSystem {
 public:
     static constexpr u32 kMaxWorkers = 16;
     static constexpr u32 kQueueCount = kMaxWorkers + 1U;
     static constexpr usize kDequeCapacity = 256;
 
-    using ParallelTaskFn = void (*)(u32 startIdx, u32 endIdx, u32 threadIdx, void* userCtx) noexcept;
+    using TaskFn = void (*)(u32 startIdx, u32 endIdx, u32 threadIdx, void* userCtx) noexcept;
 
     struct alignas(32) JobItem {
-        ParallelTaskFn fn{nullptr};
-        void* userCtx{nullptr};
-        u32 startIdx{0};
-        u32 endIdx{0};
-        u32 batchSlot{0};
-        u32 reserved{0};
+        TaskFn            fn{nullptr};
+        void*             userCtx{nullptr};
+        std::atomic<u32>* counter{nullptr};
+        u32               startIdx{0};
+        u32               endIdx{0};
     };
     static_assert(sizeof(JobItem) == 32);
 
@@ -115,10 +109,11 @@ public:
     [[nodiscard]] bool Init(u32 workerThreads = 0) noexcept;
     void Shutdown() noexcept;
 
-    void ParallelFor(u32 itemCount, u32 minBatchSize, ParallelTaskFn fn, void* userCtx = nullptr) noexcept;
+    void ParallelFor(u32 itemCount, u32 minBatchSize, TaskFn fn, void* userCtx = nullptr) noexcept;
 
     template <typename Callable>
-    void ParallelForRange(u32 itemCount, u32 minBatchSize, Callable&& callable) noexcept {
+        requires (!std::convertible_to<Callable, TaskFn>)
+    void ParallelFor(u32 itemCount, u32 minBatchSize, Callable&& callable) noexcept {
         using Fn = std::remove_reference_t<Callable>;
         struct Thunk {
             Fn* fn;
@@ -130,25 +125,18 @@ public:
     }
 
     [[nodiscard]] u32 WorkerCount() const noexcept { return m_workerCount; }
-    [[nodiscard]] bool IsDeterministicSingleThread() const noexcept { return m_workerCount == 0U; }
 
 private:
-    struct alignas(64) BatchCounterSlot {
-        std::atomic<u32> remaining{0};
-    };
-
     void WorkerLoop(u32 queueIdx) noexcept;
     [[nodiscard]] bool ExecuteOneJob(u32 callerQueueIdx) noexcept;
-    void ExecuteJobItem(const JobItem& item, u32 threadIdx) noexcept;
-    [[nodiscard]] u32 ResolveCallerQueueIndex() const noexcept;
+    void RunItem(const JobItem& item, u32 threadIdx) noexcept;
+    [[nodiscard]] u32 CallerQueueIndex() const noexcept;
 
     std::array<WorkStealingDeque<JobItem, kDequeCapacity>, kQueueCount> m_deques{};
-    std::array<BatchCounterSlot, kQueueCount * 2U> m_batchCounters{};
     std::array<std::thread, kMaxWorkers> m_workers{};
     std::mutex m_wakeMutex{};
     std::condition_variable m_wakeCv{};
-    std::atomic<u32> m_inFlightJobs{0};
-    std::atomic<u32> m_nextCounterSlot{0};
+    std::atomic<u32> m_inFlight{0};
     std::atomic<bool> m_stop{false};
     u32 m_workerCount{0};
 };

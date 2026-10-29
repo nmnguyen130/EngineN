@@ -1,110 +1,142 @@
 #pragma once
 
-#include "core/Types.h"
-
-#include <algorithm>
-#include <array>
+#include "core/Math.h"
 
 namespace en {
 
-// 120 Hz fixed simulation. Proven for precision platformers / Metroidvania feel.
-inline constexpr u32 kSimHz           = 120U;
-inline constexpr u64 kNsPerSecond     = 1'000'000'000ULL;
-inline constexpr u64 kFixedDtNs       = kNsPerSecond / kSimHz;
-inline constexpr f32 kFixedDtSec      = 1.0f / static_cast<f32>(kSimHz);
+// 120 Hz fixed simulation rate for responsive Metroidvania platforming and combat.
+inline constexpr u32 kTickHz            = 120U;
+inline constexpr u64 kNsPerSec          = 1'000'000'000ULL;
+inline constexpr u64 kFixedDtNs         = kNsPerSec / kTickHz;
+inline constexpr f32 kFixedDt           = 1.0f / static_cast<f32>(kTickHz);
 
-// 1440 Hz harmonic base = LCM of common refresh rates. Enables exact rational snap.
-inline constexpr u64 kHarmonicSubdiv  = 12ULL;
-inline constexpr u64 kHarmonicHz      = static_cast<u64>(kSimHz) * kHarmonicSubdiv;
-inline constexpr u64 kTickUnits       = kNsPerSecond * kHarmonicSubdiv; // 12e9
+// 1440 Hz harmonic base (LCM of 30, 36, 40, 48, 60, 72, 80, 90, 120, 144, 160, 180, 240, 360, 480 Hz).
+inline constexpr u64 kHarmonicSubdiv    = 12ULL;
+inline constexpr u64 kHarmonicHz        = static_cast<u64>(kTickHz) * kHarmonicSubdiv;
+inline constexpr u64 kTickUnits         = kNsPerSec * kHarmonicSubdiv;
+inline constexpr u64 kMaxFrameNs        = 250'000'000ULL;
+inline constexpr u64 kHarmonicSnapNs    = 150'000ULL;
+inline constexpr f32 kMaxTimeScale      = 8.0f;
 
-inline constexpr u32 kMaxTimeChannels = 8U;
-inline constexpr u8  kGameplayMask    = 0x3FU; // World..Camera
-inline constexpr u32 kMaxFreezeTicks  = 3600U; // 30 s @ 120 Hz
+// 4 gameplay channels (World, Player, Enemy, Camera) + 1 unscaled UI channel.
+inline constexpr u32 kGameplayChannels  = 4U;
+inline constexpr u8  kGameplayMask      = 0x0FU;
 
 enum class TimeChannel : u8 {
-    World      = 0,
-    Player     = 1,
-    Enemy      = 2,
-    Projectile = 3,
-    Vfx        = 4,
-    Camera     = 5,
-    Ui         = 6,
-    Custom     = 7,
+    World  = 0,
+    Player = 1,
+    Enemy  = 2,
+    Camera = 3,
+    Ui     = 4,
 };
 
-[[nodiscard]] constexpr u8 ChannelIdx(TimeChannel ch) noexcept {
-    return static_cast<u8>(ch) & 7U;
-}
 [[nodiscard]] constexpr u8 ChannelBit(TimeChannel ch) noexcept {
-    return static_cast<u8>(1U << ChannelIdx(ch));
+    const u8 idx = static_cast<u8>(ch);
+    return idx < kGameplayChannels ? static_cast<u8>(1U << idx) : 0U;
 }
 
-inline namespace literals {
-[[nodiscard]] consteval u32 operator""_f60(unsigned long long f) noexcept {
-    return static_cast<u32>(f * 2ULL); // 60 fps frames → 120 Hz ticks
+namespace literals {
+[[nodiscard]] consteval u16 operator""_ticks(unsigned long long v) noexcept {
+    return static_cast<u16>(v);
 }
-[[nodiscard]] consteval u32 operator""_ticks(unsigned long long t) noexcept {
-    return static_cast<u32>(t);
+[[nodiscard]] consteval u16 operator""_ms(unsigned long long ms) noexcept {
+    const unsigned long long ticks = (ms * kTickHz + 999ULL) / 1000ULL;
+    return static_cast<u16>(ticks == 0ULL && ms > 0ULL ? 1ULL : ticks);
 }
 } // namespace literals
 
-// 64-byte baked scales for one tick (cache line).
-struct alignas(64) BakedTickState {
-    std::array<f32, kMaxTimeChannels> scaledDt{};
-    std::array<f32, kMaxTimeChannels> effectiveScale{};
-};
-static_assert(sizeof(BakedTickState) == 64);
+// Compact 24-byte immutable snapshot of one 120 Hz simulation tick.
+// Value type; Scale(ch) and SimTimeNs() are derived inline without duplicate array storage.
+struct TickStep {
+    std::array<f32, kGameplayChannels> dt{kFixedDt, kFixedDt, kFixedDt, kFixedDt};
+    u32 tick{0};
+    u16 substep{0};
+    u8  frozenMask{0};
+    u8  active{0};
 
-// 16-byte per-channel modulation. Hitstop + smooth ramp.
-struct alignas(16) ChannelModSlot {
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return active != 0U; }
+
+    [[nodiscard]] constexpr f32 Dt(TimeChannel ch = TimeChannel::World) const noexcept {
+        const u8 idx = static_cast<u8>(ch);
+        return idx < kGameplayChannels ? dt[idx] : kFixedDt;
+    }
+
+    [[nodiscard]] constexpr f32 Scale(TimeChannel ch = TimeChannel::World) const noexcept {
+        const u8 idx = static_cast<u8>(ch);
+        return idx < kGameplayChannels ? (dt[idx] * static_cast<f32>(kTickHz)) : 1.0f;
+    }
+
+    [[nodiscard]] constexpr bool IsFrozen(TimeChannel ch = TimeChannel::World) const noexcept {
+        return (frozenMask & ChannelBit(ch)) != 0U;
+    }
+
+    [[nodiscard]] constexpr u64 SimTimeNs() const noexcept {
+        return static_cast<u64>(tick) * kFixedDtNs;
+    }
+};
+static_assert(sizeof(TickStep) == 24);
+
+// Compact 20-byte sub-tick interpolation state for render transform blending.
+// Frozen gameplay channels resolve to alpha = 1.0f inline; UI always uses raw alpha.
+struct RenderStep {
+    f32 alpha{0.0f};
+    f32 frameDt{kFixedDt};
+    f32 smoothDt{1.0f / 60.0f};
+    u32 tick{0};
+    u8  frozenMask{0};
+    u8  paused{0};
+    u16 frame{0};
+
+    [[nodiscard]] constexpr bool IsFrozen(TimeChannel ch = TimeChannel::World) const noexcept {
+        return (ch != TimeChannel::Ui) && (paused != 0U || (frozenMask & ChannelBit(ch)) != 0U);
+    }
+
+    [[nodiscard]] constexpr f32 Alpha(TimeChannel ch = TimeChannel::World) const noexcept {
+        return IsFrozen(ch) ? 1.0f : alpha;
+    }
+
+    [[nodiscard]] constexpr f32 Fps() const noexcept {
+        return smoothDt > 1e-6f ? (1.0f / smoothDt) : 0.0f;
+    }
+};
+static_assert(sizeof(RenderStep) == 20);
+
+// 16-byte per-channel hitstop and smoothstep time-ramp state with zero padding.
+struct ChannelMod {
     f32 baseScale{1.0f};
     f32 rampTarget{1.0f};
     u16 hitstop{0};
     u16 rampHold{0};
-    u16 rampBlend{0};
+    u16 rampRecover{0};
     u16 rampElapsed{0};
 
     constexpr void ClearRamp() noexcept {
         rampTarget = 1.0f;
-        rampHold = rampBlend = rampElapsed = 0U;
-    }
-    constexpr void Clear() noexcept {
-        ClearRamp();
-        hitstop = 0U;
+        rampHold = 0U;
+        rampRecover = 0U;
+        rampElapsed = 0U;
     }
 
-    [[nodiscard]] constexpr f32 LocalScale(bool rampOn) const noexcept {
+    [[nodiscard]] constexpr f32 LocalScale(bool rampActive) const noexcept {
         if (hitstop > 0U) return 0.0f;
-        if (!rampOn) return baseScale;
+        if (!rampActive) return baseScale;
         if (rampHold > 0U) return baseScale * rampTarget;
-        if (rampBlend == 0U) return baseScale;
-        const f32 t = std::clamp(static_cast<f32>(rampElapsed) / static_cast<f32>(rampBlend), 0.0f, 1.0f);
-        const f32 s = t * t * (3.0f - 2.0f * t); // smoothstep
-        return baseScale * (rampTarget + (1.0f - rampTarget) * s);
+        if (rampRecover == 0U) return baseScale;
+        const f32 t = static_cast<f32>(rampElapsed) / static_cast<f32>(rampRecover);
+        const f32 s = t * t * (3.0f - 2.0f * t);
+        return baseScale * Lerp(rampTarget, 1.0f, s);
     }
 };
-static_assert(sizeof(ChannelModSlot) == 16);
+static_assert(sizeof(ChannelMod) == 16);
 
-struct alignas(16) RenderTimeView {
-    std::array<f32, kMaxTimeChannels> channelAlpha{};
-    u64 tickIndex{0};
-    f32 rawAlpha{0.0f};
-    f32 realDt{kFixedDtSec};
-
-    [[nodiscard]] constexpr f32 Alpha(TimeChannel ch = TimeChannel::World) const noexcept {
-        return channelAlpha[ChannelIdx(ch)];
-    }
-};
-static_assert(sizeof(RenderTimeView) == 48);
-
-struct alignas(8) TimeTelemetry {
-    u64 totalSimTicks{0};
+// 24-byte telemetry counters for frame and tick diagnostics.
+struct TimeStats {
+    u64 totalTicks{0};
     u64 totalFrames{0};
     u32 droppedTicks{0};
-    u16 ticksLastFrame{0};
-    u16 maxCatchup{8}; // ~66 ms @ 120 Hz — safe default
+    u16 lastFrameTicks{0};
+    u16 clampedFrames{0};
 };
-static_assert(sizeof(TimeTelemetry) == 24);
+static_assert(sizeof(TimeStats) == 24);
 
 } // namespace en

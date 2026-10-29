@@ -1,13 +1,13 @@
 #pragma once
 
 #include "core/Memory.h"
-#include "world/WorldTypes.h"
+#include "world/Components.h"
 
 namespace en {
 
-// Sparse-set pool over arena memory. Swap-and-pop remove.
-// Invariant: sparse[dense[d].index] == d for all live d.
-class alignas(32) RawComponentPool {
+// Type-erased sparse-set component storage over Arena memory with O(1) swap-and-pop removal.
+// Non-owning view; Invariant: m_sparse[m_denseEntities[d].index] == d for all d in [0, m_size).
+class RawSparseSet {
 public:
     [[nodiscard]] constexpr bool IsInitialized() const noexcept {
         return m_denseBytes != nullptr;
@@ -21,9 +21,7 @@ public:
     }
 
     [[nodiscard]] constexpr bool Contains(EntityId id) const noexcept {
-        if (id.index >= m_maxEntities) {
-            return false;
-        }
+        if (id.index >= m_maxEntities) return false;
         const u16 d = m_sparse[id.index];
         return d < m_size && m_denseEntities[d] == id;
     }
@@ -33,14 +31,10 @@ public:
     }
 
     [[nodiscard]] bool EmplaceRaw(EntityId id, const void* raw) noexcept {
-        if (!raw || id.index >= m_maxEntities || !m_denseBytes) {
-            return false;
-        }
+        if (!raw || id.index >= m_maxEntities || !m_denseBytes) return false;
         u16 d = m_sparse[id.index];
         if (d >= m_size || m_denseEntities[d] != id) {
-            if (m_size >= m_capacity) {
-                return false;
-            }
+            if (m_size >= m_capacity) return false;
             d = m_size++;
             m_sparse[id.index] = d;
             m_denseEntities[d] = id;
@@ -50,22 +44,16 @@ public:
     }
 
     [[nodiscard]] bool CloneFromEntityIndex(EntityId dst, u16 srcIndex) noexcept {
-        if (srcIndex >= m_maxEntities || !m_denseBytes) {
-            return false;
-        }
+        if (srcIndex >= m_maxEntities || !m_denseBytes) return false;
         const u16 srcDense = m_sparse[srcIndex];
         return srcDense < m_size &&
                EmplaceRaw(dst, m_denseBytes + static_cast<usize>(srcDense) * m_elemBytes);
     }
 
     void RemoveUnchecked(EntityId id) noexcept {
-        if (id.index >= m_maxEntities || !m_denseBytes) {
-            return;
-        }
+        if (id.index >= m_maxEntities || !m_denseBytes) return;
         const u16 d = m_sparse[id.index];
-        if (d >= m_size) {
-            return;
-        }
+        if (d >= m_size) return;
         const u16 last = static_cast<u16>(--m_size);
         if (d != last) {
             const EntityId moved = m_denseEntities[last];
@@ -92,39 +80,38 @@ public:
     }
 
 protected:
-    u16* m_sparse{nullptr};
+    u16*      m_sparse{nullptr};
     EntityId* m_denseEntities{nullptr};
-    u8* m_denseBytes{nullptr};
-    u16 m_maxEntities{0};
-    u16 m_capacity{0};
-    u16 m_size{0};
-    u16 m_elemBytes{0};
+    u8*       m_denseBytes{nullptr};
+    u16       m_maxEntities{0};
+    u16       m_capacity{0};
+    u16       m_size{0};
+    u16       m_elemBytes{0};
 };
-static_assert(sizeof(RawComponentPool) == 32);
+static_assert(sizeof(RawSparseSet) == 32);
 
+// Strongly-typed contiguous sparse-set component pool.
 template <Component T>
-class alignas(32) ComponentPool : public RawComponentPool {
+class SparseSet : public RawSparseSet {
 public:
-    [[nodiscard]] bool Init(AlignedArena& arena, u16 maxEntities, u16 capacity) noexcept {
-        if (maxEntities == 0U || capacity == 0U) {
-            return false;
-        }
-        const u32 marker = arena.SaveMarker();
-        auto sparse = arena.Carve<u16>(maxEntities);
-        auto entities = arena.Carve<EntityId>(capacity);
-        auto comps = arena.Carve<T>(capacity);
+    [[nodiscard]] bool Init(Arena& arena, u16 maxEntities, u16 capacity) noexcept {
+        if (maxEntities == 0U || capacity == 0U) return false;
+        const u32 mark = arena.Mark();
+        auto sparse   = arena.Alloc<u16>(maxEntities);
+        auto entities = arena.Alloc<EntityId>(capacity);
+        auto comps    = arena.Alloc<T>(capacity);
         if (sparse.empty() || entities.empty() || comps.empty()) {
-            arena.RollbackToMarker(marker);
+            arena.Rollback(mark);
             return false;
         }
 
-        m_sparse = sparse.data();
+        m_sparse        = sparse.data();
         m_denseEntities = entities.data();
-        m_denseBytes = reinterpret_cast<u8*>(comps.data());
-        m_maxEntities = maxEntities;
-        m_capacity = capacity;
-        m_size = 0U;
-        m_elemBytes = static_cast<u16>(sizeof(T));
+        m_denseBytes    = reinterpret_cast<u8*>(comps.data());
+        m_maxEntities   = maxEntities;
+        m_capacity      = capacity;
+        m_size          = 0U;
+        m_elemBytes     = static_cast<u16>(sizeof(T));
         std::fill_n(m_sparse, maxEntities, kInvalidDenseIndex);
         return true;
     }
@@ -155,14 +142,10 @@ public:
 
     template <typename... Args>
     [[nodiscard]] constexpr Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
-        if (id.index >= m_maxEntities) {
-            return Err(WorldErrc::DeadEntity);
-        }
+        if (id.index >= m_maxEntities) return Err(WorldErrc::DeadEntity);
         u16 d = m_sparse[id.index];
         if (d >= m_size || m_denseEntities[d] != id) {
-            if (m_size >= m_capacity) {
-                return Err(WorldErrc::PoolCapacityReached);
-            }
+            if (m_size >= m_capacity) return Err(WorldErrc::PoolCapacityReached);
             d = m_size++;
             m_sparse[id.index] = d;
             m_denseEntities[d] = id;
@@ -173,9 +156,7 @@ public:
     }
 
     constexpr bool Remove(EntityId id) noexcept {
-        if (!Contains(id)) {
-            return false;
-        }
+        if (!Contains(id)) return false;
         RemoveUnchecked(id);
         return true;
     }
@@ -195,6 +176,10 @@ private:
         return reinterpret_cast<const T*>(m_denseBytes);
     }
 };
-static_assert(sizeof(ComponentPool<Velocity2D>) == 32);
+static_assert(sizeof(SparseSet<Velocity2D>) == 32);
+
+using RawComponentPool = RawSparseSet;
+template <Component T>
+using ComponentPool = SparseSet<T>;
 
 } // namespace en

@@ -7,14 +7,23 @@
 
 namespace en {
 
-inline constexpr f32 kPi = 3.14159265358979323846f;
-inline constexpr f32 kTwoPi = 2.0f * kPi;
-inline constexpr f32 kHalfPi = 0.5f * kPi;
+inline constexpr f32 kPi       = 3.14159265358979323846f;
+inline constexpr f32 kTwoPi    = 2.0f * kPi;
+inline constexpr f32 kHalfPi   = 0.5f * kPi;
 inline constexpr f32 kInvTwoPi = 1.0f / kTwoPi;
 inline constexpr f32 kDegToRad = kPi / 180.0f;
 inline constexpr f32 kRadToDeg = 180.0f / kPi;
 
-// Evaluates sine and cosine together on [-pi/2, pi/2] via an 11th-order minimax polynomial.
+[[nodiscard]] constexpr f32 Lerp(f32 a, f32 b, f32 t) noexcept {
+    return a + (b - a) * t;
+}
+
+[[nodiscard]] constexpr f32 Approach(f32 cur, f32 target, f32 delta) noexcept {
+    if (delta <= 0.0f) return cur;
+    return (cur < target) ? std::min(cur + delta, target) : std::max(cur - delta, target);
+}
+
+// Evaluates sine and cosine simultaneously on [-pi/2, pi/2] via an 11th-order minimax polynomial.
 constexpr void FastSinCos(f32 rad, f32& outCos, f32& outSin) noexcept {
     const f32 turns = std::floor((rad + kPi) * kInvTwoPi);
     const f32 w = rad - turns * kTwoPi;
@@ -26,17 +35,17 @@ constexpr void FastSinCos(f32 rad, f32& outCos, f32& outSin) noexcept {
     }
     const f32 cx = kHalfPi - std::abs(w);
 
-    const auto evalSin = [](f32 t) constexpr noexcept -> f32 {
+    const auto poly = [](f32 t) constexpr noexcept -> f32 {
         const f32 t2 = t * t;
         return t * (1.0f + t2 * (-0.166666666f + t2 * (0.008333333f + t2 * (-0.0001984127f +
                    t2 * (0.000002755732f - t2 * 0.0000000250521f)))));
     };
 
-    outSin = evalSin(sx);
-    outCos = evalSin(cx);
+    outSin = poly(sx);
+    outCos = poly(cx);
 }
 
-struct alignas(8) Vec2 {
+struct Vec2 {
     f32 x{0.0f};
     f32 y{0.0f};
 
@@ -46,9 +55,7 @@ struct alignas(8) Vec2 {
     [[nodiscard]] constexpr Vec2 operator*(f32 s) const noexcept { return {x * s, y * s}; }
 
     [[nodiscard]] constexpr Vec2 operator/(f32 s) const noexcept {
-        if (std::abs(s) <= 1e-12f) {
-            return {0.0f, 0.0f};
-        }
+        if (std::abs(s) <= 1e-12f) return {};
         const f32 inv = 1.0f / s;
         return {x * inv, y * inv};
     }
@@ -69,16 +76,16 @@ struct alignas(8) Vec2 {
     }
 
     [[nodiscard]] static constexpr Vec2 Lerp(Vec2 a, Vec2 b, f32 t) noexcept {
-        return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
+        return {en::Lerp(a.x, b.x, t), en::Lerp(a.y, b.y, t)};
     }
 
     [[nodiscard]] constexpr bool operator==(const Vec2&) const noexcept = default;
 };
-static_assert(sizeof(Vec2) == 8);
+static_assert(sizeof(Vec2) == 8 && alignof(Vec2) == 4);
 
 [[nodiscard]] constexpr Vec2 operator*(f32 s, Vec2 v) noexcept { return v * s; }
 
-struct alignas(8) IVec2 {
+struct IVec2 {
     i32 x{0};
     i32 y{0};
 
@@ -87,7 +94,7 @@ struct alignas(8) IVec2 {
     [[nodiscard]] constexpr IVec2 operator*(i32 s) const noexcept { return {x * s, y * s}; }
     [[nodiscard]] constexpr auto operator<=>(const IVec2&) const noexcept = default;
 };
-static_assert(sizeof(IVec2) == 8);
+static_assert(sizeof(IVec2) == 8 && alignof(IVec2) == 4);
 
 struct Rect {
     f32 x{0.0f};
@@ -125,9 +132,9 @@ struct Rect {
 
     [[nodiscard]] constexpr bool operator==(const Rect&) const noexcept = default;
 };
-static_assert(sizeof(Rect) == 16);
+static_assert(sizeof(Rect) == 16 && alignof(Rect) == 4);
 
-struct alignas(8) Mat3x2 {
+struct Mat3x2 {
     f32 m00{1.0f};
     f32 m01{0.0f};
     f32 m10{0.0f};
@@ -148,9 +155,7 @@ struct alignas(8) Mat3x2 {
 
     [[nodiscard]] constexpr Mat3x2 Inverse() const noexcept {
         const f32 det = Determinant();
-        if (std::abs(det) <= 1e-8f) {
-            return Identity();
-        }
+        if (std::abs(det) <= 1e-8f) return Identity();
         const f32 invDet = 1.0f / det;
         const f32 i00 = m11 * invDet;
         const f32 i01 = -m01 * invDet;
@@ -180,7 +185,7 @@ struct alignas(8) Mat3x2 {
 
     [[nodiscard]] constexpr bool operator==(const Mat3x2&) const noexcept = default;
 };
-static_assert(sizeof(Mat3x2) == 24);
+static_assert(sizeof(Mat3x2) == 24 && alignof(Mat3x2) == 4);
 
 struct Color {
     f32 r{1.0f};
@@ -194,8 +199,11 @@ struct Color {
 
     [[nodiscard]] static constexpr Color FromRGBA8(u8 r, u8 g, u8 b, u8 a = 255) noexcept {
         constexpr f32 kInv = 1.0f / 255.0f;
-        return Premultiplied(static_cast<f32>(r) * kInv, static_cast<f32>(g) * kInv,
-                             static_cast<f32>(b) * kInv, static_cast<f32>(a) * kInv);
+        return Premultiplied(
+            static_cast<f32>(r) * kInv,
+            static_cast<f32>(g) * kInv,
+            static_cast<f32>(b) * kInv,
+            static_cast<f32>(a) * kInv);
     }
 
     [[nodiscard]] static constexpr Color FromHSV(f32 hDeg, f32 s, f32 v, f32 a = 1.0f) noexcept {
@@ -203,9 +211,7 @@ struct Color {
         const f32 val = std::clamp(v, 0.0f, 1.0f);
         const f32 alpha = std::clamp(a, 0.0f, 1.0f);
         f32 wrappedH = hDeg - std::floor(hDeg * (1.0f / 360.0f)) * 360.0f;
-        if (wrappedH >= 360.0f) {
-            wrappedH -= 360.0f;
-        }
+        if (wrappedH >= 360.0f) wrappedH -= 360.0f;
 
         const f32 c = val * sat;
         const f32 hSector = wrappedH * (1.0f / 60.0f);
@@ -227,22 +233,20 @@ struct Color {
 
     [[nodiscard]] static constexpr Color Lerp(Color c0, Color c1, f32 t) noexcept {
         return {
-            c0.r + (c1.r - c0.r) * t,
-            c0.g + (c1.g - c0.g) * t,
-            c0.b + (c1.b - c0.b) * t,
-            c0.a + (c1.a - c0.a) * t,
+            en::Lerp(c0.r, c1.r, t),
+            en::Lerp(c0.g, c1.g, t),
+            en::Lerp(c0.b, c1.b, t),
+            en::Lerp(c0.a, c1.a, t),
         };
     }
 
     [[nodiscard]] constexpr bool operator==(const Color&) const noexcept = default;
 };
-static_assert(sizeof(Color) == 16);
+static_assert(sizeof(Color) == 16 && alignof(Color) == 4);
 
-// Implicit critically damped 2nd-order spring step (stable across arbitrary positive dt).
+// Implicit critically damped 2nd-order spring step (unconditionally stable for dt > 0).
 constexpr void StepSpring(f32& pos, f32& vel, f32 target, f32 omega, f32 dt) noexcept {
-    if (dt <= 0.0f || omega <= 0.0f) {
-        return;
-    }
+    if (dt <= 0.0f || omega <= 0.0f) return;
     const f32 f = 1.0f + 2.0f * dt * omega;
     const f32 oo = omega * omega;
     const f32 hoo = dt * oo;
@@ -254,9 +258,7 @@ constexpr void StepSpring(f32& pos, f32& vel, f32 target, f32 omega, f32 dt) noe
 }
 
 [[nodiscard]] constexpr f32 SmoothStep(f32 edge0, f32 edge1, f32 x) noexcept {
-    if (edge1 <= edge0) {
-        return x >= edge1 ? 1.0f : 0.0f;
-    }
+    if (edge1 <= edge0) return x >= edge1 ? 1.0f : 0.0f;
     const f32 t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
 }
@@ -268,7 +270,7 @@ constexpr void StepSpring(f32& pos, f32& vel, f32 target, f32 omega, f32 dt) noe
     return 1.0f + c3 * u * u * u + c1 * u * u;
 }
 
-[[nodiscard]] constexpr Vec2 CubicBezier2D(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, f32 t) noexcept {
+[[nodiscard]] constexpr Vec2 CubicBezier(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, f32 t) noexcept {
     const f32 u = 1.0f - t;
     const f32 tt = t * t;
     const f32 uu = u * u;

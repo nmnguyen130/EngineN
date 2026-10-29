@@ -1,6 +1,6 @@
 #pragma once
 
-#include "world/ComponentPool.h"
+#include "world/SparseSet.h"
 #include "world/TransformSolver.h"
 
 #include <tuple>
@@ -9,9 +9,9 @@ namespace en {
 
 class AssetBank;
 
-// Sparse-set ECS + LCRS hierarchy + deferred commands. Owns one AlignedArena.
-// Index 0 reserved. Free slots FIFO, generation 1..0x7FFF. Commands flush in EndTick.
-class alignas(64) World {
+// Sparse-set ECS registry, LCRS transform hierarchy, and deferred command buffer.
+// Move-disabled owner of an Arena; slot 0 is reserved as kNullEntity.
+class World {
 public:
     World() noexcept = default;
     ~World() noexcept { Shutdown(); }
@@ -26,14 +26,10 @@ public:
     template <Component T>
     [[nodiscard]] Result<void, WorldErrc> RegisterComponentPool(u16 capacity = 0U) noexcept {
         constexpr u8 tid = static_cast<u8>(T::kTypeId);
-        if (!m_pools) {
-            return Err(WorldErrc::InvalidConfig);
-        }
-        if ((m_registeredPoolsMask & (1ULL << tid)) != 0ULL) {
-            return {};
-        }
+        if (!m_pools) return Err(WorldErrc::InvalidConfig);
+        if ((m_registeredPoolsMask & (1ULL << tid)) != 0ULL) return {};
         const u16 cap = (capacity > 0U) ? capacity : m_defaultPoolCap;
-        if (!static_cast<ComponentPool<T>&>(m_pools[tid]).Init(m_arena, m_maxEntities, cap)) {
+        if (!static_cast<SparseSet<T>&>(m_pools[tid]).Init(m_arena, m_maxEntities, cap)) {
             return Err(WorldErrc::OutOfMemory);
         }
         m_registeredPoolsMask |= (1ULL << tid);
@@ -61,19 +57,13 @@ public:
 
     template <Component T, typename... Args>
     [[nodiscard]] Result<T*, WorldErrc> Emplace(EntityId id, Args&&... args) noexcept {
-        if (!IsAlive(id)) {
-            return Err(WorldErrc::DeadEntity);
-        }
+        if (!IsAlive(id)) return Err(WorldErrc::DeadEntity);
         constexpr u8 tid = static_cast<u8>(T::kTypeId);
         if ((m_registeredPoolsMask & (1ULL << tid)) == 0ULL) {
-            if (auto r = RegisterComponentPool<T>(); !r) {
-                return Err(r.error());
-            }
+            if (auto r = RegisterComponentPool<T>(); !r) return Err(r.error());
         }
         auto res = GetPool<T>().Emplace(id, std::forward<Args>(args)...);
-        if (res) {
-            m_componentMasks[id.index] |= (1ULL << tid);
-        }
+        if (res) m_componentMasks[id.index] |= (1ULL << tid);
         return res;
     }
 
@@ -105,16 +95,14 @@ public:
     }
 
     template <Component T>
-    [[nodiscard]] constexpr ComponentPool<T>& GetPool() noexcept {
-        return static_cast<ComponentPool<T>&>(m_pools[static_cast<u8>(T::kTypeId)]);
+    [[nodiscard]] constexpr SparseSet<T>& GetPool() noexcept {
+        return static_cast<SparseSet<T>&>(m_pools[static_cast<u8>(T::kTypeId)]);
     }
 
     template <Component T>
-    [[nodiscard]] constexpr const ComponentPool<T>& GetPool() const noexcept {
-        return static_cast<const ComponentPool<T>&>(m_pools[static_cast<u8>(T::kTypeId)]);
+    [[nodiscard]] constexpr const SparseSet<T>& GetPool() const noexcept {
+        return static_cast<const SparseSet<T>&>(m_pools[static_cast<u8>(T::kTypeId)]);
     }
-
-    // --- Views ----------------------------------------------------------------
 
     template <typename WorldPtr, Component FirstC, Component... RestCs>
     class ViewRange {
@@ -122,18 +110,16 @@ public:
         struct Sentinel {};
 
         struct Iterator {
-            WorldPtr world{nullptr};
+            WorldPtr        world{nullptr};
             const EntityId* cur{nullptr};
             const EntityId* end{nullptr};
-            u64 reqMask{0};
-            u64 exclMask{0};
+            u64             reqMask{0};
+            u64             exclMask{0};
 
             constexpr void AdvanceToValid() noexcept {
                 while (cur != end) {
                     const u64 mask = world->m_componentMasks[cur->index];
-                    if ((mask & reqMask) == reqMask && (mask & exclMask) == 0ULL) {
-                        break;
-                    }
+                    if ((mask & reqMask) == reqMask && (mask & exclMask) == 0ULL) break;
                     ++cur;
                 }
             }
@@ -164,10 +150,10 @@ public:
         }
         [[nodiscard]] constexpr Sentinel end() const noexcept { return {}; }
 
-        WorldPtr world{nullptr};
+        WorldPtr                  world{nullptr};
         std::span<const EntityId> driver{};
-        u64 reqMask{0};
-        u64 exclMask{0};
+        u64                       reqMask{0};
+        u64                       exclMask{0};
     };
 
     template <Component FirstC, Component... RestCs, Component... ExclCs>
@@ -194,8 +180,6 @@ public:
         }
     }
 
-    // --- Deferred commands ----------------------------------------------------
-
     [[nodiscard]] Result<void, WorldErrc> DeferDestroy(
         EntityId id,
         bool destroyChildren = true) noexcept {
@@ -215,9 +199,7 @@ public:
     [[nodiscard]] Result<void, WorldErrc> DeferEmplace(EntityId id, const T& comp) noexcept {
         constexpr u8 tid = static_cast<u8>(T::kTypeId);
         if ((m_registeredPoolsMask & (1ULL << tid)) == 0ULL) {
-            if (auto r = RegisterComponentPool<T>(); !r) {
-                return Err(r.error());
-            }
+            if (auto r = RegisterComponentPool<T>(); !r) return Err(r.error());
         }
         return EnqueueRawCommand(CmdKind::Emplace, id, kNullEntity, tid, &comp, sizeof(T));
     }
@@ -229,8 +211,6 @@ public:
     }
 
     [[nodiscard]] Result<void, WorldErrc> FlushCommands() noexcept;
-
-    // --- Transforms -----------------------------------------------------------
 
     [[nodiscard]] constexpr LocalTransform2D GetLocalTransform(EntityId id) const noexcept {
         return IsAlive(id) ? m_transforms.Local(id.index) : LocalTransform2D{};
@@ -252,7 +232,6 @@ public:
         if (IsAlive(id)) {
             m_transforms.Local(id.index) = local;
             m_transforms.TeleportSubtree(id.index, m_maxEntities);
-            m_teleportedWords[id.index >> 6U] |= (1ULL << (id.index & 63U));
         }
     }
 
@@ -273,9 +252,7 @@ public:
     }
 
     constexpr void SetTimeChannel(EntityId id, TimeChannel ch) noexcept {
-        if (IsAlive(id)) {
-            m_timeChannels[id.index] = static_cast<u8>(ch);
-        }
+        if (IsAlive(id)) m_timeChannels[id.index] = static_cast<u8>(ch);
     }
 
     [[nodiscard]] constexpr u64 GetComponentMaskByIndex(u16 idx) const noexcept {
@@ -301,9 +278,7 @@ public:
     }
 
     [[nodiscard]] constexpr EntityId GetParent(EntityId id) const noexcept {
-        if (!IsAlive(id)) {
-            return kNullEntity;
-        }
+        if (!IsAlive(id)) return kNullEntity;
         const u16 pIdx = m_transforms.ParentOf(id.index);
         return (pIdx != kInvalidDenseIndex && pIdx < m_maxEntities)
                    ? EntityId{pIdx, m_generations[pIdx]}
@@ -334,26 +309,17 @@ public:
         return {m_aliveWords, m_aliveWordCount};
     }
 
-    [[nodiscard]] constexpr std::span<const u64> TeleportedWords() const noexcept {
-        return {m_teleportedWords, m_aliveWordCount};
-    }
-
-    // --- Tick lifecycle -------------------------------------------------------
-
-    void BeginTick(const SimStepView& step) noexcept {
-        std::fill_n(m_teleportedWords, ActiveWordCount(), 0ULL);
+    void BeginTick(const TickStep& step) noexcept {
         m_transforms.PropagateHierarchy(AliveWords(), m_maxAllocatedIndex);
         m_transforms.SnapshotPreviousTransforms(
             AliveWords(), m_timeChannels, step.frozenMask, m_maxAllocatedIndex);
         ++m_tickCount;
     }
 
-    void EndTick(const SimStepView& /*step*/ = {}) noexcept {
+    void EndTick(const TickStep& /*step*/ = {}) noexcept {
         (void)FlushCommands();
         m_transforms.PropagateHierarchy(AliveWords(), m_maxAllocatedIndex);
     }
-
-    // --- Prefab / snapshot ----------------------------------------------------
 
     [[nodiscard]] Result<EntityId, WorldErrc> InstantiatePrefab(
         const AssetBank& bank,
@@ -383,9 +349,9 @@ public:
 
 private:
     enum class CmdKind : u8 {
-        Destroy = 0,
-        Emplace = 1,
-        Remove = 2,
+        Destroy   = 0,
+        Emplace   = 1,
+        Remove    = 2,
         SetParent = 3,
     };
 
@@ -444,36 +410,32 @@ private:
         const void* payload,
         u16 payloadBytes) noexcept;
 
-    // Cache line 0: hot ECS query / entity slot state
-    u16* m_generations{nullptr};
-    u64* m_componentMasks{nullptr};
-    u8* m_timeChannels{nullptr};
-    u64* m_aliveWords{nullptr};
-    RawComponentPool* m_pools{nullptr};
-    u64 m_registeredPoolsMask{0};
-    u32 m_aliveCount{0};
-    u16 m_maxEntities{0};
-    u16 m_maxAllocatedIndex{0};
-    u16 m_nextFreshSlot{1};
-    u16 m_freeHead{kInvalidDenseIndex};
-    u16 m_freeTail{kInvalidDenseIndex};
-    u16 m_defaultPoolCap{0};
+    u16*            m_generations{nullptr};
+    u64*            m_componentMasks{nullptr};
+    u8*             m_timeChannels{nullptr};
+    u64*            m_aliveWords{nullptr};
+    RawSparseSet*   m_pools{nullptr};
+    u64             m_registeredPoolsMask{0};
+    u32             m_aliveCount{0};
+    u16             m_maxEntities{0};
+    u16             m_maxAllocatedIndex{0};
+    u16             m_nextFreshSlot{1};
+    u16             m_freeHead{kInvalidDenseIndex};
+    u16             m_freeTail{kInvalidDenseIndex};
+    u16             m_defaultPoolCap{0};
 
-    // Cache line 1: transform solver
     TransformSolver m_transforms{};
 
-    // Cache line 2: arena, commands, telemetry
-    AlignedArena m_arena{};
-    u8* m_cmdTape{nullptr};
-    u64* m_teleportedWords{nullptr};
-    u32 m_cmdCapacity{0};
-    u32 m_cmdWriteOffset{0};
-    u32 m_tickCount{0};
-    u16 m_aliveWordCount{0};
-    u16 m_pendingCmdCount{0};
-    u64 m_spawnedTotalCount{0};
-    u64 m_destroyedTotalCount{0};
+    Arena           m_arena{};
+    u8*             m_cmdTape{nullptr};
+    u32             m_cmdCapacity{0};
+    u32             m_cmdWriteOffset{0};
+    u32             m_tickCount{0};
+    u16             m_aliveWordCount{0};
+    u16             m_pendingCmdCount{0};
+    u64             m_spawnedTotalCount{0};
+    u64             m_destroyedTotalCount{0};
 };
-static_assert(sizeof(World) == 192);
+static_assert(sizeof(World) == 184);
 
 } // namespace en
