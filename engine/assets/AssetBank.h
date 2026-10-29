@@ -17,248 +17,191 @@ struct alignas(8) AssetBankConfig {
 };
 static_assert(sizeof(AssetBankConfig) == 24);
 
-// Data-oriented asset storage, coalescing payload sub-allocator, 16-scope lifetime tracker, and LRU VRAM eviction manager.
-// Non-copyable owner of an AlignedArena storing resource tables and payload slices.
-// Invariant: Slot 0 of every resource table holds a valid non-null fallback record so queries never return null.
+// Room-scoped asset bank. Slot 0 of every table is permanent fallback.
+// Flow: BeginScope → Load/Register → Get* → EndScope → EvictUnpinned.
+// GPU: Renderer::CreateTexture → BindGpu. Destroy via Evict callback/list.
 class alignas(64) AssetBank {
 public:
-    using GpuTextureDestroyFn = void (*)(TextureHandle gpu, void* userCtx) noexcept;
+    using GpuDestroyFn = void (*)(TextureHandle gpu, void* ctx) noexcept;
 
-    struct alignas(16) FreePayloadBlock {
-        FreePayloadBlock* next{nullptr};
-        u32 byteSize{0};
+    struct alignas(16) FreeBlock {
+        FreeBlock* next{nullptr};
+        u32 bytes{0};
     };
-    static_assert(sizeof(FreePayloadBlock) == 16);
+    static_assert(sizeof(FreeBlock) == 16);
 
-    struct PoolState {
+    struct Pool {
         u16 max{0};
-        u16 highWater{0};
-        u16 freeHead{0};
+        u16 high{0};
+        u16 free{0};
 
-        constexpr void Reset(u16 maxItems = 0U) noexcept {
-            max = maxItems;
-            highWater = (maxItems > 0U) ? 1U : 0U;
-            freeHead = 0U;
+        constexpr void Reset(u16 n = 0U) noexcept {
+            max = n;
+            high = (n > 0U) ? 1U : 0U;
+            free = 0U;
         }
     };
 
     AssetBank() noexcept = default;
     ~AssetBank() noexcept { Shutdown(); }
-
     AssetBank(const AssetBank&) = delete;
     AssetBank& operator=(const AssetBank&) = delete;
 
     [[nodiscard]] Result<void, AssetErrc> Init(const AssetBankConfig& cfg = {}) noexcept;
     void Shutdown() noexcept;
 
-    constexpr void SetGpuTextureDestroyCallback(GpuTextureDestroyFn fn, void* userCtx = nullptr) noexcept {
-        m_gpuDestroyFn = fn;
-        m_gpuDestroyUserCtx = userCtx;
+    constexpr void SetGpuDestroy(GpuDestroyFn fn, void* ctx = nullptr) noexcept {
+        m_gpuDestroy = fn;
+        m_gpuCtx = ctx;
     }
 
+    // Lifetime — scope ≈ room/area cluster
     [[nodiscard]] Result<u8, AssetErrc> BeginScope() noexcept;
     void EndScope(u8 scope) noexcept;
-    constexpr void AdvanceFrame(u32 frameIndex) noexcept {
-        m_currentFrame = static_cast<u16>(frameIndex & 0xFFFFU);
+    constexpr void AdvanceFrame(u32 frame) noexcept {
+        m_frame = static_cast<u16>(frame & 0xFFFFU);
     }
+    [[nodiscard]] constexpr u16 ActiveScopes() const noexcept { return m_scopes; }
+    [[nodiscard]] constexpr u16 Frame() const noexcept { return m_frame; }
 
-    [[nodiscard]] constexpr u16 ActiveScopesMask() const noexcept { return m_activeScopesMask; }
-    [[nodiscard]] constexpr u16 CurrentFrame() const noexcept { return m_currentFrame; }
-
+    // Queries — invalid handle → slot 0 fallback, never null
     [[nodiscard]] constexpr const SpriteFrame& GetSprite(SpriteHandle h) const noexcept {
-        return (h.index < m_highWaterSprite && m_sprites[h.index].generation == h.generation)
+        return (h.IsValid() && h.index < m_spriteHigh &&
+                m_sprites[h.index].generation == h.generation)
                    ? m_sprites[h.index]
                    : m_sprites[0];
     }
-
-    [[nodiscard]] constexpr const SpriteFrame& GetAtlasFrame(AtlasHandle h, u16 frameOffset) const noexcept {
-        const u16 aIdx = ResolvePayloadSlot(h, AssetKind::Atlas);
-        const AtlasRecord& rec = m_atlases[aIdx];
-        if (rec.spriteCount > 0U) {
-            const u16 idx = static_cast<u16>(rec.firstSprite + (frameOffset % rec.spriteCount));
-            if (idx < m_highWaterSprite) return m_sprites[idx];
+    [[nodiscard]] constexpr const SpriteFrame& GetAtlasFrame(AtlasHandle h, u16 i) const noexcept {
+        const AtlasRecord& a = m_atlases[Resolve(h, AssetKind::Atlas)];
+        if (a.spriteCount > 0U) {
+            const u16 idx = static_cast<u16>(a.firstSprite + (i % a.spriteCount));
+            if (idx < m_spriteHigh && m_sprites[idx].generation != 0U) return m_sprites[idx];
         }
         return m_sprites[0];
     }
-
-    [[nodiscard]] constexpr SpriteHandle GetSpriteHandle(AtlasHandle h, u16 frameOffset) const noexcept {
-        const u16 aIdx = ResolvePayloadSlot(h, AssetKind::Atlas);
-        const AtlasRecord& rec = m_atlases[aIdx];
-        if (rec.spriteCount > 0U) {
-            const u16 idx = static_cast<u16>(rec.firstSprite + (frameOffset % rec.spriteCount));
-            if (idx < m_highWaterSprite) return SpriteHandle{idx, m_sprites[idx].generation};
+    [[nodiscard]] constexpr SpriteHandle GetSpriteHandle(AtlasHandle h, u16 i) const noexcept {
+        const AtlasRecord& a = m_atlases[Resolve(h, AssetKind::Atlas)];
+        if (a.spriteCount > 0U) {
+            const u16 idx = static_cast<u16>(a.firstSprite + (i % a.spriteCount));
+            if (idx < m_spriteHigh && m_sprites[idx].generation != 0U) {
+                return SpriteHandle{idx, m_sprites[idx].generation};
+            }
         }
         return SpriteHandle{0U, 1U};
     }
-
     [[nodiscard]] constexpr const TextureRecord& GetTexture(TextureAssetHandle h) const noexcept {
-        return m_textures[ResolvePayloadSlot(h, AssetKind::Texture)];
+        return m_textures[Resolve(h, AssetKind::Texture)];
     }
-
     [[nodiscard]] constexpr const BlobRecord& GetBlob(BlobHandle h) const noexcept {
-        return m_blobs[ResolvePayloadSlot(h, AssetKind::Blob)];
+        return m_blobs[Resolve(h, AssetKind::Blob)];
     }
-
     [[nodiscard]] constexpr const AudioRecord& GetAudio(AudioHandle h) const noexcept {
-        return m_audio[ResolvePayloadSlot(h, AssetKind::Audio)];
+        return m_audio[Resolve(h, AssetKind::Audio)];
     }
 
-    [[nodiscard]] u16 AcquireSlot(
-        AssetId id,
-        AssetKind kind,
-        u8 scope,
-        bool& outNeedsLoad) noexcept;
-
-    void TouchAsset(AssetId id) noexcept;
-    void TouchAtlas(AtlasHandle h) noexcept;
-
-    [[nodiscard]] std::span<u8> AllocatePayloadSlice(usize bytes) noexcept;
-    void FreePayloadSlice(const void* ptr, usize bytes) noexcept;
-
-    TextureAssetHandle CommitTexture(
-        u16 masterSlot,
-        u16 width,
-        u16 height,
-        std::span<const u8> rgbaPixels,
-        TextureHandle gpu = kWhiteTexture) noexcept;
-
-    AtlasHandle CommitAtlas(
-        u16 masterSlot,
-        TextureAssetHandle texHandle,
-        std::span<const SpriteFrame> frames) noexcept;
-
-    AtlasHandle CommitGridAtlas(
-        u16 masterSlot,
-        TextureAssetHandle texHandle,
-        u16 cols,
-        u16 rows,
-        Vec2 pivot = {0.5f, 0.5f}) noexcept;
-
-    BlobHandle CommitBlob(
-        u16 masterSlot,
-        std::span<const u8> payload) noexcept;
-
-    AudioHandle CommitAudio(
-        u16 masterSlot,
-        std::span<const f32> pcmSamples,
-        u32 sampleRate = 48000,
-        u8 channels = 2,
-        bool looping = false) noexcept;
-
-    [[nodiscard]] TextureAssetHandle LoadTextureFromDisk(
-        AssetId id,
-        u8 scope,
-        std::string_view primaryPngPath,
-        std::string_view fallbackBmpPath,
-        u16 width,
-        u16 height,
-        TextureHandle gpu = kWhiteTexture) noexcept;
+    // Idempotent by AssetId
+    [[nodiscard]] TextureAssetHandle LoadTexture(
+        AssetId id, u8 scope,
+        std::string_view png, std::string_view bmp,
+        u16 w, u16 h, TextureHandle gpu = kWhiteTexture) noexcept;
 
     [[nodiscard]] AtlasHandle RegisterGridAtlas(
-        AssetId id,
-        u8 scope,
-        TextureAssetHandle texHandle,
-        u16 cols,
-        u16 rows,
-        Vec2 pivot = {0.5f, 0.5f}) noexcept;
+        AssetId id, u8 scope, TextureAssetHandle tex,
+        u16 cols, u16 rows, Vec2 pivot = {0.5f, 0.5f}) noexcept;
 
-    [[nodiscard]] BlobHandle RegisterBlob(
-        AssetId id,
-        u8 scope,
-        std::span<const u8> payload) noexcept;
+    [[nodiscard]] BlobHandle RegisterBlob(AssetId id, u8 scope, std::span<const u8> data) noexcept;
 
     [[nodiscard]] AudioHandle RegisterAudio(
-        AssetId id,
-        u8 scope,
-        std::span<const f32> pcmSamples,
-        u32 sampleRate = 48000,
-        u8 channels = 2,
-        bool looping = false) noexcept;
+        AssetId id, u8 scope, std::span<const f32> pcm,
+        u32 rate = 48000, u8 ch = 2, bool loop = false) noexcept;
 
-    void MarkFailed(u16 masterSlot) noexcept;
+    void Touch(AssetId id) noexcept;
+    void TouchAtlas(AtlasHandle h) noexcept;
+    void BindGpu(TextureAssetHandle tex, TextureHandle gpu) noexcept;
 
-    [[nodiscard]] u32 EvictUnpinned(std::span<TextureHandle> outDestroyedGpuTextures = {}) noexcept;
+    [[nodiscard]] u32 EvictUnpinned(std::span<TextureHandle> outGpu = {}) noexcept;
+    [[nodiscard]] u32 EvictLru(std::span<TextureHandle> outGpu = {},
+                               u32 budget = 0xFFFFFFFFU) noexcept;
 
-    [[nodiscard]] u32 EvictLruToVramBudget(
-        std::span<TextureHandle> outDestroyedGpuTextures = {},
-        u32 targetVramBytes = 0xFFFFFFFFU) noexcept;
+    [[nodiscard]] constexpr u32 VramBytes() const noexcept { return m_vram; }
+    [[nodiscard]] constexpr u32 VramBudget() const noexcept { return m_vramBudget; }
+    [[nodiscard]] constexpr bool OverVram() const noexcept { return m_vram > m_vramBudget; }
+    [[nodiscard]] constexpr u32 EvictCount() const noexcept { return m_evicts; }
+    [[nodiscard]] constexpr u32 ArenaUsed() const noexcept { return m_arena.UsedBytes(); }
 
-    [[nodiscard]] constexpr u32 CurrentVramBytes() const noexcept { return m_currentVramBytes; }
-    [[nodiscard]] constexpr u32 VramBudgetBytes() const noexcept { return m_vramBudgetBytes; }
-    [[nodiscard]] constexpr bool IsOverVramBudget() const noexcept { return m_currentVramBytes > m_vramBudgetBytes; }
-    [[nodiscard]] constexpr u32 EvictedCount() const noexcept { return m_evictedCount; }
-    [[nodiscard]] constexpr u32 ArenaUsedBytes() const noexcept { return m_arena.UsedBytes(); }
-
-    [[nodiscard]] TextureAssetHandle FindTextureHandle(AssetId id) const noexcept {
-        return FindTypedHandle<TextureAssetHandle>(id, AssetKind::Texture);
+    [[nodiscard]] TextureAssetHandle FindTexture(AssetId id) const noexcept {
+        return Find<TextureAssetHandle>(id, AssetKind::Texture);
     }
-    [[nodiscard]] AtlasHandle FindAtlasHandle(AssetId id) const noexcept {
-        return FindTypedHandle<AtlasHandle>(id, AssetKind::Atlas);
+    [[nodiscard]] AtlasHandle FindAtlas(AssetId id) const noexcept {
+        return Find<AtlasHandle>(id, AssetKind::Atlas);
     }
-    [[nodiscard]] BlobHandle FindBlobHandle(AssetId id) const noexcept {
-        return FindTypedHandle<BlobHandle>(id, AssetKind::Blob);
+    [[nodiscard]] BlobHandle FindBlob(AssetId id) const noexcept {
+        return Find<BlobHandle>(id, AssetKind::Blob);
     }
-    [[nodiscard]] AudioHandle FindAudioHandle(AssetId id) const noexcept {
-        return FindTypedHandle<AudioHandle>(id, AssetKind::Audio);
+    [[nodiscard]] AudioHandle FindAudio(AssetId id) const noexcept {
+        return Find<AudioHandle>(id, AssetKind::Audio);
     }
-
-    void BindGpuTexture(TextureAssetHandle texHandle, TextureHandle gpu) noexcept;
 
 private:
-    template <typename HandleT>
-    [[nodiscard]] constexpr u16 ResolvePayloadSlot(HandleT h, AssetKind expectedKind) const noexcept {
-        if (h.index > 0U && h.index < m_slotPool.highWater) {
-            const SlotMeta& m = m_slots[h.index];
-            if (m.generation == h.generation && m.Kind() == expectedKind) {
-                return m.payloadSlot;
-            }
+    enum : u8 { kTex = 0, kAtl = 1, kBlob = 2, kAud = 3 };
+
+    template <typename H>
+    [[nodiscard]] constexpr u16 Resolve(H h, AssetKind kind) const noexcept {
+        if (h.IsValid() && h.index > 0U && h.index < m_slots.high) {
+            const SlotMeta& m = m_meta[h.index];
+            if (m.generation == h.generation && m.Kind() == kind) return m.Payload();
         }
         return 0U;
     }
 
-    template <typename HandleT>
-    [[nodiscard]] HandleT FindTypedHandle(AssetId id, AssetKind expectedKind) const noexcept {
-        const u16* slotIdx = m_idToSlot.Find(id.value);
-        if (slotIdx && *slotIdx < m_slotPool.highWater) {
-            const SlotMeta& m = m_slots[*slotIdx];
-            if (m.Kind() == expectedKind && m.payloadSlot != 0U) {
-                return HandleT{*slotIdx, m.generation};
-            }
+    template <typename H>
+    [[nodiscard]] H Find(AssetId id, AssetKind kind) const noexcept {
+        const u16* p = m_idMap.Find(id.value);
+        if (p && *p > 0U && *p < m_slots.high) {
+            const SlotMeta& m = m_meta[*p];
+            if (m.Kind() == kind && m.Payload() != 0U) return H{*p, m.generation};
         }
-        return HandleT{};
+        return H{};
     }
 
-    [[nodiscard]] bool EnsurePayloadSlot(SlotMeta& meta) noexcept;
-    void PropagateAtlasGpuTexture(u16 texMasterSlot, TextureHandle gpu) noexcept;
-    void EvictSlotInternal(
-        u16 slotIdx,
-        std::span<TextureHandle> outDestroyedGpuTextures,
-        u32& ioGpuDestroyCount) noexcept;
+    [[nodiscard]] u16 Acquire(AssetId id, AssetKind kind, u8 scope, bool& needsLoad) noexcept;
+    void Fail(u16 slot) noexcept;
+    [[nodiscard]] bool EnsurePayload(SlotMeta& m) noexcept;
+    [[nodiscard]] std::span<u8> AllocBytes(usize n) noexcept;
+    void FreeBytes(const void* p, usize n) noexcept;
+    void PropagateGpu(u16 texMaster, TextureHandle gpu) noexcept;
+    void EvictOne(u16 slot, std::span<TextureHandle> outGpu, u32& nGpu) noexcept;
 
-    SlotMeta* m_slots{nullptr};
+    TextureAssetHandle CommitTex(u16 slot, u16 w, u16 h, std::span<const u8> rgba,
+                                 TextureHandle gpu) noexcept;
+    AtlasHandle CommitGrid(u16 slot, TextureAssetHandle tex, u16 cols, u16 rows, Vec2 pivot) noexcept;
+    BlobHandle CommitBlob(u16 slot, std::span<const u8> data) noexcept;
+    AudioHandle CommitAudio(u16 slot, std::span<const f32> pcm, u32 rate, u8 ch, bool loop) noexcept;
+
+    SlotMeta* m_meta{nullptr};
     SpriteFrame* m_sprites{nullptr};
     AtlasRecord* m_atlases{nullptr};
     TextureRecord* m_textures{nullptr};
     BlobRecord* m_blobs{nullptr};
     AudioRecord* m_audio{nullptr};
-    FreePayloadBlock* m_freePayloadHead{nullptr};
-    GpuTextureDestroyFn m_gpuDestroyFn{nullptr};
-    void* m_gpuDestroyUserCtx{nullptr};
+    FreeBlock* m_freeHead{nullptr};
+    GpuDestroyFn m_gpuDestroy{nullptr};
+    void* m_gpuCtx{nullptr};
 
-    RobinHoodMap<u16> m_idToSlot{};
+    RobinHoodMap<u16> m_idMap{};
     AlignedArena m_arena{};
 
-    u32 m_currentVramBytes{0};
-    u32 m_vramBudgetBytes{64U * 1024U * 1024U};
-    u32 m_payloadBaseMarker{0};
-    u32 m_evictedCount{0};
+    u32 m_vram{0};
+    u32 m_vramBudget{64U * 1024U * 1024U};
+    u32 m_payloadMark{0};
+    u32 m_evicts{0};
 
-    PoolState m_slotPool{};
-    std::array<PoolState, 4> m_payloadPools{};
+    Pool m_slots{};
+    std::array<Pool, 4> m_pools{};
     u16 m_maxSprites{0};
-    u16 m_highWaterSprite{0};
-    u16 m_activeScopesMask{0};
-    u16 m_currentFrame{1};
+    u16 m_spriteHigh{0};
+    u16 m_scopes{0};
+    u16 m_frame{1};
 };
 static_assert(sizeof(AssetBank) == 192);
 

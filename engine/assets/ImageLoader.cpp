@@ -177,10 +177,15 @@ bool ImageLoader::LoadPngRgba(
         if (std::fread(chunkHdr.data(), 1U, chunkHdr.size(), fp) != chunkHdr.size()) break;
         const u32 chunkLen = ReadBeU32(chunkHdr.data());
         const u32 chunkType = ReadBeU32(chunkHdr.data() + 4U);
+        if (chunkLen > 0x3FFFFFFFU) {
+            std::fclose(fp);
+            return false;
+        }
 
         if (chunkType == 0x49484452U) {
             std::array<u8, 13> ihdr{};
-            if (chunkLen != 13U || std::fread(ihdr.data(), 1U, ihdr.size(), fp) != ihdr.size()) {
+            if (chunkLen != 13U || std::fread(ihdr.data(), 1U, ihdr.size(), fp) != ihdr.size() ||
+                std::fseek(fp, 4L, SEEK_CUR) != 0) {
                 std::fclose(fp);
                 return false;
             }
@@ -192,7 +197,6 @@ bool ImageLoader::LoadPngRgba(
                 return false;
             }
             ihdrValid = true;
-            std::fseek(fp, 4L, SEEK_CUR);
         } else if (chunkType == 0x49444154U) {
             if (!ihdrValid) {
                 std::fclose(fp);
@@ -213,11 +217,17 @@ bool ImageLoader::LoadPngRgba(
                 }
                 remaining -= toRead;
             }
-            std::fseek(fp, 4L, SEEK_CUR);
+            if (std::fseek(fp, 4L, SEEK_CUR) != 0) {
+                std::fclose(fp);
+                return false;
+            }
         } else if (chunkType == 0x49454E44U) {
             break;
         } else {
-            std::fseek(fp, static_cast<long>(chunkLen + 4U), SEEK_CUR);
+            if (std::fseek(fp, static_cast<long>(chunkLen) + 4L, SEEK_CUR) != 0) {
+                std::fclose(fp);
+                return false;
+            }
         }
     }
 
@@ -250,12 +260,12 @@ bool ImageLoader::LoadBmpRgba(
     const i32 width = static_cast<i32>(ReadLeU32(&hdr[18]));
     const i32 rawHeight = static_cast<i32>(ReadLeU32(&hdr[22]));
     const bool topDown = (rawHeight < 0);
-    const i32 height = topDown ? -rawHeight : rawHeight;
+    const u32 absHeight = topDown ? (0U - static_cast<u32>(rawHeight)) : static_cast<u32>(rawHeight);
     const u16 bpp = ReadLeU16(&hdr[28]);
     const u32 compression = ReadLeU32(&hdr[30]);
 
     if (width != static_cast<i32>(expectedWidth) ||
-        height != static_cast<i32>(expectedHeight) ||
+        absHeight != static_cast<u32>(expectedHeight) ||
         bpp != 32U ||
         (compression != 0U && compression != 3U) ||
         std::fseek(fp, static_cast<long>(pixelOffset), SEEK_SET) != 0) {

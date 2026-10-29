@@ -9,9 +9,8 @@ namespace en {
 
 class AssetBank;
 
-// 64-component sparse-set ECS container with scene hierarchy and deferred command queue.
-// Non-copyable owner of a single AlignedArena slab.
-// Invariant: EntityId index 0 is reserved for kNullEntity, destroyed slots recycle in FIFO order with generations in 1..0x7FFF, and deferred commands flush at EndTick.
+// Sparse-set ECS + LCRS hierarchy + deferred commands. Owns one AlignedArena.
+// Index 0 reserved. Free slots FIFO, generation 1..0x7FFF. Commands flush in EndTick.
 class alignas(64) World {
 public:
     World() noexcept = default;
@@ -42,9 +41,6 @@ public:
     }
 
     [[nodiscard]] Result<EntityId, WorldErrc> Spawn(const EntitySpawnDesc& desc = {}) noexcept;
-    [[nodiscard]] Result<EntityId, WorldErrc> SpawnNow(const EntitySpawnDesc& desc = {}) noexcept {
-        return Spawn(desc);
-    }
     bool Destroy(EntityId id, bool destroyChildren = true) noexcept;
     [[nodiscard]] Result<EntityId, WorldErrc> CloneEntity(
         EntityId source,
@@ -52,7 +48,8 @@ public:
         bool cloneChildren = true) noexcept;
 
     [[nodiscard]] constexpr bool IsAlive(EntityId id) const noexcept {
-        return id.index > 0U && id.index < m_maxEntities && m_generations[id.index] == id.generation;
+        return id.index > 0U && id.index < m_maxEntities &&
+               m_generations[id.index] == id.generation;
     }
     [[nodiscard]] constexpr u32 AliveCount() const noexcept { return m_aliveCount; }
     [[nodiscard]] constexpr u16 MaxAllocatedIndex() const noexcept { return m_maxAllocatedIndex; }
@@ -83,7 +80,8 @@ public:
     template <Component T>
     bool Remove(EntityId id) noexcept {
         constexpr u8 tid = static_cast<u8>(T::kTypeId);
-        if (!IsAlive(id) || (m_registeredPoolsMask & (1ULL << tid)) == 0ULL || !GetPool<T>().Remove(id)) {
+        if (!IsAlive(id) || (m_registeredPoolsMask & (1ULL << tid)) == 0ULL ||
+            !GetPool<T>().Remove(id)) {
             return false;
         }
         m_componentMasks[id.index] &= ~(1ULL << tid);
@@ -116,6 +114,8 @@ public:
         return static_cast<const ComponentPool<T>&>(m_pools[static_cast<u8>(T::kTypeId)]);
     }
 
+    // --- Views ----------------------------------------------------------------
+
     template <typename WorldPtr, Component FirstC, Component... RestCs>
     class ViewRange {
     public:
@@ -144,7 +144,9 @@ public:
                 return *this;
             }
 
-            [[nodiscard]] constexpr bool operator==(Sentinel) const noexcept { return cur == end; }
+            [[nodiscard]] constexpr bool operator==(Sentinel) const noexcept {
+                return cur == end;
+            }
 
             [[nodiscard]] constexpr auto operator*() const noexcept {
                 const u16 idx = cur->index;
@@ -192,6 +194,8 @@ public:
         }
     }
 
+    // --- Deferred commands ----------------------------------------------------
+
     [[nodiscard]] Result<void, WorldErrc> DeferDestroy(
         EntityId id,
         bool destroyChildren = true) noexcept {
@@ -226,19 +230,24 @@ public:
 
     [[nodiscard]] Result<void, WorldErrc> FlushCommands() noexcept;
 
+    // --- Transforms -----------------------------------------------------------
+
     [[nodiscard]] constexpr LocalTransform2D GetLocalTransform(EntityId id) const noexcept {
         return IsAlive(id) ? m_transforms.Local(id.index) : LocalTransform2D{};
     }
+
     [[nodiscard]] LocalTransform2D& ModifyLocalTransformByIndex(u16 idx) noexcept {
         m_transforms.MarkSubtreeDirty(idx, m_maxEntities);
         return m_transforms.Local(idx);
     }
+
     void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
         if (IsAlive(id)) {
             m_transforms.Local(id.index) = local;
             m_transforms.MarkSubtreeDirty(id.index, m_maxEntities);
         }
     }
+
     void Teleport(EntityId id, const LocalTransform2D& local) noexcept {
         if (IsAlive(id)) {
             m_transforms.Local(id.index) = local;
@@ -250,23 +259,29 @@ public:
     [[nodiscard]] constexpr WorldTransform2D GetWorldTransform(EntityId id) const noexcept {
         return IsAlive(id) ? m_transforms.World(id.index) : WorldTransform2D{};
     }
+
     [[nodiscard]] constexpr const WorldTransform2D& GetWorldByIndex(u16 idx) const noexcept {
         return m_transforms.World(idx);
     }
+
     [[nodiscard]] constexpr const PrevWorldSnapshot2D& GetPrevWorldByIndex(u16 idx) const noexcept {
         return m_transforms.Prev(idx);
     }
+
     [[nodiscard]] constexpr u8 GetTimeChannelByIndex(u16 idx) const noexcept {
         return m_timeChannels[idx];
     }
+
     constexpr void SetTimeChannel(EntityId id, TimeChannel ch) noexcept {
         if (IsAlive(id)) {
             m_timeChannels[id.index] = static_cast<u8>(ch);
         }
     }
+
     [[nodiscard]] constexpr u64 GetComponentMaskByIndex(u16 idx) const noexcept {
         return m_componentMasks[idx];
     }
+
     [[nodiscard]] constexpr EntityId EntityAtSlot(u16 idx) const noexcept {
         return {idx, m_generations[idx]};
     }
@@ -278,19 +293,23 @@ public:
         if (!IsAlive(child) || (parent.IsValid() && !IsAlive(parent))) {
             return Err(WorldErrc::DeadEntity);
         }
-        const u16 pIdx = parent.IsValid() ? parent.index : kInvalidDenseIndex;
-        return m_transforms.SetParent(child.index, pIdx, m_maxEntities, keepWorldTransform);
+        return m_transforms.SetParent(
+            child.index,
+            parent.IsValid() ? parent.index : kInvalidDenseIndex,
+            m_maxEntities,
+            keepWorldTransform);
     }
 
-    [[nodiscard]] constexpr EntityId GetParent(EntityId child) const noexcept {
-        if (!IsAlive(child)) {
+    [[nodiscard]] constexpr EntityId GetParent(EntityId id) const noexcept {
+        if (!IsAlive(id)) {
             return kNullEntity;
         }
-        const u16 pIdx = m_transforms.ParentOf(child.index);
+        const u16 pIdx = m_transforms.ParentOf(id.index);
         return (pIdx != kInvalidDenseIndex && pIdx < m_maxEntities)
                    ? EntityId{pIdx, m_generations[pIdx]}
                    : kNullEntity;
     }
+
     void PropagateTransforms() noexcept {
         m_transforms.PropagateHierarchy(AliveWords(), m_maxAllocatedIndex);
     }
@@ -298,26 +317,34 @@ public:
     [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldTransforms() const noexcept {
         return m_transforms.WorldSpan(static_cast<u16>(m_maxAllocatedIndex + 1U));
     }
+
     [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevWorldTransforms() const noexcept {
         return m_transforms.PrevSpan(static_cast<u16>(m_maxAllocatedIndex + 1U));
     }
+
     [[nodiscard]] constexpr std::span<const u8> TimeChannels() const noexcept {
         return {m_timeChannels, static_cast<usize>(m_maxAllocatedIndex + 1U)};
     }
+
     [[nodiscard]] constexpr std::span<const u64> MovedWords() const noexcept {
         return m_transforms.MovedWords(m_aliveWordCount);
     }
+
     [[nodiscard]] constexpr std::span<const u64> AliveWords() const noexcept {
         return {m_aliveWords, m_aliveWordCount};
     }
+
     [[nodiscard]] constexpr std::span<const u64> TeleportedWords() const noexcept {
         return {m_teleportedWords, m_aliveWordCount};
     }
 
+    // --- Tick lifecycle -------------------------------------------------------
+
     void BeginTick(const SimStepView& step) noexcept {
         std::fill_n(m_teleportedWords, ActiveWordCount(), 0ULL);
         m_transforms.PropagateHierarchy(AliveWords(), m_maxAllocatedIndex);
-        m_transforms.SnapshotPreviousTransforms(AliveWords(), m_timeChannels, step.frozenMask, m_maxAllocatedIndex);
+        m_transforms.SnapshotPreviousTransforms(
+            AliveWords(), m_timeChannels, step.frozenMask, m_maxAllocatedIndex);
         ++m_tickCount;
     }
 
@@ -325,6 +352,8 @@ public:
         (void)FlushCommands();
         m_transforms.PropagateHierarchy(AliveWords(), m_maxAllocatedIndex);
     }
+
+    // --- Prefab / snapshot ----------------------------------------------------
 
     [[nodiscard]] Result<EntityId, WorldErrc> InstantiatePrefab(
         const AssetBank& bank,
@@ -346,7 +375,7 @@ public:
 
     [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
-    [[nodiscard]] bool EmplaceRawByTypeId(
+    bool EmplaceRawByTypeId(
         EntityId id,
         u8 typeId,
         const void* rawData,
@@ -361,7 +390,8 @@ private:
     };
 
     [[nodiscard]] constexpr usize ActiveWordCount() const noexcept {
-        return std::min<usize>(m_aliveWordCount, (static_cast<usize>(m_maxAllocatedIndex) + 64U) >> 6U);
+        return std::min<usize>(
+            m_aliveWordCount, (static_cast<usize>(m_maxAllocatedIndex) + 64U) >> 6U);
     }
 
     template <typename Fn>
@@ -376,17 +406,22 @@ private:
 
     void PushFreeSlot(u16 idx, u16 nextGen) noexcept;
     void DestroySingleSlot(EntityId id) noexcept;
+
     [[nodiscard]] usize CollectSubtree(
         u16 rootIdx,
         bool includeChildren,
         std::span<u16> outNodes,
         std::span<i16> outParentMap) const noexcept;
+
     [[nodiscard]] bool WriteEntityComponents(class BinaryWriter& writer, u16 idx) const noexcept;
 
     template <Component FirstC, Component... RestCs>
     [[nodiscard]] constexpr std::span<const EntityId> SmallestDriverSpan() const noexcept {
         std::span<const EntityId> driver = GetPool<FirstC>().Entities();
-        ((GetPool<RestCs>().Size() < driver.size() ? (driver = GetPool<RestCs>().Entities(), 0) : 0), ...);
+        ((GetPool<RestCs>().Size() < driver.size()
+              ? (driver = GetPool<RestCs>().Entities(), 0)
+              : 0),
+         ...);
         return driver;
     }
 
@@ -409,7 +444,7 @@ private:
         const void* payload,
         u16 payloadBytes) noexcept;
 
-    // Cache Line 0 (64B): Hot ECS query, pool lookup, and entity slot state.
+    // Cache line 0: hot ECS query / entity slot state
     u16* m_generations{nullptr};
     u64* m_componentMasks{nullptr};
     u8* m_timeChannels{nullptr};
@@ -424,10 +459,10 @@ private:
     u16 m_freeTail{kInvalidDenseIndex};
     u16 m_defaultPoolCap{0};
 
-    // Cache Line 1 (64B): Hierarchical transform solver.
+    // Cache line 1: transform solver
     TransformSolver m_transforms{};
 
-    // Cache Line 2 (64B): Arena, command buffer state, and telemetry counters.
+    // Cache line 2: arena, commands, telemetry
     AlignedArena m_arena{};
     u8* m_cmdTape{nullptr};
     u64* m_teleportedWords{nullptr};

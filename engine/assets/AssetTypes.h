@@ -4,8 +4,7 @@
 
 namespace en {
 
-// Case-insensitive, slash-normalized FNV-1a asset identifier interoperable with StringId.
-// Value type; value == 0 represents an unassigned asset identifier.
+// FNV-1a path id (slash-normalized, case-insensitive). 0 = invalid.
 struct alignas(8) AssetId {
     u64 value{0};
 
@@ -14,11 +13,9 @@ struct alignas(8) AssetId {
     constexpr AssetId(StringId sid) noexcept : value(sid.value) {}
 
     [[nodiscard]] constexpr operator StringId() const noexcept { return StringId{value}; }
-
     [[nodiscard]] static constexpr AssetId Hash(std::string_view str) noexcept {
         return AssetId{StringId::Hash(str).value};
     }
-
     [[nodiscard]] constexpr bool IsValid() const noexcept { return value != 0ULL; }
     [[nodiscard]] constexpr auto operator<=>(const AssetId&) const noexcept = default;
 };
@@ -67,12 +64,11 @@ struct alignas(8) SpriteFrame {
     Vec2 pivot{0.5f, 0.5f};
     TextureHandle gpuTexture{kWhiteTexture};
     u16 generation{0};
-
-    [[nodiscard]] constexpr Vec2 Pivot() const noexcept { return pivot; }
+    u16 pad{0};
 };
 static_assert(sizeof(SpriteFrame) == 40);
 
-// Texture record (16B); while unoccupied on the freelist, width stores nextFree.
+// Free: width stores nextFree.
 struct alignas(16) TextureRecord {
     const u8* pixels{nullptr};
     TextureHandle gpu{kWhiteTexture};
@@ -80,13 +76,14 @@ struct alignas(16) TextureRecord {
     u16 height{1};
 
     [[nodiscard]] constexpr std::span<const u8> PixelBytes() const noexcept {
-        const usize count = static_cast<usize>(width) * static_cast<usize>(height) * 4U;
-        return pixels ? std::span<const u8>(pixels, count) : std::span<const u8>{};
+        if (!pixels || width == 0U || height == 0U) return {};
+        const usize n = static_cast<usize>(width) * static_cast<usize>(height) * 4U;
+        return {pixels, n};
     }
 };
 static_assert(sizeof(TextureRecord) == 16);
 
-// Sprite atlas record (8B); while unoccupied on the freelist, firstSprite stores nextFree.
+// Free: firstSprite stores nextFree.
 struct alignas(8) AtlasRecord {
     u16 firstSprite{0};
     u16 spriteCount{0};
@@ -95,20 +92,19 @@ struct alignas(8) AtlasRecord {
 };
 static_assert(sizeof(AtlasRecord) == 8);
 
-// Binary blob record (16B); while unoccupied on the freelist, size stores nextFree.
+// Free: size stores nextFree.
 struct alignas(16) BlobRecord {
     const u8* data{nullptr};
     u32 size{0};
     u32 reserved{0};
 
     [[nodiscard]] constexpr std::span<const u8> Bytes() const noexcept {
-        return data ? std::span<const u8>(data, size) : std::span<const u8>{};
+        return (data && size > 0U) ? std::span<const u8>{data, size} : std::span<const u8>{};
     }
-    [[nodiscard]] constexpr bool IsValid() const noexcept { return data != nullptr && size > 0U; }
 };
 static_assert(sizeof(BlobRecord) == 16);
 
-// Decoded PCM audio clip record (16B); while unoccupied on the freelist, sampleRate stores nextFree.
+// Free: sampleRate stores nextFree.
 struct alignas(16) AudioRecord {
     const f32* pcm{nullptr};
     u32 frameCount{0};
@@ -119,27 +115,37 @@ struct alignas(16) AudioRecord {
     [[nodiscard]] constexpr u32 TotalSamples() const noexcept {
         return frameCount * static_cast<u32>(channels);
     }
-
     [[nodiscard]] constexpr std::span<const f32> Samples() const noexcept {
-        return pcm ? std::span<const f32>(pcm, TotalSamples()) : std::span<const f32>{};
+        return (pcm && frameCount > 0U) ? std::span<const f32>{pcm, TotalSamples()}
+                                        : std::span<const f32>{};
     }
-
-    [[nodiscard]] constexpr bool IsValid() const noexcept { return pcm != nullptr && frameCount > 0U; }
 };
 static_assert(sizeof(AudioRecord) == 16);
 
-// Master asset slot metadata (16B, 4 slots per cache line).
-// When unoccupied on the freelist, assetId == 0 and payloadSlot stores nextFree (0 == end of list).
+// Free: assetId==0, payloadAndKind = nextFree.
+// Live: low 13 = payload index, high 3 = AssetKind.
 struct alignas(16) SlotMeta {
     u64 assetId{0};
     u16 scopeMask{0};
     u16 lastUsedFrame{0};
     u16 generation{0};
-    u16 payloadSlot : 13 {0};
-    u16 kind        : 3  {0};
+    u16 payloadAndKind{0};
 
+    [[nodiscard]] constexpr u16 Payload() const noexcept {
+        return static_cast<u16>(payloadAndKind & 0x1FFFU);
+    }
     [[nodiscard]] constexpr AssetKind Kind() const noexcept {
-        return static_cast<AssetKind>(kind);
+        return static_cast<AssetKind>((payloadAndKind >> 13U) & 0x7U);
+    }
+    constexpr void SetPayload(u16 slot) noexcept {
+        payloadAndKind = static_cast<u16>((payloadAndKind & 0xE000U) | (slot & 0x1FFFU));
+    }
+    constexpr void SetKind(AssetKind k) noexcept {
+        payloadAndKind = static_cast<u16>((payloadAndKind & 0x1FFFU) |
+                                          (static_cast<u16>(k) << 13U));
+    }
+    constexpr void Set(u16 slot, AssetKind k) noexcept {
+        payloadAndKind = static_cast<u16>((slot & 0x1FFFU) | (static_cast<u16>(k) << 13U));
     }
 };
 static_assert(sizeof(SlotMeta) == 16);

@@ -140,8 +140,8 @@ void WorldExtractor::Extract(
 
             Camera2D cam{};
             cam.viewport = rig.viewport;
-            cam.worldCenterX = Lerp(prev.x, wt.x, camAlpha);
-            cam.worldCenterY = Lerp(prev.y, wt.y, camAlpha);
+            cam.cx = Lerp(prev.x, wt.x, camAlpha);
+            cam.cy = Lerp(prev.y, wt.y, camAlpha);
             cam.zoom = rig.zoom;
             cam.pixelsPerMeter = (rig.pixelsPerMeter > 0.0f) ? rig.pixelsPerMeter : defaultPixelsPerMeter;
             cam.screenSpace = rig.screenSpace;
@@ -152,9 +152,9 @@ void WorldExtractor::Extract(
                 f32 c = 1.0f;
                 f32 s = 0.0f;
                 FastSinCos(t * 17.0f, c, s);
-                cam.worldCenterX += s * (0.5f * traumaSq);
+                cam.cx += s * (0.5f * traumaSq);
                 FastSinCos(t * 29.0f, c, s);
-                cam.worldCenterY += c * (0.5f * traumaSq);
+                cam.cy += c * (0.5f * traumaSq);
             }
             outRenderList.SetView(rig.viewSlot, cam);
         }
@@ -210,13 +210,13 @@ void WorldExtractor::Extract(
 
             const i32 depthOffset = static_cast<i32>(rDepth * 100.0f);
             const u16 resolvedDepth = sp.YSort()
-                                          ? SortKey::EncodeYDepth(ry + rDepth)
+                                          ? SortKey::YDepth(ry + rDepth)
                                           : static_cast<u16>(std::clamp(static_cast<i32>(sp.baseDepth) + depthOffset, 0, 65535));
 
-            outRenderList.PushQuad({
+            outRenderList.Push({
                 .center = {rx, ry},
                 .size = {sp.width * sx, sp.height * sy},
-                .pivot = framePtr->Pivot(),
+                .pivot = framePtr->pivot,
                 .cosRot = c,
                 .sinRot = s,
                 .uv = framePtr->uv,
@@ -224,7 +224,7 @@ void WorldExtractor::Extract(
                 .texture = framePtr->gpuTexture,
                 .depth = resolvedDepth,
                 .layer = sp.layer,
-                .viewSlot = sp.ViewSlot(),
+                .view = sp.ViewSlot(),
                 .blend = sp.Blend(),
                 .flipX = sp.FlipX(),
                 .flipY = sp.FlipY(),
@@ -263,7 +263,7 @@ void WorldExtractor::Extract(
             const f32 diameter = light.radius * pulse * 2.0f;
             const f32 intensity = light.intensity * pulse;
 
-            outRenderList.PushQuad({
+            outRenderList.Push({
                 .center = {lx, ly},
                 .size = {diameter, diameter},
                 .color = {

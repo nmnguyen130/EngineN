@@ -2,6 +2,8 @@
 
 #include "input/InputTypes.h"
 
+#include <bit>
+
 namespace en {
 
 // Jump buffer + coyote + release buffer. Age tables only.

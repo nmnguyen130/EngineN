@@ -35,11 +35,6 @@ file(GLOB ENGINE_SRCS
     "engine/renderer/*.cpp"
     "engine/assets/*.cpp"
     "engine/world/*.cpp"
-    "engine/physics/*.cpp"
-    "engine/gameplay/*.cpp"
-    "engine/audio/*.cpp"
-    "engine/debug/*.cpp"
-    # "engine/framework/*.cpp"
 )
 
 add_library(engine STATIC ${ENGINE_SRCS})

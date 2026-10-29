@@ -5,9 +5,9 @@
 
 namespace en {
 
-// Non-recursive scene-graph hierarchy and world-transform solver.
-// Non-owning view over World's AlignedArena; traverses arbitrary-fanout Left-Child Right-Sibling subtrees via parent links.
-// Invariant: whenever bit idx in m_movedWords is 0, m_prev[idx] equals m_world[idx].ToSnapshot().
+// LCRS hierarchy + world transform solver. Arena-backed, non-owning.
+// No PrevSibling: O(siblings) unlink is fine for Metroidvania fan-out.
+// moved bit clear => prev == world.ToSnapshot(). Frozen channels skip prev write.
 class alignas(64) TransformSolver {
 public:
     [[nodiscard]] bool Init(AlignedArena& arena, u16 maxEntities) noexcept;
@@ -82,26 +82,29 @@ public:
         u16 maxAllocatedIndex) noexcept;
 
     [[nodiscard]] constexpr LocalTransform2D& Local(u16 idx) noexcept { return m_local[idx]; }
-    [[nodiscard]] constexpr const LocalTransform2D& Local(u16 idx) const noexcept { return m_local[idx]; }
+    [[nodiscard]] constexpr const LocalTransform2D& Local(u16 idx) const noexcept {
+        return m_local[idx];
+    }
 
     [[nodiscard]] constexpr WorldTransform2D& World(u16 idx) noexcept { return m_world[idx]; }
-    [[nodiscard]] constexpr const WorldTransform2D& World(u16 idx) const noexcept { return m_world[idx]; }
+    [[nodiscard]] constexpr const WorldTransform2D& World(u16 idx) const noexcept {
+        return m_world[idx];
+    }
 
     [[nodiscard]] constexpr PrevWorldSnapshot2D& Prev(u16 idx) noexcept { return m_prev[idx]; }
-    [[nodiscard]] constexpr const PrevWorldSnapshot2D& Prev(u16 idx) const noexcept { return m_prev[idx]; }
+    [[nodiscard]] constexpr const PrevWorldSnapshot2D& Prev(u16 idx) const noexcept {
+        return m_prev[idx];
+    }
 
     [[nodiscard]] constexpr std::span<const WorldTransform2D> WorldSpan(u16 count) const noexcept {
         return {m_world, count};
     }
-
     [[nodiscard]] constexpr std::span<const PrevWorldSnapshot2D> PrevSpan(u16 count) const noexcept {
         return {m_prev, count};
     }
-
     [[nodiscard]] constexpr std::span<const u64> MovedWords(u16 wordCount) const noexcept {
         return {m_movedWords, wordCount};
     }
-
     [[nodiscard]] constexpr std::span<const u64> DirtyWords(u16 wordCount) const noexcept {
         return {m_dirtyWords, wordCount};
     }
@@ -109,6 +112,7 @@ public:
     [[nodiscard]] constexpr u16 ParentOf(u16 idx) const noexcept { return m_parent[idx]; }
     [[nodiscard]] constexpr u16 FirstChildOf(u16 idx) const noexcept { return m_firstChild[idx]; }
     [[nodiscard]] constexpr u16 NextSiblingOf(u16 idx) const noexcept { return m_nextSibling[idx]; }
+
     [[nodiscard]] u16 MaxSubtreeDepth(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) const noexcept;
 
     static void ComputeWorldFromLocal(const LocalTransform2D& loc, WorldTransform2D& outW) noexcept;
@@ -130,6 +134,7 @@ private:
             CombineParentChild(m_world[p], m_local[cur], m_world[cur]);
         }
     }
+
     void DetachFromParentList(u16 childIdx) noexcept;
     void ResolveDirtyChain(u16 idx, u16 maxEntities = kInvalidDenseIndex) noexcept;
     void EvaluateDirtySubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;

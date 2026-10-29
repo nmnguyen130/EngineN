@@ -4,9 +4,8 @@
 
 namespace en {
 
-// 2D quad command buffer, frustum culler, in-place sorter, and geometry batcher.
-// Self-contained value type with fixed L2-resident inline storage (282 KB).
-// Invariant: Compile() orders m_keys monotonically and coalesces state-identical runs into DrawBatches.
+// 2D quad command buffer providing frustum culling, key sorting, and state batching.
+// Invariant: zero runtime allocations, fixed inline storage, 64-byte cache alignment.
 class alignas(64) RenderList {
 public:
     static constexpr u32 kMaxQuads = 4096;
@@ -14,186 +13,122 @@ public:
     static constexpr u32 kChunkQuads = 512;
     static constexpr u8 kMaxPasses = 4;
     static constexpr u8 kMaxViews = 8;
-    static constexpr u8 kFirstClipViewSlot = 4;
-    static constexpr u8 kMaxClipViewSlot = 6;
     static constexpr u8 kHudViewSlot = 7;
 
     constexpr RenderList() noexcept { Reset({1280, 720}); }
 
-    constexpr void Reset(ViewportExtent viewportSize = {1280, 720}) noexcept {
-        if (viewportSize.IsValid()) m_viewport = viewportSize;
-        m_prevKey = 0ULL;
-        m_stats = RenderStats{};
-        m_clipViewStack.fill(kHudViewSlot);
-        m_clipStackDepth = 0U;
-        m_nextClipViewSlot = kFirstClipViewSlot;
-        m_activeClipView = kHudViewSlot;
-        m_enabledPassMask = 0x0FU;
-        m_clearPassMask = 0x01U;
-        m_isMonotonic = true;
+    constexpr void Reset(Viewport vp = {1280, 720}) noexcept {
+        if (vp.Valid()) m_viewport = vp;
+        m_lastKey = 0;
+        m_stats = {};
+        m_enabledPassMask = 0x0F;
+        m_clearPassMask = 0x01;
+        m_monotonic = true;
         m_compiled = false;
         m_pixelSnap = false;
-
-        for (u8 i = 0U; i < kMaxPasses; ++i) {
-            m_passes[i] = RenderPassDesc{.clear = (i == 0U)};
-        }
-        for (u8 i = 0U; i < kMaxViews; ++i) {
-            m_views[i] = Camera2D{.screenSpace = (i >= kFirstClipViewSlot)};
-        }
+        for (u8 i = 0; i < kMaxPasses; ++i)
+            m_passes[i] = PassDesc{.clear = (i == 0)};
+        for (u8 i = 0; i < kMaxViews; ++i)
+            m_views[i] = Camera2D{.screenSpace = (i == kHudViewSlot)};
     }
 
-    constexpr void SetPass(u8 passId, const RenderPassDesc& desc) noexcept {
-        if (passId >= kMaxPasses) return;
-        m_passes[passId] = desc;
-        const u8 bit = static_cast<u8>(1U << passId);
-        if (desc.enabled) m_enabledPassMask |= bit;
-        else m_enabledPassMask &= static_cast<u8>(~bit);
-
-        if (desc.enabled && desc.clear) m_clearPassMask |= bit;
-        else m_clearPassMask &= static_cast<u8>(~bit);
+    constexpr void SetPass(u8 id, const PassDesc& d) noexcept {
+        if (id >= kMaxPasses) return;
+        m_passes[id] = d;
+        const u8 bit = static_cast<u8>(1U << id);
+        m_enabledPassMask = d.enabled ? static_cast<u8>(m_enabledPassMask | bit) : static_cast<u8>(m_enabledPassMask & ~bit);
+        m_clearPassMask = (d.enabled && d.clear) ? static_cast<u8>(m_clearPassMask | bit)
+                                             : static_cast<u8>(m_clearPassMask & ~bit);
     }
 
-    constexpr void SetView(u8 viewSlot, const Camera2D& cam) noexcept {
-        if (viewSlot < kMaxViews) m_views[viewSlot] = cam;
+    constexpr void SetView(u8 slot, const Camera2D& cam) noexcept {
+        if (slot < kMaxViews) m_views[slot] = cam;
     }
 
-    constexpr void SetScissor(u8 viewSlot, Rect normalizedScissor) noexcept {
-        if (viewSlot < kMaxViews) m_views[viewSlot].scissor = normalizedScissor;
+    constexpr void SetScissor(u8 slot, Rect norm) noexcept {
+        if (slot < kMaxViews) m_views[slot].scissor = norm;
     }
 
-    constexpr void SetPixelScissor(u8 viewSlot, Rect pixelScissor) noexcept {
-        if (viewSlot >= kMaxViews || !m_viewport.IsValid()) return;
-        const Camera2D& cam = m_views[viewSlot];
-        const f32 vpX = cam.viewport.x * static_cast<f32>(m_viewport.w);
-        const f32 vpY = cam.viewport.y * static_cast<f32>(m_viewport.h);
-        const f32 vpW = std::max(1.0f, cam.viewport.w * static_cast<f32>(m_viewport.w));
-        const f32 vpH = std::max(1.0f, cam.viewport.h * static_cast<f32>(m_viewport.h));
-        m_views[viewSlot].scissor = Rect{
-            std::clamp((pixelScissor.x - vpX) / vpW, 0.0f, 1.0f),
-            std::clamp((pixelScissor.y - vpY) / vpH, 0.0f, 1.0f),
-            std::clamp(pixelScissor.w / vpW, 0.0f, 1.0f),
-            std::clamp(pixelScissor.h / vpH, 0.0f, 1.0f),
-        };
-    }
+    constexpr void SetPixelSnap(bool on) noexcept { m_pixelSnap = on; }
 
-    constexpr u8 PushClipRect(Rect pixelClip, u8 baseViewSlot = kHudViewSlot) noexcept {
-        if (m_clipStackDepth >= m_clipViewStack.size() || m_nextClipViewSlot > kMaxClipViewSlot) {
-            return m_activeClipView;
-        }
-        const u8 parentSlot = (m_clipStackDepth > 0U) ? m_activeClipView : (baseViewSlot & 0x07U);
-        m_clipViewStack[m_clipStackDepth++] = m_activeClipView;
+    void Push(const QuadCmd& cmd) noexcept;
 
-        const u8 slot = m_nextClipViewSlot++;
-        m_views[slot] = m_views[parentSlot];
-        SetPixelScissor(slot, pixelClip);
-        if (m_clipStackDepth > 1U) {
-            m_views[slot].scissor = m_views[parentSlot].scissor.Intersection(m_views[slot].scissor);
-        }
-        m_activeClipView = slot;
-        return slot;
-    }
+    void PushRect(Rect r, Color c, u8 pass = 0, u8 layer = 10, u16 depth = 32768,
+                  u8 view = 0, BlendMode blend = BlendMode::Alpha) noexcept;
 
-    constexpr void PopClipRect() noexcept {
-        if (m_clipStackDepth > 0U) m_activeClipView = m_clipViewStack[--m_clipStackDepth];
-    }
+    void PushTile(Rect r, TextureHandle tex, Vec2 tile,
+                  Rect uv = {0, 0, 1, 1}, Color c = {1, 1, 1, 1},
+                  u8 pass = 0, u8 layer = 5, u16 depth = 32768, u8 view = 0) noexcept;
 
-    [[nodiscard]] constexpr u8 ActiveClipViewSlot() const noexcept { return m_activeClipView; }
+    void PushOutline(Rect r, f32 thick, Color c, u8 pass = 0, u8 layer = 10,
+                     u16 depth = 32768, u8 view = 0) noexcept;
 
-    constexpr void SetPixelSnap(bool enabled) noexcept { m_pixelSnap = enabled; }
-    [[nodiscard]] constexpr bool PixelSnap() const noexcept { return m_pixelSnap; }
+    void PushLine(Vec2 a, Vec2 b, f32 thick, Color c, u8 pass = 0, u8 layer = 10,
+                  u16 depth = 32768, u8 view = 0) noexcept;
 
-    void PushQuad(const QuadCmd& cmd) noexcept;
+    void PushCircle(Vec2 center, f32 radius, u32 segs, f32 thick, Color c,
+                    u8 pass = 0, u8 layer = 10, u8 view = 0) noexcept;
 
-    void PushRect(
-        Rect rect, Color color, u8 passId = 0, u8 layer = 10,
-        u16 depth = 32768, u8 viewSlot = 0, BlendMode blend = BlendMode::Alpha) noexcept;
+    void PushNine(const NineSlice& n, u8 pass = 0, u8 layer = 20, u8 view = 0) noexcept;
 
-    void PushTiledRect(
-        Rect rect, TextureHandle texture, Vec2 tileSize,
-        Rect uvRect = {0.0f, 0.0f, 1.0f, 1.0f}, Color color = {1.0f, 1.0f, 1.0f, 1.0f},
-        u8 passId = 0, u8 layer = 5, u16 depth = 32768, u8 viewSlot = 0) noexcept;
-
-    void PushRectOutline(
-        Rect rect, f32 thickness, Color color,
-        u8 passId = 0, u8 layer = 10, u16 depth = 32768, u8 viewSlot = 0) noexcept;
-
-    void PushLine(
-        Vec2 a, Vec2 b, f32 thickness, Color color,
-        u8 passId = 0, u8 layer = 10, u16 depth = 32768, u8 viewSlot = 0) noexcept;
-
-    void PushCircleOutline(
-        Vec2 center, f32 radius, u32 segments, f32 thickness, Color color,
-        u8 passId = 0, u8 layer = 10, u8 viewSlot = 0) noexcept;
-
-    void PushNineSlice(
-        const NineSliceDesc& desc, u8 passId = 0, u8 layer = 20, u8 viewSlot = 0) noexcept;
-
-    void PushText(
-        Vec2 pos, std::string_view text, Color color, f32 scale = 1.0f,
-        u8 passId = 0, u8 layer = 30, u8 viewSlot = 0, TextureHandle fontTex = {}) noexcept;
+    void PushText(Vec2 pos, std::string_view text, Color c, f32 scale = 1.0f,
+                  u8 pass = 0, u8 layer = 30, u8 view = 0, TextureHandle font = {}) noexcept;
 
     [[nodiscard]] static constexpr Vec2 MeasureText(std::string_view text, f32 scale = 1.0f) noexcept {
-        if (text.empty()) return {0.0f, 0.0f};
-        const f32 quadSize = 16.0f * scale;
-        const f32 advanceX = 12.0f * scale;
-        const f32 lineStep = quadSize * 1.15f;
-        f32 maxW = 0.0f;
-        f32 curW = 0.0f;
-        u32 lines = 1U;
-        for (const char c : text) {
-            if (c == '\n') {
-                maxW = std::max(maxW, curW);
-                curW = 0.0f;
+        if (text.empty()) return {};
+        const f32 qs = 16.0f * scale;
+        const f32 adv = 12.0f * scale;
+        const f32 line = qs * 1.15f;
+        f32 maxW = 0, cur = 0;
+        u32 lines = 1;
+        for (char ch : text) {
+            if (ch == '\n') {
+                maxW = std::max(maxW, cur);
+                cur = 0;
                 ++lines;
-            } else if ((static_cast<u8>(c) & 0xC0U) != 0x80U) {
-                curW += advanceX;
+            } else if ((static_cast<u8>(ch) & 0xC0U) != 0x80U) {
+                cur += adv;
             }
         }
-        return {std::max(maxW, curW), static_cast<f32>(lines - 1U) * lineStep + quadSize};
+        return {std::max(maxW, cur), static_cast<f32>(lines - 1) * line + qs};
     }
 
     void Compile() noexcept;
 
-    void ExpandVertices(u32 firstQuad, u32 quadCount, std::span<Vertex2D> outVertices) const noexcept;
+    void Expand(u32 first, u32 count, std::span<Vertex2D> out) const noexcept;
 
-    [[nodiscard]] static std::span<const u16> SharedQuadIndices(u32 quadCount) noexcept;
+    [[nodiscard]] static std::span<const u16> Indices(u32 count) noexcept;
 
-    [[nodiscard]] constexpr ViewportExtent Viewport() const noexcept { return m_viewport; }
+    [[nodiscard]] constexpr Viewport GetViewport() const noexcept { return m_viewport; }
     [[nodiscard]] constexpr const RenderStats& Stats() const noexcept { return m_stats; }
     [[nodiscard]] constexpr u8 ClearPassMask() const noexcept { return m_clearPassMask; }
 
     [[nodiscard]] constexpr std::span<const DrawBatch> Batches() const noexcept {
-        return {m_batches.data(), m_stats.drawBatches};
+        return {m_batches.data(), m_stats.batches};
     }
-
-    [[nodiscard]] constexpr const RenderPassDesc& Pass(u8 passId) const noexcept {
-        return m_passes[passId & 0x03U];
+    [[nodiscard]] constexpr const PassDesc& Pass(u8 id) const noexcept {
+        return m_passes[id & 0x03U];
     }
-
-    [[nodiscard]] constexpr const Camera2D& View(u8 viewSlot) const noexcept {
-        return m_views[viewSlot & 0x07U];
+    [[nodiscard]] constexpr const Camera2D& View(u8 slot) const noexcept {
+        return m_views[slot & 0x07U];
     }
 
 private:
-    u64 m_prevKey{0};
-    ViewportExtent m_viewport{1280, 720};
+    u64 m_lastKey{0};
+    Viewport m_viewport{1280, 720};
     RenderStats m_stats{};
-    std::array<u8, 4> m_clipViewStack{};
-    u8 m_clipStackDepth{0};
-    u8 m_nextClipViewSlot{kFirstClipViewSlot};
-    u8 m_activeClipView{kHudViewSlot};
-    u8 m_enabledPassMask{0x0FU};
-    u8 m_clearPassMask{0x01U};
-    bool m_isMonotonic{true};
+    u8 m_enabledPassMask{0x0F};
+    u8 m_clearPassMask{0x01};
+    bool m_monotonic{true};
     bool m_compiled{false};
     bool m_pixelSnap{false};
 
-    std::array<RenderPassDesc, kMaxPasses> m_passes{};
+    std::array<PassDesc, kMaxPasses> m_passes{};
     std::array<Camera2D, kMaxViews> m_views{};
     std::array<DrawBatch, kMaxBatches> m_batches{};
     alignas(64) std::array<u64, kMaxQuads> m_keys{};
     alignas(64) std::array<PreparedQuad, kMaxQuads> m_quads{};
 };
-static_assert(sizeof(RenderList) == 282176);
+// ~282 KB fixed storage
 
 } // namespace en

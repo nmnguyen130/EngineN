@@ -23,7 +23,6 @@ bool TransformSolver::Init(AlignedArena& arena, u16 maxEntities) noexcept {
     const usize count = maxEntities;
     const usize wordCount = (count + 63U) >> 6U;
 
-    // Carve largest-alignment arrays first (32B -> 8B -> 4B -> 2B) to eliminate arena alignment holes.
     auto worldSpan = arena.Carve<WorldTransform2D>(count);
     auto bitSpan = arena.Carve<u64>(wordCount * 2U);
     auto localSpan = arena.Carve<LocalTransform2D>(count);
@@ -63,7 +62,9 @@ void TransformSolver::Clear(u16 maxAllocatedIndex) noexcept {
     std::fill_n(m_movedWords, wordCount, 0ULL);
 }
 
-void TransformSolver::ComputeWorldFromLocal(const LocalTransform2D& loc, WorldTransform2D& outW) noexcept {
+void TransformSolver::ComputeWorldFromLocal(
+    const LocalTransform2D& loc,
+    WorldTransform2D& outW) noexcept {
     outW.x = loc.x;
     outW.y = loc.y;
     outW.scaleX = loc.scaleX;

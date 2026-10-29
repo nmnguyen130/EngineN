@@ -5,380 +5,335 @@
 #include <SDL3/SDL.h>
 
 namespace en {
-
 namespace {
 
-constexpr u8 kFallbackWhitePixel[4]{255U, 255U, 255U, 255U};
+constexpr u8 kWhitePx[4]{255, 255, 255, 255};
 
-[[nodiscard]] SDL_ScaleMode ToSdlScaleMode(TextureFilter filter) noexcept {
+[[nodiscard]] SDL_ScaleMode ToScale(TextureFilter filter) noexcept {
     switch (filter) {
-        case TextureFilter::Linear:
-            return SDL_SCALEMODE_LINEAR;
+        case TextureFilter::Linear: return SDL_SCALEMODE_LINEAR;
         case TextureFilter::PixelArt:
             #if defined(SDL_SCALEMODE_PIXELART)
                 return SDL_SCALEMODE_PIXELART;
             #else
                 return SDL_SCALEMODE_NEAREST;
             #endif
-        case TextureFilter::Nearest:
-        default:
-            return SDL_SCALEMODE_NEAREST;
+        default: return SDL_SCALEMODE_NEAREST;
     }
 }
 
-[[nodiscard]] SDL_BlendMode ToSdlBlendMode(BlendMode mode) noexcept {
+[[nodiscard]] SDL_BlendMode ToBlend(BlendMode mode) noexcept {
     switch (mode) {
-        case BlendMode::Additive:
-            return SDL_BLENDMODE_ADD_PREMULTIPLIED;
+        case BlendMode::Additive: return SDL_BLENDMODE_ADD_PREMULTIPLIED;
         case BlendMode::Multiply: {
             static const SDL_BlendMode kMultiply = SDL_ComposeCustomBlendMode(
-                SDL_BLENDFACTOR_DST_COLOR,
-                SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
-                SDL_BLENDOPERATION_ADD,
-                SDL_BLENDFACTOR_ZERO,
-                SDL_BLENDFACTOR_ONE,
-                SDL_BLENDOPERATION_ADD);
+                SDL_BLENDFACTOR_DST_COLOR, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, SDL_BLENDOPERATION_ADD,
+                SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
             return kMultiply;
         }
-        case BlendMode::Opaque:
-            return SDL_BLENDMODE_NONE;
-        case BlendMode::Alpha:
-        default:
-            return SDL_BLENDMODE_BLEND_PREMULTIPLIED;
+        case BlendMode::Opaque: return SDL_BLENDMODE_NONE;
+        default: return SDL_BLENDMODE_BLEND_PREMULTIPLIED;
     }
 }
 
-[[nodiscard]] SDL_Rect ComputePixelViewport(ViewportExtent windowPx, Rect normVp) noexcept {
+[[nodiscard]] SDL_Rect ToPixelViewport(Viewport windowPx, Rect norm) noexcept {
     const f32 fw = static_cast<f32>(windowPx.w);
     const f32 fh = static_cast<f32>(windowPx.h);
-    return SDL_Rect{
-        static_cast<i32>(normVp.x * fw + 0.5f),
-        static_cast<i32>(normVp.y * fh + 0.5f),
-        std::max(1, static_cast<i32>(normVp.w * fw + 0.5f)),
-        std::max(1, static_cast<i32>(normVp.h * fh + 0.5f)),
+    return {
+        static_cast<i32>(norm.x * fw + 0.5f),
+        static_cast<i32>(norm.y * fh + 0.5f),
+        std::max(1, static_cast<i32>(norm.w * fw + 0.5f)),
+        std::max(1, static_cast<i32>(norm.h * fh + 0.5f)),
     };
 }
 
 } // namespace
 
 Renderer::Renderer(Renderer&& other) noexcept
-    : m_renderer(std::exchange(other.m_renderer, nullptr)),
-      m_viewportSize(other.m_viewportSize),
-      m_lastStats(other.m_lastStats),
-      m_highWaterSlot(std::exchange(other.m_highWaterSlot, 0U)),
+    : m_sdl(std::exchange(other.m_sdl, nullptr)),
+      m_stats(other.m_stats),
+      m_highWater(std::exchange(other.m_highWater, 0U)),
       m_freeHead(std::exchange(other.m_freeHead, kInvalidSlot)),
-      m_liveTextureCount(std::exchange(other.m_liveTextureCount, 0U)),
-      m_activeRenderTarget(std::exchange(other.m_activeRenderTarget, 0U)),
+      m_liveCount(std::exchange(other.m_liveCount, 0U)),
+      m_activeTarget(std::exchange(other.m_activeTarget, 0U)),
       m_presentMode(other.m_presentMode),
       m_initialized(std::exchange(other.m_initialized, false)) {
-    for (u16 i = 0U; i < m_highWaterSlot; ++i) {
-        m_textures[i] = std::exchange(other.m_textures[i], TextureSlot{});
-    }
+    for (u16 i = 0; i < m_highWater; ++i)
+        m_slots[i] = std::exchange(other.m_slots[i], Slot{});
 }
 
 Renderer& Renderer::operator=(Renderer&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_renderer = std::exchange(other.m_renderer, nullptr);
-        m_viewportSize = other.m_viewportSize;
-        m_lastStats = other.m_lastStats;
-        m_highWaterSlot = std::exchange(other.m_highWaterSlot, 0U);
+        m_sdl = std::exchange(other.m_sdl, nullptr);
+        m_stats = other.m_stats;
+        m_highWater = std::exchange(other.m_highWater, 0U);
         m_freeHead = std::exchange(other.m_freeHead, kInvalidSlot);
-        m_liveTextureCount = std::exchange(other.m_liveTextureCount, 0U);
-        m_activeRenderTarget = std::exchange(other.m_activeRenderTarget, 0U);
+        m_liveCount = std::exchange(other.m_liveCount, 0U);
+        m_activeTarget = std::exchange(other.m_activeTarget, 0U);
         m_presentMode = other.m_presentMode;
         m_initialized = std::exchange(other.m_initialized, false);
-        for (u16 i = 0U; i < m_highWaterSlot; ++i) {
-            m_textures[i] = std::exchange(other.m_textures[i], TextureSlot{});
-        }
+        for (u16 i = 0; i < m_highWater; ++i)
+            m_slots[i] = std::exchange(other.m_slots[i], Slot{});
     }
     return *this;
 }
 
 Result<void, RendererErrc> Renderer::Init(Window& window, const RendererConfig& cfg) noexcept {
     Shutdown();
+    if (!cfg.headless && !window.IsValid()) return Err(RendererErrc::DeviceInitFailed);
 
-    m_viewportSize = window.State().pixelSize.IsValid() ? ViewportExtent{window.State().pixelSize}
-                                                        : ViewportExtent{1280, 720};
     m_presentMode = cfg.presentMode;
-
-    if (!cfg.headless && window.Native() != nullptr) {
-        m_renderer = SDL_CreateRenderer(window.Native(), nullptr);
-        if (!m_renderer) return Err(RendererErrc::DeviceInitFailed);
+    if (!cfg.headless && window.Native()) {
+        m_sdl = SDL_CreateRenderer(window.Native(), nullptr);
+        if (!m_sdl) return Err(RendererErrc::DeviceInitFailed);
         (void)SetPresentMode(cfg.presentMode);
     }
+    m_initialized = true;
 
-    const auto whiteRes = CreateTexture(TextureDesc{
-        .pixels = {kFallbackWhitePixel, 4U},
-        .width = 1U,
-        .height = 1U,
-        .pitch = 4U,
+    const auto white = CreateTexture(TextureDesc{
+        .pixels = {kWhitePx, 4}, .width = 1, .height = 1, .pitch = 4,
         .filter = TextureFilter::Nearest,
     });
-    if (!whiteRes.has_value() || whiteRes.value() != kWhiteTexture) {
+    if (!white || white.value() != kWhiteTexture) {
         Shutdown();
         return Err(RendererErrc::TextureCreateFailed);
     }
-
-    m_initialized = true;
     return {};
 }
 
 void Renderer::Shutdown() noexcept {
-    for (u16 i = 0U; i < m_highWaterSlot; ++i) {
-        if (m_textures[i].texture && m_renderer) {
-            SDL_DestroyTexture(m_textures[i].texture);
-        }
-        m_textures[i] = TextureSlot{};
+    for (u16 i = 0; i < m_highWater; ++i) {
+        if (m_slots[i].texture && m_sdl) SDL_DestroyTexture(m_slots[i].texture);
+        m_slots[i] = {};
     }
-    if (m_renderer) {
-        SDL_DestroyRenderer(m_renderer);
-        m_renderer = nullptr;
+    if (m_sdl) {
+        SDL_DestroyRenderer(m_sdl);
+        m_sdl = nullptr;
     }
-    m_lastStats = RenderStats{};
-    m_highWaterSlot = 0U;
+    m_stats = {};
+    m_highWater = 0;
     m_freeHead = kInvalidSlot;
-    m_liveTextureCount = 0U;
-    m_activeRenderTarget = 0U;
+    m_liveCount = 0;
+    m_activeTarget = 0;
     m_initialized = false;
 }
 
 Result<void, RendererErrc> Renderer::SetPresentMode(PresentMode mode) noexcept {
     m_presentMode = mode;
-    if (!m_renderer) return {};
-
-    int vsyncVal = 0;
-    if (mode == PresentMode::VSync) vsyncVal = 1;
-    else if (mode == PresentMode::AdaptiveVSync) vsyncVal = SDL_RENDERER_VSYNC_ADAPTIVE;
-
-    if (!SDL_SetRenderVSync(m_renderer, vsyncVal)) {
-        if (mode == PresentMode::AdaptiveVSync && SDL_SetRenderVSync(m_renderer, 1)) return {};
+    if (!m_sdl) return {};
+    int vsync = 0;
+    if (mode == PresentMode::VSync) vsync = 1;
+    else if (mode == PresentMode::AdaptiveVSync) vsync = SDL_RENDERER_VSYNC_ADAPTIVE;
+    if (!SDL_SetRenderVSync(m_sdl, vsync)) {
+        if (mode == PresentMode::AdaptiveVSync && SDL_SetRenderVSync(m_sdl, 1)) return {};
         return Err(RendererErrc::DeviceInitFailed);
     }
     return {};
 }
 
 Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& desc) noexcept {
-    if (desc.width == 0U || desc.height == 0U || desc.width > 16384U || desc.height > 16384U) {
+    if (!m_initialized) return Err(RendererErrc::DeviceInitFailed);
+    if (desc.width == 0 || desc.height == 0 || desc.width > 16384 || desc.height > 16384)
         return Err(RendererErrc::InvalidDimension);
-    }
-    const u32 rowBytes = desc.width * 4U;
-    const u32 pitch = desc.pitch != 0U ? desc.pitch : rowBytes;
+    const u32 rowBytes = desc.width * 4;
+    const u32 pitch = desc.pitch ? desc.pitch : rowBytes;
     if (pitch < rowBytes) return Err(RendererErrc::InvalidDimension);
-
     if (!desc.pixels.empty()) {
-        const usize minBytes = static_cast<usize>(desc.height - 1U) * pitch + rowBytes;
-        if (desc.pixels.size() < minBytes) return Err(RendererErrc::TextureCreateFailed);
+        const usize need = static_cast<usize>(desc.height - 1) * pitch + rowBytes;
+        if (desc.pixels.size() < need) return Err(RendererErrc::TextureCreateFailed);
     }
-    if (m_freeHead == kInvalidSlot && m_highWaterSlot >= kMaxTextures) {
+    if (m_freeHead == kInvalidSlot && m_highWater >= kMaxTextures)
         return Err(RendererErrc::PoolExhausted);
-    }
 
     SDL_Texture* sdlTex = nullptr;
-    if (m_renderer) {
+    if (m_sdl) {
         const SDL_PixelFormat fmt =
             (desc.format == TextureFormat::BGRA8) ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_RGBA32;
         const SDL_TextureAccess access =
             desc.renderTarget ? SDL_TEXTUREACCESS_TARGET : SDL_TEXTUREACCESS_STATIC;
         sdlTex = SDL_CreateTexture(
-            m_renderer, fmt, access, static_cast<int>(desc.width), static_cast<int>(desc.height));
+            m_sdl, fmt, access, static_cast<int>(desc.width), static_cast<int>(desc.height));
         if (!sdlTex) return Err(RendererErrc::TextureCreateFailed);
-
         if (!desc.pixels.empty() &&
             !SDL_UpdateTexture(sdlTex, nullptr, desc.pixels.data(), static_cast<int>(pitch))) {
             SDL_DestroyTexture(sdlTex);
             return Err(RendererErrc::TextureUpdateFailed);
         }
-        SDL_SetTextureScaleMode(sdlTex, ToSdlScaleMode(desc.filter));
+        SDL_SetTextureScaleMode(sdlTex, ToScale(desc.filter));
         SDL_SetTextureBlendMode(sdlTex, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
     }
 
-    u16 slotIdx = m_freeHead;
-    if (slotIdx != kInvalidSlot) {
-        m_freeHead = m_textures[slotIdx].width;
+    u16 slotIndex = m_freeHead;
+    if (slotIndex != kInvalidSlot) {
+        m_freeHead = m_slots[slotIndex].width;
     } else {
-        slotIdx = m_highWaterSlot++;
+        slotIndex = m_highWater++;
     }
-
-    TextureSlot& slot = m_textures[slotIdx];
-    if (slot.generation == 0U) slot.generation = 1U;
+    Slot& slot = m_slots[slotIndex];
+    if (slot.generation == 0) slot.generation = 1;
     slot.texture = sdlTex;
     slot.width = static_cast<u16>(desc.width);
     slot.height = static_cast<u16>(desc.height);
-    slot.flags = static_cast<u8>(kSlotOccupied | (desc.renderTarget ? kSlotRenderTarget : 0U));
-    ++m_liveTextureCount;
-    return TextureHandle{slotIdx, slot.generation};
+    slot.flags = static_cast<u8>(kSlotOccupied | (desc.renderTarget ? kSlotRenderTarget : 0));
+    ++m_liveCount;
+    return TextureHandle{slotIndex, slot.generation};
 }
 
 Result<void, RendererErrc> Renderer::UpdateTexture(
     TextureHandle handle, Rect region, std::span<const u8> pixels, u32 pitch) noexcept {
     if (!IsTextureValid(handle)) return Err(RendererErrc::InvalidHandle);
-
-    const TextureSlot& slot = m_textures[handle.index];
-    const i32 rx = region.IsEmpty() ? 0 : static_cast<i32>(region.x);
-    const i32 ry = region.IsEmpty() ? 0 : static_cast<i32>(region.y);
-    const i32 rw = region.IsEmpty() ? static_cast<i32>(slot.width) : static_cast<i32>(region.w);
-    const i32 rh = region.IsEmpty() ? static_cast<i32>(slot.height) : static_cast<i32>(region.h);
-
-    if (rx < 0 || ry < 0 || rw <= 0 || rh <= 0 ||
-        (rx + rw) > static_cast<i32>(slot.width) ||
-        (ry + rh) > static_cast<i32>(slot.height)) {
+    const Slot& slot = m_slots[handle.index];
+    const bool full = (region.x == 0 && region.y == 0 && region.w == 0 && region.h == 0);
+    if (!full && (region.x < 0 || region.y < 0 || region.w < 1 || region.h < 1))
         return Err(RendererErrc::InvalidDimension);
-    }
 
-    const u32 rowBytes = static_cast<u32>(rw) * 4U;
-    const u32 actualPitch = pitch != 0U ? pitch : rowBytes;
+    const i32 rx = full ? 0 : static_cast<i32>(region.x);
+    const i32 ry = full ? 0 : static_cast<i32>(region.y);
+    const i32 rw = full ? static_cast<i32>(slot.width) : static_cast<i32>(region.w);
+    const i32 rh = full ? static_cast<i32>(slot.height) : static_cast<i32>(region.h);
+    if (rx < 0 || ry < 0 || rw <= 0 || rh <= 0 ||
+        rx + rw > static_cast<i32>(slot.width) || ry + rh > static_cast<i32>(slot.height))
+        return Err(RendererErrc::InvalidDimension);
+
+    const u32 rowBytes = static_cast<u32>(rw) * 4;
+    const u32 actualPitch = pitch ? pitch : rowBytes;
     if (actualPitch < rowBytes) return Err(RendererErrc::InvalidDimension);
+    const usize need = static_cast<usize>(rh - 1) * actualPitch + rowBytes;
+    if (pixels.size() < need) return Err(RendererErrc::TextureUpdateFailed);
 
-    const usize minBytes = static_cast<usize>(rh - 1) * actualPitch + rowBytes;
-    if (pixels.size() < minBytes) return Err(RendererErrc::TextureUpdateFailed);
-
-    if (m_renderer && slot.texture) {
-        const SDL_Rect sdlRect{rx, ry, rw, rh};
-        if (!SDL_UpdateTexture(slot.texture, &sdlRect, pixels.data(), static_cast<int>(actualPitch))) {
+    if (m_sdl && slot.texture) {
+        const SDL_Rect rect{rx, ry, rw, rh};
+        if (!SDL_UpdateTexture(slot.texture, &rect, pixels.data(), static_cast<int>(actualPitch)))
             return Err(RendererErrc::TextureUpdateFailed);
-        }
     }
     return {};
 }
 
 void Renderer::DestroyTexture(TextureHandle handle) noexcept {
-    if (handle.index == 0U || !IsTextureValid(handle)) return;
+    if (handle.index == 0 || !IsTextureValid(handle)) return;
+    if (m_activeTarget == handle.index) BindRenderTarget(0);
 
-    TextureSlot& slot = m_textures[handle.index];
-    if (slot.texture && m_renderer) {
+    Slot& slot = m_slots[handle.index];
+    if (slot.texture && m_sdl) {
         SDL_DestroyTexture(slot.texture);
         slot.texture = nullptr;
     }
-    slot.flags = 0U;
-    if (++slot.generation == 0U) slot.generation = 1U;
+    slot.flags = 0;
+    if (++slot.generation == 0) slot.generation = 1;
     slot.width = m_freeHead;
     m_freeHead = handle.index;
-    if (m_liveTextureCount > 0U) --m_liveTextureCount;
+    if (m_liveCount > 0) --m_liveCount;
 }
 
-void Renderer::BindRenderTarget(u16 targetTexIndex) noexcept {
-    if (m_activeRenderTarget == targetTexIndex) return;
-    m_activeRenderTarget = targetTexIndex;
-
-    SDL_Texture* targetSdlTex = nullptr;
-    if (targetTexIndex > 0U && targetTexIndex < m_highWaterSlot &&
-        m_textures[targetTexIndex].IsOccupied() &&
-        m_textures[targetTexIndex].IsRenderTarget()) {
-        targetSdlTex = m_textures[targetTexIndex].texture;
+void Renderer::BindRenderTarget(u16 slotIndex) noexcept {
+    if (m_activeTarget == slotIndex) return;
+    m_activeTarget = slotIndex;
+    SDL_Texture* target = nullptr;
+    if (slotIndex > 0 && slotIndex < m_highWater &&
+        m_slots[slotIndex].Occupied() && m_slots[slotIndex].IsRenderTarget()) {
+        target = m_slots[slotIndex].texture;
     }
-    SDL_SetRenderTarget(m_renderer, targetSdlTex);
+    if (m_sdl) SDL_SetRenderTarget(m_sdl, target);
 }
 
 void Renderer::Submit(RenderList& list) noexcept {
     list.Compile();
-    m_lastStats = list.Stats();
-    if (!m_renderer) return;
+    m_stats = list.Stats();
+    if (!m_sdl) return;
 
-    const ViewportExtent vpExtent = list.Viewport();
-    constexpr Rect kFullNormalizedRect{0.0f, 0.0f, 1.0f, 1.0f};
+    const Viewport vp = list.GetViewport();
+    constexpr Rect kFull{0, 0, 1, 1};
     u8 pendingClears = list.ClearPassMask();
-    u8 activePassId = 0xFFU;
-    u8 activeViewSlot = 0xFFU;
-    Rect activeViewport{-1.0f, -1.0f, -1.0f, -1.0f};
-    Rect activeScissor{-1.0f, -1.0f, -1.0f, -1.0f};
+    u8 activePass = 0xFF;
+    u8 activeView = 0xFF;
+    Rect activeViewport{-1, -1, -1, -1};
+    Rect activeScissor{-1, -1, -1, -1};
 
-    auto flushClearsUpTo = [&](u8 targetPassId) noexcept {
-        const u8 upToMask = static_cast<u8>((2U << (targetPassId & 0x03U)) - 1U);
-        u8 toClear = static_cast<u8>(pendingClears & upToMask);
-        while (toClear != 0U) {
-            const u8 p = static_cast<u8>(std::countr_zero(toClear));
-            toClear &= static_cast<u8>(toClear - 1U);
-            const RenderPassDesc& pDesc = list.Pass(p);
-            BindRenderTarget(pDesc.targetTexIndex);
-            SDL_SetRenderViewport(m_renderer, nullptr);
-            SDL_SetRenderClipRect(m_renderer, nullptr);
+    auto flushClears = [&](u8 upToPass) noexcept {
+        const u8 mask = static_cast<u8>((2U << (upToPass & 0x03U)) - 1U);
+        u8 todo = static_cast<u8>(pendingClears & mask);
+        while (todo) {
+            const u8 passId = static_cast<u8>(std::countr_zero(todo));
+            todo &= static_cast<u8>(todo - 1);
+            const PassDesc& desc = list.Pass(passId);
+            BindRenderTarget(desc.target);
+            SDL_SetRenderViewport(m_sdl, nullptr);
+            SDL_SetRenderClipRect(m_sdl, nullptr);
             SDL_SetRenderDrawColorFloat(
-                m_renderer, pDesc.clearColor.r, pDesc.clearColor.g, pDesc.clearColor.b, pDesc.clearColor.a);
-            SDL_RenderClear(m_renderer);
-            activeViewSlot = 0xFFU;
-            activeViewport = kFullNormalizedRect;
-            activeScissor = kFullNormalizedRect;
+                m_sdl, desc.clearColor.r, desc.clearColor.g, desc.clearColor.b, desc.clearColor.a);
+            SDL_RenderClear(m_sdl);
+            activeView = 0xFF;
+            activeViewport = kFull;
+            activeScissor = kFull;
         }
-        pendingClears &= static_cast<u8>(~upToMask);
+        pendingClears &= static_cast<u8>(~mask);
     };
 
     for (const DrawBatch& batch : list.Batches()) {
-        if (batch.passId != activePassId) {
-            flushClearsUpTo(batch.passId);
-            activePassId = batch.passId;
-            BindRenderTarget(list.Pass(activePassId).targetTexIndex);
+        if (batch.pass != activePass) {
+            flushClears(batch.pass);
+            activePass = batch.pass;
+            BindRenderTarget(list.Pass(activePass).target);
         }
 
-        if (batch.viewSlot != activeViewSlot) {
-            activeViewSlot = batch.viewSlot;
-            const Camera2D& cam = list.View(activeViewSlot);
+        if (batch.view != activeView) {
+            activeView = batch.view;
+            const Camera2D& cam = list.View(activeView);
 
             if (cam.viewport != activeViewport) {
                 activeViewport = cam.viewport;
-                if (cam.viewport == kFullNormalizedRect) {
-                    SDL_SetRenderViewport(m_renderer, nullptr);
+                if (cam.viewport == kFull) {
+                    SDL_SetRenderViewport(m_sdl, nullptr);
                 } else {
-                    const SDL_Rect vpRect = ComputePixelViewport(vpExtent, cam.viewport);
-                    SDL_SetRenderViewport(m_renderer, &vpRect);
+                    const SDL_Rect rect = ToPixelViewport(vp, cam.viewport);
+                    SDL_SetRenderViewport(m_sdl, &rect);
                 }
             }
-
             if (cam.scissor != activeScissor) {
                 activeScissor = cam.scissor;
-                if (cam.scissor.x <= 0.0f && cam.scissor.y <= 0.0f &&
-                    cam.scissor.w >= 1.0f && cam.scissor.h >= 1.0f) {
-                    SDL_SetRenderClipRect(m_renderer, nullptr);
+                if (cam.scissor.x <= 0 && cam.scissor.y <= 0 &&
+                    cam.scissor.w >= 1 && cam.scissor.h >= 1) {
+                    SDL_SetRenderClipRect(m_sdl, nullptr);
                 } else {
-                    const SDL_Rect vpRect = ComputePixelViewport(vpExtent, cam.viewport);
+                    const SDL_Rect viewRect = ToPixelViewport(vp, cam.viewport);
                     const SDL_Rect clipRect{
-                        static_cast<i32>(cam.scissor.x * static_cast<f32>(vpRect.w) + 0.5f),
-                        static_cast<i32>(cam.scissor.y * static_cast<f32>(vpRect.h) + 0.5f),
-                        std::max(1, static_cast<i32>(cam.scissor.w * static_cast<f32>(vpRect.w) + 0.5f)),
-                        std::max(1, static_cast<i32>(cam.scissor.h * static_cast<f32>(vpRect.h) + 0.5f)),
+                        static_cast<i32>(cam.scissor.x * static_cast<f32>(viewRect.w) + 0.5f),
+                        static_cast<i32>(cam.scissor.y * static_cast<f32>(viewRect.h) + 0.5f),
+                        std::max(0, static_cast<i32>(cam.scissor.w * static_cast<f32>(viewRect.w) + 0.5f)),
+                        std::max(0, static_cast<i32>(cam.scissor.h * static_cast<f32>(viewRect.h) + 0.5f)),
                     };
-                    SDL_SetRenderClipRect(m_renderer, &clipRect);
+                    SDL_SetRenderClipRect(m_sdl, &clipRect);
                 }
             }
         }
 
-        const u16 resolvedIdx = IsTextureValid(batch.texture) ? batch.texture.index : 0U;
-        SDL_Texture* sdlTex = m_textures[resolvedIdx].texture;
-        if (sdlTex) {
-            SDL_SetTextureBlendMode(sdlTex, ToSdlBlendMode(batch.blend));
-        }
+        const u16 texIndex = IsTextureValid(batch.texture) ? batch.texture.index : 0U;
+        SDL_Texture* sdlTex = m_slots[texIndex].texture;
+        if (sdlTex) SDL_SetTextureBlendMode(sdlTex, ToBlend(batch.blend));
 
-        u32 remaining = batch.quadCount;
-        u32 currentQuad = batch.firstQuad;
-        while (remaining > 0U) {
+        u32 remaining = batch.count;
+        u32 current = batch.first;
+        while (remaining) {
             const u32 chunk = std::min(remaining, RenderList::kChunkQuads);
-            list.ExpandVertices(currentQuad, chunk, m_vertices);
-            const std::span<const u16> indices = RenderList::SharedQuadIndices(chunk);
-
+            list.Expand(current, chunk, m_verts);
+            const auto indices = RenderList::Indices(chunk);
             SDL_RenderGeometryRaw(
-                m_renderer,
-                sdlTex,
-                &m_vertices[0].x,
+                m_sdl, sdlTex,
+                &m_verts[0].x, static_cast<int>(sizeof(Vertex2D)),
+                reinterpret_cast<const SDL_FColor*>(&m_verts[0].r),
                 static_cast<int>(sizeof(Vertex2D)),
-                reinterpret_cast<const SDL_FColor*>(&m_vertices[0].color),
-                static_cast<int>(sizeof(Vertex2D)),
-                &m_vertices[0].u,
-                static_cast<int>(sizeof(Vertex2D)),
-                static_cast<int>(chunk * 4U),
-                indices.data(),
-                static_cast<int>(indices.size()),
-                static_cast<int>(sizeof(u16)));
-
-            currentQuad += chunk;
+                &m_verts[0].u, static_cast<int>(sizeof(Vertex2D)),
+                static_cast<int>(chunk * 4),
+                indices.data(), static_cast<int>(indices.size()), static_cast<int>(sizeof(u16)));
+            current += chunk;
             remaining -= chunk;
         }
     }
 
-    if (pendingClears != 0U) {
-        flushClearsUpTo(RenderList::kMaxPasses - 1U);
-    }
-    BindRenderTarget(0U);
-    SDL_RenderPresent(m_renderer);
+    if (pendingClears) flushClears(RenderList::kMaxPasses - 1);
+    BindRenderTarget(0);
+    SDL_RenderPresent(m_sdl);
 }
 
 } // namespace en

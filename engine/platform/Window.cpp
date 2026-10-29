@@ -67,8 +67,7 @@ Result<void, PlatformErrc> Window::SetMode(WindowMode mode, f32 targetRefreshHz)
         if (mode == WindowMode::ExclusiveFullscreen) {
             const SDL_DisplayID dispId = SDL_GetDisplayForWindow(m_window);
             const f32 reqHz = targetRefreshHz > 0.0f ? targetRefreshHz : m_state.refreshHz;
-            if (dispId != 0U &&
-                SDL_GetClosestFullscreenDisplayMode(
+            if (dispId != 0U && SDL_GetClosestFullscreenDisplayMode(
                     dispId, m_state.pixelSize.w, m_state.pixelSize.h, reqHz, true, &closest)) {
                 fsMode = &closest;
             }

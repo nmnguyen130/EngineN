@@ -5,14 +5,14 @@
 
 namespace en {
 
-// Generational entity identifier for the ECS slot table.
-// Value type; generation == 0 represents kNullEntity.
-// Invariant: IsValid() holds iff index != 0 and generation != 0.
+// Generational id. Valid iff index != 0 && generation != 0.
 struct alignas(4) EntityId {
     u16 index{0};
     u16 generation{0};
 
-    [[nodiscard]] constexpr bool IsValid() const noexcept { return index != 0U && generation != 0U; }
+    [[nodiscard]] constexpr bool IsValid() const noexcept {
+        return index != 0U && generation != 0U;
+    }
 
     [[nodiscard]] constexpr u32 Packed() const noexcept {
         return (static_cast<u32>(generation) << 16U) | static_cast<u32>(index);
@@ -90,7 +90,6 @@ struct alignas(4) PrevWorldSnapshot2D {
 };
 static_assert(sizeof(PrevWorldSnapshot2D) == 24);
 
-// Resolved world-space 2D transform with precomputed rotation sine and cosine.
 struct alignas(32) WorldTransform2D {
     f32 x{0.0f};
     f32 y{0.0f};
@@ -117,7 +116,6 @@ struct alignas(32) WorldTransform2D {
 };
 static_assert(sizeof(WorldTransform2D) == 32);
 
-// Spawn parameters for World::Spawn; when keepWorldTransform is true, local is interpreted in world space.
 struct alignas(4) EntitySpawnDesc {
     LocalTransform2D local{};
     EntityId parent{kNullEntity};
@@ -136,7 +134,7 @@ struct alignas(16) Velocity2D {
 };
 static_assert(sizeof(Velocity2D) == 16);
 
-// 2D sprite component; flags pack [0]=visible, [1]=flipX, [2]=flipY, [3]=ySort, [4..5]=BlendMode, [6..7]=viewSlot.
+// flags: [0]visible [1]flipX [2]flipY [3]ySort [4..5]blend [6..7]viewSlot
 struct alignas(32) Sprite2D {
     static constexpr u8 kTypeId = 2;
     Color tint{1.0f, 1.0f, 1.0f, 1.0f};
@@ -154,12 +152,22 @@ struct alignas(32) Sprite2D {
     [[nodiscard]] constexpr BlendMode Blend() const noexcept {
         return static_cast<BlendMode>((flags >> 4U) & 0x03U);
     }
-    [[nodiscard]] constexpr u8 ViewSlot() const noexcept { return static_cast<u8>((flags >> 6U) & 0x03U); }
+    [[nodiscard]] constexpr u8 ViewSlot() const noexcept {
+        return static_cast<u8>((flags >> 6U) & 0x03U);
+    }
 
-    constexpr void SetVisible(bool v) noexcept { flags = static_cast<u8>((flags & ~0x01U) | u8(v)); }
-    constexpr void SetFlipX(bool f) noexcept { flags = static_cast<u8>((flags & ~0x02U) | (u8(f) << 1U)); }
-    constexpr void SetFlipY(bool f) noexcept { flags = static_cast<u8>((flags & ~0x04U) | (u8(f) << 2U)); }
-    constexpr void SetYSort(bool y) noexcept { flags = static_cast<u8>((flags & ~0x08U) | (u8(y) << 3U)); }
+    constexpr void SetVisible(bool v) noexcept {
+        flags = static_cast<u8>((flags & ~0x01U) | u8(v));
+    }
+    constexpr void SetFlipX(bool f) noexcept {
+        flags = static_cast<u8>((flags & ~0x02U) | (u8(f) << 1U));
+    }
+    constexpr void SetFlipY(bool f) noexcept {
+        flags = static_cast<u8>((flags & ~0x04U) | (u8(f) << 2U));
+    }
+    constexpr void SetYSort(bool y) noexcept {
+        flags = static_cast<u8>((flags & ~0x08U) | (u8(y) << 3U));
+    }
     constexpr void SetBlend(BlendMode b) noexcept {
         flags = static_cast<u8>((flags & ~0x30U) | ((static_cast<u8>(b) & 0x03U) << 4U));
     }

@@ -3,8 +3,6 @@
 #include "core/Math.h"
 
 #include <array>
-#include <bit>
-#include <cmath>
 #include <cstring>
 #include <initializer_list>
 #include <span>

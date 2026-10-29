@@ -6,9 +6,8 @@
 
 namespace en {
 
-// Stateless presentation, visual/lifetime stepping, and prefab bridge between World, AssetBank, and RenderList.
-// Keeps World storage decoupled from AssetBank.h, RenderList.h, and visual/lifetime tick systems.
-// Invariant: Stationary sprites (MovedWords bit == 0) bypass PrevWorldSnapshot2D and TimeChannel reads during Extract.
+// Presentation + visual/lifetime step + prefab bridge.
+// Stationary (moved bit clear) skips prev/alpha. Frozen channels force alpha=1.
 class WorldExtractor {
 public:
     WorldExtractor() = delete;
