@@ -76,19 +76,15 @@ template <BitmaskEnum E>
     return (std::to_underlying(value) & std::to_underlying(flag)) != 0;
 }
 
-// Rounds up to the next power of two, or returns 0 when `value > 0x80000000U`.
 [[nodiscard]] constexpr u32 NextPow2(u32 value) noexcept {
     if (value <= 1U) return 1U;
-    if (value > 0x80000000U) return 0U;
-    return std::bit_ceil(value);
+    return (value <= 0x80000000U) ? std::bit_ceil(value) : 0U;
 }
 
-// Rounds `value` up to a power-of-two `alignment`, returning 0 on invalid alignment or overflow.
 [[nodiscard]] constexpr usize AlignUp(usize value, usize alignment) noexcept {
     if (!std::has_single_bit(alignment)) return 0U;
     const usize mask = alignment - 1U;
-    if (value > ~mask) return 0U;
-    return (value + mask) & ~mask;
+    return (value <= ~mask) ? ((value + mask) & ~mask) : 0U;
 }
 
 [[nodiscard]] constexpr u64 Mix64(u64 x) noexcept {
@@ -108,7 +104,7 @@ consteval std::array<u32, 256> BuildCrc32Table() noexcept {
     std::array<u32, 256> table{};
     for (u32 i = 0U; i < 256U; ++i) {
         u32 crc = i;
-        for (u32 bit = 0U; bit < 8U; ++bit) {
+        for (u32 b = 0U; b < 8U; ++b) {
             crc = (crc & 1U) != 0U ? ((crc >> 1U) ^ 0xEDB88320U) : (crc >> 1U);
         }
         table[i] = crc;
@@ -137,15 +133,12 @@ struct StringId {
     constexpr explicit StringId(u64 raw) noexcept : value(raw) {}
 
     [[nodiscard]] static constexpr StringId Hash(std::string_view str) noexcept {
-        if (str.empty()) return StringId{0};
+        if (str.empty()) return {};
         u64 h = 0xCBF29CE484222325ULL;
         for (const char ch : str) {
             char c = (ch == '\\') ? '/' : ch;
-            if (c >= 'A' && c <= 'Z') {
-                c = static_cast<char>(c + ('a' - 'A'));
-            }
-            h ^= static_cast<u8>(c);
-            h *= 0x100000001B3ULL;
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            h = (h ^ static_cast<u8>(c)) * 0x100000001B3ULL;
         }
         return StringId{h};
     }
@@ -157,12 +150,12 @@ static_assert(sizeof(StringId) == 8);
 
 inline namespace literals {
 [[nodiscard]] consteval StringId operator""_sid(const char* str, usize len) noexcept {
-    return StringId::Hash(std::string_view{str, len});
+    return StringId::Hash({str, len});
 }
 } // namespace literals
 
 // Strongly-typed 32-bit generational slot handle.
-// Value type; generation == 0 denotes a null/invalid handle.
+// Value type; generation == 0 denotes an invalid handle.
 template <typename Tag>
 struct Handle {
     u16 index{0};
@@ -175,10 +168,7 @@ struct Handle {
     }
 
     [[nodiscard]] static constexpr Handle FromPacked(u32 packed) noexcept {
-        return Handle{
-            static_cast<u16>(packed & 0xFFFFU),
-            static_cast<u16>(packed >> 16U),
-        };
+        return {static_cast<u16>(packed & 0xFFFFU), static_cast<u16>(packed >> 16U)};
     }
 
     [[nodiscard]] constexpr auto operator<=>(const Handle&) const noexcept = default;
@@ -186,7 +176,7 @@ struct Handle {
 static_assert(sizeof(Handle<void>) == 4);
 
 // Fixed-capacity stack string with guaranteed null termination and zero heap allocation.
-// Value type; failed mutations leave existing string contents intact.
+// Value type; failed mutations leave existing contents intact.
 // Invariant: sizeof(FixedString<N>) == N, m_len <= kMaxLength, and m_buf[m_len] == '\0'.
 template <usize CapacityBytes>
     requires (CapacityBytes >= 8U && CapacityBytes <= 65536U && (CapacityBytes % 2U) == 0U)
@@ -195,28 +185,19 @@ public:
     static constexpr usize kMaxLength = CapacityBytes - 3U;
 
     constexpr FixedString() noexcept = default;
-
-    constexpr explicit FixedString(std::string_view sv) noexcept {
-        (void)Assign(sv);
-    }
+    constexpr explicit FixedString(std::string_view sv) noexcept { (void)Assign(sv); }
 
     constexpr bool Assign(std::string_view sv) noexcept {
         if (sv.size() > kMaxLength || sv.contains('\0')) return false;
-        for (usize i = 0U; i < sv.size(); ++i) {
-            m_buf[i] = sv[i];
-        }
+        for (usize i = 0U; i < sv.size(); ++i) m_buf[i] = sv[i];
         m_len = static_cast<u16>(sv.size());
         m_buf[m_len] = '\0';
         return true;
     }
 
     [[nodiscard]] constexpr bool Append(std::string_view sv) noexcept {
-        if (m_len > kMaxLength || sv.size() > (kMaxLength - m_len) || sv.contains('\0')) {
-            return false;
-        }
-        for (usize i = 0U; i < sv.size(); ++i) {
-            m_buf[m_len + i] = sv[i];
-        }
+        if (sv.size() > (kMaxLength - m_len) || sv.contains('\0')) return false;
+        for (usize i = 0U; i < sv.size(); ++i) m_buf[m_len + i] = sv[i];
         m_len = static_cast<u16>(m_len + sv.size());
         m_buf[m_len] = '\0';
         return true;
@@ -233,12 +214,8 @@ public:
     [[nodiscard]] constexpr bool Empty() const noexcept { return m_len == 0U; }
     [[nodiscard]] static constexpr usize Capacity() noexcept { return kMaxLength; }
 
-    [[nodiscard]] constexpr bool operator==(const FixedString& other) const noexcept {
-        return View() == other.View();
-    }
-    [[nodiscard]] constexpr bool operator==(std::string_view sv) const noexcept {
-        return View() == sv;
-    }
+    [[nodiscard]] constexpr bool operator==(const FixedString& o) const noexcept { return View() == o.View(); }
+    [[nodiscard]] constexpr bool operator==(std::string_view sv) const noexcept { return View() == sv; }
 
 private:
     u16 m_len{0};
@@ -246,7 +223,7 @@ private:
 };
 static_assert(sizeof(FixedString<256>) == 256);
 
-// Deterministic 64-bit SplitMix PRNG with Lemire unbiased bounded sampling.
+// Deterministic 64-bit SplitMix PRNG with Lemire divisionless bounded sampling.
 // Value type suitable for replay-safe gameplay simulation.
 class Rng {
 public:
@@ -259,9 +236,7 @@ public:
         return Mix64(m_state);
     }
 
-    [[nodiscard]] constexpr u32 NextU32() noexcept {
-        return static_cast<u32>(NextU64() >> 32U);
-    }
+    [[nodiscard]] constexpr u32 NextU32() noexcept { return static_cast<u32>(NextU64() >> 32U); }
 
     [[nodiscard]] constexpr f32 NextF32() noexcept {
         return static_cast<f32>(NextU32() >> 8U) * (1.0f / 16777216.0f);
@@ -272,9 +247,7 @@ public:
         const u32 threshold = (0U - bound) % bound;
         for (;;) {
             const u64 prod = static_cast<u64>(NextU32()) * static_cast<u64>(bound);
-            if (static_cast<u32>(prod) >= threshold) {
-                return static_cast<u32>(prod >> 32U);
-            }
+            if (static_cast<u32>(prod) >= threshold) return static_cast<u32>(prod >> 32U);
         }
     }
 
@@ -285,11 +258,8 @@ public:
     [[nodiscard]] constexpr i32 Range(i32 lo, i32 hi) noexcept {
         if (hi <= lo) return lo;
         const u64 span = static_cast<u64>(static_cast<i64>(hi) - static_cast<i64>(lo));
-        if (span >= 0xFFFFFFFFULL) {
-            return std::bit_cast<i32>(NextU32());
-        }
-        return static_cast<i32>(
-            static_cast<i64>(lo) + static_cast<i64>(Bounded(static_cast<u32>(span + 1ULL))));
+        if (span >= 0xFFFFFFFFULL) return std::bit_cast<i32>(NextU32());
+        return static_cast<i32>(static_cast<i64>(lo) + static_cast<i64>(Bounded(static_cast<u32>(span + 1ULL))));
     }
 
     [[nodiscard]] constexpr u64 State() const noexcept { return m_state; }

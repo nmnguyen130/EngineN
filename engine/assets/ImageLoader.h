@@ -1,8 +1,6 @@
 #pragma once
 
 #include "core/Types.h"
-#include <span>
-#include <string_view>
 
 namespace en {
 

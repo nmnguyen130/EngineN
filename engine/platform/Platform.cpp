@@ -19,7 +19,7 @@ Result<void, PlatformErrc> Platform::Init(
     std::string_view appName, std::string_view orgName, bool headless) noexcept {
     Shutdown();
     m_headless = headless;
-    m_quit = false;
+    m_quit     = false;
     m_events.ClearFrameDeltas();
 
     if (!headless) {
@@ -38,8 +38,7 @@ Result<void, PlatformErrc> Platform::Init(
     const FixedString<64> orgBuf(orgName.empty() ? "EngineN" : orgName);
     const FixedString<64> appBuf(appName.empty() ? "EngineN" : appName);
     char* pref = SDL_GetPrefPath(orgBuf.CStr(), appBuf.CStr());
-    const bool prefOk =
-        (pref && NormalizeDir(pref, m_prefPath)) || NormalizeDir("./", m_prefPath);
+    const bool prefOk = (pref && NormalizeDir(pref, m_prefPath)) || NormalizeDir("./", m_prefPath);
     if (pref) SDL_free(pref);
 
     if (!prefOk) {
@@ -65,14 +64,14 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
     m_events.ClearFrameDeltas();
     if (!m_initialized || m_headless) return WindowFlags::None;
 
-    WindowFlags winFlags = WindowFlags::None;
-    bool needRefresh = false;
+    WindowFlags winFlags  = WindowFlags::None;
+    bool needRefresh      = false;
     const u32 targetWinId = window.Id();
 
     SDL_Event ev{};
     while (SDL_PollEvent(&ev)) {
         const bool focused = window.State().focused;
-        const f32 density = window.State().pixelDensity;
+        const f32  density = window.State().pixelDensity;
 
         switch (ev.type) {
             case SDL_EVENT_QUIT:
@@ -245,8 +244,8 @@ WindowFlags Platform::Pump(Window& window, EventCapture captured) noexcept {
         StopRumble();
         m_events.mouseDx = 0.0f;
         m_events.mouseDy = 0.0f;
-        m_events.wheelX = 0.0f;
-        m_events.wheelY = 0.0f;
+        m_events.wheelX  = 0.0f;
+        m_events.wheelY  = 0.0f;
     }
     m_events.focused = window.State().focused ? 1U : 0U;
     return winFlags;
@@ -264,7 +263,7 @@ bool Platform::OpenGamepad(u32 instanceId) noexcept {
         m_gamepad = pad;
     }
     m_gamepadId = instanceId;
-    m_rumbling = false;
+    m_rumbling  = false;
     return true;
 }
 
@@ -276,7 +275,7 @@ void Platform::CloseGamepad(u32 instanceId) noexcept {
         m_gamepad = nullptr;
     }
     m_gamepadId = 0U;
-    m_rumbling = false;
+    m_rumbling  = false;
     m_events.IngestGamepadDisconnect();
 }
 
@@ -309,7 +308,7 @@ Result<usize, PlatformErrc> Platform::ReadFile(
         return Err(PlatformErrc::FileIoFailed);
     }
 
-    const usize fsize = static_cast<usize>(fsizeSigned);
+    const usize fsize     = static_cast<usize>(fsizeSigned);
     const usize bytesRead = fsize > 0U ? SDL_ReadIO(io, outBuf.data(), fsize) : 0U;
     (void)SDL_CloseIO(io);
     if (bytesRead != fsize) return Err(PlatformErrc::FileIoFailed);
@@ -376,10 +375,7 @@ void Platform::ShowErrorBox(
     std::fprintf(stderr, "[Platform] %s: %s\n", titleBuf.CStr(), msgBuf.CStr());
     if (SDL_WasInit(SDL_INIT_VIDEO) != 0U && std::getenv("CI") == nullptr) {
         (void)SDL_ShowSimpleMessageBox(
-            SDL_MESSAGEBOX_ERROR,
-            titleBuf.CStr(),
-            msgBuf.CStr(),
-            parent ? parent->Native() : nullptr);
+            SDL_MESSAGEBOX_ERROR, titleBuf.CStr(), msgBuf.CStr(), parent ? parent->Native() : nullptr);
     }
 }
 

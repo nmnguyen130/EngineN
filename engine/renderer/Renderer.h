@@ -20,9 +20,9 @@ static_assert(sizeof(RendererConfig) == 2);
 // SDL3 2D rendering backend and generational GPU texture pool (slot 0 = permanent 1x1 white).
 class Renderer {
 public:
-    static constexpr u32 kMaxTextures = 512;
-    static constexpr u16 kInvalidSlot = 0xFFFFU;
-    static constexpr u8  kSlotOccupied = 1U << 0;
+    static constexpr u32 kMaxTextures      = 512;
+    static constexpr u16 kInvalidSlot      = 0xFFFFU;
+    static constexpr u8  kSlotOccupied     = 1U << 0;
     static constexpr u8  kSlotRenderTarget = 1U << 1;
 
     struct Slot {
@@ -103,8 +103,8 @@ private:
     PresentMode   m_presentMode{PresentMode::VSync};
     bool          m_initialized{false};
 
-    std::array<Slot, kMaxTextures>                      m_slots{};
-    std::array<Vertex2D, RenderList::kChunkQuads * 4U>  m_verts{};
+    std::array<Slot, kMaxTextures>                     m_slots{};
+    std::array<Vertex2D, RenderList::kChunkQuads * 4U> m_verts{};
 };
 static_assert(sizeof(Renderer) == 73768);
 

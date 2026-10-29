@@ -146,9 +146,9 @@ struct Sprite2D {
     u8           flags{1U};
 
     [[nodiscard]] constexpr bool Visible() const noexcept { return (flags & 0x01U) != 0U; }
-    [[nodiscard]] constexpr bool FlipX() const noexcept { return (flags & 0x02U) != 0U; }
-    [[nodiscard]] constexpr bool FlipY() const noexcept { return (flags & 0x04U) != 0U; }
-    [[nodiscard]] constexpr bool YSort() const noexcept { return (flags & 0x08U) != 0U; }
+    [[nodiscard]] constexpr bool FlipX() const noexcept   { return (flags & 0x02U) != 0U; }
+    [[nodiscard]] constexpr bool FlipY() const noexcept   { return (flags & 0x04U) != 0U; }
+    [[nodiscard]] constexpr bool YSort() const noexcept   { return (flags & 0x08U) != 0U; }
     [[nodiscard]] constexpr BlendMode Blend() const noexcept {
         return static_cast<BlendMode>((flags >> 4U) & 0x03U);
     }
@@ -231,6 +231,25 @@ struct Tag2D {
     u32      userData{0};
 };
 static_assert(sizeof(Tag2D) == 16);
+
+// 24-byte 2D AABB collider for Metroidvania platforming, triggers, and combat hitboxes.
+struct Collider2D {
+    static constexpr u8 kTypeId = 8;
+    Vec2 offset{0.0f, 0.0f};
+    Vec2 halfExtents{0.5f, 0.5f};
+    u16  layerMask{1U};
+    u16  queryMask{0xFFFFU};
+    u8   isTrigger{0};
+    u8   isStatic{0};
+    u16  userTag{0};
+
+    [[nodiscard]] constexpr Rect WorldBounds(Vec2 worldPos, Vec2 worldScale = {1.0f, 1.0f}) const noexcept {
+        const Vec2 center{worldPos.x + offset.x * worldScale.x, worldPos.y + offset.y * worldScale.y};
+        const Vec2 half{std::abs(halfExtents.x * worldScale.x), std::abs(halfExtents.y * worldScale.y)};
+        return Rect::FromCenterHalf(center, half);
+    }
+};
+static_assert(sizeof(Collider2D) == 24);
 
 inline constexpr u32 kCookedPrefabMagic  = 0x42465045U;
 inline constexpr u32 kWorldSnapshotMagic = 0x504E5357U;

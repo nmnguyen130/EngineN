@@ -14,7 +14,7 @@ Result<void, PlatformErrc> Window::Create(const WindowConfig& cfg, bool headless
         .refreshHz   = cfg.targetRefreshHz > 0.0f ? cfg.targetRefreshHz : 60.0f,
         .mode        = cfg.mode,
     };
-    m_cursorVisible = true;
+    m_cursorVisible   = true;
     m_textInputActive = false;
 
     if (headless) {
@@ -51,10 +51,10 @@ void Window::Destroy() noexcept {
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
     }
-    m_windowId = 0U;
-    m_cursorVisible = true;
-    m_textInputActive = false;
-    m_state.relativeMouse = false;
+    m_windowId             = 0U;
+    m_cursorVisible        = true;
+    m_textInputActive      = false;
+    m_state.relativeMouse  = false;
 }
 
 Result<void, PlatformErrc> Window::SetMode(WindowMode mode, f32 targetRefreshHz) noexcept {
@@ -128,9 +128,9 @@ WindowFlags Window::RefreshMetrics() noexcept {
     SDL_GetWindowSize(m_window, &lw, &lh);
     SDL_GetWindowSizeInPixels(m_window, &pw, &ph);
 
-    const f32 density = SDL_GetWindowPixelDensity(m_window);
+    const f32 density      = SDL_GetWindowPixelDensity(m_window);
     const f32 displayScale = SDL_GetWindowDisplayScale(m_window);
-    f32 refreshHz = m_state.refreshHz;
+    f32 refreshHz          = m_state.refreshHz;
 
     if (const SDL_DisplayID dispId = SDL_GetDisplayForWindow(m_window); dispId != 0U) {
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(dispId);

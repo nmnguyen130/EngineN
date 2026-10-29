@@ -13,9 +13,9 @@ template <typename ValueT>
 class HashMap {
 public:
     struct Slot {
-        u64 key{0};
+        u64    key{0};
         ValueT value{};
-        u32 dist{0};
+        u32    dist{0};
     };
 
     [[nodiscard]] bool Init(Arena& arena, u32 minCapacity) noexcept {
@@ -24,7 +24,7 @@ public:
         const u32 cap = std::max(16U, NextPow2(minCapacity));
         auto slots = arena.Alloc<Slot>(cap);
         if (slots.empty()) return false;
-        m_slots = slots.data();
+        m_slots    = slots.data();
         m_capacity = cap;
         return true;
     }
@@ -36,21 +36,19 @@ public:
 
     [[nodiscard]] constexpr bool Insert(u64 key, const ValueT& val) noexcept {
         if (key == 0ULL || !m_slots) return false;
-        const u32 mask = m_capacity - 1U;
+        const u32 mask    = m_capacity - 1U;
         const u32 maxLoad = MaxLoad();
-        u32 idx = static_cast<u32>(Mix64(key)) & mask;
-        u64 curKey = key;
-        ValueT curVal = val;
-        u32 curDist = 1U;
-        bool displacing = false;
+        u32    idx        = static_cast<u32>(Mix64(key)) & mask;
+        u64    curKey     = key;
+        ValueT curVal     = val;
+        u32    curDist    = 1U;
+        bool   displacing = false;
 
         for (u32 step = 0U; step < m_capacity; ++step) {
             Slot& slot = m_slots[idx];
             if (slot.dist == 0U) {
                 if (!displacing && m_count >= maxLoad) return false;
-                slot.key = curKey;
-                slot.value = std::move(curVal);
-                slot.dist = curDist;
+                slot = Slot{curKey, std::move(curVal), curDist};
                 ++m_count;
                 return true;
             }
@@ -124,8 +122,8 @@ private:
     }
 
     Slot* m_slots{nullptr};
-    u32 m_capacity{0};
-    u32 m_count{0};
+    u32   m_capacity{0};
+    u32   m_count{0};
 };
 static_assert(sizeof(HashMap<u32>) == 16);
 static_assert(sizeof(HashMap<u32>::Slot) == 16);
@@ -169,7 +167,7 @@ public:
         return Empty() ? nullptr : &m_storage[(m_tail - 1U) & kMask];
     }
 
-    [[nodiscard]] constexpr u32 Size() const noexcept { return m_tail - m_head; }
+    [[nodiscard]] constexpr u32  Size() const noexcept { return m_tail - m_head; }
     [[nodiscard]] constexpr bool Empty() const noexcept { return m_head == m_tail; }
     [[nodiscard]] constexpr bool Full() const noexcept { return Size() >= CapacityPow2; }
     [[nodiscard]] static constexpr usize Capacity() noexcept { return CapacityPow2; }

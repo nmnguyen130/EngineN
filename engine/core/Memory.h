@@ -16,7 +16,7 @@ namespace en {
 class Arena {
 public:
     static constexpr usize kSlabAlignment = 64U;
-    static constexpr u32 kMaxBytes = 512U * 1024U * 1024U;
+    static constexpr u32   kMaxBytes      = 512U * 1024U * 1024U;
 
     constexpr Arena() noexcept = default;
     ~Arena() noexcept { Shutdown(); }
@@ -32,9 +32,9 @@ public:
     constexpr Arena& operator=(Arena&& other) noexcept {
         if (this != &other) {
             Shutdown();
-            m_base = std::exchange(other.m_base, nullptr);
+            m_base     = std::exchange(other.m_base, nullptr);
             m_capacity = std::exchange(other.m_capacity, 0U);
-            m_offset = std::exchange(other.m_offset, 0U);
+            m_offset   = std::exchange(other.m_offset, 0U);
         }
         return *this;
     }
@@ -47,9 +47,9 @@ public:
             ::operator new(alignedCap, std::align_val_t{kSlabAlignment}, std::nothrow));
         if (!raw) return false;
         std::memset(raw, 0, alignedCap);
-        m_base = raw;
+        m_base     = raw;
         m_capacity = alignedCap;
-        m_offset = 0U;
+        m_offset   = 0U;
         return true;
     }
 
@@ -59,20 +59,18 @@ public:
             m_base = nullptr;
         }
         m_capacity = 0U;
-        m_offset = 0U;
+        m_offset   = 0U;
     }
 
     void Reset() noexcept { Rollback(0U); }
 
     [[nodiscard]] u8* AllocBytes(usize bytes, usize alignment = 8U) noexcept {
-        if (bytes == 0U || !m_base || bytes > kMaxBytes || !std::has_single_bit(alignment) ||
-            alignment > kSlabAlignment) {
+        if (bytes == 0U || !m_base || bytes > kMaxBytes ||
+            !std::has_single_bit(alignment) || alignment > kSlabAlignment) {
             return nullptr;
         }
         const usize alignedOff = AlignUp(m_offset, alignment);
-        if (alignedOff > m_capacity || bytes > (m_capacity - alignedOff)) {
-            return nullptr;
-        }
+        if (alignedOff > m_capacity || bytes > (m_capacity - alignedOff)) return nullptr;
         m_offset = static_cast<u32>(alignedOff + bytes);
         return m_base + alignedOff;
     }
@@ -85,9 +83,7 @@ public:
         u8* ptr = AllocBytes(sizeof(T) * count, std::max<usize>(alignof(T), 8U));
         if (!ptr) return {};
         T* typed = reinterpret_cast<T*>(ptr);
-        for (usize i = 0U; i < count; ++i) {
-            std::construct_at(typed + i);
-        }
+        for (usize i = 0U; i < count; ++i) std::construct_at(typed + i);
         return {typed, count};
     }
 
@@ -100,10 +96,10 @@ public:
         }
     }
 
-    [[nodiscard]] constexpr u8* Base() const noexcept { return m_base; }
-    [[nodiscard]] constexpr u32 Capacity() const noexcept { return m_capacity; }
-    [[nodiscard]] constexpr u32 Used() const noexcept { return m_offset; }
-    [[nodiscard]] constexpr u32 Remaining() const noexcept { return m_capacity - m_offset; }
+    [[nodiscard]] constexpr u8*  Base() const noexcept { return m_base; }
+    [[nodiscard]] constexpr u32  Capacity() const noexcept { return m_capacity; }
+    [[nodiscard]] constexpr u32  Used() const noexcept { return m_offset; }
+    [[nodiscard]] constexpr u32  Remaining() const noexcept { return m_capacity - m_offset; }
     [[nodiscard]] constexpr bool IsValid() const noexcept { return m_base != nullptr; }
 
 private:
@@ -125,7 +121,7 @@ public:
 
 private:
     Arena& m_arena;
-    u32 m_mark{0};
+    u32    m_mark{0};
 };
 
 } // namespace en

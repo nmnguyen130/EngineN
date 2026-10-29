@@ -6,7 +6,7 @@
 namespace en {
 
 // Left-child right-sibling (LCRS) transform hierarchy and world-matrix solver over Arena memory.
-// Non-owning view; Invariant: moved bit clear implies m_prev[i] == m_world[i].ToSnapshot().
+// Non-owning view; O(1) dirty marking with single-pass subtree propagation.
 class TransformSolver {
 public:
     [[nodiscard]] bool Init(Arena& arena, u16 maxEntities) noexcept;
@@ -19,10 +19,10 @@ public:
         bool keepWorldTransform = false) noexcept;
 
     constexpr void LinkLoadedSlot(u16 idx, const LocalTransform2D& local, u16 parentIdx) noexcept {
-        m_local[idx] = local;
+        m_local[idx]  = local;
         m_parent[idx] = parentIdx;
         if (parentIdx != kInvalidDenseIndex) {
-            m_nextSibling[idx] = m_firstChild[parentIdx];
+            m_nextSibling[idx]   = m_firstChild[parentIdx];
             m_firstChild[parentIdx] = idx;
         }
         MarkDirty(idx);
@@ -63,7 +63,6 @@ public:
         }
     }
 
-    void MarkSubtreeDirty(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
     void TeleportSubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
     void SnapshotPreviousTransforms(
@@ -132,7 +131,7 @@ private:
 
     void DetachFromParentList(u16 childIdx) noexcept;
     void ResolveDirtyChain(u16 idx, u16 maxEntities = kInvalidDenseIndex) noexcept;
-    void EvaluateDirtySubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
+    void EvaluateSubtree(u16 rootIdx, u16 maxEntities = kInvalidDenseIndex) noexcept;
 
     LocalTransform2D*    m_local{nullptr};
     WorldTransform2D*    m_world{nullptr};

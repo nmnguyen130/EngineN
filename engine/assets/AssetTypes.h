@@ -12,7 +12,7 @@ using AssetId = StringId;
 
 namespace literals {
 [[nodiscard]] consteval AssetId operator""_aid(const char* str, usize len) noexcept {
-    return AssetId::Hash(std::string_view{str, len});
+    return AssetId::Hash({str, len});
 }
 } // namespace literals
 
@@ -45,7 +45,7 @@ enum class AssetKind : u8 {
     Audio   = 4,
 };
 
-// 40-byte sprite atlas cell descriptor (natural 4-byte alignment, no artificial 64B padding).
+// 40-byte sprite atlas cell descriptor (natural 4-byte alignment).
 struct SpriteFrame {
     Rect          uv{0.0f, 0.0f, 1.0f, 1.0f};
     f32           width{1.0f};
@@ -119,6 +119,30 @@ struct SlotMeta {
     }
 };
 static_assert(sizeof(SlotMeta) == 16);
+
+// Unified 32-byte cache-local asset slot pairing SlotMeta with its active 16-byte asset record.
+struct AssetSlot {
+    SlotMeta meta{};
+    union {
+        TextureRecord tex;
+        AtlasRecord   atlas;
+        BlobRecord    blob;
+        AudioRecord   audio;
+    };
+
+    constexpr AssetSlot() noexcept : meta{}, tex{} {}
+};
+static_assert(sizeof(AssetSlot) == 32);
+
+namespace detail {
+inline constexpr u8            kWhitePixel[4]{255, 255, 255, 255};
+inline constexpr u8            kEmptyByte{0};
+inline constexpr f32           kSilencePcm[2]{0.0f, 0.0f};
+inline constexpr TextureRecord kDefaultTexture{.pixels = kWhitePixel, .gpu = kWhiteTexture, .width = 1, .height = 1};
+inline constexpr AtlasRecord   kDefaultAtlas{.firstSprite = 0, .spriteCount = 1};
+inline constexpr BlobRecord    kDefaultBlob{.data = &kEmptyByte, .size = 0};
+inline constexpr AudioRecord   kDefaultAudio{.pcm = kSilencePcm, .frameCount = 0, .sampleRate = 48000, .channels = 2};
+} // namespace detail
 
 struct AssetBankConfig {
     usize arenaBytes{8U * 1024U * 1024U};

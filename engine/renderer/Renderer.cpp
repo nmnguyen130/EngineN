@@ -13,11 +13,11 @@ constexpr u8 kWhitePx[4]{255, 255, 255, 255};
     switch (filter) {
         case TextureFilter::Linear: return SDL_SCALEMODE_LINEAR;
         case TextureFilter::PixelArt:
-            #if defined(SDL_SCALEMODE_PIXELART)
-                return SDL_SCALEMODE_PIXELART;
-            #else
-                return SDL_SCALEMODE_NEAREST;
-            #endif
+#if defined(SDL_SCALEMODE_PIXELART)
+            return SDL_SCALEMODE_PIXELART;
+#else
+            return SDL_SCALEMODE_NEAREST;
+#endif
         default: return SDL_SCALEMODE_NEAREST;
     }
 }
@@ -58,23 +58,25 @@ Renderer::Renderer(Renderer&& other) noexcept
       m_activeTarget(std::exchange(other.m_activeTarget, 0U)),
       m_presentMode(other.m_presentMode),
       m_initialized(std::exchange(other.m_initialized, false)) {
-    for (u16 i = 0; i < m_highWater; ++i)
+    for (u16 i = 0; i < m_highWater; ++i) {
         m_slots[i] = std::exchange(other.m_slots[i], Slot{});
+    }
 }
 
 Renderer& Renderer::operator=(Renderer&& other) noexcept {
     if (this != &other) {
         Shutdown();
-        m_sdl = std::exchange(other.m_sdl, nullptr);
-        m_stats = other.m_stats;
-        m_highWater = std::exchange(other.m_highWater, 0U);
-        m_freeHead = std::exchange(other.m_freeHead, kInvalidSlot);
-        m_liveCount = std::exchange(other.m_liveCount, 0U);
+        m_sdl          = std::exchange(other.m_sdl, nullptr);
+        m_stats        = other.m_stats;
+        m_highWater    = std::exchange(other.m_highWater, 0U);
+        m_freeHead     = std::exchange(other.m_freeHead, kInvalidSlot);
+        m_liveCount    = std::exchange(other.m_liveCount, 0U);
         m_activeTarget = std::exchange(other.m_activeTarget, 0U);
-        m_presentMode = other.m_presentMode;
-        m_initialized = std::exchange(other.m_initialized, false);
-        for (u16 i = 0; i < m_highWater; ++i)
+        m_presentMode  = other.m_presentMode;
+        m_initialized  = std::exchange(other.m_initialized, false);
+        for (u16 i = 0; i < m_highWater; ++i) {
             m_slots[i] = std::exchange(other.m_slots[i], Slot{});
+        }
     }
     return *this;
 }
@@ -111,12 +113,12 @@ void Renderer::Shutdown() noexcept {
         SDL_DestroyRenderer(m_sdl);
         m_sdl = nullptr;
     }
-    m_stats = {};
-    m_highWater = 0;
-    m_freeHead = kInvalidSlot;
-    m_liveCount = 0;
+    m_stats        = {};
+    m_highWater    = 0;
+    m_freeHead     = kInvalidSlot;
+    m_liveCount    = 0;
     m_activeTarget = 0;
-    m_initialized = false;
+    m_initialized  = false;
 }
 
 Result<void, RendererErrc> Renderer::SetPresentMode(PresentMode mode) noexcept {
@@ -134,17 +136,19 @@ Result<void, RendererErrc> Renderer::SetPresentMode(PresentMode mode) noexcept {
 
 Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& desc) noexcept {
     if (!m_initialized) return Err(RendererErrc::DeviceInitFailed);
-    if (desc.width == 0 || desc.height == 0 || desc.width > 16384 || desc.height > 16384)
+    if (desc.width == 0 || desc.height == 0 || desc.width > 16384 || desc.height > 16384) {
         return Err(RendererErrc::InvalidDimension);
+    }
     const u32 rowBytes = desc.width * 4;
-    const u32 pitch = desc.pitch ? desc.pitch : rowBytes;
+    const u32 pitch    = desc.pitch ? desc.pitch : rowBytes;
     if (pitch < rowBytes) return Err(RendererErrc::InvalidDimension);
     if (!desc.pixels.empty()) {
         const usize need = static_cast<usize>(desc.height - 1) * pitch + rowBytes;
         if (desc.pixels.size() < need) return Err(RendererErrc::TextureCreateFailed);
     }
-    if (m_freeHead == kInvalidSlot && m_highWater >= kMaxTextures)
+    if (m_freeHead == kInvalidSlot && m_highWater >= kMaxTextures) {
         return Err(RendererErrc::PoolExhausted);
+    }
 
     SDL_Texture* sdlTex = nullptr;
     if (m_sdl) {
@@ -173,9 +177,9 @@ Result<TextureHandle, RendererErrc> Renderer::CreateTexture(const TextureDesc& d
     Slot& slot = m_slots[slotIndex];
     if (slot.generation == 0) slot.generation = 1;
     slot.texture = sdlTex;
-    slot.width = static_cast<u16>(desc.width);
-    slot.height = static_cast<u16>(desc.height);
-    slot.flags = static_cast<u8>(kSlotOccupied | (desc.renderTarget ? kSlotRenderTarget : 0));
+    slot.width   = static_cast<u16>(desc.width);
+    slot.height  = static_cast<u16>(desc.height);
+    slot.flags   = static_cast<u8>(kSlotOccupied | (desc.renderTarget ? kSlotRenderTarget : 0));
     ++m_liveCount;
     return TextureHandle{slotIndex, slot.generation};
 }
@@ -185,18 +189,20 @@ Result<void, RendererErrc> Renderer::UpdateTexture(
     if (!IsTextureValid(handle)) return Err(RendererErrc::InvalidHandle);
     const Slot& slot = m_slots[handle.index];
     const bool full = (region.x == 0 && region.y == 0 && region.w == 0 && region.h == 0);
-    if (!full && (region.x < 0 || region.y < 0 || region.w < 1 || region.h < 1))
+    if (!full && (region.x < 0 || region.y < 0 || region.w < 1 || region.h < 1)) {
         return Err(RendererErrc::InvalidDimension);
+    }
 
     const i32 rx = full ? 0 : static_cast<i32>(region.x);
     const i32 ry = full ? 0 : static_cast<i32>(region.y);
-    const i32 rw = full ? static_cast<i32>(slot.width) : static_cast<i32>(region.w);
+    const i32 rw = full ? static_cast<i32>(slot.width)  : static_cast<i32>(region.w);
     const i32 rh = full ? static_cast<i32>(slot.height) : static_cast<i32>(region.h);
     if (rx < 0 || ry < 0 || rw <= 0 || rh <= 0 ||
-        rx + rw > static_cast<i32>(slot.width) || ry + rh > static_cast<i32>(slot.height))
+        rx + rw > static_cast<i32>(slot.width) || ry + rh > static_cast<i32>(slot.height)) {
         return Err(RendererErrc::InvalidDimension);
+    }
 
-    const u32 rowBytes = static_cast<u32>(rw) * 4;
+    const u32 rowBytes    = static_cast<u32>(rw) * 4;
     const u32 actualPitch = pitch ? pitch : rowBytes;
     if (actualPitch < rowBytes) return Err(RendererErrc::InvalidDimension);
     const usize need = static_cast<usize>(rh - 1) * actualPitch + rowBytes;
@@ -204,8 +210,9 @@ Result<void, RendererErrc> Renderer::UpdateTexture(
 
     if (m_sdl && slot.texture) {
         const SDL_Rect rect{rx, ry, rw, rh};
-        if (!SDL_UpdateTexture(slot.texture, &rect, pixels.data(), static_cast<int>(actualPitch)))
+        if (!SDL_UpdateTexture(slot.texture, &rect, pixels.data(), static_cast<int>(actualPitch))) {
             return Err(RendererErrc::TextureUpdateFailed);
+        }
     }
     return {};
 }
@@ -244,9 +251,9 @@ void Renderer::Submit(RenderList& list) noexcept {
 
     const Viewport vp = list.GetViewport();
     constexpr Rect kFull{0, 0, 1, 1};
-    u8 pendingClears = list.ClearPassMask();
-    u8 activePass = 0xFF;
-    u8 activeView = 0xFF;
+    u8 pendingClears    = list.ClearPassMask();
+    u8 activePass       = 0xFF;
+    u8 activeView       = 0xFF;
     Rect activeViewport{-1, -1, -1, -1};
     Rect activeScissor{-1, -1, -1, -1};
 
@@ -263,9 +270,9 @@ void Renderer::Submit(RenderList& list) noexcept {
             SDL_SetRenderDrawColorFloat(
                 m_sdl, desc.clearColor.r, desc.clearColor.g, desc.clearColor.b, desc.clearColor.a);
             SDL_RenderClear(m_sdl);
-            activeView = 0xFF;
+            activeView     = 0xFF;
             activeViewport = kFull;
-            activeScissor = kFull;
+            activeScissor  = kFull;
         }
         pendingClears &= static_cast<u8>(~mask);
     };
@@ -308,12 +315,12 @@ void Renderer::Submit(RenderList& list) noexcept {
             }
         }
 
-        const u16 texIndex = IsTextureValid(batch.texture) ? batch.texture.index : 0U;
+        const u16 texIndex  = IsTextureValid(batch.texture) ? batch.texture.index : 0U;
         SDL_Texture* sdlTex = m_slots[texIndex].texture;
         if (sdlTex) SDL_SetTextureBlendMode(sdlTex, ToBlend(batch.blend));
 
         u32 remaining = batch.count;
-        u32 current = batch.first;
+        u32 current   = batch.first;
         while (remaining) {
             const u32 chunk = std::min(remaining, RenderList::kChunkQuads);
             list.Expand(current, chunk, m_verts);
@@ -326,7 +333,7 @@ void Renderer::Submit(RenderList& list) noexcept {
                 &m_verts[0].u, static_cast<int>(sizeof(Vertex2D)),
                 static_cast<int>(chunk * 4),
                 indices.data(), static_cast<int>(indices.size()), static_cast<int>(sizeof(u16)));
-            current += chunk;
+            current   += chunk;
             remaining -= chunk;
         }
     }

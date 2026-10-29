@@ -4,53 +4,58 @@
 
 namespace en {
 
-// Compact 36-byte bitmask-indexed input buffer for jump/dash pre-buffering and coyote time.
-// Iterates only active buffered bits via std::countr_zero; pauses aging during hitstop freezes.
+// Compact 32-byte SIMD-friendly input buffer for Metroidvania jump/dash pre-buffering and coyote time.
+// Value type; 0xFF denotes an unbuffered slot, and aging pauses during hitstop freezes.
 class ActionBuffer {
 public:
-    static constexpr u8 kMaxAge = 60U;
+    static constexpr u8 kUnbuffered = 0xFFU;
 
     constexpr ActionBuffer() noexcept { Clear(); }
 
     constexpr void Clear() noexcept {
-        m_pressMask = 0U;
-        m_releaseMask = 0U;
-        m_pressAge.fill(0xFFU);
-        m_releaseAge.fill(0xFFU);
+        m_pressAge.fill(kUnbuffered);
+        m_releaseAge.fill(kUnbuffered);
     }
 
     constexpr void Feed(const TickInput& in, bool frozen = false) noexcept {
         if (!frozen) {
-            Age(m_pressMask, m_pressAge);
-            Age(m_releaseMask, m_releaseAge);
+            for (u8& a : m_pressAge) {
+                if (a < kUnbuffered) ++a;
+            }
+            for (u8& a : m_releaseAge) {
+                if (a < kUnbuffered) ++a;
+            }
         }
-        Enqueue(in.released, m_releaseMask, m_releaseAge);
-        Enqueue(in.pressed, m_pressMask, m_pressAge);
+        for (u16 m = in.released; m != 0U; m &= static_cast<u16>(m - 1U)) {
+            m_releaseAge[std::countr_zero(m)] = 0U;
+        }
+        for (u16 m = in.pressed; m != 0U; m &= static_cast<u16>(m - 1U)) {
+            m_pressAge[std::countr_zero(m)] = 0U;
+        }
     }
 
     [[nodiscard]] constexpr bool Peek(u8 action, u8 windowTicks = 12U) const noexcept {
-        const u8 i = action & 0x0FU;
-        return (m_pressMask & (1U << i)) != 0U && m_pressAge[i] <= windowTicks;
+        return m_pressAge[action & 0x0FU] <= windowTicks;
     }
 
     [[nodiscard]] constexpr bool Consume(u8 action, u8 windowTicks = 12U) noexcept {
         const u8 i = action & 0x0FU;
-        if ((m_pressMask & (1U << i)) == 0U || m_pressAge[i] > windowTicks) return false;
-        m_pressMask &= static_cast<u16>(~(1U << i));
+        if (m_pressAge[i] > windowTicks) return false;
+        m_pressAge[i] = kUnbuffered;
         return true;
     }
 
     [[nodiscard]] constexpr bool ConsumeRelease(u8 action, u8 windowTicks = 12U) noexcept {
         const u8 i = action & 0x0FU;
-        if ((m_releaseMask & (1U << i)) == 0U || m_releaseAge[i] > windowTicks) return false;
-        m_releaseMask &= static_cast<u16>(~(1U << i));
+        if (m_releaseAge[i] > windowTicks) return false;
+        m_releaseAge[i] = kUnbuffered;
         return true;
     }
 
     constexpr void Cancel(u8 action) noexcept {
-        const u16 m = static_cast<u16>(~(1U << (action & 0x0FU)));
-        m_pressMask &= m;
-        m_releaseMask &= m;
+        const u8 i = action & 0x0FU;
+        m_pressAge[i]   = kUnbuffered;
+        m_releaseAge[i] = kUnbuffered;
     }
 
     [[nodiscard]] constexpr bool TryJump(
@@ -64,28 +69,9 @@ public:
     }
 
 private:
-    static constexpr void Age(u16& mask, std::array<u8, kMaxActions>& age) noexcept {
-        for (u16 m = mask; m != 0U; m &= static_cast<u16>(m - 1U)) {
-            const u8 i = static_cast<u8>(std::countr_zero(m));
-            const u8 next = age[i] < 0xFEU ? static_cast<u8>(age[i] + 1U) : 0xFEU;
-            age[i] = next;
-            if (next > kMaxAge) mask &= static_cast<u16>(~(1U << i));
-        }
-    }
-
-    static constexpr void Enqueue(u16 bits, u16& mask, std::array<u8, kMaxActions>& age) noexcept {
-        for (; bits != 0U; bits &= static_cast<u16>(bits - 1U)) {
-            const u8 i = static_cast<u8>(std::countr_zero(bits));
-            age[i] = 0U;
-            mask |= static_cast<u16>(1U << i);
-        }
-    }
-
-    u16                         m_pressMask{0};
-    u16                         m_releaseMask{0};
     std::array<u8, kMaxActions> m_pressAge{};
     std::array<u8, kMaxActions> m_releaseAge{};
 };
-static_assert(sizeof(ActionBuffer) == 36);
+static_assert(sizeof(ActionBuffer) == 32);
 
 } // namespace en

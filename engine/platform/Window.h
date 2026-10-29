@@ -27,10 +27,10 @@ public:
     Window& operator=(Window&& o) noexcept {
         if (this != &o) {
             Destroy();
-            m_state = o.m_state;
-            m_window = std::exchange(o.m_window, nullptr);
-            m_windowId = std::exchange(o.m_windowId, 0U);
-            m_cursorVisible = o.m_cursorVisible;
+            m_state           = o.m_state;
+            m_window          = std::exchange(o.m_window, nullptr);
+            m_windowId        = std::exchange(o.m_windowId, 0U);
+            m_cursorVisible   = o.m_cursorVisible;
             m_textInputActive = o.m_textInputActive;
         }
         return *this;

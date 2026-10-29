@@ -26,17 +26,16 @@ namespace {
     return static_cast<u8>(level) >= static_cast<u8>(minLevel) && level != LogLevel::Off;
 }
 
-std::mutex            g_logMutex{};
-std::atomic<LogLevel> g_minLevel{LogLevel::Info};
-LogSinkFn             g_sink{&Log::StderrSink};
-void*                 g_sinkCtx{nullptr};
-
+std::mutex                   g_logMutex{};
+std::atomic<LogLevel>        g_minLevel{LogLevel::Info};
+LogSinkFn                    g_sink{&Log::StderrSink};
+void*                        g_sinkCtx{nullptr};
 std::atomic<AssertHandlerFn> g_assertHandler{nullptr};
 std::atomic<void*>           g_assertCtx{nullptr};
 #if defined(NDEBUG)
-std::atomic<bool> g_abortOnAssert{false};
+std::atomic<bool>            g_abortOnAssert{false};
 #else
-std::atomic<bool> g_abortOnAssert{true};
+std::atomic<bool>            g_abortOnAssert{true};
 #endif
 
 } // namespace

@@ -216,15 +216,15 @@ public:
         return IsAlive(id) ? m_transforms.Local(id.index) : LocalTransform2D{};
     }
 
-    [[nodiscard]] LocalTransform2D& ModifyLocalTransformByIndex(u16 idx) noexcept {
-        m_transforms.MarkSubtreeDirty(idx, m_maxEntities);
+    [[nodiscard]] constexpr LocalTransform2D& ModifyLocalTransformByIndex(u16 idx) noexcept {
+        m_transforms.MarkDirty(idx);
         return m_transforms.Local(idx);
     }
 
-    void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
+    constexpr void SetLocalTransform(EntityId id, const LocalTransform2D& local) noexcept {
         if (IsAlive(id)) {
             m_transforms.Local(id.index) = local;
-            m_transforms.MarkSubtreeDirty(id.index, m_maxEntities);
+            m_transforms.MarkDirty(id.index);
         }
     }
 
@@ -393,7 +393,7 @@ private:
 
     template <Component FirstC, Component... RestCs, Component... ExclCs, typename WorldT>
     [[nodiscard]] static constexpr auto MakeView(WorldT& self, Exclude<ExclCs...>) noexcept {
-        constexpr u64 reqMask = MakeComponentMask<FirstC, RestCs...>();
+        constexpr u64 reqMask  = MakeComponentMask<FirstC, RestCs...>();
         constexpr u64 exclMask = MakeComponentMask<ExclCs...>();
         if ((self.m_registeredPoolsMask & reqMask) != reqMask) {
             return ViewRange<WorldT*, FirstC, RestCs...>{&self, {}, reqMask, exclMask};

@@ -68,8 +68,8 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
         cx = std::floor(cx + 0.5f);
         cy = std::floor(cy + 0.5f);
         if (cmd.sinRot == 0.0f && cmd.cosRot == 1.0f) {
-            hw = std::floor(cmd.size.x * scale + 0.5f) * 0.5f;
-            hh = std::floor(cmd.size.y * scale + 0.5f) * 0.5f;
+            hw  = std::floor(cmd.size.x * scale + 0.5f) * 0.5f;
+            hh  = std::floor(cmd.size.y * scale + 0.5f) * 0.5f;
             hxX = hw;   hxY = 0.0f;
             hyX = 0.0f; hyY = hh * ySign;
         }
@@ -93,18 +93,18 @@ void RenderList::Push(const QuadCmd& cmd) noexcept {
     const TextureHandle tex = cmd.texture.IsValid() ? cmd.texture : kWhiteTexture;
     const u64 key = SortKey::Pack(cmd, tex.index, idx);
     if (idx > 0U && key < m_lastKey) m_monotonic = false;
-    m_lastKey = key;
+    m_lastKey  = key;
     m_keys[idx] = key;
 
     m_quads[idx] = PreparedQuad{
-        .r = cmd.color.r, .g = cmd.color.g, .b = cmd.color.b, .a = cmd.color.a,
+        .r  = cmd.color.r, .g = cmd.color.g, .b = cmd.color.b, .a = cmd.color.a,
         .cx = cx, .cy = cy,
         .d0x = d0x, .d0y = d0y,
         .d1x = d1x, .d1y = d1y,
-        .u0 = cmd.flipX ? cmd.uv.Right() : cmd.uv.x,
+        .u0 = cmd.flipX ? cmd.uv.Right()  : cmd.uv.x,
         .v0 = cmd.flipY ? cmd.uv.Bottom() : cmd.uv.y,
-        .u1 = cmd.flipX ? cmd.uv.x : cmd.uv.Right(),
-        .v1 = cmd.flipY ? cmd.uv.y : cmd.uv.Bottom(),
+        .u1 = cmd.flipX ? cmd.uv.x        : cmd.uv.Right(),
+        .v1 = cmd.flipY ? cmd.uv.y        : cmd.uv.Bottom(),
         .texture = tex,
     };
     m_compiled = false;
@@ -126,13 +126,13 @@ void RenderList::PushTile(Rect r, TextureHandle tex, Vec2 tile, Rect uv, Color c
         .depth = depth, .pass = pass, .layer = layer, .view = view,
     };
     for (f32 y = r.y; y < r.Bottom(); y += tile.y) {
-        const f32 h = std::min(tile.y, r.Bottom() - y);
+        const f32 h  = std::min(tile.y, r.Bottom() - y);
         const f32 vr = h / tile.y;
         for (f32 x = r.x; x < r.Right(); x += tile.x) {
             const f32 w = std::min(tile.x, r.Right() - x);
             cmd.center = {x + w * 0.5f, y + h * 0.5f};
-            cmd.size = {w, h};
-            cmd.uv = {uv.x, uv.y, uv.w * (w / tile.x), uv.h * vr};
+            cmd.size   = {w, h};
+            cmd.uv     = {uv.x, uv.y, uv.w * (w / tile.x), uv.h * vr};
             Push(cmd);
         }
     }
@@ -159,16 +159,16 @@ void RenderList::PushLine(Vec2 a, Vec2 b, f32 thick, Color c, u8 pass, u8 layer,
     const f32 inv = 1.0f / len;
     Push(QuadCmd{
         .center = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f},
-        .size = {len, thick},
+        .size   = {len, thick},
         .cosRot = dx * inv, .sinRot = dy * inv,
-        .color = c, .depth = depth, .pass = pass, .layer = layer, .view = view,
+        .color  = c, .depth = depth, .pass = pass, .layer = layer, .view = view,
     });
 }
 
 void RenderList::PushCircle(Vec2 center, f32 radius, u32 segs, f32 thick, Color c,
                             u8 pass, u8 layer, u8 view) noexcept {
     if (radius <= 0.0f || thick <= 0.0f) return;
-    const u32 n = std::clamp(segs, 6U, 64U);
+    const u32 n    = std::clamp(segs, 6U, 64U);
     const f32 step = kTwoPi / static_cast<f32>(n);
     Vec2 prev{center.x + radius, center.y};
     for (u32 i = 1U; i <= n; ++i) {
@@ -181,7 +181,7 @@ void RenderList::PushCircle(Vec2 center, f32 radius, u32 segs, f32 thick, Color 
 }
 
 void RenderList::PushNine(const NineSlice& n, u8 pass, u8 layer, u8 view) noexcept {
-    const Rect& r = n.rect;
+    const Rect& r  = n.rect;
     const Rect& uv = n.uv;
     if (r.IsEmpty() || uv.IsEmpty()) return;
 
@@ -208,8 +208,8 @@ void RenderList::PushNine(const NineSlice& n, u8 pass, u8 layer, u8 view) noexce
             const f32 px = xc[col], pw = xc[col + 1U] - px;
             if (pw <= 1e-4f) continue;
             q.center = {px + pw * 0.5f, py + ph * 0.5f};
-            q.size = {pw, ph};
-            q.uv = {uc[col], vy, uc[col + 1U] - uc[col], vh};
+            q.size   = {pw, ph};
+            q.uv     = {uc[col], vy, uc[col + 1U] - uc[col], vh};
             Push(q);
         }
     }
@@ -218,7 +218,7 @@ void RenderList::PushNine(const NineSlice& n, u8 pass, u8 layer, u8 view) noexce
 void RenderList::PushText(Vec2 pos, std::string_view text, Color c, f32 scale,
                           u8 pass, u8 layer, u8 view, TextureHandle font) noexcept {
     if (text.empty() || scale <= 0.0f || !font.IsValid() || font == kWhiteTexture) return;
-    const f32 qs = 16.0f * scale;
+    const f32 qs  = 16.0f * scale;
     const f32 adv = 12.0f * scale;
     f32 x = pos.x, y = pos.y;
     QuadCmd q{
@@ -275,8 +275,6 @@ void RenderList::Compile() noexcept {
         };
     };
 
-    // SortKey::kBatchStateMask includes Pass, Blend, View, and 14-bit TextureIndex,
-    // so batch boundaries are detected purely from contiguous 64-bit keys without touching m_quads.
     u64 state = m_keys[0] & SortKey::kBatchStateMask;
     u32 start = 0U;
     for (u32 i = 1U; i < n; ++i) {

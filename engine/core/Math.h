@@ -23,16 +23,22 @@ inline constexpr f32 kRadToDeg = 180.0f / kPi;
     return (cur < target) ? std::min(cur + delta, target) : std::max(cur - delta, target);
 }
 
+[[nodiscard]] constexpr f32 SmoothStep(f32 edge0, f32 edge1, f32 x) noexcept {
+    if (edge1 <= edge0) return x >= edge1 ? 1.0f : 0.0f;
+    const f32 t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+[[nodiscard]] constexpr f32 WrapAngle(f32 rad) noexcept {
+    return rad - std::floor((rad + kPi) * kInvTwoPi) * kTwoPi;
+}
+
 // Evaluates sine and cosine simultaneously on [-pi/2, pi/2] via an 11th-order minimax polynomial.
 constexpr void FastSinCos(f32 rad, f32& outCos, f32& outSin) noexcept {
-    const f32 turns = std::floor((rad + kPi) * kInvTwoPi);
-    const f32 w = rad - turns * kTwoPi;
+    const f32 w = WrapAngle(rad);
     f32 sx = w;
-    if (sx > kHalfPi) {
-        sx = kPi - sx;
-    } else if (sx < -kHalfPi) {
-        sx = -kPi - sx;
-    }
+    if (sx > kHalfPi) sx = kPi - sx;
+    else if (sx < -kHalfPi) sx = -kPi - sx;
     const f32 cx = kHalfPi - std::abs(w);
 
     const auto poly = [](f32 t) constexpr noexcept -> f32 {
@@ -45,6 +51,19 @@ constexpr void FastSinCos(f32 rad, f32& outCos, f32& outSin) noexcept {
     outCos = poly(cx);
 }
 
+// Implicit critically damped 2nd-order spring step (unconditionally stable for dt > 0).
+constexpr void StepSpring(f32& pos, f32& vel, f32 target, f32 omega, f32 dt) noexcept {
+    if (dt <= 0.0f || omega <= 0.0f) return;
+    const f32 f = 1.0f + 2.0f * dt * omega;
+    const f32 oo = omega * omega;
+    const f32 hoo = dt * oo;
+    const f32 hhoo = dt * hoo;
+    const f32 detInv = 1.0f / (f + hhoo);
+    const f32 nextPos = (f * pos + dt * vel + hhoo * target) * detInv;
+    vel = (vel + hoo * (target - pos)) * detInv;
+    pos = nextPos;
+}
+
 struct Vec2 {
     f32 x{0.0f};
     f32 y{0.0f};
@@ -55,9 +74,7 @@ struct Vec2 {
     [[nodiscard]] constexpr Vec2 operator*(f32 s) const noexcept { return {x * s, y * s}; }
 
     [[nodiscard]] constexpr Vec2 operator/(f32 s) const noexcept {
-        if (std::abs(s) <= 1e-12f) return {};
-        const f32 inv = 1.0f / s;
-        return {x * inv, y * inv};
+        return (std::abs(s) <= 1e-12f) ? Vec2{} : (*this * (1.0f / s));
     }
 
     constexpr Vec2& operator+=(Vec2 r) noexcept { x += r.x; y += r.y; return *this; }
@@ -106,6 +123,7 @@ struct Rect {
     [[nodiscard]] constexpr f32 Right() const noexcept { return x + w; }
     [[nodiscard]] constexpr f32 Bottom() const noexcept { return y + h; }
     [[nodiscard]] constexpr Vec2 Center() const noexcept { return {x + w * 0.5f, y + h * 0.5f}; }
+    [[nodiscard]] constexpr Vec2 HalfExtents() const noexcept { return {w * 0.5f, h * 0.5f}; }
 
     [[nodiscard]] constexpr bool Contains(Vec2 p) const noexcept {
         return !IsEmpty() && p.x >= x && p.x <= Right() && p.y >= y && p.y <= Bottom();
@@ -134,19 +152,72 @@ struct Rect {
 };
 static_assert(sizeof(Rect) == 16 && alignof(Rect) == 4);
 
+// Swept 2D AABB collision result for continuous Metroidvania platforming and dash kinematics.
+// Value type; time in [0, 1] indicates normalized impact fraction along movement delta.
+struct SweepHit {
+    f32  time{1.0f};
+    Vec2 normal{};
+    u8   hit{0};
+    u8   pad[3]{};
+
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return hit != 0U; }
+};
+static_assert(sizeof(SweepHit) == 16);
+
+// Computes Minkowski-expanded slab intersection of `moving` travelling by `delta` against `staticBox`.
+[[nodiscard]] constexpr SweepHit SweepRect(const Rect& moving, Vec2 delta, const Rect& staticBox) noexcept {
+    if (moving.IsEmpty() || staticBox.IsEmpty()) return {};
+
+    const Rect expanded{
+        staticBox.x - moving.w * 0.5f,
+        staticBox.y - moving.h * 0.5f,
+        staticBox.w + moving.w,
+        staticBox.h + moving.h,
+    };
+    const Vec2 origin = moving.Center();
+
+    f32 tNearX = -1e30f, tFarX = 1e30f;
+    if (std::abs(delta.x) <= 1e-8f) {
+        if (origin.x <= expanded.x || origin.x >= expanded.Right()) return {};
+    } else {
+        const f32 invX = 1.0f / delta.x;
+        tNearX = (expanded.x - origin.x) * invX;
+        tFarX  = (expanded.Right() - origin.x) * invX;
+        if (tNearX > tFarX) std::swap(tNearX, tFarX);
+    }
+
+    f32 tNearY = -1e30f, tFarY = 1e30f;
+    if (std::abs(delta.y) <= 1e-8f) {
+        if (origin.y <= expanded.y || origin.y >= expanded.Bottom()) return {};
+    } else {
+        const f32 invY = 1.0f / delta.y;
+        tNearY = (expanded.y - origin.y) * invY;
+        tFarY  = (expanded.Bottom() - origin.y) * invY;
+        if (tNearY > tFarY) std::swap(tNearY, tFarY);
+    }
+
+    const f32 tEnter = std::max(tNearX, tNearY);
+    const f32 tExit  = std::min(tFarX, tFarY);
+    if (tEnter > tExit || tEnter < 0.0f || tEnter >= 1.0f || tExit <= 0.0f) return {};
+
+    Vec2 n{};
+    if (tNearX > tNearY) {
+        n.x = (delta.x < 0.0f) ? 1.0f : -1.0f;
+    } else {
+        n.y = (delta.y < 0.0f) ? 1.0f : -1.0f;
+    }
+    return SweepHit{.time = tEnter, .normal = n, .hit = 1U};
+}
+
 struct Mat3x2 {
-    f32 m00{1.0f};
-    f32 m01{0.0f};
-    f32 m10{0.0f};
-    f32 m11{1.0f};
-    f32 tx{0.0f};
-    f32 ty{0.0f};
+    f32 m00{1.0f}, m01{0.0f};
+    f32 m10{0.0f}, m11{1.0f};
+    f32 tx{0.0f},  ty{0.0f};
 
     [[nodiscard]] static constexpr Mat3x2 Identity() noexcept { return {}; }
 
     [[nodiscard]] static constexpr Mat3x2 FromTRS(Vec2 pos, f32 rotRad, Vec2 scale = {1.0f, 1.0f}) noexcept {
-        f32 c = 1.0f;
-        f32 s = 0.0f;
+        f32 c = 1.0f, s = 0.0f;
         FastSinCos(rotRad, c, s);
         return {c * scale.x, s * scale.x, -s * scale.y, c * scale.y, pos.x, pos.y};
     }
@@ -157,10 +228,10 @@ struct Mat3x2 {
         const f32 det = Determinant();
         if (std::abs(det) <= 1e-8f) return Identity();
         const f32 invDet = 1.0f / det;
-        const f32 i00 = m11 * invDet;
+        const f32 i00 =  m11 * invDet;
         const f32 i01 = -m01 * invDet;
         const f32 i10 = -m10 * invDet;
-        const f32 i11 = m00 * invDet;
+        const f32 i11 =  m00 * invDet;
         return {i00, i01, i10, i11, -(i00 * tx + i10 * ty), -(i01 * tx + i11 * ty)};
     }
 
@@ -178,8 +249,8 @@ struct Mat3x2 {
             m01 * r.m00 + m11 * r.m01,
             m00 * r.m10 + m10 * r.m11,
             m01 * r.m10 + m11 * r.m11,
-            m00 * r.tx + m10 * r.ty + tx,
-            m01 * r.tx + m11 * r.ty + ty,
+            m00 * r.tx  + m10 * r.ty + tx,
+            m01 * r.tx  + m11 * r.ty + ty,
         };
     }
 
@@ -188,10 +259,7 @@ struct Mat3x2 {
 static_assert(sizeof(Mat3x2) == 24 && alignof(Mat3x2) == 4);
 
 struct Color {
-    f32 r{1.0f};
-    f32 g{1.0f};
-    f32 b{1.0f};
-    f32 a{1.0f};
+    f32 r{1.0f}, g{1.0f}, b{1.0f}, a{1.0f};
 
     [[nodiscard]] static constexpr Color Premultiplied(f32 r, f32 g, f32 b, f32 a = 1.0f) noexcept {
         return {r * a, g * a, b * a, a};
@@ -199,29 +267,7 @@ struct Color {
 
     [[nodiscard]] static constexpr Color FromRGBA8(u8 r, u8 g, u8 b, u8 a = 255) noexcept {
         constexpr f32 kInv = 1.0f / 255.0f;
-        return Premultiplied(
-            static_cast<f32>(r) * kInv,
-            static_cast<f32>(g) * kInv,
-            static_cast<f32>(b) * kInv,
-            static_cast<f32>(a) * kInv);
-    }
-
-    [[nodiscard]] static constexpr Color FromHSV(f32 hDeg, f32 s, f32 v, f32 a = 1.0f) noexcept {
-        const f32 sat = std::clamp(s, 0.0f, 1.0f);
-        const f32 val = std::clamp(v, 0.0f, 1.0f);
-        const f32 alpha = std::clamp(a, 0.0f, 1.0f);
-        f32 wrappedH = hDeg - std::floor(hDeg * (1.0f / 360.0f)) * 360.0f;
-        if (wrappedH >= 360.0f) wrappedH -= 360.0f;
-
-        const f32 c = val * sat;
-        const f32 hSector = wrappedH * (1.0f / 60.0f);
-        const f32 x = c * (1.0f - std::abs((hSector - std::floor(hSector * 0.5f) * 2.0f) - 1.0f));
-        const f32 m = val - c;
-
-        constexpr u8 kSectorMap[6][3]{{0, 1, 2}, {1, 0, 2}, {2, 0, 1}, {2, 1, 0}, {1, 2, 0}, {0, 2, 1}};
-        const f32 ch[3]{c + m, x + m, m};
-        const auto& idx = kSectorMap[static_cast<usize>(hSector) % 6U];
-        return Premultiplied(ch[idx[0]], ch[idx[1]], ch[idx[2]], alpha);
+        return Premultiplied(r * kInv, g * kInv, b * kInv, a * kInv);
     }
 
     [[nodiscard]] constexpr u32 ToRGBA8() const noexcept {
@@ -243,38 +289,5 @@ struct Color {
     [[nodiscard]] constexpr bool operator==(const Color&) const noexcept = default;
 };
 static_assert(sizeof(Color) == 16 && alignof(Color) == 4);
-
-// Implicit critically damped 2nd-order spring step (unconditionally stable for dt > 0).
-constexpr void StepSpring(f32& pos, f32& vel, f32 target, f32 omega, f32 dt) noexcept {
-    if (dt <= 0.0f || omega <= 0.0f) return;
-    const f32 f = 1.0f + 2.0f * dt * omega;
-    const f32 oo = omega * omega;
-    const f32 hoo = dt * oo;
-    const f32 hhoo = dt * hoo;
-    const f32 detInv = 1.0f / (f + hhoo);
-    const f32 nextPos = (f * pos + dt * vel + hhoo * target) * detInv;
-    vel = (vel + hoo * (target - pos)) * detInv;
-    pos = nextPos;
-}
-
-[[nodiscard]] constexpr f32 SmoothStep(f32 edge0, f32 edge1, f32 x) noexcept {
-    if (edge1 <= edge0) return x >= edge1 ? 1.0f : 0.0f;
-    const f32 t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
-
-[[nodiscard]] constexpr f32 EaseOutBack(f32 t) noexcept {
-    constexpr f32 c1 = 1.70158f;
-    constexpr f32 c3 = c1 + 1.0f;
-    const f32 u = std::clamp(t, 0.0f, 1.0f) - 1.0f;
-    return 1.0f + c3 * u * u * u + c1 * u * u;
-}
-
-[[nodiscard]] constexpr Vec2 CubicBezier(Vec2 p0, Vec2 p1, Vec2 p2, Vec2 p3, f32 t) noexcept {
-    const f32 u = 1.0f - t;
-    const f32 tt = t * t;
-    const f32 uu = u * u;
-    return p0 * (uu * u) + p1 * (3.0f * uu * t) + p2 * (3.0f * u * tt) + p3 * (tt * t);
-}
 
 } // namespace en

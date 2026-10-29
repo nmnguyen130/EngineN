@@ -5,8 +5,8 @@
 
 namespace en {
 
-// Room-scoped asset bank with direct O(1) generational handle resolution and permanent slot-0 fallbacks.
-// Move-disabled owner of an Arena; invalid handles resolve to safe default records at index 0.
+// Room-scoped asset bank with O(1) generational handle resolution over unified 32-byte AssetSlots.
+// Move-disabled owner of an Arena; invalid handles resolve to permanent constexpr fallback records.
 class AssetBank {
 public:
     using GpuDestroyFn = void (*)(TextureHandle gpu, void* ctx) noexcept;
@@ -27,7 +27,7 @@ public:
 
     constexpr void SetGpuDestroy(GpuDestroyFn fn, void* ctx = nullptr) noexcept {
         m_gpuDestroy = fn;
-        m_gpuCtx = ctx;
+        m_gpuCtx     = ctx;
     }
 
     [[nodiscard]] Result<u8, AssetErrc> BeginScope() noexcept;
@@ -46,7 +46,8 @@ public:
     }
 
     [[nodiscard]] constexpr const SpriteFrame& GetAtlasFrame(AtlasHandle h, u16 i) const noexcept {
-        const AtlasRecord& a = m_atlases[Resolve(h, AssetKind::Atlas)];
+        const u16 slot = Resolve(h, AssetKind::Atlas);
+        const AtlasRecord& a = (slot > 0U) ? m_slots[slot].atlas : detail::kDefaultAtlas;
         if (a.spriteCount > 0U) {
             const u16 idx = static_cast<u16>(a.firstSprite + (i % a.spriteCount));
             if (idx < m_spriteHigh && m_sprites[idx].generation != 0U) return m_sprites[idx];
@@ -55,7 +56,8 @@ public:
     }
 
     [[nodiscard]] constexpr SpriteHandle GetSpriteHandle(AtlasHandle h, u16 i) const noexcept {
-        const AtlasRecord& a = m_atlases[Resolve(h, AssetKind::Atlas)];
+        const u16 slot = Resolve(h, AssetKind::Atlas);
+        const AtlasRecord& a = (slot > 0U) ? m_slots[slot].atlas : detail::kDefaultAtlas;
         if (a.spriteCount > 0U) {
             const u16 idx = static_cast<u16>(a.firstSprite + (i % a.spriteCount));
             if (idx < m_spriteHigh && m_sprites[idx].generation != 0U) {
@@ -66,13 +68,18 @@ public:
     }
 
     [[nodiscard]] constexpr const TextureRecord& GetTexture(TextureAssetHandle h) const noexcept {
-        return m_textures[Resolve(h, AssetKind::Texture)];
+        const u16 slot = Resolve(h, AssetKind::Texture);
+        return (slot > 0U) ? m_slots[slot].tex : detail::kDefaultTexture;
     }
+
     [[nodiscard]] constexpr const BlobRecord& GetBlob(BlobHandle h) const noexcept {
-        return m_blobs[Resolve(h, AssetKind::Blob)];
+        const u16 slot = Resolve(h, AssetKind::Blob);
+        return (slot > 0U) ? m_slots[slot].blob : detail::kDefaultBlob;
     }
+
     [[nodiscard]] constexpr const AudioRecord& GetAudio(AudioHandle h) const noexcept {
-        return m_audio[Resolve(h, AssetKind::Audio)];
+        const u16 slot = Resolve(h, AssetKind::Audio);
+        return (slot > 0U) ? m_slots[slot].audio : detail::kDefaultAudio;
     }
 
     [[nodiscard]] TextureAssetHandle RegisterTexture(
@@ -125,8 +132,8 @@ private:
     template <typename H>
     [[nodiscard]] constexpr u16 Resolve(H h, AssetKind kind) const noexcept {
         return (h.IsValid() && h.index > 0U && h.index < m_slotHigh &&
-                m_meta[h.index].generation == h.generation &&
-                m_meta[h.index].Kind() == kind)
+                m_slots[h.index].meta.generation == h.generation &&
+                m_slots[h.index].meta.Kind() == kind)
                    ? h.index
                    : 0U;
     }
@@ -135,7 +142,7 @@ private:
     [[nodiscard]] H Find(AssetId id, AssetKind kind) const noexcept {
         const u16* p = m_idMap.Find(id.value);
         if (p && *p > 0U && *p < m_slotHigh) {
-            const SlotMeta& m = m_meta[*p];
+            const SlotMeta& m = m_slots[*p].meta;
             if (m.assetId != 0ULL && m.Kind() == kind) return H{*p, m.generation};
         }
         return H{};
@@ -148,12 +155,8 @@ private:
     void PropagateGpu(u16 texSlot, TextureHandle gpu) noexcept;
     void EvictOne(u16 slot, std::span<TextureHandle> outGpu, u32& nGpu) noexcept;
 
-    SlotMeta*          m_meta{nullptr};
+    AssetSlot*         m_slots{nullptr};
     SpriteFrame*       m_sprites{nullptr};
-    AtlasRecord*       m_atlases{nullptr};
-    TextureRecord*     m_textures{nullptr};
-    BlobRecord*        m_blobs{nullptr};
-    AudioRecord*       m_audio{nullptr};
     FreeBlock*         m_freeHead{nullptr};
     GpuDestroyFn       m_gpuDestroy{nullptr};
     void*              m_gpuCtx{nullptr};

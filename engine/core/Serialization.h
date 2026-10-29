@@ -5,13 +5,14 @@
 namespace en {
 
 // Bounds-checked little-endian binary writer over a caller-owned byte span.
+// Non-owning view; sets sticky overflow state on out-of-bounds writes.
 class BinaryWriter {
 public:
     constexpr explicit BinaryWriter(std::span<u8> buf) noexcept : m_buf(buf) {}
 
     [[nodiscard]] constexpr usize Offset() const noexcept { return m_pos; }
     [[nodiscard]] constexpr usize Remaining() const noexcept { return m_buf.size() - m_pos; }
-    [[nodiscard]] constexpr bool Ok() const noexcept { return !m_overflow; }
+    [[nodiscard]] constexpr bool  Ok() const noexcept { return !m_overflow; }
     [[nodiscard]] constexpr std::span<const u8> Written() const noexcept {
         return m_buf.subspan(0U, m_pos);
     }
@@ -54,13 +55,14 @@ private:
 };
 
 // Bounds-checked little-endian binary reader over a caller-owned byte span.
+// Non-owning view; sets sticky overflow state on out-of-bounds reads.
 class BinaryReader {
 public:
     constexpr explicit BinaryReader(std::span<const u8> buf) noexcept : m_buf(buf) {}
 
     [[nodiscard]] constexpr usize Offset() const noexcept { return m_pos; }
     [[nodiscard]] constexpr usize Remaining() const noexcept { return m_buf.size() - m_pos; }
-    [[nodiscard]] constexpr bool Ok() const noexcept { return !m_overflow; }
+    [[nodiscard]] constexpr bool  Ok() const noexcept { return !m_overflow; }
 
     constexpr bool ReadBytes(void* dst, usize bytes) noexcept {
         if (m_overflow || bytes > Remaining()) {
@@ -90,8 +92,7 @@ public:
             m_overflow = true;
             return false;
         }
-        out = std::string_view{
-            reinterpret_cast<const char*>(m_buf.data() + m_pos), len};
+        out = {reinterpret_cast<const char*>(m_buf.data() + m_pos), len};
         m_pos += len;
         return true;
     }

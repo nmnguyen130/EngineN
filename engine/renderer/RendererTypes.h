@@ -90,7 +90,7 @@ struct QuadCmd {
 };
 static_assert(sizeof(QuadCmd) == 80);
 
-// 64-bit sort key: [61..60]Pass [59..52]Layer [51..36]Depth [35..34]Blend [33..31]View [29..16]TexIdx [15..0]QuadIdx
+// 64-bit sort key: [61..60]Pass [59..52]Layer [51..36]Depth [35..34]Blend [32..30]View [29..16]TexIdx [15..0]QuadIdx
 struct SortKey {
     static constexpr u64 kBatchStateMask = 0xF000000FFFFF0000ULL;
 
@@ -155,7 +155,7 @@ struct Camera2D {
 
     [[nodiscard]] constexpr Vec2 ToView(Vec2 world, Viewport vp) const noexcept {
         if (screenSpace) return world * zoom;
-        const f32 s = Scale();
+        const f32 s  = Scale();
         const f32 vw = viewport.w * static_cast<f32>(vp.w);
         const f32 vh = viewport.h * static_cast<f32>(vp.h);
         return {
@@ -167,8 +167,8 @@ struct Camera2D {
     [[nodiscard]] constexpr Vec2 ToWorld(Vec2 view, Viewport vp) const noexcept {
         if (screenSpace) return view * (zoom > 1e-5f ? (1.0f / zoom) : 1.0f);
         const f32 inv = 1.0f / Scale();
-        const f32 vw = viewport.w * static_cast<f32>(vp.w);
-        const f32 vh = viewport.h * static_cast<f32>(vp.h);
+        const f32 vw  = viewport.w * static_cast<f32>(vp.w);
+        const f32 vh  = viewport.h * static_cast<f32>(vp.h);
         return {
             cx + (view.x - vw * 0.5f) * inv,
             cy + (view.y - vh * 0.5f) * inv * (yUp ? -1.0f : 1.0f),

@@ -4,7 +4,7 @@
 
 namespace en {
 
-// Monotonic high-resolution OS clock and thread yield wrapper.
+// Monotonic high-resolution OS clock and thread yield wrapper using standard C++23 chrono.
 struct Clock {
     [[nodiscard]] static u64 NowNs() noexcept;
     static void SleepNs(u64 ns) noexcept;
@@ -21,7 +21,7 @@ public:
     constexpr explicit FramePacer(u32 targetFps = 0U) noexcept { SetTargetFps(targetFps); }
 
     constexpr void SetTargetFps(u32 fps) noexcept {
-        m_targetFps = fps;
+        m_targetFps     = fps;
         m_framePeriodNs = (fps > 0U) ? (1'000'000'000ULL / fps) : 0ULL;
     }
 

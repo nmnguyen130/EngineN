@@ -7,15 +7,15 @@
 
 namespace en {
 
-inline constexpr usize kMaxActions            = 16U;
-inline constexpr usize kMaxAxes               = 4U;
-inline constexpr usize kBindingsPerAction     = 4U;
-inline constexpr f32   kInvAxisMax            = 1.0f / 32767.0f;
+inline constexpr usize kMaxActions           = 16U;
+inline constexpr usize kMaxAxes              = 4U;
+inline constexpr usize kBindingsPerAction    = 4U;
+inline constexpr f32   kInvAxisMax           = 1.0f / 32767.0f;
 
 // Virtual gamepad buttons [20..31] driven by Schmitt-trigger hysteresis on axes [0..5].
-inline constexpr u16   kPadVirtualButtonBase  = 20U;
-inline constexpr i16   kAxisPressThreshold    = 18000;
-inline constexpr i16   kAxisReleaseThreshold  = 12000;
+inline constexpr u16   kPadVirtualButtonBase = 20U;
+inline constexpr i16   kAxisPressThreshold   = 18000;
+inline constexpr i16   kAxisReleaseThreshold = 12000;
 
 enum class InputDevice : u8 {
     None     = 0,
@@ -82,16 +82,13 @@ struct AxisBinding {
     u16         pad{0};
 
     [[nodiscard]] constexpr bool Invert() const noexcept { return (flags & kFlagInvert) != 0U; }
-    [[nodiscard]] constexpr bool NeutralSocd() const noexcept {
-        return (flags & kFlagNeutralSocd) != 0U;
-    }
+    [[nodiscard]] constexpr bool NeutralSocd() const noexcept { return (flags & kFlagNeutralSocd) != 0U; }
 
     constexpr void SetInvert(bool v) noexcept {
         flags = v ? static_cast<u8>(flags | kFlagInvert) : static_cast<u8>(flags & ~kFlagInvert);
     }
     constexpr void SetNeutralSocd(bool v) noexcept {
-        flags = v ? static_cast<u8>(flags | kFlagNeutralSocd)
-                  : static_cast<u8>(flags & ~kFlagNeutralSocd);
+        flags = v ? static_cast<u8>(flags | kFlagNeutralSocd) : static_cast<u8>(flags & ~kFlagNeutralSocd);
     }
 
     constexpr void Sanitize() noexcept {
@@ -114,7 +111,7 @@ public:
 
     constexpr void Clear() noexcept {
         m_actions = {};
-        m_axes = {};
+        m_axes    = {};
     }
 
     constexpr InputMap& BindSlot(u8 action, u8 slot, InputSource src) noexcept {
@@ -209,7 +206,7 @@ struct TickInput {
     }
 
     [[nodiscard]] constexpr bool TapReleased(u8 a, u16 maxTicks = 12U) const noexcept {
-        const u8 i = a & 0x0FU;
+        const u8 i  = a & 0x0FU;
         const u16 b = static_cast<u16>(1U << i);
         return (released & b) != 0U && (held & b) == 0U &&
                heldTicks[i] > 0U && heldTicks[i] <= maxTicks;

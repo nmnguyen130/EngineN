@@ -1,6 +1,5 @@
 #include "assets/ImageLoader.h"
 
-#include <SDL3/SDL_filesystem.h>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -8,13 +7,12 @@
 #include <utility>
 
 namespace en {
-
 namespace {
 
 [[nodiscard]] constexpr u32 ReadBeU32(const u8* p) noexcept {
     return (static_cast<u32>(p[0]) << 24U) |
            (static_cast<u32>(p[1]) << 16U) |
-           (static_cast<u32>(p[2]) << 8U) |
+           (static_cast<u32>(p[2]) << 8U)  |
            static_cast<u32>(p[3]);
 }
 
@@ -24,37 +22,32 @@ namespace {
 
 [[nodiscard]] constexpr u32 ReadLeU32(const u8* p) noexcept {
     return static_cast<u32>(p[0]) |
-           (static_cast<u32>(p[1]) << 8U) |
+           (static_cast<u32>(p[1]) << 8U)  |
            (static_cast<u32>(p[2]) << 16U) |
            (static_cast<u32>(p[3]) << 24U);
 }
 
 [[nodiscard]] constexpr u8 PaethPredictor(u8 a, u8 b, u8 c) noexcept {
-    const i32 p = static_cast<i32>(a) + static_cast<i32>(b) - static_cast<i32>(c);
-    const i32 pa = (p >= static_cast<i32>(a)) ? (p - static_cast<i32>(a)) : (static_cast<i32>(a) - p);
-    const i32 pb = (p >= static_cast<i32>(b)) ? (p - static_cast<i32>(b)) : (static_cast<i32>(b) - p);
-    const i32 pc = (p >= static_cast<i32>(c)) ? (p - static_cast<i32>(c)) : (static_cast<i32>(c) - p);
+    const i32 p  = static_cast<i32>(a) + static_cast<i32>(b) - static_cast<i32>(c);
+    const i32 pa = std::abs(p - static_cast<i32>(a));
+    const i32 pb = std::abs(p - static_cast<i32>(b));
+    const i32 pc = std::abs(p - static_cast<i32>(c));
     if (pa <= pb && pa <= pc) return a;
     return (pb <= pc) ? b : c;
 }
 
-// Reconstructs PNG scanline in-place inside row[] using left neighbor and previous row.
 [[nodiscard]] bool UnfilterScanlineInPlace(
-    u8 filterType,
-    u8* row,
-    const u8* prevRow,
-    usize strideBytes) noexcept {
+    u8 filterType, u8* row, const u8* prevRow, usize strideBytes) noexcept {
     constexpr usize kBpp = 4U;
     switch (filterType) {
-        case 0U:
-            return true;
+        case 0U: return true;
         case 1U:
             for (usize i = kBpp; i < strideBytes; ++i) {
                 row[i] = static_cast<u8>(row[i] + row[i - kBpp]);
             }
             return true;
         case 2U:
-            if (prevRow != nullptr) {
+            if (prevRow) {
                 for (usize i = 0U; i < strideBytes; ++i) {
                     row[i] = static_cast<u8>(row[i] + prevRow[i]);
                 }
@@ -63,15 +56,15 @@ namespace {
         case 3U:
             for (usize i = 0U; i < strideBytes; ++i) {
                 const u32 left = (i >= kBpp) ? row[i - kBpp] : 0U;
-                const u32 up = (prevRow != nullptr) ? prevRow[i] : 0U;
+                const u32 up   = prevRow ? prevRow[i] : 0U;
                 row[i] = static_cast<u8>(row[i] + ((left + up) >> 1U));
             }
             return true;
         case 4U:
             for (usize i = 0U; i < strideBytes; ++i) {
-                const u8 left = (i >= kBpp) ? row[i - kBpp] : 0U;
-                const u8 up = (prevRow != nullptr) ? prevRow[i] : 0U;
-                const u8 upLeft = (prevRow != nullptr && i >= kBpp) ? prevRow[i - kBpp] : 0U;
+                const u8 left   = (i >= kBpp) ? row[i - kBpp] : 0U;
+                const u8 up     = prevRow ? prevRow[i] : 0U;
+                const u8 upLeft = (prevRow && i >= kBpp) ? prevRow[i - kBpp] : 0U;
                 row[i] = static_cast<u8>(row[i] + PaethPredictor(left, up, upLeft));
             }
             return true;
@@ -88,13 +81,13 @@ bool ImageLoader::LoadPngRgba(
     u16 expectedHeight,
     std::span<u8> outPixels) noexcept {
     const usize expectedByteSize = static_cast<usize>(expectedWidth) * expectedHeight * 4U;
-    if (filePath == nullptr || expectedWidth == 0U || expectedHeight == 0U ||
+    if (!filePath || expectedWidth == 0U || expectedHeight == 0U ||
         outPixels.size() < expectedByteSize) {
         return false;
     }
 
     std::FILE* fp = std::fopen(filePath, "rb");
-    if (fp == nullptr) return false;
+    if (!fp) return false;
 
     static constexpr std::array<u8, 8> kPngSignature{{0x89U, 0x50U, 0x4EU, 0x47U, 0x0DU, 0x0AU, 0x1AU, 0x0AU}};
     std::array<u8, 8> sig{};
@@ -103,20 +96,18 @@ bool ImageLoader::LoadPngRgba(
         return false;
     }
 
-    bool ihdrValid = false;
-    bool zlibHeaderParsed = false;
-    bool finalBlockSeen = false;
-    u16 blockRemaining = 0U;
-
+    bool  ihdrValid        = false;
+    bool  zlibHeaderParsed = false;
+    bool  finalBlockSeen   = false;
+    u16   blockRemaining   = 0U;
     const usize strideBytes = static_cast<usize>(expectedWidth) * 4U;
-    usize rowColPos = 0U;
-    u16 currentRow = 0U;
-    u8 curFilter = 0U;
-
-    u8 zlibHdrBytes[2]{};
-    u8 zlibHdrRead = 0U;
-    u8 blockHdrBytes[5]{};
-    u8 blockHdrRead = 0U;
+    usize rowColPos        = 0U;
+    u16   currentRow       = 0U;
+    u8    curFilter        = 0U;
+    u8    zlibHdrBytes[2]{};
+    u8    zlibHdrRead      = 0U;
+    u8    blockHdrBytes[5]{};
+    u8    blockHdrRead     = 0U;
 
     const auto feedIdatByte = [&](u8 byteVal) noexcept -> bool {
         if (!zlibHeaderParsed) {
@@ -130,7 +121,6 @@ bool ImageLoader::LoadPngRgba(
             }
             return true;
         }
-
         if (currentRow >= expectedHeight) return true;
 
         if (blockRemaining == 0U) {
@@ -140,11 +130,11 @@ bool ImageLoader::LoadPngRgba(
                 const u8 bheader = blockHdrBytes[0];
                 if (((bheader >> 1U) & 0x03U) != 0U) return false;
                 finalBlockSeen = ((bheader & 0x01U) != 0U);
-                const u16 len = ReadLeU16(&blockHdrBytes[1]);
+                const u16 len  = ReadLeU16(&blockHdrBytes[1]);
                 const u16 nlen = ReadLeU16(&blockHdrBytes[3]);
                 if (static_cast<u16>(len ^ 0xFFFFU) != nlen) return false;
                 blockRemaining = len;
-                blockHdrRead = 0U;
+                blockHdrRead   = 0U;
             }
             return true;
         }
@@ -160,9 +150,7 @@ bool ImageLoader::LoadPngRgba(
         dstRow[rowColPos - 1U] = byteVal;
         if (rowColPos == strideBytes) {
             const u8* prevRow = (currentRow > 0U) ? (dstRow - strideBytes) : nullptr;
-            if (!UnfilterScanlineInPlace(curFilter, dstRow, prevRow, strideBytes)) {
-                return false;
-            }
+            if (!UnfilterScanlineInPlace(curFilter, dstRow, prevRow, strideBytes)) return false;
             rowColPos = 0U;
             ++currentRow;
         } else {
@@ -172,10 +160,10 @@ bool ImageLoader::LoadPngRgba(
     };
 
     std::array<u8, 4096> chunkBuf{};
-    while (true) {
+    for (;;) {
         std::array<u8, 8> chunkHdr{};
         if (std::fread(chunkHdr.data(), 1U, chunkHdr.size(), fp) != chunkHdr.size()) break;
-        const u32 chunkLen = ReadBeU32(chunkHdr.data());
+        const u32 chunkLen  = ReadBeU32(chunkHdr.data());
         const u32 chunkType = ReadBeU32(chunkHdr.data() + 4U);
         if (chunkLen > 0x3FFFFFFFU) {
             std::fclose(fp);
@@ -189,9 +177,7 @@ bool ImageLoader::LoadPngRgba(
                 std::fclose(fp);
                 return false;
             }
-            const u32 w = ReadBeU32(&ihdr[0]);
-            const u32 h = ReadBeU32(&ihdr[4]);
-            if (w != expectedWidth || h != expectedHeight ||
+            if (ReadBeU32(&ihdr[0]) != expectedWidth || ReadBeU32(&ihdr[4]) != expectedHeight ||
                 ihdr[8] != 8U || ihdr[9] != 6U || ihdr[12] != 0U) {
                 std::fclose(fp);
                 return false;
@@ -223,11 +209,9 @@ bool ImageLoader::LoadPngRgba(
             }
         } else if (chunkType == 0x49454E44U) {
             break;
-        } else {
-            if (std::fseek(fp, static_cast<long>(chunkLen) + 4L, SEEK_CUR) != 0) {
-                std::fclose(fp);
-                return false;
-            }
+        } else if (std::fseek(fp, static_cast<long>(chunkLen) + 4L, SEEK_CUR) != 0) {
+            std::fclose(fp);
+            return false;
         }
     }
 
@@ -241,13 +225,13 @@ bool ImageLoader::LoadBmpRgba(
     u16 expectedHeight,
     std::span<u8> outPixels) noexcept {
     const usize expectedByteSize = static_cast<usize>(expectedWidth) * expectedHeight * 4U;
-    if (filePath == nullptr || expectedWidth == 0U || expectedHeight == 0U ||
+    if (!filePath || expectedWidth == 0U || expectedHeight == 0U ||
         outPixels.size() < expectedByteSize) {
         return false;
     }
 
     std::FILE* fp = std::fopen(filePath, "rb");
-    if (fp == nullptr) return false;
+    if (!fp) return false;
 
     std::array<u8, 54> hdr{};
     if (std::fread(hdr.data(), 1U, hdr.size(), fp) != hdr.size() ||
@@ -257,17 +241,16 @@ bool ImageLoader::LoadBmpRgba(
     }
 
     const u32 pixelOffset = ReadLeU32(&hdr[10]);
-    const i32 width = static_cast<i32>(ReadLeU32(&hdr[18]));
-    const i32 rawHeight = static_cast<i32>(ReadLeU32(&hdr[22]));
-    const bool topDown = (rawHeight < 0);
-    const u32 absHeight = topDown ? (0U - static_cast<u32>(rawHeight)) : static_cast<u32>(rawHeight);
-    const u16 bpp = ReadLeU16(&hdr[28]);
+    const i32 width       = static_cast<i32>(ReadLeU32(&hdr[18]));
+    const i32 rawHeight   = static_cast<i32>(ReadLeU32(&hdr[22]));
+    const bool topDown    = (rawHeight < 0);
+    const u32 absHeight   = topDown ? (0U - static_cast<u32>(rawHeight)) : static_cast<u32>(rawHeight);
+    const u16 bpp         = ReadLeU16(&hdr[28]);
     const u32 compression = ReadLeU32(&hdr[30]);
 
     if (width != static_cast<i32>(expectedWidth) ||
         absHeight != static_cast<u32>(expectedHeight) ||
-        bpp != 32U ||
-        (compression != 0U && compression != 3U) ||
+        bpp != 32U || (compression != 0U && compression != 3U) ||
         std::fseek(fp, static_cast<long>(pixelOffset), SEEK_SET) != 0) {
         std::fclose(fp);
         return false;
@@ -299,29 +282,18 @@ bool ImageLoader::LoadRgbaImageFromDisk(
     static constexpr std::array<const char*, 3> kPrefixes{{"", "../", "../../"}};
     char pathBuf[512]{};
 
-    const auto tryPrefix = [&](const char* base, const char* rel) noexcept -> bool {
+    for (const char* prefix : kPrefixes) {
         if (!primaryPngPath.empty()) {
             std::snprintf(
-                pathBuf, sizeof(pathBuf), "%s%s%.*s",
-                base, rel, static_cast<int>(primaryPngPath.size()), primaryPngPath.data());
+                pathBuf, sizeof(pathBuf), "%s%.*s",
+                prefix, static_cast<int>(primaryPngPath.size()), primaryPngPath.data());
             if (LoadPngRgba(pathBuf, expectedWidth, expectedHeight, outPixels)) return true;
         }
         if (!fallbackBmpPath.empty()) {
             std::snprintf(
-                pathBuf, sizeof(pathBuf), "%s%s%.*s",
-                base, rel, static_cast<int>(fallbackBmpPath.size()), fallbackBmpPath.data());
+                pathBuf, sizeof(pathBuf), "%s%.*s",
+                prefix, static_cast<int>(fallbackBmpPath.size()), fallbackBmpPath.data());
             if (LoadBmpRgba(pathBuf, expectedWidth, expectedHeight, outPixels)) return true;
-        }
-        return false;
-    };
-
-    for (const char* prefix : kPrefixes) {
-        if (tryPrefix("", prefix)) return true;
-    }
-
-    if (const char* sdlBase = SDL_GetBasePath()) {
-        for (const char* prefix : kPrefixes) {
-            if (tryPrefix(sdlBase, prefix)) return true;
         }
     }
     return false;

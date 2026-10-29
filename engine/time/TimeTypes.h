@@ -4,23 +4,21 @@
 
 namespace en {
 
-// 120 Hz fixed simulation rate for responsive Metroidvania platforming and combat.
-inline constexpr u32 kTickHz            = 120U;
-inline constexpr u64 kNsPerSec          = 1'000'000'000ULL;
-inline constexpr u64 kFixedDtNs         = kNsPerSec / kTickHz;
-inline constexpr f32 kFixedDt           = 1.0f / static_cast<f32>(kTickHz);
+inline constexpr u32 kTickHz           = 120U;
+inline constexpr u64 kNsPerSec         = 1'000'000'000ULL;
+inline constexpr u64 kFixedDtNs        = kNsPerSec / kTickHz;
+inline constexpr f32 kFixedDt          = 1.0f / static_cast<f32>(kTickHz);
 
 // 1440 Hz harmonic base (LCM of 30, 36, 40, 48, 60, 72, 80, 90, 120, 144, 160, 180, 240, 360, 480 Hz).
-inline constexpr u64 kHarmonicSubdiv    = 12ULL;
-inline constexpr u64 kHarmonicHz        = static_cast<u64>(kTickHz) * kHarmonicSubdiv;
-inline constexpr u64 kTickUnits         = kNsPerSec * kHarmonicSubdiv;
-inline constexpr u64 kMaxFrameNs        = 250'000'000ULL;
-inline constexpr u64 kHarmonicSnapNs    = 150'000ULL;
-inline constexpr f32 kMaxTimeScale      = 8.0f;
+inline constexpr u64 kHarmonicSubdiv   = 12ULL;
+inline constexpr u64 kHarmonicHz       = static_cast<u64>(kTickHz) * kHarmonicSubdiv;
+inline constexpr u64 kTickUnits        = kNsPerSec * kHarmonicSubdiv;
+inline constexpr u64 kMaxFrameNs       = 250'000'000ULL;
+inline constexpr u64 kHarmonicSnapNs   = 150'000ULL;
+inline constexpr f32 kMaxTimeScale     = 8.0f;
 
-// 4 gameplay channels (World, Player, Enemy, Camera) + 1 unscaled UI channel.
-inline constexpr u32 kGameplayChannels  = 4U;
-inline constexpr u8  kGameplayMask      = 0x0FU;
+inline constexpr u32 kGameplayChannels = 4U;
+inline constexpr u8  kGameplayMask     = 0x0FU;
 
 enum class TimeChannel : u8 {
     World  = 0,
@@ -45,8 +43,8 @@ namespace literals {
 }
 } // namespace literals
 
-// Compact 24-byte immutable snapshot of one 120 Hz simulation tick.
-// Value type; Scale(ch) and SimTimeNs() are derived inline without duplicate array storage.
+// 24-byte immutable snapshot of one 120 Hz simulation tick.
+// Value type; Scale(ch) and SimTimeNs() are derived inline without duplicate storage.
 struct TickStep {
     std::array<f32, kGameplayChannels> dt{kFixedDt, kFixedDt, kFixedDt, kFixedDt};
     u32 tick{0};
@@ -76,7 +74,7 @@ struct TickStep {
 };
 static_assert(sizeof(TickStep) == 24);
 
-// Compact 20-byte sub-tick interpolation state for render transform blending.
+// 20-byte sub-tick interpolation state for render transform blending.
 // Frozen gameplay channels resolve to alpha = 1.0f inline; UI always uses raw alpha.
 struct RenderStep {
     f32 alpha{0.0f};
@@ -111,20 +109,37 @@ struct ChannelMod {
     u16 rampElapsed{0};
 
     constexpr void ClearRamp() noexcept {
-        rampTarget = 1.0f;
-        rampHold = 0U;
+        rampTarget  = 1.0f;
+        rampHold    = 0U;
         rampRecover = 0U;
         rampElapsed = 0U;
     }
 
-    [[nodiscard]] constexpr f32 LocalScale(bool rampActive) const noexcept {
+    [[nodiscard]] constexpr bool HasRamp() const noexcept {
+        return rampHold > 0U || rampRecover > 0U;
+    }
+
+    [[nodiscard]] constexpr f32 LocalScale() const noexcept {
         if (hitstop > 0U) return 0.0f;
-        if (!rampActive) return baseScale;
+        if (!HasRamp()) return baseScale;
         if (rampHold > 0U) return baseScale * rampTarget;
-        if (rampRecover == 0U) return baseScale;
         const f32 t = static_cast<f32>(rampElapsed) / static_cast<f32>(rampRecover);
         const f32 s = t * t * (3.0f - 2.0f * t);
         return baseScale * Lerp(rampTarget, 1.0f, s);
+    }
+
+    constexpr bool StepTick() noexcept {
+        if (hitstop > 0U) {
+            --hitstop;
+            return true;
+        }
+        if (!HasRamp()) return false;
+        if (rampHold > 0U) {
+            if (--rampHold == 0U && rampRecover == 0U) ClearRamp();
+        } else if (++rampElapsed >= rampRecover) {
+            ClearRamp();
+        }
+        return true;
     }
 };
 static_assert(sizeof(ChannelMod) == 16);

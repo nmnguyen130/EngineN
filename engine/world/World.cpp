@@ -66,7 +66,7 @@ Result<void, WorldErrc> World::Init(const WorldConfig& cfg) noexcept {
     if (!RegisterComponentPool<Velocity2D>() || !RegisterComponentPool<Sprite2D>() ||
         !RegisterComponentPool<SpriteAnimator2D>() || !RegisterComponentPool<CameraRig2D>(64U) ||
         !RegisterComponentPool<Lifetime2D>() || !RegisterComponentPool<PointLight2D>(256U) ||
-        !RegisterComponentPool<Tag2D>()) {
+        !RegisterComponentPool<Tag2D>() || !RegisterComponentPool<Collider2D>()) {
         Shutdown();
         return Err(WorldErrc::OutOfMemory);
     }
@@ -121,7 +121,6 @@ void World::Clear() noexcept {
     m_pendingCmdCount   = 0U;
 }
 
-// Dead entity slots pack the FIFO free-list link into low 16 bits and next generation into bits 16..30 of m_componentMasks.
 void World::PushFreeSlot(u16 idx, u16 nextGen) noexcept {
     m_componentMasks[idx] =
         static_cast<u64>(kInvalidDenseIndex) | (static_cast<u64>(nextGen) << 16U);
@@ -141,7 +140,7 @@ Result<EntityId, WorldErrc> World::Spawn(const EntitySpawnDesc& desc) noexcept {
     if (desc.parent.IsValid()) {
         if (!IsAlive(desc.parent)) return Err(WorldErrc::DeadEntity);
         parentIdx = desc.parent.index;
-        usize depth = 1U;
+        usize depth = 0U;
         for (u16 anc = parentIdx; anc != kInvalidDenseIndex; anc = m_transforms.ParentOf(anc)) {
             if (++depth > kMaxHierarchyDepth) return Err(WorldErrc::HierarchyDepthExceeded);
         }
@@ -161,7 +160,7 @@ Result<EntityId, WorldErrc> World::Spawn(const EntitySpawnDesc& desc) noexcept {
         idx = m_nextFreshSlot++;
     }
 
-    m_maxAllocatedIndex = std::max(m_maxAllocatedIndex, idx);
+    m_maxAllocatedIndex   = std::max(m_maxAllocatedIndex, idx);
     m_generations[idx]    = gen;
     m_componentMasks[idx] = 0ULL;
     m_timeChannels[idx]   = static_cast<u8>(desc.timeChannel);
@@ -204,10 +203,8 @@ bool World::Destroy(EntityId id, bool destroyChildren) noexcept {
             cur = firstChild;
             continue;
         }
-        const u16 nextSib =
-            (cur == rootIdx) ? kInvalidDenseIndex : m_transforms.NextSiblingOf(cur);
-        const u16 parent =
-            (cur == rootIdx) ? kInvalidDenseIndex : m_transforms.ParentOf(cur);
+        const u16 nextSib = (cur == rootIdx) ? kInvalidDenseIndex : m_transforms.NextSiblingOf(cur);
+        const u16 parent  = (cur == rootIdx) ? kInvalidDenseIndex : m_transforms.ParentOf(cur);
         if (m_generations[cur] != 0U) {
             DestroySingleSlot({cur, m_generations[cur]});
         }
@@ -223,12 +220,12 @@ usize World::CollectSubtree(
     std::span<u16> outNodes,
     std::span<i16> outParentMap) const noexcept {
     if (!includeChildren || m_transforms.FirstChildOf(rootIdx) == kInvalidDenseIndex) {
-        outNodes[0] = rootIdx;
+        outNodes[0]     = rootIdx;
         outParentMap[0] = -1;
         return 1U;
     }
 
-    usize count = 0U;
+    usize count   = 0U;
     bool overflow = false;
     m_transforms.TraverseSubtree(rootIdx, m_maxEntities, [&](u16 cur) noexcept {
         if (m_generations[cur] == 0U) return;
@@ -246,7 +243,7 @@ usize World::CollectSubtree(
                 }
             }
         }
-        outNodes[count] = cur;
+        outNodes[count]     = cur;
         outParentMap[count] = mappedParent;
         ++count;
     });
@@ -269,11 +266,10 @@ Result<EntityId, WorldErrc> World::CloneEntity(
     for (usize n = 0U; n < nodeCount; ++n) {
         const u16 srcIdx = srcNodes[n];
         EntitySpawnDesc desc{
-            .local = (n == 0U) ? overrideLocal : m_transforms.Local(srcIdx),
+            .local  = (n == 0U) ? overrideLocal : m_transforms.Local(srcIdx),
             .parent = (n == 0U)
                           ? GetParent(source)
-                          : (parentMap[n] >= 0 ? cloned[static_cast<usize>(parentMap[n])]
-                                               : kNullEntity),
+                          : (parentMap[n] >= 0 ? cloned[static_cast<usize>(parentMap[n])] : kNullEntity),
             .timeChannel = static_cast<TimeChannel>(m_timeChannels[srcIdx]),
         };
 
@@ -298,7 +294,7 @@ Result<EntityId, WorldErrc> World::CloneEntity(
 
 bool World::WriteEntityComponents(BinaryWriter& writer, u16 idx) const noexcept {
     for (u64 m = m_componentMasks[idx]; m != 0ULL; m &= (m - 1ULL)) {
-        const u8 tid = static_cast<u8>(std::countr_zero(m));
+        const u8 tid        = static_cast<u8>(std::countr_zero(m));
         const u16 elemBytes = m_pools[tid].ElemBytes();
         if (!writer.Write(tid) || !writer.Write(elemBytes) ||
             !writer.WriteBytes({m_pools[tid].RawAtEntityIndex(idx), elemBytes})) {
@@ -353,16 +349,16 @@ Result<void, WorldErrc> World::EnqueueRawCommand(
 Result<void, WorldErrc> World::FlushCommands() noexcept {
     using namespace en::literals;
     const usize endOffset = m_cmdWriteOffset;
-    m_cmdWriteOffset = 0U;
+    m_cmdWriteOffset  = 0U;
     m_pendingCmdCount = 0U;
-    usize offset = 0U;
+    usize offset       = 0U;
     WorldErrc firstErr = WorldErrc::None;
 
     while (offset + 12U <= endOffset) {
         const u8* src = m_cmdTape + offset;
-        const auto kind = static_cast<CmdKind>(src[0]);
-        const u8 tidOrFlag = src[1];
-        u16 payloadBytes = 0U;
+        const auto kind     = static_cast<CmdKind>(src[0]);
+        const u8 tidOrFlag  = src[1];
+        u16 payloadBytes    = 0U;
         EntityId id{};
         EntityId auxId{};
         std::memcpy(&payloadBytes, src + 2U, 2U);
@@ -440,7 +436,7 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
         }
 
         EntitySpawnDesc sdesc{
-            .local = (i == 0U) ? rootTransform : rec.local,
+            .local  = (i == 0U) ? rootTransform : rec.local,
             .parent = (rec.parentEntityIndex >= 0)
                           ? spawned[static_cast<usize>(rec.parentEntityIndex)]
                           : kNullEntity,
@@ -457,7 +453,7 @@ Result<EntityId, WorldErrc> World::InstantiatePrefab(
 
         parsedComponentRecords += rec.componentCount;
         for (u8 c = 0U; c < rec.componentCount; ++c) {
-            u8 tid = 0U;
+            u8 tid       = 0U;
             u16 compSize = 0U;
             if (!reader.Read(tid) || !reader.Read(compSize) || compSize == 0U) {
                 rollback(static_cast<u16>(i + 1U));
@@ -556,8 +552,8 @@ Result<usize, WorldErrc> World::SerializeWorldSnapshot(std::span<u8> outBuffer) 
         if (!ok) return;
         const EntityId id{idx, m_generations[idx]};
         const u16 parentIdx = m_transforms.ParentOf(idx);
-        const u8 ch = m_timeChannels[idx];
-        const u8 compCount = static_cast<u8>(std::popcount(m_componentMasks[idx]));
+        const u8 ch         = m_timeChannels[idx];
+        const u8 compCount  = static_cast<u8>(std::popcount(m_componentMasks[idx]));
 
         if (!writer.Write(id) || !writer.Write(m_transforms.Local(idx)) ||
             !writer.Write(parentIdx) || !writer.Write(ch) || !writer.Write(compCount) ||
@@ -587,8 +583,8 @@ Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBu
         EntityId id{};
         LocalTransform2D loc{};
         u16 parentIdx = kInvalidDenseIndex;
-        u8 ch = 0U;
-        u8 compCount = 0U;
+        u8 ch         = 0U;
+        u8 compCount  = 0U;
         if (!reader.Read(id) || !reader.Read(loc) || !reader.Read(parentIdx) ||
             !reader.Read(ch) || !reader.Read(compCount)) {
             Clear();
@@ -610,7 +606,7 @@ Result<void, WorldErrc> World::DeserializeWorldSnapshot(std::span<const u8> inBu
         m_transforms.LinkLoadedSlot(id.index, loc, parentIdx);
 
         for (u8 c = 0U; c < compCount; ++c) {
-            u8 tid = 0U;
+            u8 tid        = 0U;
             u16 elemBytes = 0U;
             if (!reader.Read(tid) || !reader.Read(elemBytes)) {
                 Clear();

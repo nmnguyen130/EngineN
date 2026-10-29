@@ -81,7 +81,7 @@ static_assert(sizeof(WindowConfig) == 32);
     for (const char ch : raw) {
         const char norm = (ch == '\\') ? '/' : ch;
         if (norm == '/' && prev == '/' && out.Size() > 1U) continue;
-        if (!out.Append(std::string_view{&norm, 1U})) return false;
+        if (!out.Append({&norm, 1U})) return false;
         prev = norm;
     }
     if (!out.Empty() && out.View().back() != '/') {
@@ -107,9 +107,7 @@ static_assert(sizeof(WindowConfig) == 32);
         const std::string_view seg = rel.substr(start, i - start);
         if (seg == ".") continue;
         if (seg == "..") return false;
-        if (!work.Empty() && work.View().back() != '/') {
-            if (!work.Append("/")) return false;
-        }
+        if (!work.Empty() && work.View().back() != '/' && !work.Append("/")) return false;
         if (!work.Append(seg)) return false;
     }
     if (work.Size() <= baseDir.Size()) return false;
@@ -136,11 +134,11 @@ struct WindowState {
         }
         if (HasFlag(evFlag, WindowFlags::Minimized)) {
             minimized = true;
-            focused = false;
+            focused   = false;
             ioNetFlags &= ~(WindowFlags::Restored | WindowFlags::FocusGained);
         }
         if (HasFlag(evFlag, WindowFlags::Restored)) {
-            minimized = false;
+            minimized      = false;
             outNeedRefresh = true;
             ioNetFlags &= ~WindowFlags::Minimized;
         }
@@ -167,15 +165,15 @@ struct WindowState {
             changed |= WindowFlags::Resized;
         }
         const f32 density = newDensity > 0.0f ? newDensity : 1.0f;
-        const f32 scale = newScale > 0.0f ? newScale : density;
-        const f32 hz = newHz > 0.0f ? newHz : 60.0f;
+        const f32 scale   = newScale > 0.0f ? newScale : density;
+        const f32 hz      = newHz > 0.0f ? newHz : 60.0f;
         if (std::abs(density - pixelDensity) > 1e-3f || std::abs(scale - displayScale) > 1e-3f ||
             std::abs(hz - refreshHz) > 1e-2f) {
             changed |= WindowFlags::DisplayChanged;
         }
         pixelDensity = density;
         displayScale = scale;
-        refreshHz = hz;
+        refreshHz    = hz;
         return changed;
     }
 
@@ -250,12 +248,8 @@ struct InputEvent {
     u16 packedHeader{0};
     i16 value{0};
 
-    [[nodiscard]] static constexpr InputEvent Make(
-        InputEventKind kind, u16 code, i16 val) noexcept {
-        return {
-            static_cast<u16>((code & 0x3FFFU) | (static_cast<u16>(kind) << 14U)),
-            val,
-        };
+    [[nodiscard]] static constexpr InputEvent Make(InputEventKind kind, u16 code, i16 val) noexcept {
+        return {static_cast<u16>((code & 0x3FFFU) | (static_cast<u16>(kind) << 14U)), val};
     }
     [[nodiscard]] constexpr u16 Code() const noexcept { return packedHeader & 0x3FFFU; }
     [[nodiscard]] constexpr InputEventKind Kind() const noexcept {
@@ -285,20 +279,19 @@ struct FrameEvents {
     std::array<InputEvent, kMaxEvents>   events{};
 
     constexpr void ClearFrameDeltas() noexcept {
-        mouseDx = 0.0f;
-        mouseDy = 0.0f;
-        wheelX = 0.0f;
-        wheelY = 0.0f;
-        eventCount = 0U;
+        mouseDx         = 0.0f;
+        mouseDy         = 0.0f;
+        wheelX          = 0.0f;
+        wheelY          = 0.0f;
+        eventCount      = 0U;
         padDisconnected = 0U;
-        focused = 1U;
-        textLen = 0U;
-        textInput[0] = '\0';
+        focused         = 1U;
+        textLen         = 0U;
+        textInput[0]    = '\0';
     }
 
     constexpr void PushEvent(InputEventKind kind, u16 code, i16 value) noexcept {
-        const i16 clamped =
-            (kind == InputEventKind::GamepadAxis && value == -32768) ? i16{-32767} : value;
+        const i16 clamped = (kind == InputEventKind::GamepadAxis && value == -32768) ? i16{-32767} : value;
         const InputEvent ev = InputEvent::Make(kind, code, clamped);
 
         if (kind == InputEventKind::GamepadAxis) {
@@ -322,7 +315,9 @@ struct FrameEvents {
             return;
         }
 
-        // Never drop a discrete button/key release when the queue is full.
+        // Never drop a discrete button/key release when the queue is full:
+        // 1) First scan the full queue to overwrite a prior press of the SAME key/button.
+        // 2) Otherwise overwrite the latest GamepadAxis motion or non-release event.
         if (kind != InputEventKind::GamepadAxis && clamped == 0) {
             for (u8 i = eventCount; i > 0U; --i) {
                 if (events[i - 1U].packedHeader == ev.packedHeader) {
@@ -331,8 +326,13 @@ struct FrameEvents {
                 }
             }
             for (u8 i = eventCount; i > 0U; --i) {
-                if (events[i - 1U].Kind() == InputEventKind::GamepadAxis ||
-                    events[i - 1U].value != 0) {
+                if (events[i - 1U].Kind() == InputEventKind::GamepadAxis) {
+                    events[i - 1U] = ev;
+                    return;
+                }
+            }
+            for (u8 i = eventCount; i > 0U; --i) {
+                if (events[i - 1U].value != 0) {
                     events[i - 1U] = ev;
                     return;
                 }
@@ -366,8 +366,8 @@ struct FrameEvents {
         f32 x, f32 y, f32 dx, f32 dy, f32 density, bool winFocused, EventCapture cap) noexcept {
         if (winFocused && !HasFlag(cap, EventCapture::Mouse)) {
             const f32 d = density > 0.0f ? density : 1.0f;
-            mouseX = x * d;
-            mouseY = y * d;
+            mouseX  = x * d;
+            mouseY  = y * d;
             mouseDx += dx * d;
             mouseDy += dy * d;
         }

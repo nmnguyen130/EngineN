@@ -8,24 +8,24 @@ namespace en {
 // Value type with fixed inline storage and zero runtime allocations.
 class RenderList {
 public:
-    static constexpr u32 kMaxQuads = 4096;
-    static constexpr u32 kMaxBatches = 256;
-    static constexpr u32 kChunkQuads = 512;
-    static constexpr u8  kMaxPasses = 4;
-    static constexpr u8  kMaxViews = 8;
+    static constexpr u32 kMaxQuads    = 4096;
+    static constexpr u32 kMaxBatches  = 256;
+    static constexpr u32 kChunkQuads  = 512;
+    static constexpr u8  kMaxPasses   = 4;
+    static constexpr u8  kMaxViews    = 8;
     static constexpr u8  kHudViewSlot = 7;
 
     constexpr RenderList() noexcept { Reset({1280, 720}); }
 
     constexpr void Reset(Viewport vp = {1280, 720}) noexcept {
         if (vp.Valid()) m_viewport = vp;
-        m_lastKey = 0ULL;
-        m_stats = {};
+        m_lastKey         = 0ULL;
+        m_stats           = {};
         m_enabledPassMask = 0x0FU;
-        m_clearPassMask = 0x01U;
-        m_monotonic = true;
-        m_compiled = false;
-        m_pixelSnap = false;
+        m_clearPassMask   = 0x01U;
+        m_monotonic       = true;
+        m_compiled        = false;
+        m_pixelSnap       = false;
         for (u8 i = 0U; i < kMaxPasses; ++i) {
             m_passes[i] = PassDesc{.clear = (i == 0U)};
         }
@@ -81,15 +81,15 @@ public:
 
     [[nodiscard]] static constexpr Vec2 MeasureText(std::string_view text, f32 scale = 1.0f) noexcept {
         if (text.empty()) return {};
-        const f32 qs = 16.0f * scale;
-        const f32 adv = 12.0f * scale;
+        const f32 qs   = 16.0f * scale;
+        const f32 adv  = 12.0f * scale;
         const f32 line = qs * 1.15f;
         f32 maxW = 0.0f, cur = 0.0f;
         u32 lines = 1U;
         for (const char ch : text) {
             if (ch == '\n') {
                 maxW = std::max(maxW, cur);
-                cur = 0.0f;
+                cur  = 0.0f;
                 ++lines;
             } else if ((static_cast<u8>(ch) & 0xC0U) != 0x80U) {
                 cur += adv;
@@ -128,9 +128,9 @@ private:
     bool        m_compiled{false};
     bool        m_pixelSnap{false};
 
-    std::array<PassDesc, kMaxPasses>               m_passes{};
-    std::array<Camera2D, kMaxViews>                m_views{};
-    std::array<DrawBatch, kMaxBatches>             m_batches{};
+    std::array<PassDesc, kMaxPasses>    m_passes{};
+    std::array<Camera2D, kMaxViews>     m_views{};
+    std::array<DrawBatch, kMaxBatches>  m_batches{};
     std::array<u64, kMaxQuads>          m_keys{};
     std::array<PreparedQuad, kMaxQuads> m_quads{};
 };
