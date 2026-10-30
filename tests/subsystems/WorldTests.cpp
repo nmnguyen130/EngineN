@@ -129,27 +129,42 @@ bool CtsHierarchyKeepWorldAndDepthGuards(CtsRunner& r) noexcept {
     return true;
 }
 
-bool CtsMetroidvaniaSweepSlideAndTriggers(CtsRunner& r) noexcept {
+bool CtsRenderExtractionAndLifetimeDeferredDestroy(CtsRunner& r) noexcept {
     World world;
     CTS_CHECK(r, world.Init({.maxEntities = 64U, .defaultPoolCapacity = 64U}).has_value());
 
-    const EntityId hero = *world.Spawn({.local = {.x = 0.0f, .y = 0.0f}});
-    const EntityId wall = *world.Spawn({.local = {.x = 5.0f, .y = 0.0f}});
-    const EntityId trig = *world.Spawn({.local = {.x = 2.0f, .y = 0.0f}});
+    AssetBank bank;
+    CTS_CHECK(r, bank.Init().has_value());
 
-    (void)world.Emplace<Collider2D>(hero, Collider2D{.halfExtents = {1.0f, 1.0f}, .layerMask = 1U, .queryMask = 2U});
-    (void)world.Emplace<Collider2D>(wall, Collider2D{.halfExtents = {1.0f, 5.0f}, .layerMask = 2U, .isStatic = 1U});
-    (void)world.Emplace<Collider2D>(trig, Collider2D{.halfExtents = {1.0f, 2.0f}, .layerMask = 4U, .isTrigger = 1U});
+    const EntityId cam = *world.Spawn({.local = {.x = 4.0f, .y = 2.0f}});
+    (void)world.Emplace<CameraRig2D>(cam, CameraRig2D{.zoom = 1.0f, .pixelsPerMeter = 48.0f, .trauma = 0.4f});
 
-    // Sweep hero diagonally (+6m X, +3m Y): must pass through trigger, hit wall at X ~= 3.0m, and slide up to Y = 3.0m.
-    const SweepHit hit = WorldSystems::SweepMove(world, hero, {6.0f, 3.0f});
-    CTS_CHECK(r, hit && hit.normal == Vec2{-1.0f, 0.0f});
-    const WorldTransform2D wt = world.GetWorldTransform(hero);
-    CTS_CHECK(r, Near(wt.x, 3.0f, 1e-2f) && Near(wt.y, 3.0f, 1e-2f));
+    const EntityId vfx = *world.Spawn({.local = {.x = 1.0f, .y = 2.0f}});
+    (void)world.Emplace<Sprite2D>(vfx);
+    (void)world.Emplace<PointLight2D>(vfx, PointLight2D{.radius = 2.0f, .intensity = 1.0f, .pulseSpeed = 3.0f});
+    (void)world.Emplace<Lifetime2D>(vfx, Lifetime2D{.remainingTicks = 2U, .initialTicks = 2U, .fadeSpriteAlpha = true});
 
-    std::array<EntityId, 4> hits{};
-    const u32 n = WorldSystems::QueryBoxOverlaps(world, {1.5f, -1.0f, 2.0f, 5.0f}, 4U, hits);
-    CTS_CHECK(r, n == 1U && hits[0] == trig);
+    TimeSystem time;
+    time.BeginFrame(kFixedDtNs);
+    const TickStep s1 = time.PollTick();
+    world.BeginTick(s1);
+    WorldSystems::StepVisualsAndLifetimes(world, s1);
+    world.EndTick(s1);
+
+    CTS_CHECK(r, world.IsAlive(vfx));
+    CTS_CHECK(r, Near(world.TryGet<Sprite2D>(vfx)->tint.a, 0.5f, 1e-3f));
+
+    RenderList list;
+    list.Reset({1280, 720});
+    WorldSystems::ExtractRender(world, bank, time.RenderView(), list, 48.0f);
+    CTS_CHECK(r, list.Stats().submitted == 2U);
+
+    time.BeginFrame(kFixedDtNs);
+    const TickStep s2 = time.PollTick();
+    world.BeginTick(s2);
+    WorldSystems::StepVisualsAndLifetimes(world, s2);
+    world.EndTick(s2);
+    CTS_CHECK(r, !world.IsAlive(vfx));
     return true;
 }
 
@@ -244,7 +259,7 @@ int main() {
     CtsRunner runner{.suiteName = "WorldTests (CTS+DST)"};
     runner.RunCase("DST: 8,000-Op SparseSet & View Oracle Fuzz", DstEcsSparseSetAndViewOracleFuzz);
     runner.RunCase("Hierarchy KeepWorldTransform & Depth Guards", CtsHierarchyKeepWorldAndDepthGuards);
-    runner.RunCase("Metroidvania Swept AABB Slide & Triggers", CtsMetroidvaniaSweepSlideAndTriggers);
+    runner.RunCase("Render Extraction & Lifetime Deferred Destroy", CtsRenderExtractionAndLifetimeDeferredDestroy);
     runner.RunCase("DST: 500-Tick Lockstep & Snapshot Rollback", Dst500TickLockstepAndMidRunSnapshotRollback);
     return runner.Finish();
 }

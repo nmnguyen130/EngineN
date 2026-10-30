@@ -1,4 +1,5 @@
 #include "debug/DebugSystem.h"
+
 #include "input/InputSystem.h"
 
 #include <charconv>
@@ -21,47 +22,47 @@ DebugConsole& NullConsole() noexcept {
 
 } // namespace
 
-struct alignas(64) DebugSystem::State {
-    ShapePool     shapes{};
-    DebugProfiler profiler{};
-    DebugConsole  console{};
-    DebugConfig   cfg{};
-    Overlay       active{Overlay::Profiler};
-    u16           savedMask{0xFFFFU};
-    u8            maskSaved{0U};
-    std::array<ShapeCmd, kMaxShapes>           shapeStorage{};
-    std::array<ActorSample, kFlightTicks>      flightStorage{};
-    std::array<FrameSample, kProfileFrames>    profileStorage{};
-    std::array<ConsoleSymbol, kMaxSymbols>     symbolStorage{};
-    std::array<LogMeta, kMaxLogs>              logStorage{};
-    std::array<char, kLogTextBytes>            textStorage{};
+struct DebugSystem::State {
+    ShapePool                                   shapes{};
+    DebugProfiler                               profiler{};
+    DebugConsole                                console{};
+    DebugConfig                                 cfg{};
+    Overlay                                     active{Overlay::Profiler};
+    u16                                         savedMask{0xFFFFU};
+    u8                                          maskSaved{0};
+    std::array<ShapeCmd, kMaxGizmos>            shapeStorage{};
+    std::array<ActorSample, kFlightTicks>       flightStorage{};
+    std::array<FrameSample, kProfileFrames>     profileStorage{};
+    std::array<ConsoleSymbol, kMaxSymbols>      symbolStorage{};
+    std::array<ConsoleLogMeta, kMaxConsoleLogs> logStorage{};
+    std::array<char, kConsoleTextBytes>         textStorage{};
 };
 
 #if EN_ENABLE_DEBUG_TOOLS
 
 namespace {
 
-constexpr u16 kReturn = 40U;
-constexpr u16 kEscape = 41U;
+constexpr u16 kReturn    = 40U;
+constexpr u16 kEscape    = 41U;
 constexpr u16 kBackspace = 42U;
-constexpr u16 kTab = 43U;
-constexpr u16 kRight = 79U;
-constexpr u16 kLeft = 80U;
-constexpr u16 kDown = 81U;
-constexpr u16 kUp = 82U;
+constexpr u16 kTab       = 43U;
+constexpr u16 kRight     = 79U;
+constexpr u16 kLeft      = 80U;
+constexpr u16 kDown      = 81U;
+constexpr u16 kUp        = 82U;
 
-struct OverlayName {
+struct OverlayEntry {
     std::string_view name;
-    Overlay flag;
+    Overlay          flag;
 };
 
-constexpr std::array<OverlayName, 7> kOverlays{{
+constexpr std::array<OverlayEntry, 7> kOverlays{{
     {"profiler",   Overlay::Profiler},
     {"colliders",  Overlay::Colliders},
     {"broadphase", Overlay::Broadphase},
     {"hitboxes",   Overlay::Hitboxes},
     {"velocity",   Overlay::Velocity},
-    {"contacts",   Overlay::Contacts},
+    {"audio",      Overlay::Audio},
     {"inspector",  Overlay::Inspector},
 }};
 
@@ -99,13 +100,13 @@ void CmdStep(std::string_view args, void* ctx, DebugConsole& c) noexcept {
 void CmdTimeScale(std::string_view args, void* ctx, DebugConsole& c) noexcept {
     auto* s = static_cast<DebugSystem*>(ctx);
     if (!s || args.empty()) return;
-    const usize sp = args.find(' ');
-    const auto scaleStr = (sp == std::string_view::npos) ? args : args.substr(0, sp);
-    f32 scale = 1.0f;
+    const usize sp       = args.find(' ');
+    const auto  scaleStr = (sp == std::string_view::npos) ? args : args.substr(0, sp);
+    f32         scale    = 1.0f;
     if (std::from_chars(scaleStr.data(), scaleStr.data() + scaleStr.size(), scale).ec != std::errc{}) return;
     u8 ch = 0U;
     if (sp != std::string_view::npos) {
-        u32 v = 0U;
+        u32        v    = 0U;
         const auto rest = args.substr(sp + 1);
         if (std::from_chars(rest.data(), rest.data() + rest.size(), v).ec == std::errc{}) {
             ch = static_cast<u8>(v & 7U);
@@ -118,7 +119,7 @@ void CmdOverlay(std::string_view args, void* ctx, DebugConsole& c) noexcept {
     auto* s = static_cast<DebugSystem*>(ctx);
     if (!s) return;
     if (args.empty()) {
-        c.Print(LogLevel::Info, "overlay <profiler|colliders|broadphase|hitboxes|velocity|contacts|inspector>");
+        c.Print(LogLevel::Info, "overlay <profiler|colliders|broadphase|hitboxes|velocity|audio|inspector>");
         return;
     }
     for (const auto& e : kOverlays) {
@@ -151,17 +152,16 @@ Result<void, DebugErrc> DebugSystem::Init(const DebugConfig& cfg) noexcept {
     auto slice = m_arena.Alloc<State>(1U);
     if (slice.empty()) {
         Shutdown();
-        return Err(DebugErrc::ArenaExhausted);
+        return Err(DebugErrc::OutOfMemory);
     }
     m_state = slice.data();
-    *m_state = State{};
     m_state->shapes.Init(m_state->shapeStorage);
     m_state->profiler.Init(m_state->profileStorage);
     m_state->console.Init(m_state->symbolStorage, m_state->logStorage, m_state->textStorage);
     m_inspector.Init(m_state->flightStorage);
-    m_state->cfg = cfg;
+    m_state->cfg    = cfg;
     m_state->active = cfg.overlays;
-    m_pending = {};
+    m_pending       = {};
 
     (void)m_state->console.RegisterCmd("help", &CmdHelp, this);
     (void)m_state->console.RegisterCmd("clear", &CmdClear, this);
@@ -177,9 +177,9 @@ Result<void, DebugErrc> DebugSystem::Init(const DebugConfig& cfg) noexcept {
 
 void DebugSystem::Shutdown() noexcept {
     m_arena.Shutdown();
-    m_state = nullptr;
+    m_state     = nullptr;
     m_inspector = DebugInspector{};
-    m_pending = {};
+    m_pending   = {};
 }
 
 Overlay DebugSystem::Overlays() const noexcept {
@@ -215,27 +215,42 @@ bool DebugSystem::OnKey(u16 scancode, bool down) noexcept {
         return true;
     }
 
-    if (scancode == m_state->cfg.keyPause) { RequestPause(); return true; }
-    if (scancode == m_state->cfg.keyStep) { RequestStep(1U); return true; }
-    if (scancode == m_state->cfg.keyProfiler) { Toggle(Overlay::Profiler); return true; }
+    if (scancode == m_state->cfg.keyPause) {
+        RequestPause();
+        return true;
+    }
+    if (scancode == m_state->cfg.keyStep) {
+        RequestStep(1U);
+        return true;
+    }
+    if (scancode == m_state->cfg.keyProfiler) {
+        Toggle(Overlay::Profiler);
+        return true;
+    }
 
     if (HasFlag(m_state->active, Overlay::Inspector) && m_inspector.Recorded() > 0U) {
-        if (scancode == kLeft) { m_inspector.Scrub(1); return true; }
-        if (scancode == kRight) { m_inspector.Scrub(-1); return true; }
+        if (scancode == kLeft) {
+            m_inspector.Scrub(1);
+            return true;
+        }
+        if (scancode == kRight) {
+            m_inspector.Scrub(-1);
+            return true;
+        }
     }
     return false;
 }
 
 bool DebugSystem::OnKey(u16 scancode, bool down, InputSystem& input) noexcept {
     if (!m_state) return false;
-    const bool wasOpen = m_state->console.IsOpen();
+    const bool wasOpen  = m_state->console.IsOpen();
     const bool consumed = OnKey(scancode, down);
-    const bool isOpen = m_state->console.IsOpen();
+    const bool isOpen   = m_state->console.IsOpen();
     if (!wasOpen && isOpen) {
         m_state->savedMask = 0xFFFFU;
         m_state->maskSaved = 1U;
         input.SetActionMask(0U);
-    } else if (wasOpen && !isOpen && m_state->maskSaved) {
+    } else if (wasOpen && !isOpen && m_state->maskSaved != 0U) {
         input.SetActionMask(m_state->savedMask);
         m_state->maskSaved = 0U;
     }
@@ -253,13 +268,15 @@ LoopDirectives DebugSystem::BeginFrame(const FrameCtx&) noexcept {
     m_state->console.Flush();
     m_state->profiler.BeginFrame();
     const LoopDirectives out = m_pending;
-    m_pending = {};
+    m_pending                = {};
     return out;
 }
 
 void DebugSystem::EndTick(
-    const World& world, u32 tick,
-    const TickInput* input, const ActionBuffer* buffer) noexcept {
+    const World& world,
+    u32 tick,
+    const TickInput* input,
+    const ActionBuffer* buffer) noexcept {
     if (!m_state) return;
     m_state->shapes.SetTick(tick);
     m_inspector.Record(world, tick, input, buffer);

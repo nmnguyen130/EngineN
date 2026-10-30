@@ -1,20 +1,19 @@
 #pragma once
 
-#include "debug/DebugInspector.h"
-#include "debug/DebugProfilerAndConsole.h"
+#include "debug/DebugTools.h"
 
 namespace en {
 
-// Debug coordinator. No-op when EN_ENABLE_DEBUG_TOOLS == 0.
-class alignas(64) DebugSystem {
+// Runtime developer diagnostics coordinator owning gizmo pool, profiler, console, and entity inspector.
+// Move-disabled owner of an Arena; compiles to zero-overhead inline no-ops when EN_ENABLE_DEBUG_TOOLS == 0.
+// Invariant: sizeof(DebugSystem) == 48.
+class DebugSystem {
 public:
     DebugSystem() noexcept = default;
     ~DebugSystem() noexcept { Shutdown(); }
 
     DebugSystem(const DebugSystem&) = delete;
     DebugSystem& operator=(const DebugSystem&) = delete;
-    DebugSystem(DebugSystem&&) = delete;
-    DebugSystem& operator=(DebugSystem&&) = delete;
 
 #if EN_ENABLE_DEBUG_TOOLS
     [[nodiscard]] Result<void, DebugErrc> Init(const DebugConfig& cfg = {}) noexcept;
@@ -27,9 +26,11 @@ public:
     bool OnText(std::string_view utf8) noexcept;
 
     [[nodiscard]] LoopDirectives BeginFrame(const FrameCtx& ctx) noexcept;
-    void EndTick(const World& world, u32 tick,
-                 const TickInput* input = nullptr,
-                 const ActionBuffer* buffer = nullptr) noexcept;
+    void EndTick(
+        const World& world,
+        u32 tick,
+        const TickInput* input = nullptr,
+        const ActionBuffer* buffer = nullptr) noexcept;
     void Emit(const FrameCtx& ctx, RenderList& list) noexcept;
 
     [[nodiscard]] Overlay Overlays() const noexcept;
@@ -44,10 +45,10 @@ public:
     }
     constexpr void RequestStep(u16 ticks = 1U) noexcept {
         m_pending.stepTicks = static_cast<u16>(m_pending.stepTicks + ticks);
-        m_pending.flags |= LoopDirectives::kForcePause;
+        m_pending.flags    |= LoopDirectives::kForcePause;
     }
     constexpr void RequestTimeScale(f32 scale, TimeChannel ch = TimeChannel::World) noexcept {
-        m_pending.timeScale = std::clamp(scale, 0.0f, 8.0f);
+        m_pending.timeScale   = std::clamp(scale, 0.0f, 8.0f);
         m_pending.timeChannel = static_cast<u8>(ch) & 7U;
     }
 
@@ -89,11 +90,11 @@ public:
 private:
     struct State;
 
-    Arena            m_arena{};
-    DebugInspector   m_inspector{};
-    State*           m_state{nullptr};
-    LoopDirectives   m_pending{};
+    Arena          m_arena{};
+    DebugInspector m_inspector{};
+    State*         m_state{nullptr};
+    LoopDirectives m_pending{};
 };
-static_assert(sizeof(DebugSystem) == 64);
+static_assert(sizeof(DebugSystem) == 48);
 
 } // namespace en

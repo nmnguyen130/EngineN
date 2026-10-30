@@ -1,18 +1,14 @@
 #pragma once
 
 #include "audio/AudioTypes.h"
+#include "core/Log.h"
 #include "core/Math.h"
-#include "core/Types.h"
 #include "renderer/RenderList.h"
 #include "time/TimeTypes.h"
-#include "world/WorldTypes.h"
-
-#include <array>
-#include <span>
-#include <string_view>
+#include "world/Components.h"
 
 #ifndef EN_ENABLE_DEBUG_TOOLS
-#if defined(NDEBUG)
+#if defined(EN_SHIPPING)
 #define EN_ENABLE_DEBUG_TOOLS 0
 #else
 #define EN_ENABLE_DEBUG_TOOLS 1
@@ -27,23 +23,22 @@ class InputSystem;
 struct TickInput;
 class ActionBuffer;
 
-inline constexpr u8  kDebugWorldPass   = 14U;
-inline constexpr u8  kDebugHudPass     = 15U;
+inline constexpr u8  kDebugWorldPass   = 2U;
+inline constexpr u8  kDebugHudPass     = 3U;
 inline constexpr u8  kDebugWorldView   = 0U;
 inline constexpr u8  kDebugHudView     = RenderList::kHudViewSlot;
 inline constexpr u16 kDebugDepth       = 65000U;
-inline constexpr u32 kMaxShapes        = 1024U;
+inline constexpr u32 kMaxGizmos        = 1024U;
 inline constexpr u32 kProfileFrames    = 128U;
 inline constexpr u32 kProfileBuckets   = 32U;
 inline constexpr u32 kFlightTicks      = 64U;
 inline constexpr u32 kMaxSymbols       = 128U;
-inline constexpr u32 kMaxLogs          = 256U;
-inline constexpr u32 kLogTextBytes     = 8192U;
+inline constexpr u32 kMaxConsoleLogs   = 256U;
+inline constexpr u32 kConsoleTextBytes = 8192U;
 
 enum class DebugErrc : u8 {
     None = 0,
     OutOfMemory,
-    ArenaExhausted,
     SymbolFull,
     DuplicateSymbol,
     NotFound,
@@ -52,14 +47,14 @@ enum class DebugErrc : u8 {
 
 enum class Overlay : u32 {
     None       = 0U,
-    Colliders  = 1U << 0U,
-    Velocity   = 1U << 1U,
-    Hitboxes   = 1U << 2U,
-    Contacts   = 1U << 3U,
-    Broadphase = 1U << 4U,
-    Inspector  = 1U << 5U,
-    Profiler   = 1U << 6U,
-    Console    = 1U << 7U,
+    Colliders  = 1U << 0,
+    Velocity   = 1U << 1,
+    Hitboxes   = 1U << 2,
+    Broadphase = 1U << 3,
+    Audio      = 1U << 4,
+    Inspector  = 1U << 5,
+    Profiler   = 1U << 6,
+    Console    = 1U << 7,
 };
 consteval bool enable_bitmask_operators(Overlay) noexcept { return true; }
 
@@ -76,26 +71,26 @@ enum class ProfileScope : u8 {
     Count,
 };
 
-enum class LogLevel : u8 { Info = 0, Warn, Error, Cmd };
-
-struct alignas(8) LoopDirectives {
-    static constexpr u8 kTogglePause = 1U << 0U;
-    static constexpr u8 kForcePause  = 1U << 1U;
-    static constexpr u8 kReset       = 1U << 2U;
+// 8-byte frame loop control directives issued by DebugSystem hotkeys or console commands.
+struct LoopDirectives {
+    static constexpr u8 kTogglePause = 1U << 0;
+    static constexpr u8 kForcePause  = 1U << 1;
+    static constexpr u8 kReset       = 1U << 2;
 
     f32 timeScale{-1.0f};
-    u16 stepTicks{0U};
-    u8  timeChannel{0U};
-    u8  flags{0U};
+    u16 stepTicks{0};
+    u8  timeChannel{0};
+    u8  flags{0};
 
     [[nodiscard]] constexpr bool TogglePause() const noexcept { return (flags & kTogglePause) != 0U; }
-    [[nodiscard]] constexpr bool ForcePause()  const noexcept { return (flags & kForcePause)  != 0U; }
-    [[nodiscard]] constexpr bool Reset()       const noexcept { return (flags & kReset)       != 0U; }
+    [[nodiscard]] constexpr bool ForcePause() const noexcept  { return (flags & kForcePause) != 0U; }
+    [[nodiscard]] constexpr bool Reset() const noexcept       { return (flags & kReset) != 0U; }
 };
 static_assert(sizeof(LoopDirectives) == 8);
 
-struct alignas(32) ShapeCmd {
-    enum class Kind : u8 { Line, Box, Solid, Arrow, Circle, Capsule, TextWorld, TextHud };
+// 32-byte transient or timed 2D debug gizmo primitive queued in ShapePool.
+struct ShapeCmd {
+    enum class Kind : u8 { Line, Box, Solid, Arrow, Circle, Cross, TextWorld, TextHud };
 
     f32 x0{0.0f};
     f32 y0{0.0f};
@@ -104,73 +99,79 @@ struct alignas(32) ShapeCmd {
         char text[12];
     } u{};
     u32  rgba{0xFFFFFFFFU};
-    u32  expire{0U};
-    u16  thickQ8{256U};
+    u32  expire{0};
+    u16  thickQ8{256};
     Kind kind{Kind::Line};
-    u8   aux{0U};
+    u8   aux{0};
 };
 static_assert(sizeof(ShapeCmd) == 32);
 
-struct alignas(32) FrameSample {
+// 32-byte per-frame timing and subsystem counter record stored in DebugProfiler.
+struct FrameSample {
     std::array<u16, static_cast<usize>(ProfileScope::Count)> us{};
-    u16 entities{0U};
-    u16 quads{0U};
-    u16 batches{0U};
-    u16 contacts{0U};
-    u8  voices{0U};
-    u8  worldQ6{64U};
-    u8  playerQ6{64U};
-    u8  _pad{0U};
+    u16 entities{0};
+    u16 quads{0};
+    u16 batches{0};
+    u16 contacts{0};
+    u8  voices{0};
+    u8  worldScaleQ6{64};
+    u8  playerScaleQ6{64};
+    u8  pad[3]{};
 };
 static_assert(sizeof(FrameSample) == 32);
 
-struct alignas(32) ActorSample {
-    u32 tick{0U};
+// 32-byte flight-recorder snapshot for a pinned entity in DebugInspector.
+struct ActorSample {
+    u32 tick{0};
     f32 x{0.0f};
     f32 y{0.0f};
     f32 vx{0.0f};
     f32 vy{0.0f};
-    u16 entity{0U};
+    u16 entity{0};
     i16 hp{0};
     i8  ax{0};
     i8  ay{0};
-    u8  held{0U};
-    u8  pressed{0U};
-    u8  buffer{0U};
-    u8  state{0U};
-    u8  iframe{0U};
-    u8  contacts{0U};
+    u8  held{0};
+    u8  pressed{0};
+    u8  buffer{0};
+    u8  state{0};
+    u8  iframe{0};
+    u8  contacts{0};
 };
 static_assert(sizeof(ActorSample) == 32);
 
-struct alignas(8) Telemetry {
+// 24-byte frame telemetry input passed to DebugProfiler::RecordTelemetry.
+struct Telemetry {
     const f32* scales{nullptr};
-    u16 entities{0U};
-    u16 quads{0U};
-    u16 batches{0U};
-    u16 contacts{0U};
-    u8  voices{0U};
-    u8  _pad[3]{};
+    u16        entities{0};
+    u16        quads{0};
+    u16        batches{0};
+    u16        contacts{0};
+    u8         voices{0};
+    u8         pad[3]{};
 };
 static_assert(sizeof(Telemetry) == 24);
 
-struct alignas(16) FrameCtx {
+// 48-byte read-only context passed to DebugSystem::Emit each frame.
+struct FrameCtx {
     const World*                      world{nullptr};
     const PhysicsSystem*              physics{nullptr};
     std::span<const AudioEmitterView> emitters{};
     Viewport                          viewport{1280, 720};
-    u32                               tick{0U};
-    u8                                worldView{0U};
+    u32                               tick{0};
+    u8                                worldView{0};
+    u8                                pad[3]{};
 };
 static_assert(sizeof(FrameCtx) == 48);
 
-struct alignas(8) DebugConfig {
-    u32     arenaBytes{65536U};
+// 16-byte initialization configuration for DebugSystem.
+struct DebugConfig {
+    u32     arenaBytes{65536};
     Overlay overlays{Overlay::Profiler};
-    u16     keyConsole{53U};
-    u16     keyPause{72U};
-    u16     keyStep{67U};
-    u16     keyProfiler{60U};
+    u16     keyConsole{53};
+    u16     keyPause{72};
+    u16     keyStep{67};
+    u16     keyProfiler{60};
 };
 static_assert(sizeof(DebugConfig) == 16);
 

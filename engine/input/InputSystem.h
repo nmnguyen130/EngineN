@@ -105,6 +105,7 @@ public:
         return out;
     }
 
+    [[nodiscard]] constexpr const FrameInput& Frame() const noexcept { return m_frame; }
     [[nodiscard]] constexpr InputMap& Map() noexcept { return m_map; }
     [[nodiscard]] constexpr const InputMap& Map() const noexcept { return m_map; }
 

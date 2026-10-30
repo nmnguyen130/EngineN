@@ -2,268 +2,281 @@
 
 #include "assets/AssetBank.h"
 #include "audio/AudioSystem.h"
-#include "gameplay/GameplayPipeline.h"
+#include "gameplay/GameplaySystem.h"
 #include "physics/PhysicsSystem.h"
 #include "world/World.h"
 
-#include <algorithm>
-#include <bit>
-
 namespace en {
 
-Result<void, FwErr> SceneDirector::Init(AssetBank& assets) noexcept {
+Result<void, FwErrc> SceneDirector::Init(AssetBank& assets) noexcept {
     *this = SceneDirector{};
     auto keep = assets.BeginScope();
-    if (!keep) return Err(FwErr::Scope);
-    m_keep = *keep;
+    if (!keep) return Err(FwErrc::ScopeExhausted);
+    m_persistentScope = *keep;
+
     auto room = assets.BeginScope();
     if (!room) {
-        assets.EndScope(m_keep);
-        m_keep = 0xFF;
-        return Err(FwErr::Scope);
+        assets.EndScope(m_persistentScope);
+        m_persistentScope = 0xFFU;
+        return Err(FwErrc::ScopeExhausted);
     }
-    m_room = *room;
+    m_roomScope = *room;
     return {};
 }
 
-void SceneDirector::Shutdown(AssetBank& assets, AudioSystem& audio, LoadCtx* load) noexcept {
-    if (load && m_roomExit) {
-        m_roomExit(*load);
-        m_roomExit = nullptr;
+void SceneDirector::Shutdown(AssetBank& assets, LoadCtx* load) noexcept {
+    if (load && m_roomExitFn) {
+        m_roomExitFn(*load);
+        m_roomExitFn = nullptr;
     }
-    for (u8 i = m_depth; i > 0;) {
+    for (u8 i = m_depth; i > 0U;) {
         --i;
-        if (m_exit[i] && load) m_exit[i](*load, m_user[i]);
+        if (m_exitFns[i] && load) m_exitFns[i](*load, m_userData[i]);
     }
-    m_depth = 0;
-    if (m_stage != 0xFF) {
-        assets.EndScope(m_stage);
-        m_stage = 0xFF;
+    m_depth = 0U;
+    if (m_stagingScope != 0xFFU) {
+        assets.EndScope(m_stagingScope);
+        m_stagingScope = 0xFFU;
     }
-    if (m_room != 0xFF) {
-        audio.RequestScopeRelease(m_room);
-        assets.EndScope(m_room);
-        m_room = 0xFF;
+    if (m_roomScope != 0xFFU) {
+        assets.EndScope(m_roomScope);
+        m_roomScope = 0xFFU;
     }
-    if (m_keep != 0xFF) {
-        assets.EndScope(m_keep);
-        m_keep = 0xFF;
+    if (m_persistentScope != 0xFFU) {
+        assets.EndScope(m_persistentScope);
+        m_persistentScope = 0xFFU;
     }
-    m_phase = Phase::Idle;
-    m_nCmd = 0;
+    (void)assets.EvictUnpinned();
+    m_phase    = TransitionPhase::Idle;
+    m_cmdCount = 0U;
 }
 
-Result<void, FwErr> SceneDirector::Go(const Room& room) noexcept {
-    if (m_phase != Phase::Idle) return Err(FwErr::Busy);
-    if (!room.scene.IsValid()) return Err(FwErr::Manifest);
-    m_next = room;
-    m_wipe = room.wipe;
-    m_wipeN = room.wipeTicks;
-    m_wipeT = 0;
-    m_phase = (m_wipe == Wipe::None || m_wipeN == 0) ? Phase::Load : Phase::Out;
+Result<void, FwErrc> SceneDirector::TransitionToRoom(const RoomDesc& room) noexcept {
+    if (m_phase != TransitionPhase::Idle) return Err(FwErrc::Busy);
+    if (!room.roomId.IsValid()) return Err(FwErrc::InvalidRoom);
+    m_nextRoom     = room;
+    m_wipe         = room.wipe;
+    m_wipeDuration = room.wipeTicks;
+    m_wipeTick     = 0U;
+    m_phase        = (m_wipe == WipeKind::None || m_wipeDuration == 0U)
+        ? TransitionPhase::Load
+        : TransitionPhase::Out;
     return {};
 }
 
-void SceneDirector::Rebake() noexcept {
-    m_sim = 0;
-    m_draw = 0;
-    m_freeze = 0;
-    m_inMask = 0xFFFF;
-    for (u8 i = 0; i < m_depth; ++i) {
-        const u8 b = u8(1u << i);
-        if (!HasFlag(m_flag[i], StateFlag::NoSim)) m_sim |= b;
-        if (!HasFlag(m_flag[i], StateFlag::NoDraw)) m_draw |= b;
-        if (HasFlag(m_flag[i], StateFlag::Freeze)) m_freeze = 1;
-        m_inMask = m_mask[i]; // top wins
+void SceneDirector::RebakeMasks() noexcept {
+    m_simMask   = 0U;
+    m_drawMask  = 0U;
+    m_freeze    = 0U;
+    m_inputMask = 0xFFFFU;
+    for (u8 i = 0U; i < m_depth; ++i) {
+        const u8 bit = static_cast<u8>(1U << i);
+        if (!HasFlag(m_flags[i], StateFlags::PauseSim)) m_simMask |= bit;
+        if (!HasFlag(m_flags[i], StateFlags::NoDraw)) m_drawMask |= bit;
+        if (HasFlag(m_flags[i], StateFlags::Freeze)) m_freeze = 1U;
+        m_inputMask = HasFlag(m_flags[i], StateFlags::NoInput) ? 0U : m_masks[i];
     }
 }
 
-void SceneDirector::Apply(LoadCtx& load) noexcept {
-    for (u8 c = 0; c < m_nCmd; ++c) {
-        const StateOp op = m_op[c];
-        const State& s = m_cmd[c];
-        auto pushOne = [&] {
+void SceneDirector::ApplyStateCommands(LoadCtx& load) noexcept {
+    for (u8 c = 0U; c < m_cmdCount; ++c) {
+        const StateOp     op = m_ops[c];
+        const SceneState& s  = m_cmds[c];
+        const auto pushOne = [&]() noexcept {
             if (m_depth >= kMaxStates) return;
-            const u8 i = m_depth++;
-            m_id[i] = s.id;
-            m_flag[i] = s.flags;
-            m_mask[i] = s.inMask;
-            m_tick[i] = s.tick;
-            m_drawFn[i] = s.draw;
-            m_exit[i] = s.exit;
-            m_user[i] = s.data;
-            if (s.enter) s.enter(load, s.data);
+            const u8 i     = m_depth++;
+            m_ids[i]       = s.id;
+            m_flags[i]     = s.flags;
+            m_masks[i]     = s.inputMask;
+            m_tickFns[i]   = s.onTick;
+            m_drawFns[i]   = s.onDraw;
+            m_exitFns[i]   = s.onExit;
+            m_userData[i]  = s.userData;
+            if (s.onEnter) s.onEnter(load, s.userData);
         };
-        auto popOne = [&] {
-            if (!m_depth) return;
+        const auto popOne = [&]() noexcept {
+            if (m_depth == 0U) return;
             --m_depth;
-            if (m_exit[m_depth]) m_exit[m_depth](load, m_user[m_depth]);
+            if (m_exitFns[m_depth]) m_exitFns[m_depth](load, m_userData[m_depth]);
         };
         switch (op) {
-            case StateOp::Pop:  popOne(); break;
+            case StateOp::Pop:
+                popOne();
+                break;
             case StateOp::Reset:
-                while (m_depth) popOne();
+                while (m_depth > 0U) popOne();
                 [[fallthrough]];
-            case StateOp::Push: pushOne(); break;
-            case StateOp::Swap: popOne(); pushOne(); break;
+            case StateOp::Push:
+                pushOne();
+                break;
+            case StateOp::Swap:
+                popOne();
+                pushOne();
+                break;
         }
     }
-    m_nCmd = 0;
-    Rebake();
+    m_cmdCount = 0U;
+    RebakeMasks();
 }
 
-Result<bool, FwErr> SceneDirector::Advance(LoadCtx& load) noexcept {
-    if (m_phase == Phase::Idle) return false;
+Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcept {
+    if (m_phase == TransitionPhase::Idle) return false;
 
-    if (m_phase == Phase::Out) {
-        if (m_wipeT < m_wipeN) {
-            ++m_wipeT;
+    if (m_phase == TransitionPhase::Out) {
+        if (m_wipeTick < m_wipeDuration) {
+            ++m_wipeTick;
             return false;
         }
-        m_phase = Phase::Load;
-        m_wipeT = m_wipeN;
+        m_phase    = TransitionPhase::Load;
+        m_wipeTick = m_wipeDuration;
     }
 
-    if (m_phase == Phase::Load) {
+    if (m_phase == TransitionPhase::Load) {
         AssetBank& assets = *load.assets;
-        if (m_roomExit) {
-            m_roomExit(load);
-            m_roomExit = nullptr;
+        if (m_roomExitFn) {
+            m_roomExitFn(load);
+            m_roomExitFn = nullptr;
         }
-        if (load.phys) load.phys->Clear();
-        if (load.game) load.game->Clear();
+        if (m_nextRoom.clearWorld && load.world) load.world->Clear();
+        if (load.physics) load.physics->Clear();
+        if (load.gameplay) load.gameplay->Clear();
 
-        if (m_stage == 0xFF) {
+        if (m_stagingScope == 0xFFU) {
             auto st = assets.BeginScope();
-            if (!st) return Err(FwErr::Scope);
-            m_stage = *st;
+            if (!st) return Err(FwErrc::ScopeExhausted);
+            m_stagingScope = *st;
         }
 
-        if (m_next.collMap.IsValid() && load.phys) {
-            const BlobHandle bh = assets.FindBlob(m_next.collMap);
-            if (bh.IsValid()) (void)load.phys->BindCollisionMapBlob(assets, bh);
+        load.roomScope       = m_stagingScope;
+        load.persistentScope = m_persistentScope;
+
+        if (m_nextRoom.collisionMap.IsValid() && load.physics) {
+            const BlobHandle bh = assets.FindBlob(m_nextRoom.collisionMap);
+            if (bh.IsValid()) (void)load.physics->BindCollisionMapBlob(assets, bh);
         }
-        if (m_next.prefab.IsValid() && load.world) {
-            const BlobHandle bh = assets.FindBlob(m_next.prefab);
+        if (m_nextRoom.prefab.IsValid() && load.world) {
+            const BlobHandle bh = assets.FindBlob(m_nextRoom.prefab);
             if (bh.IsValid()) (void)load.world->InstantiatePrefab(assets, bh);
         }
-        if (m_next.cues.IsValid() && load.audio) {
-            const BlobHandle bh = assets.FindBlob(m_next.cues);
-            if (bh.IsValid()) (void)load.audio->RegisterBank(assets.GetBlob(bh), m_stage);
+        if (m_nextRoom.musicTrack.IsValid() && load.audio) {
+            (void)load.audio->PlayMusic(m_nextRoom.musicTrack, assets, m_nextRoom.musicFadeBlocks);
         }
-        if (m_next.enter) {
-            if (auto r = m_next.enter(load); !r) {
-                assets.EndScope(m_stage);
-                m_stage = 0xFF;
-                m_phase = Phase::Idle;
+        if (m_nextRoom.onEnter) {
+            if (auto r = m_nextRoom.onEnter(load); !r) {
+                assets.EndScope(m_stagingScope);
+                (void)assets.EvictUnpinned();
+                m_stagingScope = 0xFFU;
+                m_phase        = TransitionPhase::Idle;
                 return Err(r.error());
             }
         }
 
-        const u8 old = m_room;
-        m_room = m_stage;
-        m_stage = 0xFF;
-        m_scene = m_next.scene;
-        m_roomExit = m_next.exit;
-        load.roomScope = m_room;
-        load.keepScope = m_keep;
-        ++m_nTrans;
+        const u8 oldScope = m_roomScope;
+        m_roomScope       = m_stagingScope;
+        m_stagingScope    = 0xFFU;
+        m_currentRoom     = m_nextRoom.roomId;
+        m_roomExitFn      = m_nextRoom.onExit;
+        load.roomScope    = m_roomScope;
+        ++m_transitionCount;
 
-        if (old != 0xFF && old != m_keep && old != m_room) {
-            load.audio->RequestScopeRelease(old);
-            assets.EndScope(old);
+        if (oldScope != 0xFFU && oldScope != m_persistentScope && oldScope != m_roomScope) {
+            assets.EndScope(oldScope);
+            (void)assets.EvictUnpinned();
         }
 
-        if (m_wipe == Wipe::None || m_wipeN == 0) {
-            m_phase = Phase::Idle;
-            m_wipeT = 0;
+        if (m_wipe == WipeKind::None || m_wipeDuration == 0U) {
+            m_phase    = TransitionPhase::Idle;
+            m_wipeTick = 0U;
             return true;
         }
-        m_phase = Phase::In;
-        m_wipeT = m_wipeN;
+        m_phase    = TransitionPhase::In;
+        m_wipeTick = m_wipeDuration;
         return true;
     }
 
-    if (m_phase == Phase::In) {
-        if (m_wipeT > 0) {
-            --m_wipeT;
+    if (m_phase == TransitionPhase::In) {
+        if (m_wipeTick > 0U) {
+            --m_wipeTick;
             return false;
         }
-        m_phase = Phase::Idle;
-        m_wipe = Wipe::None;
+        m_phase = TransitionPhase::Idle;
+        m_wipe  = WipeKind::None;
         return false;
     }
     return false;
 }
 
-Result<bool, FwErr> SceneDirector::Tick(LoadCtx& load) noexcept {
-    if (m_nCmd) Apply(load);
-    return Advance(load);
+Result<bool, FwErrc> SceneDirector::Tick(LoadCtx& load) noexcept {
+    if (m_cmdCount > 0U) ApplyStateCommands(load);
+    return AdvanceRoomTransition(load);
 }
 
-void SceneDirector::TickStates(SimCtx& ctx, const SimStepView& step) const noexcept {
-    for (u8 m = m_sim; m; m &= u8(m - 1)) {
-        const u8 i = u8(std::countr_zero(m));
-        if (m_tick[i]) m_tick[i](ctx, step, m_user[i]);
+void SceneDirector::TickStates(SimCtx& ctx, const TickStep& step) const noexcept {
+    for (u8 m = m_simMask; m != 0U; m &= static_cast<u8>(m - 1U)) {
+        const u8 i = static_cast<u8>(std::countr_zero(m));
+        if (m_tickFns[i]) m_tickFns[i](ctx, step, m_userData[i]);
     }
 }
 
 void SceneDirector::DrawStates(DrawCtx& ctx) const noexcept {
-    for (u8 m = m_draw; m; m &= u8(m - 1)) {
-        const u8 i = u8(std::countr_zero(m));
-        if (m_drawFn[i]) m_drawFn[i](ctx, m_user[i]);
+    for (u8 m = m_drawMask; m != 0U; m &= static_cast<u8>(m - 1U)) {
+        const u8 i = static_cast<u8>(std::countr_zero(m));
+        if (m_drawFns[i]) m_drawFns[i](ctx, m_userData[i]);
     }
 }
 
 void SceneDirector::DrawWipe(RenderList& list, Viewport vp) const noexcept {
-    if (m_phase == Phase::Idle || m_wipe == Wipe::None || !vp.Valid()) return;
+    if (m_phase == TransitionPhase::Idle || m_wipe == WipeKind::None || !vp.Valid()) return;
 
-    f32 t = 0.f;
-    if (m_wipeN) {
-        t = std::clamp(f32(m_wipeT) / f32(m_wipeN), 0.f, 1.f);
-        t = t * t * (3.f - 2.f * t);
-        if (m_phase == Phase::Load) t = 1.f;
+    f32 t = 0.0f;
+    if (m_wipeDuration > 0U) {
+        t = std::clamp(static_cast<f32>(m_wipeTick) / static_cast<f32>(m_wipeDuration), 0.0f, 1.0f);
+        t = t * t * (3.0f - 2.0f * t);
+        if (m_phase == TransitionPhase::Load) t = 1.0f;
     }
     if (t <= 1e-4f) return;
 
-    const f32 vw = f32(vp.w), vh = f32(vp.h);
-    const Vec2 c{vw * 0.5f, vh * 0.5f};
+    const f32  vw = static_cast<f32>(vp.w);
+    const f32  vh = static_cast<f32>(vp.h);
+    const Vec2 center{vw * 0.5f, vh * 0.5f};
 
-    QuadCmd q{};
-    q.center = c;
-    q.size = {vw, vh};
-    q.texture = kWhiteTexture;
-    q.depth = 65500;
-    q.layer = 250;
-    q.view = RenderList::kHudViewSlot;
-    q.blend = BlendMode::Alpha;
+    QuadCmd q{
+        .center  = center,
+        .size    = {vw, vh},
+        .texture = kWhiteTexture,
+        .depth   = 65500U,
+        .layer   = 250U,
+        .view    = RenderList::kHudViewSlot,
+        .blend   = BlendMode::Alpha,
+    };
 
     switch (m_wipe) {
-        case Wipe::Fade:
-            q.color = Color{0, 0, 0, t};
+        case WipeKind::Fade:
+            q.color = Color{0.0f, 0.0f, 0.0f, t};
             list.Push(q);
             break;
-        case Wipe::HSlide: {
-            const f32 w = c.x * t;
-            q.color = Color{0.03f, 0.03f, 0.05f, 1};
-            q.size.x = w;
-            q.center.x = w * 0.5f;
+        case WipeKind::HSlide: {
+            const f32 w = center.x * t;
+            q.color     = Color{0.03f, 0.03f, 0.05f, 1.0f};
+            q.size.x    = w;
+            q.center.x  = w * 0.5f;
             list.Push(q);
-            q.center.x = vw - w * 0.5f;
-            list.Push(q);
-            break;
-        }
-        case Wipe::VSlide: {
-            const f32 h = c.y * t;
-            q.color = Color{0.03f, 0.03f, 0.05f, 1};
-            q.size.y = h;
-            q.center.y = h * 0.5f;
-            list.Push(q);
-            q.center.y = vh - h * 0.5f;
+            q.center.x  = vw - w * 0.5f;
             list.Push(q);
             break;
         }
-        default: break;
+        case WipeKind::VSlide: {
+            const f32 h = center.y * t;
+            q.color     = Color{0.03f, 0.03f, 0.05f, 1.0f};
+            q.size.y    = h;
+            q.center.y  = h * 0.5f;
+            list.Push(q);
+            q.center.y  = vh - h * 0.5f;
+            list.Push(q);
+            break;
+        }
+        default:
+            break;
     }
 }
 

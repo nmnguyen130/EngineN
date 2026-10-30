@@ -4,10 +4,12 @@
 
 namespace en {
 
-// Fixed-pool SoA mixer. Non-owning arena slice. Zero heap after Init.
-class alignas(64) AudioMixer {
+// Fixed-pool SoA 48 kHz stereo software mixer with 4-point Hermite resampling, SVF occlusion, and bus ducking.
+// Non-owning view over an Arena slice; performs zero heap allocations during mixing.
+// Invariant: sizeof(AudioMixer) == 48.
+class AudioMixer {
 public:
-    [[nodiscard]] static constexpr usize RequiredArenaBytes() noexcept;
+    [[nodiscard]] static usize RequiredArenaBytes() noexcept;
 
     [[nodiscard]] Result<void, AudioErrc> Init(std::span<u8> arena) noexcept;
     void Reset() noexcept;
@@ -16,8 +18,7 @@ public:
 
     [[nodiscard]] constexpr const AudioTelemetry& Telemetry() const noexcept { return m_tel; }
     [[nodiscard]] constexpr u64 ActiveMask() const noexcept { return m_active; }
-    [[nodiscard]] u32 ScopeMask() const noexcept;
-    [[nodiscard]] u64 AuditHash() const noexcept;
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
     [[nodiscard]] static constexpr f32 Hermite4(f32 a, f32 b, f32 c, f32 d, f32 t) noexcept {
         const f32 c1 = 0.5f * (c - a);
@@ -26,7 +27,8 @@ public:
         return ((c3 * t + c2) * t + c1) * t + b;
     }
 
-    [[nodiscard]] static constexpr f32 SvfLp(f32 x, f32& ic1, f32& ic2, f32 a1, f32 a2, f32 a3) noexcept {
+    [[nodiscard]] static constexpr f32 SvfLowPass(
+        f32 x, f32& ic1, f32& ic2, f32 a1, f32 a2, f32 a3) noexcept {
         const f32 v3 = x - ic2;
         const f32 v1 = a1 * ic1 + a2 * v3;
         const f32 v2 = ic2 + a2 * ic1 + a3 * v3;
@@ -44,10 +46,11 @@ public:
 
 private:
     struct State;
-    State* m_state{nullptr};
-    u64 m_active{0ULL};
+
+    State*         m_state{nullptr};
+    u64            m_active{0};
     AudioTelemetry m_tel{};
 };
-static_assert(sizeof(AudioMixer) == 64);
+static_assert(sizeof(AudioMixer) == 48);
 
 } // namespace en

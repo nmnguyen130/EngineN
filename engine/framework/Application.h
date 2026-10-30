@@ -5,7 +5,7 @@
 #include "core/Jobs.h"
 #include "debug/DebugSystem.h"
 #include "framework/SceneDirector.h"
-#include "gameplay/GameplayPipeline.h"
+#include "gameplay/GameplaySystem.h"
 #include "input/ActionBuffer.h"
 #include "input/InputSystem.h"
 #include "physics/PhysicsSystem.h"
@@ -19,98 +19,100 @@
 
 namespace en {
 
-struct alignas(32) AppConfig {
-    AssetBankConfig   assets{};
-    AudioSystemConfig audio{};
-    DebugConfig       debug{};
-    WorldConfig       world{};
-    Viewport          viewport{1280, 720};
-    f32               ppm{48.f};
-    u16               maxManifolds{1024};
-    u16               maxCues{64};
-    u8                velIters{8};
-    u8                sleepTicks{60};
-    u8                headless{1};
-    u8                debugOn{1};
+struct AppConfig {
+    std::string_view title{"EngineN"};
+    Viewport         viewport{1280, 720};
+    f32              pixelsPerMeter{48.0f};
+    AssetBankConfig  assets{};
+    AudioConfig      audio{};
+    WorldConfig      world{};
+    PhysicsConfig    physics{};
+    GameplayConfig   gameplay{};
+    DebugConfig      debug{};
+    bool             headless{true};
+    bool             enableDebug{true};
 };
-static_assert(sizeof(AppConfig) <= 96);
 
-// Owns all subsystems. One Step() drives the whole frame.
-class alignas(64) Application {
+// Top-level Metroidvania engine runtime owning and orchestrating all 12 subsystems.
+// Move-only owner of an Arena-allocated Runtime state; Step() drives one full frame.
+// Invariant: sizeof(Application) == 48.
+class Application {
 public:
     Application() noexcept = default;
     ~Application() noexcept { Shutdown(); }
+
     Application(const Application&) = delete;
     Application& operator=(const Application&) = delete;
-    Application(Application&&) noexcept;
-    Application& operator=(Application&&) noexcept;
+    Application(Application&& other) noexcept;
+    Application& operator=(Application&& other) noexcept;
 
-    [[nodiscard]] Result<void, FwError> Init(const AppConfig& cfg = {}, const Hooks& hooks = {}) noexcept;
+    [[nodiscard]] Result<void, FwErrc> Init(
+        const AppConfig& cfg = {},
+        const AppHooks& hooks = {}) noexcept;
     void Shutdown() noexcept;
 
-    [[nodiscard]] constexpr bool Ready() const noexcept { return m_ok != 0; }
-    [[nodiscard]] constexpr bool Running() const noexcept { return m_run != 0; }
-    constexpr void Quit() noexcept { m_run = 0; }
+    [[nodiscard]] constexpr bool Ready() const noexcept { return m_ready != 0U; }
+    [[nodiscard]] constexpr bool Running() const noexcept { return m_running != 0U; }
+    constexpr void Quit() noexcept { m_running = 0U; }
 
-    [[nodiscard]] Result<void, FwError> Run(u32 fps = 120) noexcept;
-    [[nodiscard]] Result<void, FwError> Step(u64 dtNs = kFixedDtNs) noexcept;
-    [[nodiscard]] Result<void, FwError> StepN(u32 ticks) noexcept;
+    [[nodiscard]] Result<void, FwErrc> Run(u32 targetFps = 120U) noexcept;
+    [[nodiscard]] Result<void, FwErrc> Step(u64 dtNs = kFixedDtNs) noexcept;
+    [[nodiscard]] Result<void, FwErrc> StepTicks(u32 ticks) noexcept;
 
-    [[nodiscard]] u64 Frame() const noexcept { return m_frame; }
-    [[nodiscard]] u64 Ticks() const noexcept { return m_ticks; }
-    [[nodiscard]] u64 Hash() const noexcept;
+    [[nodiscard]] constexpr u64 FrameCount() const noexcept { return m_frame; }
+    [[nodiscard]] constexpr u64 TickCount() const noexcept { return m_ticks; }
+    [[nodiscard]] u64 ComputeAuditHash() const noexcept;
 
-    [[nodiscard]] Platform&         Plat() noexcept;
-    [[nodiscard]] Window&           Win() noexcept;
-    [[nodiscard]] Renderer&         Gfx() noexcept;
-    [[nodiscard]] JobSystem&        Jobs() noexcept;
-    [[nodiscard]] SceneDirector&    Dir() noexcept;
-    [[nodiscard]] World&            Wld() noexcept;
-    [[nodiscard]] PhysicsSystem&    Phys() noexcept;
-    [[nodiscard]] GameplayPipeline& Game() noexcept;
-    [[nodiscard]] AssetBank&        Assets() noexcept;
-    [[nodiscard]] AudioSystem&      Sfx() noexcept;
-    [[nodiscard]] DebugSystem&      Dbg() noexcept;
-    [[nodiscard]] TimeSystem&       Clock() noexcept;
-    [[nodiscard]] InputSystem&      In() noexcept;
-    [[nodiscard]] ActionBuffer&     Acts() noexcept;
-    [[nodiscard]] RenderList&       List() noexcept;
+    [[nodiscard]] Platform&       GetPlatform() noexcept;
+    [[nodiscard]] Window&         GetWindow() noexcept;
+    [[nodiscard]] Renderer&       GetRenderer() noexcept;
+    [[nodiscard]] JobSystem&      GetJobs() noexcept;
+    [[nodiscard]] SceneDirector&  GetScenes() noexcept;
+    [[nodiscard]] World&          GetWorld() noexcept;
+    [[nodiscard]] PhysicsSystem&  GetPhysics() noexcept;
+    [[nodiscard]] GameplaySystem& GetGameplay() noexcept;
+    [[nodiscard]] AssetBank&      GetAssets() noexcept;
+    [[nodiscard]] AudioSystem&    GetAudio() noexcept;
+    [[nodiscard]] DebugSystem&    GetDebug() noexcept;
+    [[nodiscard]] TimeSystem&     GetTime() noexcept;
+    [[nodiscard]] InputSystem&    GetInput() noexcept;
+    [[nodiscard]] ActionBuffer&   GetActions() noexcept;
+    [[nodiscard]] RenderList&     GetRenderList() noexcept;
 
-    [[nodiscard]] const Platform&         Plat() const noexcept;
-    [[nodiscard]] const Window&           Win() const noexcept;
-    [[nodiscard]] const Renderer&         Gfx() const noexcept;
-    [[nodiscard]] const JobSystem&        Jobs() const noexcept;
-    [[nodiscard]] const SceneDirector&    Dir() const noexcept;
-    [[nodiscard]] const World&            Wld() const noexcept;
-    [[nodiscard]] const PhysicsSystem&    Phys() const noexcept;
-    [[nodiscard]] const GameplayPipeline& Game() const noexcept;
-    [[nodiscard]] const AssetBank&        Assets() const noexcept;
-    [[nodiscard]] const AudioSystem&      Sfx() const noexcept;
-    [[nodiscard]] const DebugSystem&      Dbg() const noexcept;
-    [[nodiscard]] const TimeSystem&       Clock() const noexcept;
-    [[nodiscard]] const InputSystem&      In() const noexcept;
-    [[nodiscard]] const ActionBuffer&     Acts() const noexcept;
-    [[nodiscard]] const RenderList&       List() const noexcept;
+    [[nodiscard]] const Platform&       GetPlatform() const noexcept;
+    [[nodiscard]] const Window&         GetWindow() const noexcept;
+    [[nodiscard]] const Renderer&       GetRenderer() const noexcept;
+    [[nodiscard]] const JobSystem&      GetJobs() const noexcept;
+    [[nodiscard]] const SceneDirector&  GetScenes() const noexcept;
+    [[nodiscard]] const World&          GetWorld() const noexcept;
+    [[nodiscard]] const PhysicsSystem&  GetPhysics() const noexcept;
+    [[nodiscard]] const GameplaySystem& GetGameplay() const noexcept;
+    [[nodiscard]] const AssetBank&      GetAssets() const noexcept;
+    [[nodiscard]] const AudioSystem&    GetAudio() const noexcept;
+    [[nodiscard]] const DebugSystem&    GetDebug() const noexcept;
+    [[nodiscard]] const TimeSystem&     GetTime() const noexcept;
+    [[nodiscard]] const InputSystem&    GetInput() const noexcept;
+    [[nodiscard]] const ActionBuffer&   GetActions() const noexcept;
+    [[nodiscard]] const RenderList&     GetRenderList() const noexcept;
 
 private:
-    struct RT;
+    struct Runtime;
 
-    [[nodiscard]] LoadCtx MakeLoad() const noexcept;
-    void HandleCues(SimCtx& ctx, const SimStepView& step) noexcept;
-    void Draw() noexcept;
+    [[nodiscard]] LoadCtx MakeLoadCtx() const noexcept;
+    void ApplyDebugDirectives(const LoopDirectives& dir) noexcept;
+    void RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept;
+    void RenderFrame() noexcept;
 
-    Arena m_arena{};
-    RT*   m_rt{};
-    void* m_user{};
-    u64   m_frame{0};
-    u64   m_ticks{0};
-    u16   m_ppmQ4{768};
-    u8    m_ok{0};
-    u8    m_run{0};
-    u8    m_headless{1};
-    u8    m_debug{1};
-    u8    m_freeze{0};
+    Arena    m_arena{};
+    Runtime* m_rt{nullptr};
+    u64      m_frame{0};
+    u64      m_ticks{0};
+    f32      m_ppm{48.0f};
+    u8       m_ready{0};
+    u8       m_running{0};
+    u8       m_headless{1};
+    u8       m_debug{1};
 };
-static_assert(sizeof(Application) <= 64);
+static_assert(sizeof(Application) == 48);
 
 } // namespace en

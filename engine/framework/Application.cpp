@@ -1,448 +1,449 @@
 #include "framework/Application.h"
 
-#include "time/Clock.h"
 #include "world/WorldSystems.h"
-
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <new>
-#include <utility>
 
 namespace en {
 
-struct alignas(64) Application::RT {
-    TimeSystem       time{};
-    InputSystem      input{};
-    ActionBuffer     acts{};
-    AssetBank        assets{};
-    AudioSystem      audio{};
-    World            world{};
-    PhysicsSystem    phys{};
-    GameplayPipeline game{};
-    SceneDirector    dir{};
-    DebugSystem      debug{};
-    FramePacer       pacer{};
-    JobSystem        jobs{};
-    Hooks            hooks{};
-    Viewport         vp{1280, 720};
-    u8               focusOff{0};
-    u8               hasGfx{0};
-    std::array<AudioTriggerReq, 64> cues{};
-    Window           win{};
-    Platform         plat{};
-    RenderList       list{};
-    union {
-        u8       gfxPad{};
-        Renderer gfx;
-    };
-
-    RT() noexcept : gfxPad{0} {}
-    ~RT() noexcept { if (hasGfx) std::destroy_at(&gfx); }
+struct Application::Runtime {
+    TimeSystem                    time{};
+    InputSystem                   input{};
+    ActionBuffer                  actions{};
+    AssetBank                     assets{};
+    AudioSystem                   audio{};
+    World                         world{};
+    PhysicsSystem                 physics{};
+    GameplaySystem                gameplay{};
+    SceneDirector                 scenes{};
+    DebugSystem                   debug{};
+    FramePacer                    pacer{};
+    JobSystem                     jobs{};
+    Platform                      platform{};
+    Window                        window{};
+    Renderer                      renderer{};
+    RenderList                    renderList{};
+    AppHooks                      hooks{};
+    Viewport                      viewport{1280, 720};
+    std::array<AudioTrigger, 64>  audioTriggers{};
+    bool                          focusPaused{false};
 };
 
-Application::Application(Application&& o) noexcept { *this = std::move(o); }
+Application::Application(Application&& other) noexcept {
+    *this = std::move(other);
+}
 
-Application& Application::operator=(Application&& o) noexcept {
-    if (this == &o) return *this;
-    Shutdown();
-    m_arena = std::move(o.m_arena);
-    m_rt = std::exchange(o.m_rt, nullptr);
-    m_user = std::exchange(o.m_user, nullptr);
-    m_frame = std::exchange(o.m_frame, 0ULL);
-    m_ticks = std::exchange(o.m_ticks, 0ULL);
-    m_ppmQ4 = o.m_ppmQ4;
-    m_ok = std::exchange(o.m_ok, 0);
-    m_run = std::exchange(o.m_run, 0);
-    m_headless = o.m_headless;
-    m_debug = o.m_debug;
-    m_freeze = std::exchange(o.m_freeze, 0);
+Application& Application::operator=(Application&& other) noexcept {
+    if (this != &other) {
+        Shutdown();
+        m_arena    = std::move(other.m_arena);
+        m_rt       = std::exchange(other.m_rt, nullptr);
+        m_frame    = std::exchange(other.m_frame, 0ULL);
+        m_ticks    = std::exchange(other.m_ticks, 0ULL);
+        m_ppm      = other.m_ppm;
+        m_ready    = std::exchange(other.m_ready, 0U);
+        m_running  = std::exchange(other.m_running, 0U);
+        m_headless = other.m_headless;
+        m_debug    = other.m_debug;
+    }
     return *this;
 }
 
-LoadCtx Application::MakeLoad() const noexcept {
-    LoadCtx c{};
-    if (!m_rt) return c;
-    c.world = &m_rt->world;
-    c.phys = &m_rt->phys;
-    c.game = &m_rt->game;
-    c.assets = &m_rt->assets;
-    c.audio = &m_rt->audio;
-    c.dir = &m_rt->dir;
-    c.user = m_user;
-    c.frame = u32(m_frame);
-    c.roomScope = m_rt->dir.RoomScope();
-    c.keepScope = m_rt->dir.KeepScope();
-    return c;
+LoadCtx Application::MakeLoadCtx() const noexcept {
+    if (!m_rt) return {};
+    return LoadCtx{
+        .world           = &m_rt->world,
+        .physics         = &m_rt->physics,
+        .gameplay        = &m_rt->gameplay,
+        .assets          = &m_rt->assets,
+        .audio           = &m_rt->audio,
+        .scenes          = &m_rt->scenes,
+        .userData        = m_rt->hooks.userData,
+        .frame           = static_cast<u32>(m_frame),
+        .roomScope       = m_rt->scenes.RoomScope(),
+        .persistentScope = m_rt->scenes.PersistentScope(),
+    };
 }
 
-Result<void, FwError> Application::Init(const AppConfig& cfg, const Hooks& hooks) noexcept {
+Result<void, FwErrc> Application::Init(const AppConfig& cfg, const AppHooks& hooks) noexcept {
     Shutdown();
-    if (!cfg.viewport.Valid() || cfg.ppm <= 0.f) {
-        return Err(FwError{FwErr::BadConfig, FwStage::None, 0});
+    if (!cfg.viewport.Valid() || cfg.pixelsPerMeter <= 0.0f) {
+        return Err(FwErrc::InvalidConfig);
     }
 
-    const bool headless = cfg.headless != 0;
-    const usize bytes = headless ? offsetof(RT, gfx) + 64 : sizeof(RT);
-    if (!m_arena.Init(bytes)) {
-        return Err(FwError{FwErr::BadConfig, FwStage::None, 0});
+    if (!m_arena.Init(sizeof(Runtime) + 1024U)) {
+        return Err(FwErrc::InvalidConfig);
     }
-    auto span = m_arena.Alloc<RT>(1);
-    if (span.empty()) {
+    u8* raw = m_arena.AllocBytes(sizeof(Runtime), alignof(Runtime));
+    if (!raw) {
         m_arena.Shutdown();
-        return Err(FwError{FwErr::BadConfig, FwStage::None, 0});
+        return Err(FwErrc::InvalidConfig);
     }
-    std::destroy_at(span.data());
-    m_rt = ::new (span.data()) RT{};
+    m_rt = std::construct_at(reinterpret_cast<Runtime*>(raw));
 
-    m_rt->hooks = hooks;
-    m_rt->vp = cfg.viewport;
-    m_user = hooks.user;
-    m_ppmQ4 = u16(std::clamp(cfg.ppm * 16.f, 16.f, 65535.f));
-    m_headless = cfg.headless;
-    m_debug = cfg.debugOn;
-    m_freeze = 0;
-    m_frame = 0;
-    m_ticks = 0;
+    m_rt->hooks    = hooks;
+    m_rt->viewport = cfg.viewport;
+    m_ppm          = cfg.pixelsPerMeter;
+    m_headless     = cfg.headless ? 1U : 0U;
+    m_debug        = cfg.enableDebug ? 1U : 0U;
+    m_frame        = 0ULL;
+    m_ticks        = 0ULL;
 
-    auto fail = [&](FwErr e, FwStage s, u16 sub = 0) -> Result<void, FwError> {
+    const auto fail = [&](FwErrc err) noexcept -> Result<void, FwErrc> {
         Shutdown();
-        return Err(FwError{e, s, sub});
+        return Err(err);
     };
 
-    if (!headless) {
-        (void)m_rt->jobs.Init(1);
-        if (auto r = m_rt->plat.Init("VeilOfTheSilent", "EngineN", false); !r)
-            return fail(FwErr::Platform, FwStage::Platform, u16(r.error()));
-        WindowConfig wc{};
-        wc.title = "Veil of the Silent";
-        wc.size = WindowSize{cfg.viewport.w, cfg.viewport.h};
-        if (auto r = m_rt->win.Create(wc, false); !r)
-            return fail(FwErr::Window, FwStage::Window, u16(r.error()));
-        std::construct_at(&m_rt->gfx);
-        m_rt->hasGfx = 1;
-        if (auto r = m_rt->gfx.Init(m_rt->win); !r)
-            return fail(FwErr::Renderer, FwStage::Renderer, u16(r.error()));
+    if (!cfg.headless) {
+        (void)m_rt->jobs.Init(1U);
+    }
+    if (!m_rt->platform.Init(cfg.title, "EngineN", cfg.headless).has_value()) {
+        return fail(FwErrc::PlatformFailed);
+    }
+    if (!m_rt->window.Create({.title = cfg.title, .size = {cfg.viewport.w, cfg.viewport.h}}, cfg.headless).has_value()) {
+        return fail(FwErrc::WindowFailed);
+    }
+    if (!m_rt->renderer.Init(m_rt->window, {.headless = cfg.headless}).has_value()) {
+        return fail(FwErrc::RendererFailed);
+    }
+    if (!m_rt->assets.Init(cfg.assets).has_value()) {
+        return fail(FwErrc::AssetsFailed);
+    }
+    m_rt->assets.SetGpuDestroy(
+        [](TextureHandle t, void* ctx) noexcept {
+            if (t != kWhiteTexture) static_cast<Renderer*>(ctx)->DestroyTexture(t);
+        },
+        &m_rt->renderer);
+
+    AudioConfig audioCfg = cfg.audio;
+    audioCfg.headless    = cfg.headless;
+    if (!m_rt->audio.Init(audioCfg).has_value()) {
+        return fail(FwErrc::AudioFailed);
+    }
+    if (!m_rt->world.Init(cfg.world).has_value()) {
+        return fail(FwErrc::WorldFailed);
+    }
+    if (hooks.onRegisterComponents) {
+        if (auto r = hooks.onRegisterComponents(m_rt->world, hooks.userData); !r) {
+            return fail(r.error());
+        }
+    }
+    if (!m_rt->physics.Init(m_rt->world, cfg.physics).has_value()) {
+        return fail(FwErrc::PhysicsFailed);
+    }
+    if (!m_rt->gameplay.Init(m_rt->world, cfg.gameplay, hooks.gameplay).has_value()) {
+        return fail(FwErrc::GameplayFailed);
+    }
+    if (m_debug != 0U) {
+        if (!m_rt->debug.Init(cfg.debug).has_value()) {
+            return fail(FwErrc::DebugFailed);
+        }
+    }
+    if (auto r = m_rt->scenes.Init(m_rt->assets); !r) {
+        return fail(r.error());
+    }
+    if (hooks.onBoot) {
+        LoadCtx bootCtx = MakeLoadCtx();
+        if (auto r = hooks.onBoot(bootCtx); !r) {
+            return fail(r.error());
+        }
     }
 
-    if (auto r = m_rt->assets.Init(cfg.assets); !r)
-        return fail(FwErr::Assets, FwStage::Assets, u16(r.error()));
-    if (!headless && m_rt->gfx.IsValid()) {
-        m_rt->assets.SetGpuDestroy(
-            [](TextureHandle t, void* ctx) noexcept {
-                if (t != kWhiteTexture) static_cast<Renderer*>(ctx)->DestroyTexture(t);
-            },
-            &m_rt->gfx);
-    }
-
-    AudioSystemConfig ac = cfg.audio;
-    ac.headless = headless;
-    if (auto r = m_rt->audio.Init(ac); !r)
-        return fail(FwErr::Audio, FwStage::Audio, u16(r.error()));
-    if (auto r = m_rt->world.Init(cfg.world); !r)
-        return fail(FwErr::World, FwStage::World, u16(r.error()));
-    if (hooks.registerComponents) {
-        if (auto r = hooks.registerComponents(m_rt->world, m_user); !r)
-            return fail(r.error(), FwStage::Client);
-    }
-
-    PhysicsConfig pc{};
-    pc.maxManifolds = cfg.maxManifolds;
-    pc.velocityIterations = cfg.velIters;
-    pc.sleepTicksThreshold = cfg.sleepTicks;
-    if (auto r = m_rt->phys.Init(m_rt->world, pc); !r)
-        return fail(FwErr::Physics, FwStage::Physics, u16(r.error()));
-
-    GameplayConfig gc{};
-    gc.maxCuesPerTick = cfg.maxCues;
-    if (auto r = m_rt->game.Init(m_rt->world, hooks.policies, gc); !r)
-        return fail(FwErr::Gameplay, FwStage::Gameplay, u16(r.error()));
-
-    if (m_debug) {
-        if (auto r = m_rt->debug.Init(cfg.debug); !r)
-            return fail(FwErr::Debug, FwStage::Debug, u16(r.error()));
-    }
-    if (auto r = m_rt->dir.Init(m_rt->assets); !r)
-        return fail(r.error(), FwStage::Director);
-    if (hooks.boot) {
-        LoadCtx boot = MakeLoad();
-        if (auto r = hooks.boot(boot); !r)
-            return fail(r.error(), FwStage::Client);
-    }
-
-    m_ok = 1;
-    m_run = 1;
+    m_ready   = 1U;
+    m_running = 1U;
     return {};
 }
 
 void Application::Shutdown() noexcept {
     if (!m_rt) {
         m_arena.Shutdown();
-        m_ok = m_run = 0;
+        m_ready   = 0U;
+        m_running = 0U;
         return;
     }
-    if (m_ok) {
-        LoadCtx load = MakeLoad();
-        if (m_rt->hooks.preShutdown) m_rt->hooks.preShutdown(load);
-        m_rt->dir.Shutdown(m_rt->assets, m_rt->audio, &load);
-        if (m_debug) m_rt->debug.Shutdown();
-        m_rt->game.Shutdown();
-        m_rt->phys.Shutdown();
+    if (m_ready != 0U) {
+        LoadCtx load = MakeLoadCtx();
+        if (m_rt->hooks.onShutdown) m_rt->hooks.onShutdown(load);
+        m_rt->scenes.Shutdown(m_rt->assets, &load);
+        if (m_debug != 0U) m_rt->debug.Shutdown();
+        m_rt->gameplay.Shutdown();
+        m_rt->physics.Shutdown();
         m_rt->world.Shutdown();
         m_rt->audio.Shutdown();
         m_rt->assets.Shutdown();
-        if (!m_headless) {
-            m_rt->jobs.Shutdown();
-            if (m_rt->hasGfx) m_rt->gfx.Shutdown();
-            if (m_rt->plat.IsInitialized()) m_rt->plat.Shutdown();
-        }
+        m_rt->renderer.Shutdown();
+        m_rt->window.Destroy();
+        m_rt->platform.Shutdown();
+        m_rt->jobs.Shutdown();
     }
-    m_rt->~RT();
+    std::destroy_at(m_rt);
     m_rt = nullptr;
     m_arena.Shutdown();
-    m_ok = m_run = 0;
-    m_user = nullptr;
+    m_ready   = 0U;
+    m_running = 0U;
 }
 
-Result<void, FwError> Application::Run(u32 fps) noexcept {
-    if (!m_rt || !m_ok) return Err(FwError{FwErr::BadConfig, FwStage::None, 0});
-    if (m_headless) return StepN(120);
+Result<void, FwErrc> Application::Run(u32 targetFps) noexcept {
+    if (!m_rt || m_ready == 0U) return Err(FwErrc::InvalidConfig);
+    if (m_headless != 0U) return StepTicks(120U);
 
-    m_rt->pacer.SetTargetFps(fps);
-    u64 prev = Clock::NowNs();
+    m_rt->pacer.SetTargetFps(targetFps);
+    u64 prevNs = Clock::NowNs();
 
-    while (m_run && !m_rt->plat.ShouldQuit()) {
+    while (m_running != 0U && !m_rt->platform.ShouldQuit()) {
         m_rt->pacer.BeginFrame();
-        const u64 now = Clock::NowNs();
-        const u64 dt = now > prev ? now - prev : kFixedDtNs;
-        prev = now;
+        const u64 nowNs = Clock::NowNs();
+        const u64 dtNs  = (nowNs > prevNs) ? (nowNs - prevNs) : kFixedDtNs;
+        prevNs          = nowNs;
 
-        const WindowFlags f = m_rt->plat.Pump(m_rt->win, m_rt->input);
-        if (HasFlag(f, WindowFlags::CloseRequested)) {
+        const WindowFlags winFlags = m_rt->platform.Pump(m_rt->window, m_rt->input);
+        if (HasFlag(winFlags, WindowFlags::CloseRequested)) {
             Quit();
             break;
         }
-        if (HasFlag(f, WindowFlags::Resized)) {
-            const WindowSize s = m_rt->win.State().pixelSize;
-            if (s.IsValid()) m_rt->vp = Viewport{s.w, s.h};
+        if (HasFlag(winFlags, WindowFlags::Resized)) {
+            const WindowSize s = m_rt->window.State().pixelSize;
+            if (s.IsValid()) m_rt->viewport = Viewport{s.w, s.h};
         }
-        if (HasFlag(f, WindowFlags::Minimized | WindowFlags::FocusLost)) {
-            if (!m_rt->focusOff) {
-                m_rt->focusOff = 1;
+        if (HasFlag(winFlags, WindowFlags::Minimized | WindowFlags::FocusLost)) {
+            if (!m_rt->focusPaused) {
+                m_rt->focusPaused = true;
                 m_rt->time.SetPaused(true);
                 m_rt->audio.SetFocusMuted(true);
             }
-        } else if (HasFlag(f, WindowFlags::Restored | WindowFlags::FocusGained)) {
-            if (m_rt->focusOff) {
-                m_rt->focusOff = 0;
+        } else if (HasFlag(winFlags, WindowFlags::Restored | WindowFlags::FocusGained)) {
+            if (m_rt->focusPaused) {
+                m_rt->focusPaused = false;
                 m_rt->time.OnWindowRefocus();
                 m_rt->time.SetPaused(false);
                 m_rt->audio.SetFocusMuted(false);
-                prev = Clock::NowNs();
+                prevNs = Clock::NowNs();
             }
         }
 
-        if (auto r = Step(dt); !r) return r;
+        if (auto r = Step(dtNs); !r) return r;
         m_rt->pacer.EndFrame();
     }
     return {};
 }
 
-void Application::HandleCues(SimCtx& ctx, const SimStepView& step) noexcept {
-    u32 n = 0;
-    const auto cues = m_rt->game.DrainCues();
+void Application::ApplyDebugDirectives(const LoopDirectives& dir) noexcept {
+    if (dir.TogglePause()) {
+        m_rt->time.SetPaused(!m_rt->time.IsPaused());
+    }
+    if (dir.ForcePause()) {
+        m_rt->time.SetPaused(true);
+    }
+    if (dir.stepTicks > 0U) {
+        m_rt->time.Step(dir.stepTicks);
+    }
+    if (dir.timeScale >= 0.0f) {
+        m_rt->time.SetScale(static_cast<TimeChannel>(dir.timeChannel), dir.timeScale);
+    }
+}
 
-    CameraController2D* cam = nullptr;
-    if ((m_rt->world.RegisteredPoolsMask() & MakeComponentMask<CameraController2D>()) != 0) {
-        auto& pool = m_rt->world.GetPool<CameraController2D>();
-        if (pool.Size()) cam = &pool.ComponentAtDense(0);
+void Application::RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept {
+    u32        trigCount = 0U;
+    const auto cues      = m_rt->gameplay.DrainCues();
+
+    CameraFollow2D* cam = nullptr;
+    if ((m_rt->world.RegisteredPoolsMask() & MakeComponentMask<CameraFollow2D>()) != 0ULL) {
+        auto& pool = m_rt->world.GetPool<CameraFollow2D>();
+        if (pool.Size() > 0U) cam = &pool.ComponentAtDense(0U);
     }
 
-    for (const SimCue& c : cues) {
+    for (const GameplayCue& c : cues) {
         switch (c.kind) {
-            case SimCueKind::AudioOneShot:
-                if (n < m_rt->cues.size()) {
-                    f32 x = c.worldX, y = c.worldY;
-                    if (x == 0.f && y == 0.f && c.emitter.IsValid() && m_rt->world.IsAlive(c.emitter)) {
-                        const auto& wt = m_rt->world.GetWorldByIndex(c.emitter.index);
-                        x = wt.x;
-                        y = wt.y;
+            case CueKind::Audio:
+                if (trigCount < m_rt->audioTriggers.size()) {
+                    Vec2 pos = c.position;
+                    if (pos == Vec2{} && c.emitter.IsValid() && m_rt->world.IsAlive(c.emitter)) {
+                        const WorldTransform2D& wt = m_rt->world.GetWorldByIndex(c.emitter.index);
+                        pos = {wt.x, wt.y};
                     }
-                    m_rt->cues[n++] = AudioTriggerReq{
-                        SoundCueId::FromAssetId(c.assetId), x, y, c.emitter.Packed()};
+                    m_rt->audioTriggers[trigCount++] = AudioTrigger{
+                        .cueId     = c.asset,
+                        .position  = pos,
+                        .emitter   = c.emitter.Packed(),
+                        .gainScale = c.magnitude,
+                    };
                 }
                 break;
-            case SimCueKind::CameraTraumaPulse:
-                if (cam) cam->AddTrauma(c.Magnitude());
+            case CueKind::CameraShake:
+                if (cam) cam->AddTrauma(c.magnitude);
                 break;
-            case SimCueKind::HitstopFreeze:
-                if (c.channel == 0xFF)
-                    m_rt->time.MaskHitstop(kGameplayMask, c.durationTicks);
-                else if (c.channel < kGameplayChannels)
-                    m_rt->time.Hitstop(TimeChannel(c.channel), c.durationTicks);
+            case CueKind::Hitstop:
+                m_rt->time.Hitstop(c.channel, c.durationTicks);
                 break;
-            case SimCueKind::GamepadRumble:
-                if (!m_headless && m_rt->plat.IsInitialized()) {
-                    const u16 f = u16(std::clamp(c.Magnitude() * 65535.f, 0.f, 65535.f));
-                    (void)m_rt->plat.RumbleGamepad(f, f, u32(c.durationTicks) * 8);
+            case CueKind::Rumble:
+                if (m_headless == 0U && m_rt->platform.IsInitialized()) {
+                    const u16 freq = static_cast<u16>(std::clamp(c.magnitude * 65535.0f, 0.0f, 65535.0f));
+                    (void)m_rt->platform.RumbleGamepad(freq, freq, static_cast<u32>(c.durationTicks) * 8U);
                 }
                 break;
-            default: break;
+            default:
+                break;
         }
-        if (m_rt->hooks.cue) m_rt->hooks.cue(c, ctx, m_user);
+        if (m_rt->hooks.onCue) m_rt->hooks.onCue(c, ctx, m_rt->hooks.userData);
     }
 
     std::array<f32, kGameplayChannels> scales{};
-    for (u8 i = 0; i < kGameplayChannels; ++i)
-        scales[i] = step.Scale(TimeChannel(i));
-
-    AudioUpdateDesc ad{};
-    ad.triggers = {m_rt->cues.data(), n};
-    ad.assets = &m_rt->assets;
-    ad.occlusion = [](f32 lx, f32 ly, f32 ex, f32 ey, void* p) noexcept -> bool {
-        const auto* phys = static_cast<const PhysicsSystem*>(p);
-        if (!phys) return false;
-        const f32 dx = ex - lx, dy = ey - ly;
-        const f32 d2 = dx * dx + dy * dy;
-        if (d2 <= 1e-6f) return false;
-        const f32 d = std::sqrt(d2);
-        return phys->Raycast(lx, ly, dx / d, dy / d, d, 0x0001).Hit();
-    };
-    ad.occlusionCtx = &m_rt->phys;
-    ad.channelScales = scales.data();
-    ad.tick = step.tick;
-    ad.listenerX = cam ? cam->anchorX : 0.f;
-    ad.listenerY = cam ? cam->anchorY : 0.f;
-    ad.frozenMask = u8(step.frozenMask | (m_freeze ? kGameplayMask : 0));
-    m_rt->audio.Update(ad);
-
-    for (u32 rel = m_rt->audio.PollReleasableScopes(); rel; rel &= rel - 1)
-        m_rt->assets.EndScope(u8(std::countr_zero(rel)));
-}
-
-void Application::Draw() noexcept {
-    const RenderStep& rv = m_rt->time.RenderView();
-    const f32 ppm = f32(m_ppmQ4) * (1.f / 16.f);
-    m_rt->list.Reset(m_rt->vp);
-    WorldSystems::ExtractRender(m_rt->world, m_rt->assets, rv, m_rt->list, ppm);
-
-    DrawCtx dc{};
-    dc.world = &m_rt->world;
-    dc.phys = &m_rt->phys;
-    dc.game = &m_rt->game;
-    dc.assets = &m_rt->assets;
-    dc.list = &m_rt->list;
-    dc.frame = &m_rt->input.Frame();
-    dc.time = &rv;
-    dc.dir = &m_rt->dir;
-    m_rt->dir.DrawStates(dc);
-    m_rt->dir.DrawWipe(m_rt->list, m_rt->vp);
-
-    if (m_debug) {
-        FrameCtx fc{};
-        fc.world = &m_rt->world;
-        fc.physics = &m_rt->phys;
-        fc.viewport = m_rt->vp;
-        fc.tick = u32(m_rt->time.Stats().totalTicks);
-        m_rt->debug.Emit(fc, m_rt->list);
+    for (u8 i = 0U; i < kGameplayChannels; ++i) {
+        scales[i] = step.Scale(static_cast<TimeChannel>(i));
     }
-    m_rt->list.Compile();
+
+    AudioUpdateDesc ad{
+        .triggers      = {m_rt->audioTriggers.data(), trigCount},
+        .assets        = &m_rt->assets,
+        .occlusionFn   = [](Vec2 l, Vec2 e, void* p) noexcept -> bool {
+            const auto* phys = static_cast<const PhysicsSystem*>(p);
+            if (!phys) return false;
+            const Vec2 d   = e - l;
+            const f32  len = d.Length();
+            return len > 1e-4f && static_cast<bool>(phys->Raycast(l, d, len, 0x0001U));
+        },
+        .occlusionCtx  = &m_rt->physics,
+        .channelScales = scales.data(),
+        .listenerPos   = cam ? cam->anchor : Vec2{},
+        .tick          = step.tick,
+        .frozenMask    = static_cast<u8>(step.frozenMask | (m_rt->scenes.IsFrozen() ? kGameplayMask : 0U)),
+    };
+    m_rt->audio.Update(ad);
 }
 
-Result<void, FwError> Application::Step(u64 dtNs) noexcept {
-    if (!m_rt || !m_ok) return Err(FwError{FwErr::BadConfig, FwStage::None, 0});
+void Application::RenderFrame() noexcept {
+    const RenderStep& rv = m_rt->time.RenderView();
+    m_rt->renderList.Reset(m_rt->viewport);
+    WorldSystems::ExtractRender(m_rt->world, m_rt->assets, rv, m_rt->renderList, m_ppm);
+
+    DrawCtx dc{
+        .world      = &m_rt->world,
+        .physics    = &m_rt->physics,
+        .gameplay   = &m_rt->gameplay,
+        .assets     = &m_rt->assets,
+        .list       = &m_rt->renderList,
+        .input      = &m_rt->input.Frame(),
+        .renderStep = &rv,
+        .scenes     = &m_rt->scenes,
+    };
+    m_rt->scenes.DrawStates(dc);
+    m_rt->scenes.DrawWipe(m_rt->renderList, m_rt->viewport);
+
+    if (m_debug != 0U) {
+        std::array<AudioEmitterView, 16> emitters{};
+        const u32 emCount = m_rt->audio.ExtractEmitters(emitters);
+        FrameCtx fc{
+            .world    = &m_rt->world,
+            .physics  = &m_rt->physics,
+            .emitters = {emitters.data(), emCount},
+            .viewport = m_rt->viewport,
+            .tick     = static_cast<u32>(m_rt->time.Stats().totalTicks),
+        };
+        m_rt->debug.Emit(fc, m_rt->renderList);
+    }
+    m_rt->renderer.Submit(m_rt->renderList);
+}
+
+Result<void, FwErrc> Application::Step(u64 dtNs) noexcept {
+    if (!m_rt || m_ready == 0U) return Err(FwErrc::InvalidConfig);
+
+    ++m_frame;
+    m_rt->assets.AdvanceFrame(static_cast<u32>(m_frame));
+
+    if (m_debug != 0U) {
+        FrameCtx fc{.world = &m_rt->world, .physics = &m_rt->physics, .viewport = m_rt->viewport};
+        ApplyDebugDirectives(m_rt->debug.BeginFrame(fc));
+    }
 
     m_rt->time.BeginFrame(dtNs);
-    ++m_frame;
 
-    LoadCtx load = MakeLoad();
-    (void)m_rt->dir.Tick(load);
-    m_freeze = m_rt->dir.Frozen() ? 1 : 0;
+    LoadCtx load = MakeLoadCtx();
+    if (auto r = m_rt->scenes.Tick(load); !r) return Err(r.error());
+    m_rt->input.SetActionMask(m_rt->scenes.InputMask());
 
     while (const TickStep step = m_rt->time.PollTick()) {
-        if (m_freeze) continue;
+        if (m_rt->scenes.IsFrozen()) continue;
 
         const TickInput tin = m_rt->input.PollTick(step.tick);
         m_rt->world.BeginTick(step);
 
-        if (!step.IsFrozen(TimeChannel::World)) {
-            SimCtx sc{};
-            sc.world = &m_rt->world;
-            sc.phys = &m_rt->phys;
-            sc.game = &m_rt->game;
-            sc.assets = &m_rt->assets;
-            sc.audio = &m_rt->audio;
-            sc.acts = &m_rt->acts;
-            sc.input = &tin;
-            sc.dir = &m_rt->dir;
+        SimCtx sc{
+            .world    = &m_rt->world,
+            .physics  = &m_rt->physics,
+            .gameplay = &m_rt->gameplay,
+            .assets   = &m_rt->assets,
+            .audio    = &m_rt->audio,
+            .actions  = &m_rt->actions,
+            .input    = &tin,
+            .scenes   = &m_rt->scenes,
+        };
 
-            m_rt->dir.TickStates(sc, step);
-            m_rt->game.Tick(m_rt->world, m_rt->phys, m_rt->assets, step, tin, m_rt->acts);
-            m_rt->phys.Step(m_rt->world, step);
-            HandleCues(sc, step);
-        }
+        m_rt->scenes.TickStates(sc, step);
+        WorldSystems::StepVelocities(m_rt->world, step);
+        m_rt->gameplay.Step(m_rt->world, m_rt->physics, step, tin, m_rt->actions);
+        WorldSystems::StepVisualsAndLifetimes(m_rt->world, step);
+        RouteGameplayCues(sc, step);
 
         m_rt->world.EndTick(step);
         ++m_ticks;
-        if (m_debug) m_rt->debug.EndTick(m_rt->world, step.tick, &tin, &m_rt->acts);
+        if (m_debug != 0U) {
+            m_rt->debug.EndTick(m_rt->world, step.tick, &tin, &m_rt->actions);
+        }
     }
 
-    if (!m_headless && !m_rt->focusOff && m_rt->hasGfx && m_rt->gfx.IsValid()) {
-        Draw();
-        m_rt->gfx.Submit(m_rt->list);
+    if (!m_rt->focusPaused) {
+        RenderFrame();
     }
-    m_rt->audio.Pump(2);
+    m_rt->audio.Pump(1U);
     return {};
 }
 
-Result<void, FwError> Application::StepN(u32 ticks) noexcept {
-    for (u32 i = 0; i < ticks; ++i)
+Result<void, FwErrc> Application::StepTicks(u32 ticks) noexcept {
+    for (u32 i = 0U; i < ticks; ++i) {
         if (auto r = Step(kFixedDtNs); !r) return r;
+    }
     return {};
 }
 
-u64 Application::Hash() const noexcept {
-    if (!m_rt) return 0;
-    return SceneDirector::Mix(
-        m_ticks,
-        m_rt->world.ComputeAuditHash(),
-        m_rt->phys.ComputeAuditHash(m_rt->world),
-        m_rt->game.ComputeAuditHash(m_rt->world),
-        m_rt->audio.AuditHash(),
-        0,
-        m_rt->dir.Hash());
+u64 Application::ComputeAuditHash() const noexcept {
+    if (!m_rt) return 0ULL;
+    u64 h = HashCombine(0xCBF29CE484222325ULL, m_ticks);
+    h     = HashCombine(h, m_rt->world.ComputeAuditHash());
+    h     = HashCombine(h, m_rt->physics.ComputeAuditHash(m_rt->world));
+    h     = HashCombine(h, m_rt->gameplay.ComputeAuditHash(m_rt->world));
+    h     = HashCombine(h, m_rt->audio.ComputeAuditHash());
+    h     = HashCombine(h, m_rt->scenes.ComputeAuditHash());
+    return h;
 }
 
-Platform& Application::Plat() noexcept { return m_rt->plat; }
-Window& Application::Win() noexcept { return m_rt->win; }
-Renderer& Application::Gfx() noexcept { return m_rt->gfx; }
-JobSystem& Application::Jobs() noexcept { return m_rt->jobs; }
-SceneDirector& Application::Dir() noexcept { return m_rt->dir; }
-World& Application::Wld() noexcept { return m_rt->world; }
-PhysicsSystem& Application::Phys() noexcept { return m_rt->phys; }
-GameplayPipeline& Application::Game() noexcept { return m_rt->game; }
-AssetBank& Application::Assets() noexcept { return m_rt->assets; }
-AudioSystem& Application::Sfx() noexcept { return m_rt->audio; }
-DebugSystem& Application::Dbg() noexcept { return m_rt->debug; }
-TimeSystem& Application::Clock() noexcept { return m_rt->time; }
-InputSystem& Application::In() noexcept { return m_rt->input; }
-ActionBuffer& Application::Acts() noexcept { return m_rt->acts; }
-RenderList& Application::List() noexcept { return m_rt->list; }
+Platform&       Application::GetPlatform() noexcept       { return m_rt->platform; }
+Window&         Application::GetWindow() noexcept         { return m_rt->window; }
+Renderer&       Application::GetRenderer() noexcept       { return m_rt->renderer; }
+JobSystem&      Application::GetJobs() noexcept           { return m_rt->jobs; }
+SceneDirector&  Application::GetScenes() noexcept         { return m_rt->scenes; }
+World&          Application::GetWorld() noexcept          { return m_rt->world; }
+PhysicsSystem&  Application::GetPhysics() noexcept        { return m_rt->physics; }
+GameplaySystem& Application::GetGameplay() noexcept       { return m_rt->gameplay; }
+AssetBank&      Application::GetAssets() noexcept         { return m_rt->assets; }
+AudioSystem&    Application::GetAudio() noexcept          { return m_rt->audio; }
+DebugSystem&    Application::GetDebug() noexcept          { return m_rt->debug; }
+TimeSystem&     Application::GetTime() noexcept           { return m_rt->time; }
+InputSystem&    Application::GetInput() noexcept          { return m_rt->input; }
+ActionBuffer&   Application::GetActions() noexcept        { return m_rt->actions; }
+RenderList&     Application::GetRenderList() noexcept     { return m_rt->renderList; }
 
-const Platform& Application::Plat() const noexcept { return m_rt->plat; }
-const Window& Application::Win() const noexcept { return m_rt->win; }
-const Renderer& Application::Gfx() const noexcept { return m_rt->gfx; }
-const JobSystem& Application::Jobs() const noexcept { return m_rt->jobs; }
-const SceneDirector& Application::Dir() const noexcept { return m_rt->dir; }
-const World& Application::Wld() const noexcept { return m_rt->world; }
-const PhysicsSystem& Application::Phys() const noexcept { return m_rt->phys; }
-const GameplayPipeline& Application::Game() const noexcept { return m_rt->game; }
-const AssetBank& Application::Assets() const noexcept { return m_rt->assets; }
-const AudioSystem& Application::Sfx() const noexcept { return m_rt->audio; }
-const DebugSystem& Application::Dbg() const noexcept { return m_rt->debug; }
-const TimeSystem& Application::Clock() const noexcept { return m_rt->time; }
-const InputSystem& Application::In() const noexcept { return m_rt->input; }
-const ActionBuffer& Application::Acts() const noexcept { return m_rt->acts; }
-const RenderList& Application::List() const noexcept { return m_rt->list; }
+const Platform&       Application::GetPlatform() const noexcept   { return m_rt->platform; }
+const Window&         Application::GetWindow() const noexcept     { return m_rt->window; }
+const Renderer&       Application::GetRenderer() const noexcept   { return m_rt->renderer; }
+const JobSystem&      Application::GetJobs() const noexcept       { return m_rt->jobs; }
+const SceneDirector&  Application::GetScenes() const noexcept     { return m_rt->scenes; }
+const World&          Application::GetWorld() const noexcept      { return m_rt->world; }
+const PhysicsSystem&  Application::GetPhysics() const noexcept    { return m_rt->physics; }
+const GameplaySystem& Application::GetGameplay() const noexcept   { return m_rt->gameplay; }
+const AssetBank&      Application::GetAssets() const noexcept     { return m_rt->assets; }
+const AudioSystem&    Application::GetAudio() const noexcept      { return m_rt->audio; }
+const DebugSystem&    Application::GetDebug() const noexcept      { return m_rt->debug; }
+const TimeSystem&     Application::GetTime() const noexcept       { return m_rt->time; }
+const InputSystem&    Application::GetInput() const noexcept      { return m_rt->input; }
+const ActionBuffer&   Application::GetActions() const noexcept    { return m_rt->actions; }
+const RenderList&     Application::GetRenderList() const noexcept { return m_rt->renderList; }
 
 } // namespace en

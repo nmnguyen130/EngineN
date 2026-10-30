@@ -1,366 +1,307 @@
 #pragma once
 
-#include "core/Math.h"
-#include "time/TimeTypes.h"
-#include "world/WorldTypes.h"
+#include "world/Components.h"
 
 namespace en {
+
+inline constexpr u32 kTileMapMagic = 0x50414D54U;
 
 enum class PhysicsErrc : u8 {
     None = 0,
     InvalidConfig,
     OutOfMemory,
-    CorruptedCollisionBlob,
+    CorruptedBlob,
     PoolRegistrationFailed,
 };
 
-enum class BodyType2D : u8 { Static = 0, Kinematic, Dynamic };
+enum class BodyType : u8 {
+    Static    = 0,
+    Kinematic = 1,
+    Dynamic   = 2,
+};
 
-enum class ShapeKind2D : u8 { Aabb = 0, Circle, CapsuleY, Obb, Segment };
+enum class TileFlag : u8 {
+    Empty     = 0,
+    Solid     = 1U << 0,
+    OneWay    = 1U << 1,
+    Hazard    = 1U << 2,
+    Climbable = 1U << 3,
+};
+consteval bool enable_bitmask_operators(TileFlag) noexcept { return true; }
 
 enum class ContactFlags : u8 {
     None      = 0,
-    Ground    = 1U << 0U,
-    Ceiling   = 1U << 1U,
-    WallLeft  = 1U << 2U,
-    WallRight = 1U << 3U,
-    OnSlope   = 1U << 4U,
-    OnOneWay  = 1U << 5U,
-    Submerged = 1U << 6U,
-    Crushed   = 1U << 7U,
+    Ground    = 1U << 0,
+    Ceiling   = 1U << 1,
+    WallLeft  = 1U << 2,
+    WallRight = 1U << 3,
+    OneWay    = 1U << 4,
+    Slope     = 1U << 5,
+    Crushed   = 1U << 6,
 };
 consteval bool enable_bitmask_operators(ContactFlags) noexcept { return true; }
 
-enum class BodyFlags2D : u8 {
-    None          = 0,
-    BulletCCD     = 1U << 0U,
-    FixedRotation = 1U << 1U,
-    Sleeping      = 1U << 2U,
-    CanSleep      = 1U << 3U,
-    IgnoreOneWay  = 1U << 4U,
-    UseGravity    = 1U << 5U,
-    Enabled       = 1U << 6U,
-    IsSensor      = 1U << 7U,
-};
-consteval bool enable_bitmask_operators(BodyFlags2D) noexcept { return true; }
-
-enum class TileMaterialFlags : u8 {
-    Empty  = 0,
-    Solid  = 1U << 0U,
-    OneWay = 1U << 1U,
-};
-consteval bool enable_bitmask_operators(TileMaterialFlags) noexcept { return true; }
-
 enum class ContactEventKind : u8 {
-    BeginTouch = 0,
-    EndTouch,
-    HitImpact,
-    SensorEnter,
-    SensorExit,
+    BeginContact = 0,
+    EndContact   = 1,
+    TriggerEnter = 2,
+    TriggerExit  = 3,
 };
 
-// Q8.8 local geometry (1/256 m). Boxes: offset+half; segments: p0 in offset, p1 in half slots.
-struct alignas(4) CompactAabb2D {
-    i16 offsetX_q8{0};
-    i16 offsetY_q8{0};
-    u16 halfW_q8{128};
-    u16 halfH_q8{128};
-
-    [[nodiscard]] static constexpr i16 QuantizeS16(f32 m) noexcept {
-        const f32 s = m * 256.0f;
-        return static_cast<i16>(std::clamp(static_cast<i32>(s >= 0.0f ? s + 0.5f : s - 0.5f), -32768, 32767));
-    }
-    [[nodiscard]] static constexpr u16 QuantizeU16(f32 m) noexcept {
-        return static_cast<u16>(std::clamp(static_cast<i32>(std::max(0.0f, m) * 256.0f + 0.5f), 0, 65535));
-    }
-    [[nodiscard]] static constexpr CompactAabb2D FromMeters(f32 ox, f32 oy, f32 hw, f32 hh) noexcept {
-        return {QuantizeS16(ox), QuantizeS16(oy), QuantizeU16(hw), QuantizeU16(hh)};
-    }
-    [[nodiscard]] static constexpr CompactAabb2D FromSegment(f32 x0, f32 y0, f32 x1, f32 y1) noexcept {
-        return {QuantizeS16(x0), QuantizeS16(y0),
-                static_cast<u16>(QuantizeS16(x1)), static_cast<u16>(QuantizeS16(y1))};
-    }
-
-    [[nodiscard]] constexpr f32 OffsetX() const noexcept { return static_cast<f32>(offsetX_q8) * (1.0f / 256.0f); }
-    [[nodiscard]] constexpr f32 OffsetY() const noexcept { return static_cast<f32>(offsetY_q8) * (1.0f / 256.0f); }
-    [[nodiscard]] constexpr f32 HalfW() const noexcept { return static_cast<f32>(halfW_q8) * (1.0f / 256.0f); }
-    [[nodiscard]] constexpr f32 HalfH() const noexcept { return static_cast<f32>(halfH_q8) * (1.0f / 256.0f); }
-    [[nodiscard]] constexpr Vec2 SegmentP0() const noexcept { return {OffsetX(), OffsetY()}; }
-    [[nodiscard]] constexpr Vec2 SegmentP1() const noexcept {
-        return {static_cast<f32>(static_cast<i16>(halfW_q8)) * (1.0f / 256.0f),
-                static_cast<f32>(static_cast<i16>(halfH_q8)) * (1.0f / 256.0f)};
-    }
-};
-static_assert(sizeof(CompactAabb2D) == 8);
-
-struct alignas(4) CollisionFilter2D {
-    u16 categoryBits{0x0001U};
-    u16 maskBits{0xFFFFU};
-    i16 groupIndex{0};
-    u16 materialTag{0};
-
-    [[nodiscard]] constexpr bool ShouldCollide(const CollisionFilter2D& o) const noexcept {
-        if (groupIndex != 0 && groupIndex == o.groupIndex) return groupIndex > 0;
-        return ((categoryBits & o.maskBits) != 0U) && ((o.categoryBits & maskBits) != 0U);
-    }
-};
-static_assert(sizeof(CollisionFilter2D) == 8);
-
-struct alignas(8) Collider2D {
-    static constexpr u8 kTypeId = 8;
-
-    CompactAabb2D localBounds{};
-    CollisionFilter2D filter{};
-    u16 friction_q16{19661U};   // ~0.3
-    u16 restitution_q16{0U};
-    u16 density_q8{256U};       // 1.0
-    ShapeKind2D shape{ShapeKind2D::Aabb};
-    TileMaterialFlags flags{TileMaterialFlags::Solid};
-
-    [[nodiscard]] static constexpr u16 QuantizeUnit(f32 v) noexcept {
-        return static_cast<u16>(std::clamp(v, 0.0f, 1.0f) * 65535.0f + 0.5f);
-    }
-    [[nodiscard]] constexpr f32 Friction() const noexcept { return static_cast<f32>(friction_q16) * (1.0f / 65535.0f); }
-    [[nodiscard]] constexpr f32 Restitution() const noexcept { return static_cast<f32>(restitution_q16) * (1.0f / 65535.0f); }
-    [[nodiscard]] constexpr f32 Density() const noexcept { return static_cast<f32>(density_q8) * (1.0f / 256.0f); }
-    [[nodiscard]] constexpr bool IsSensor() const noexcept { return !HasFlag(flags, TileMaterialFlags::Solid); }
-    [[nodiscard]] constexpr bool IsOneWay() const noexcept { return HasFlag(flags, TileMaterialFlags::OneWay); }
-
-    constexpr void SetFriction(f32 f) noexcept { friction_q16 = QuantizeUnit(f); }
-    constexpr void SetRestitution(f32 r) noexcept { restitution_q16 = QuantizeUnit(r); }
-    constexpr void SetSensor(bool s) noexcept {
-        flags = s ? (flags & ~TileMaterialFlags::Solid) : (flags | TileMaterialFlags::Solid);
-    }
-    constexpr void SetOneWay(bool w) noexcept {
-        flags = w ? (flags | TileMaterialFlags::OneWay) : (flags & ~TileMaterialFlags::OneWay);
-    }
-};
-static_assert(sizeof(Collider2D) == 24);
-
-struct alignas(32) RigidBody2D {
+// 32-byte 2D kinematic/dynamic body state paired with Collider2D for Metroidvania simulation.
+// Value type; contacts and carrier are updated every PhysicsSystem::Step.
+// Invariant: sizeof(PhysicsBody2D) == 32.
+struct PhysicsBody2D {
     static constexpr u8 kTypeId = 9;
 
-    f32 vx{0.0f};
-    f32 vy{0.0f};
-    f32 angularVel{0.0f};
-    f32 invMass{1.0f};
-    f32 invInertia{0.0f};
-    f32 gravityScale{1.0f};
-    u8  linearDamping_q4{0};
-    u8  angularDamping_q4{0};
-    u8  sleepTimerTicks{0};
-    BodyType2D bodyType{BodyType2D::Dynamic};
-    BodyFlags2D flags{BodyFlags2D::UseGravity | BodyFlags2D::CanSleep | BodyFlags2D::Enabled};
+    Vec2         velocity{0.0f, 0.0f};
+    f32          gravityScale{1.0f};
+    f32          linearDamping{0.0f};
+    f32          restitution{0.0f};
+    f32          friction{0.0f};
+    EntityId     carrier{kNullEntity};
+    BodyType     type{BodyType::Dynamic};
     ContactFlags contacts{ContactFlags::None};
-    u16 userTag{0};
+    u8           ignoreOneWay{0};
+    u8           enabled{1};
 
-    [[nodiscard]] constexpr bool IsStatic() const noexcept {
-        return bodyType == BodyType2D::Static || (bodyType == BodyType2D::Dynamic && invMass <= 0.0f);
-    }
-    [[nodiscard]] constexpr bool IsKinematic() const noexcept { return bodyType == BodyType2D::Kinematic; }
-    [[nodiscard]] constexpr bool IsDynamic() const noexcept { return bodyType == BodyType2D::Dynamic && invMass > 0.0f; }
-    [[nodiscard]] constexpr bool IsSleeping() const noexcept { return HasFlag(flags, BodyFlags2D::Sleeping); }
-    [[nodiscard]] constexpr bool IsBullet() const noexcept { return HasFlag(flags, BodyFlags2D::BulletCCD); }
-
-    [[nodiscard]] constexpr f32 LinearDamping() const noexcept { return static_cast<f32>(linearDamping_q4) * (1.0f / 16.0f); }
-    constexpr void SetLinearDamping(f32 d) noexcept {
-        linearDamping_q4 = static_cast<u8>(std::clamp(d, 0.0f, 15.9375f) * 16.0f + 0.5f);
-    }
-    [[nodiscard]] constexpr f32 AngularDamping() const noexcept { return static_cast<f32>(angularDamping_q4) * (1.0f / 16.0f); }
-    constexpr void SetAngularDamping(f32 d) noexcept {
-        angularDamping_q4 = static_cast<u8>(std::clamp(d, 0.0f, 15.9375f) * 16.0f + 0.5f);
-    }
-
-    constexpr void WakeUp() noexcept {
-        flags &= ~BodyFlags2D::Sleeping;
-        sleepTimerTicks = 0U;
-    }
-
-    constexpr void ApplyLinearImpulse(f32 ix, f32 iy) noexcept {
-        if (!IsDynamic()) return;
-        vx += ix * invMass;
-        vy += iy * invMass;
-        WakeUp();
-    }
-    constexpr void ApplyAngularImpulse(f32 a) noexcept {
-        if (!IsDynamic() || invInertia <= 0.0f) return;
-        angularVel += a * invInertia;
-        WakeUp();
-    }
-    constexpr void ApplyImpulseAtOffset(f32 ix, f32 iy, f32 rx, f32 ry) noexcept {
-        if (!IsDynamic()) return;
-        vx += ix * invMass;
-        vy += iy * invMass;
-        angularVel += (rx * iy - ry * ix) * invInertia;
-        WakeUp();
-    }
-    constexpr void ApplyForce(f32 fx, f32 fy, f32 dt) noexcept { ApplyLinearImpulse(fx * dt, fy * dt); }
-
-    constexpr void SetBoxMass(f32 mass, f32 hw, f32 hh, bool fixedRot = true) noexcept {
-        SetMassInertia(mass, (mass * (hw * hw + hh * hh)) * (1.0f / 3.0f), fixedRot);
-    }
-    constexpr void SetCircleMass(f32 mass, f32 r, bool fixedRot = false) noexcept {
-        SetMassInertia(mass, 0.5f * mass * r * r, fixedRot);
-    }
-    constexpr void ComputeMassFromCollider(const Collider2D& col, bool fixedRot = false) noexcept {
-        if (bodyType != BodyType2D::Dynamic || col.IsSensor()) {
-            invMass = 0.0f;
-            invInertia = 0.0f;
-            return;
-        }
-        const f32 rho = std::max(0.01f, col.Density());
-        const f32 hw = std::max(0.01f, col.localBounds.HalfW());
-        const f32 hh = std::max(0.01f, col.localBounds.HalfH());
-        if (col.shape == ShapeKind2D::Circle) {
-            SetCircleMass(kPi * hw * hw * rho, hw, fixedRot);
-        } else {
-            SetBoxMass(4.0f * hw * hh * rho, hw, hh, fixedRot);
-        }
-    }
-
-private:
-    constexpr void SetMassInertia(f32 mass, f32 inertia, bool fixedRot) noexcept {
-        if (mass <= 0.0f || bodyType != BodyType2D::Dynamic) {
-            invMass = 0.0f;
-            invInertia = 0.0f;
-            return;
-        }
-        invMass = 1.0f / mass;
-        if (fixedRot) {
-            flags |= BodyFlags2D::FixedRotation;
-            invInertia = 0.0f;
-        } else {
-            flags &= ~BodyFlags2D::FixedRotation;
-            invInertia = (inertia > 1e-6f) ? (1.0f / inertia) : 0.0f;
-        }
-    }
-};
-static_assert(sizeof(RigidBody2D) == 32);
-
-// Kinematic character (player/NPC). Set vx/vy each tick; contacts filled after Step.
-struct alignas(32) CharacterMotor2D {
-    static constexpr u8 kTypeId = 10;
-
-    f32 vx{0.0f};
-    f32 vy{0.0f};
-    f32 groundNormalX{0.0f};
-    f32 groundNormalY{1.0f};
-    CompactAabb2D bounds{};
-    EntityId carrierId{kNullEntity};
-    u16 solidMask{0x0001U};
-    ContactFlags contacts{ContactFlags::None};
-    BodyFlags2D flags{BodyFlags2D::UseGravity | BodyFlags2D::Enabled};
-
+    [[nodiscard]] constexpr bool IsStatic() const noexcept { return type == BodyType::Static; }
+    [[nodiscard]] constexpr bool IsKinematic() const noexcept { return type == BodyType::Kinematic; }
+    [[nodiscard]] constexpr bool IsDynamic() const noexcept { return type == BodyType::Dynamic; }
     [[nodiscard]] constexpr bool IsGrounded() const noexcept { return HasFlag(contacts, ContactFlags::Ground); }
-    [[nodiscard]] constexpr Vec2 GroundNormal() const noexcept { return {groundNormalX, groundNormalY}; }
+    [[nodiscard]] constexpr bool OnCeiling() const noexcept { return HasFlag(contacts, ContactFlags::Ceiling); }
+    [[nodiscard]] constexpr bool OnWallLeft() const noexcept { return HasFlag(contacts, ContactFlags::WallLeft); }
+    [[nodiscard]] constexpr bool OnWallRight() const noexcept { return HasFlag(contacts, ContactFlags::WallRight); }
+    [[nodiscard]] constexpr bool TouchingWall() const noexcept {
+        return HasFlag(contacts, ContactFlags::WallLeft | ContactFlags::WallRight);
+    }
+    [[nodiscard]] constexpr bool OnOneWay() const noexcept { return HasFlag(contacts, ContactFlags::OneWay); }
+    [[nodiscard]] constexpr bool IsCrushed() const noexcept { return HasFlag(contacts, ContactFlags::Crushed); }
+
+    constexpr void ApplyImpulse(Vec2 impulse) noexcept {
+        if (IsDynamic() && enabled != 0U) velocity += impulse;
+    }
 };
-static_assert(sizeof(CharacterMotor2D) == 32);
+static_assert(sizeof(PhysicsBody2D) == 32);
 
-struct alignas(32) RayHit2D {
-    f32 fraction{1.0f};
-    f32 distance{0.0f};
-    f32 pointX{0.0f};
-    f32 pointY{0.0f};
-    f32 normalX{0.0f};
-    f32 normalY{0.0f};
-    EntityId hitEntity{kNullEntity};
-    TileMaterialFlags tileFlags{TileMaterialFlags::Empty};
-    ShapeKind2D shapeKind{ShapeKind2D::Aabb};
-    u8 hitValid{0U};
-    u8 startSolid{0U};
+// 32-byte 2D raycast result against tilemap geometry and entity colliders.
+// Value type; fraction in [0, 1] and distance in meters when hit != 0.
+struct RayHit2D {
+    Vec2     point{};
+    Vec2     normal{};
+    f32      distance{0.0f};
+    f32      fraction{1.0f};
+    EntityId entity{kNullEntity};
+    TileFlag tile{TileFlag::Empty};
+    u8       hit{0};
+    u8       startSolid{0};
+    u8       pad{0};
 
-    [[nodiscard]] constexpr bool Hit() const noexcept { return hitValid != 0U; }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return hit != 0U; }
 };
 static_assert(sizeof(RayHit2D) == 32);
 
-struct alignas(32) SweepHit2D {
-    f32 toi{1.0f};
-    f32 pointX{0.0f};
-    f32 pointY{0.0f};
-    f32 normalX{0.0f};
-    f32 normalY{0.0f};
-    f32 penetration{0.0f};
-    EntityId hitEntity{kNullEntity};
-    TileMaterialFlags tileFlags{TileMaterialFlags::Empty};
-    u8 startPenetrating{0U};
-    u8 hitValid{0U};
-    u8 isOneWay{0U};
+// 32-byte swept AABB collision result against tilemap geometry and entity colliders.
+// Value type; time in [0, 1] indicates normalized impact fraction along delta.
+struct SweepResult2D {
+    Vec2     point{};
+    Vec2     normal{};
+    f32      time{1.0f};
+    f32      penetration{0.0f};
+    EntityId entity{kNullEntity};
+    TileFlag tile{TileFlag::Empty};
+    u8       hit{0};
+    u8       startSolid{0};
+    u8       oneWay{0};
 
-    [[nodiscard]] constexpr bool Hit() const noexcept { return hitValid != 0U; }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return hit != 0U; }
 };
-static_assert(sizeof(SweepHit2D) == 32);
+static_assert(sizeof(SweepResult2D) == 32);
 
-struct alignas(64) ContactManifold2D {
-    EntityId entityA{kNullEntity};
-    EntityId entityB{kNullEntity};
-    f32 normalX{0.0f};
-    f32 normalY{0.0f};
-    f32 pointX[2]{0.0f, 0.0f};
-    f32 pointY[2]{0.0f, 0.0f};
-    f32 separation[2]{0.0f, 0.0f};
-    f32 normalImpulse[2]{0.0f, 0.0f};
-    f32 tangentImpulse[2]{0.0f, 0.0f};
-    u16 friction_q16{0U};
-    u16 restitution_q16{0U};
-    u8  pointCount{0U};
-    u8  isSensor{0U};
-    u16 persistedTicks{0U};
-
-    [[nodiscard]] constexpr u64 PairKey() const noexcept {
-        return (static_cast<u64>(entityA.Packed()) << 32U) | static_cast<u64>(entityB.Packed());
-    }
-};
-static_assert(sizeof(ContactManifold2D) == 64);
-
-struct alignas(32) ContactEvent2D {
-    EntityId entityA{kNullEntity};
-    EntityId entityB{kNullEntity};
-    f32 pointX{0.0f};
-    f32 pointY{0.0f};
-    f32 normalX{0.0f};
-    f32 normalY{0.0f};
-    f32 approachSpeed{0.0f};
-    ContactEventKind kind{ContactEventKind::BeginTouch};
-    u8  pointCount{1U};
-    u16 materialTag{0U};
+// 32-byte solid contact or trigger overlap transition event emitted during PhysicsSystem::Step.
+// Value type; entityB is kNullEntity when entityA collides with static tilemap geometry.
+struct ContactEvent2D {
+    EntityId         entityA{kNullEntity};
+    EntityId         entityB{kNullEntity};
+    Vec2             point{};
+    Vec2             normal{};
+    f32              approachSpeed{0.0f};
+    ContactEventKind kind{ContactEventKind::BeginContact};
+    u8               isTrigger{0};
+    u16              userTag{0};
 };
 static_assert(sizeof(ContactEvent2D) == 32);
 
-// Defaults tuned for tight Metroidvania feel.
-struct alignas(16) PhysicsConfig {
-    f32 gravityX{0.0f};
-    f32 gravityY{-24.0f};
-    f32 contactHertz{30.0f};
-    f32 contactDampingRatio{1.0f};
-    f32 warmStartFactor{0.85f};
-    f32 minGroundNormalY{0.65f};  // ~50° max floor
-    f32 groundSnapDist{0.15f};
-    f32 maxStepHeight{0.18f};
-    u16 maxManifolds{2048U};
-    u16 maxContactEvents{512U};
-    u16 maxSpatialProxies{4096U};
-    u8  velocityIterations{6U};
-    u8  sleepTicksThreshold{60U};
-    u32 arenaBytes{2U * 1024U * 1024U};
+// 24-byte binary header for serialized tilemap collision blobs.
+struct TileMapHeader {
+    u32  magic{kTileMapMagic};
+    u16  version{1};
+    u16  width{0};
+    u16  height{0};
+    u16  pad{0};
+    f32  tileSize{1.0f};
+    Vec2 origin{0.0f, 0.0f};
 };
-static_assert(sizeof(PhysicsConfig) == 48);
+static_assert(sizeof(TileMapHeader) == 24);
 
-struct alignas(16) CookedCollisionMapHeader {
-    static constexpr u32 kMagic = 0x4C4F4345U; // "ECOL"
-    static constexpr u16 kVersion = 1U;
-
-    u32 magic{kMagic};
-    u16 version{kVersion};
-    u16 widthTiles{0U};
-    u16 heightTiles{0U};
-    u16 chunkCols{0U};
-    u16 chunkRows{0U};
-    u16 flags{0U};
-    f32 tileSizeMeters{1.0f};
-    f32 originX{0.0f};
-    f32 originY{0.0f};
-    u32 payloadChecksum{0U};
+// 32-byte configuration for PhysicsSystem initialization and solver tolerances.
+struct PhysicsConfig {
+    Vec2 gravity{0.0f, -32.0f};
+    f32  cellSize{2.0f};
+    f32  maxStepHeight{0.20f};
+    f32  groundSnapDist{0.12f};
+    f32  cornerCorrectionDist{0.18f};
+    u16  maxProxies{4096};
+    u16  maxContactPairs{1024};
+    u32  arenaBytes{1024U * 1024U};
 };
-static_assert(sizeof(CookedCollisionMapHeader) == 32);
+static_assert(sizeof(PhysicsConfig) == 32);
+
+[[nodiscard]] constexpr RayHit2D RaycastBox(
+    Vec2 origin, Vec2 dir, f32 maxDist, const Rect& box) noexcept {
+    if (box.IsEmpty() || maxDist < 0.0f) return {};
+    if (box.Contains(origin)) {
+        return {
+            .point      = origin,
+            .normal     = -dir,
+            .distance   = 0.0f,
+            .fraction   = 0.0f,
+            .hit        = 1U,
+            .startSolid = 1U,
+        };
+    }
+
+    f32 tMin  = 0.0f;
+    f32 tMax  = maxDist;
+    Vec2 norm = {};
+
+    if (std::abs(dir.x) <= 1e-8f) {
+        if (origin.x < box.x || origin.x > box.Right()) return {};
+    } else {
+        const f32 invX = 1.0f / dir.x;
+        f32 t1 = (box.x - origin.x) * invX;
+        f32 t2 = (box.Right() - origin.x) * invX;
+        f32 sign = -1.0f;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+            sign = 1.0f;
+        }
+        if (t1 > tMin) {
+            tMin = t1;
+            norm = {sign, 0.0f};
+        }
+        tMax = std::min(tMax, t2);
+        if (tMin > tMax) return {};
+    }
+
+    if (std::abs(dir.y) <= 1e-8f) {
+        if (origin.y < box.y || origin.y > box.Bottom()) return {};
+    } else {
+        const f32 invY = 1.0f / dir.y;
+        f32 t1 = (box.y - origin.y) * invY;
+        f32 t2 = (box.Bottom() - origin.y) * invY;
+        f32 sign = -1.0f;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+            sign = 1.0f;
+        }
+        if (t1 > tMin) {
+            tMin = t1;
+            norm = {0.0f, sign};
+        }
+        tMax = std::min(tMax, t2);
+        if (tMin > tMax) return {};
+    }
+
+    if (tMin < 0.0f || tMin > maxDist) return {};
+    return {
+        .point    = origin + dir * tMin,
+        .normal   = norm,
+        .distance = tMin,
+        .fraction = (maxDist > 1e-8f) ? (tMin / maxDist) : 0.0f,
+        .hit      = 1U,
+    };
+}
+
+[[nodiscard]] constexpr SweepResult2D SweepBoxVsBox(
+    const Rect& moving, Vec2 delta, const Rect& target) noexcept {
+    if (moving.IsEmpty() || target.IsEmpty()) return {};
+
+    constexpr f32 kSkin = 2e-4f;
+    const Vec2 center   = moving.Center();
+    const Vec2 half     = moving.HalfExtents();
+    const f32  eMinX    = target.x - half.x;
+    const f32  eMinY    = target.y - half.y;
+    const f32  eMaxX    = target.Right() + half.x;
+    const f32  eMaxY    = target.Bottom() + half.y;
+
+    if (center.x > eMinX + kSkin && center.x < eMaxX - kSkin &&
+        center.y > eMinY + kSkin && center.y < eMaxY - kSkin) {
+        const f32 dl = center.x - eMinX;
+        const f32 dr = eMaxX - center.x;
+        const f32 dd = center.y - eMinY;
+        const f32 du = eMaxY - center.y;
+        const f32 px = std::min(dl, dr);
+        const f32 py = std::min(dd, du);
+        if (px < py) {
+            return {
+                .point       = center,
+                .normal      = {(dl < dr) ? -1.0f : 1.0f, 0.0f},
+                .time        = 0.0f,
+                .penetration = px,
+                .hit         = 1U,
+                .startSolid  = 1U,
+            };
+        }
+        return {
+            .point       = center,
+            .normal      = {0.0f, (dd < du) ? -1.0f : 1.0f},
+            .time        = 0.0f,
+            .penetration = py,
+            .hit         = 1U,
+            .startSolid  = 1U,
+        };
+    }
+
+    f32 tNearX = -1e30f, tFarX = 1e30f;
+    if (std::abs(delta.x) <= 1e-8f) {
+        if (center.x <= eMinX || center.x >= eMaxX) return {};
+    } else {
+        const f32 invX = 1.0f / delta.x;
+        tNearX = (eMinX - center.x) * invX;
+        tFarX  = (eMaxX - center.x) * invX;
+        if (tNearX > tFarX) std::swap(tNearX, tFarX);
+    }
+
+    f32 tNearY = -1e30f, tFarY = 1e30f;
+    if (std::abs(delta.y) <= 1e-8f) {
+        if (center.y <= eMinY || center.y >= eMaxY) return {};
+    } else {
+        const f32 invY = 1.0f / delta.y;
+        tNearY = (eMinY - center.y) * invY;
+        tFarY  = (eMaxY - center.y) * invY;
+        if (tNearY > tFarY) std::swap(tNearY, tFarY);
+    }
+
+    const f32 tEnter = std::max(tNearX, tNearY);
+    const f32 tExit  = std::min(tFarX, tFarY);
+    const f32 move   = std::abs(delta.x) + std::abs(delta.y);
+    const f32 minT   = (move > 1e-6f) ? (-2.0f * kSkin / move) : -1e-3f;
+    if (tEnter > tExit || tEnter < minT || tEnter >= 1.0f || tExit <= 0.0f) return {};
+
+    Vec2 n{};
+    if (tNearX > tNearY) {
+        n.x = (delta.x < 0.0f) ? 1.0f : -1.0f;
+    } else {
+        n.y = (delta.y < 0.0f) ? 1.0f : -1.0f;
+    }
+    const f32 clampedT = std::clamp(tEnter, 0.0f, 1.0f);
+    return {
+        .point  = center + delta * clampedT,
+        .normal = n,
+        .time   = clampedT,
+        .hit    = 1U,
+    };
+}
 
 } // namespace en

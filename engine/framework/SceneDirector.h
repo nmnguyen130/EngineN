@@ -2,111 +2,101 @@
 
 #include "framework/FrameworkTypes.h"
 #include "renderer/RenderList.h"
-#include "renderer/RendererTypes.h"
 
 namespace en {
 
-// State stack (play/pause/menu) + room transition with wipe.
-// Non-owning; subsystems passed at call sites.
-class alignas(64) SceneDirector {
+// 4-layer state stack (play/pause/menu) and room transition state machine with asset scope management.
+// Value type; coordinates room scope eviction and screen wipe rendering without heap allocation.
+class SceneDirector {
 public:
-    [[nodiscard]] Result<void, FwErr> Init(AssetBank& assets) noexcept;
-    void Shutdown(AssetBank& assets, AudioSystem& audio, LoadCtx* load = nullptr) noexcept;
+    [[nodiscard]] Result<void, FwErrc> Init(AssetBank& assets) noexcept;
+    void Shutdown(AssetBank& assets, LoadCtx* load = nullptr) noexcept;
 
-    [[nodiscard]] constexpr Result<void, FwErr> Push(const State& s) noexcept {
-        return Enq(s, StateOp::Push);
+    [[nodiscard]] constexpr Result<void, FwErrc> Push(const SceneState& s) noexcept {
+        return Enqueue(s, StateOp::Push);
     }
-    [[nodiscard]] constexpr Result<void, FwErr> Pop() noexcept {
-        return Enq({}, StateOp::Pop);
+    [[nodiscard]] constexpr Result<void, FwErrc> Pop() noexcept {
+        return Enqueue({}, StateOp::Pop);
     }
-    [[nodiscard]] constexpr Result<void, FwErr> Swap(const State& s) noexcept {
-        return Enq(s, StateOp::Swap);
+    [[nodiscard]] constexpr Result<void, FwErrc> Swap(const SceneState& s) noexcept {
+        return Enqueue(s, StateOp::Swap);
     }
-    [[nodiscard]] constexpr Result<void, FwErr> Reset(const State& s) noexcept {
-        return Enq(s, StateOp::Reset);
+    [[nodiscard]] constexpr Result<void, FwErrc> Reset(const SceneState& s) noexcept {
+        return Enqueue(s, StateOp::Reset);
     }
 
-    [[nodiscard]] Result<void, FwErr> Go(const Room& room) noexcept;
+    [[nodiscard]] Result<void, FwErrc> TransitionToRoom(const RoomDesc& room) noexcept;
 
-    // Once per frame before sim. true = room committed this frame.
-    [[nodiscard]] Result<bool, FwErr> Tick(LoadCtx& load) noexcept;
+    [[nodiscard]] Result<bool, FwErrc> Tick(LoadCtx& load) noexcept;
 
-    void TickStates(SimCtx& ctx, const SimStepView& step) const noexcept;
+    void TickStates(SimCtx& ctx, const TickStep& step) const noexcept;
     void DrawStates(DrawCtx& ctx) const noexcept;
     void DrawWipe(RenderList& list, Viewport vp) const noexcept;
 
-    [[nodiscard]] constexpr bool Busy() const noexcept {
-        return m_nCmd > 0 || m_phase != Phase::Idle;
+    [[nodiscard]] constexpr bool IsBusy() const noexcept {
+        return m_cmdCount > 0U || m_phase != TransitionPhase::Idle;
     }
-    [[nodiscard]] constexpr Phase GetPhase() const noexcept { return m_phase; }
-    [[nodiscard]] constexpr u8 RoomScope() const noexcept { return m_room; }
-    [[nodiscard]] constexpr u8 KeepScope() const noexcept { return m_keep; }
-    [[nodiscard]] constexpr AssetId Scene() const noexcept { return m_scene; }
+    [[nodiscard]] constexpr TransitionPhase Phase() const noexcept { return m_phase; }
+    [[nodiscard]] constexpr u8 RoomScope() const noexcept { return m_roomScope; }
+    [[nodiscard]] constexpr u8 PersistentScope() const noexcept { return m_persistentScope; }
+    [[nodiscard]] constexpr AssetId CurrentRoom() const noexcept { return m_currentRoom; }
     [[nodiscard]] constexpr u8 Depth() const noexcept { return m_depth; }
-    [[nodiscard]] constexpr u16 InMask() const noexcept { return m_inMask; }
-    [[nodiscard]] constexpr bool Frozen() const noexcept { return m_freeze != 0; }
-    [[nodiscard]] constexpr u8 Top() const noexcept {
-        return m_depth ? m_id[m_depth - 1] : kNoState;
+    [[nodiscard]] constexpr u16 InputMask() const noexcept { return m_inputMask; }
+    [[nodiscard]] constexpr bool IsFrozen() const noexcept { return m_freeze != 0U; }
+    [[nodiscard]] constexpr u16 TransitionCount() const noexcept { return m_transitionCount; }
+    [[nodiscard]] constexpr u8 TopStateId() const noexcept {
+        return m_depth > 0U ? m_ids[m_depth - 1U] : kNoState;
     }
-    [[nodiscard]] constexpr u64 Hash() const noexcept {
-        u64 h = 14695981039346656037ULL;
-        for (u64 v : {m_scene.value, u64(m_depth), u64(m_sim), u64(m_draw),
-                      u64(m_freeze), u64(m_inMask), u64(m_nTrans)}) {
-            h = (h ^ v) * 1099511628211ULL;
-        }
-        for (u8 i = 0; i < m_depth; ++i) h = (h ^ u64(m_id[i])) * 1099511628211ULL;
-        return h;
-    }
-    [[nodiscard]] static constexpr u64 Mix(
-        u64 tick, u64 world, u64 phys, u64 game, u64 audio, u64 draw, u64 dir) noexcept {
-        u64 h = 14695981039346656037ULL;
-        for (u64 v : {tick, world, phys, game, audio, draw, dir})
-            h = (h ^ v) * 1099511628211ULL;
+
+    [[nodiscard]] constexpr u64 ComputeAuditHash() const noexcept {
+        u64 h = HashCombine(0xCBF29CE484222325ULL, m_currentRoom.value);
+        h     = HashCombine(h, static_cast<u64>(m_depth) | (static_cast<u64>(m_transitionCount) << 16U));
+        for (u8 i = 0U; i < m_depth; ++i) h = HashCombine(h, m_ids[i]);
         return h;
     }
 
 private:
-    [[nodiscard]] constexpr Result<void, FwErr> Enq(const State& s, StateOp op) noexcept {
-        if (m_nCmd >= kMaxStateCmd) return Err(FwErr::StackFull);
-        m_cmd[m_nCmd] = s;
-        m_op[m_nCmd] = op;
-        ++m_nCmd;
+    [[nodiscard]] constexpr Result<void, FwErrc> Enqueue(const SceneState& s, StateOp op) noexcept {
+        if (m_cmdCount >= kMaxStateCmds) return Err(FwErrc::StackFull);
+        m_cmds[m_cmdCount] = s;
+        m_ops[m_cmdCount]  = op;
+        ++m_cmdCount;
         return {};
     }
 
-    void Rebake() noexcept;
-    void Apply(LoadCtx& load) noexcept;
-    [[nodiscard]] Result<bool, FwErr> Advance(LoadCtx& load) noexcept;
+    void RebakeMasks() noexcept;
+    void ApplyStateCommands(LoadCtx& load) noexcept;
+    [[nodiscard]] Result<bool, FwErrc> AdvanceRoomTransition(LoadCtx& load) noexcept;
 
-    u8    m_sim{0};
-    u8    m_draw{0};
-    u8    m_freeze{0};
-    u8    m_depth{0};
-    u8    m_nCmd{0};
-    Phase m_phase{Phase::Idle};
-    u8    m_keep{0xFF};
-    u8    m_room{0xFF};
-    u8    m_stage{0xFF};
-    u8    m_wipeT{0};
-    u8    m_wipeN{0};
-    Wipe  m_wipe{Wipe::None};
-    u16   m_inMask{0xFFFF};
-    u16   m_nTrans{0};
+    u8              m_simMask{0};
+    u8              m_drawMask{0};
+    u8              m_freeze{0};
+    u8              m_depth{0};
+    u8              m_cmdCount{0};
+    TransitionPhase m_phase{TransitionPhase::Idle};
+    u8              m_persistentScope{0xFF};
+    u8              m_roomScope{0xFF};
+    u8              m_stagingScope{0xFF};
+    u8              m_wipeTick{0};
+    u8              m_wipeDuration{0};
+    WipeKind        m_wipe{WipeKind::None};
+    u16             m_inputMask{0xFFFF};
+    u16             m_transitionCount{0};
 
-    std::array<StateFlag, kMaxStates> m_flag{};
-    std::array<u8, kMaxStates>        m_id{};
-    std::array<u16, kMaxStates>       m_mask{};
-    std::array<void (*)(SimCtx&, const SimStepView&, void*) noexcept, kMaxStates> m_tick{};
-    std::array<void (*)(DrawCtx&, void*) noexcept, kMaxStates>                    m_drawFn{};
-    std::array<void (*)(LoadCtx&, void*) noexcept, kMaxStates>                    m_exit{};
-    std::array<void*, kMaxStates>     m_user{};
+    std::array<StateFlags, kMaxStates> m_flags{};
+    std::array<u8, kMaxStates>         m_ids{};
+    std::array<u16, kMaxStates>        m_masks{};
+    std::array<void (*)(SimCtx&, const TickStep&, void*) noexcept, kMaxStates> m_tickFns{};
+    std::array<void (*)(DrawCtx&, void*) noexcept, kMaxStates>                 m_drawFns{};
+    std::array<void (*)(LoadCtx&, void*) noexcept, kMaxStates>                 m_exitFns{};
+    std::array<void*, kMaxStates>      m_userData{};
 
-    std::array<State, kMaxStateCmd>   m_cmd{};
-    std::array<StateOp, kMaxStateCmd> m_op{};
+    std::array<SceneState, kMaxStateCmds> m_cmds{};
+    std::array<StateOp, kMaxStateCmds>    m_ops{};
 
-    Room    m_next{};
-    AssetId m_scene{};
-    void (*m_roomExit)(LoadCtx&) noexcept{};
+    RoomDesc m_nextRoom{};
+    AssetId  m_currentRoom{};
+    void (*m_roomExitFn)(LoadCtx&) noexcept{nullptr};
 };
 static_assert(sizeof(SceneDirector) <= 512);
 

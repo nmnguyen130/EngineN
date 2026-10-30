@@ -1,141 +1,149 @@
 #pragma once
 
-#include "physics/DynamicsSolver2D.h"
+#include "assets/AssetBank.h"
+#include "physics/SpatialGrid2D.h"
 
 namespace en {
 
-struct BlobRecord;
-class AssetBank;
-
-// Fixed-rate 2D physics orchestrator. Owns spatial index + manifold/event buffers from one Arena.
-// Zero heap after Init(). sizeof == 192 (3 cache lines).
-class alignas(64) PhysicsSystem {
+// Deterministic 2D Metroidvania physics solver managing tilemaps, moving platforms, swept slide, and triggers.
+// Move-disabled owner of an Arena; registers Collider2D and PhysicsBody2D pools on Init.
+// Invariant: sizeof(PhysicsSystem) == 144, and zero heap allocations occur after Init.
+class PhysicsSystem {
 public:
+    struct ActivePair {
+        u64 key{0};
+        u16 userTag{0};
+        u8  isTrigger{0};
+        u8  pad{0};
+    };
+    static_assert(sizeof(ActivePair) == 16);
+
     PhysicsSystem() noexcept = default;
     ~PhysicsSystem() noexcept { Shutdown(); }
 
     PhysicsSystem(const PhysicsSystem&) = delete;
     PhysicsSystem& operator=(const PhysicsSystem&) = delete;
-    PhysicsSystem(PhysicsSystem&&) = delete;
-    PhysicsSystem& operator=(PhysicsSystem&&) = delete;
 
     [[nodiscard]] Result<void, PhysicsErrc> Init(
         World& world,
         const PhysicsConfig& cfg = {}) noexcept;
-
     void Shutdown() noexcept;
     void Clear() noexcept;
 
+    [[nodiscard]] Result<void, PhysicsErrc> BuildTileMap(
+        u16 width,
+        u16 height,
+        f32 tileSize,
+        Vec2 origin,
+        std::span<const TileFlag> tiles) noexcept {
+        return m_grid.BuildTileMap(m_arena, width, height, tileSize, origin, tiles);
+    }
+
     [[nodiscard]] Result<void, PhysicsErrc> BindCollisionMapBlob(
         const AssetBank& bank,
-        BlobHandle collisionBlob) noexcept;
-
-    [[nodiscard]] Result<void, PhysicsErrc> BindCollisionMapBytes(
-        std::span<const u8> blobBytes) noexcept {
-        return m_spatial.BindCollisionMap(m_arena, blobBytes);
+        BlobHandle blob) noexcept {
+        const BlobRecord& rec = bank.GetBlob(blob);
+        return (rec.data && rec.size > 0U)
+            ? m_grid.LoadTileMapBlob(m_arena, rec.Bytes())
+            : Err(PhysicsErrc::CorruptedBlob);
     }
 
-    [[nodiscard]] Result<void, PhysicsErrc> BuildTileMap(
-        u16 widthTiles,
-        u16 heightTiles,
-        f32 tileSizeMeters,
-        f32 originX,
-        f32 originY,
-        std::span<const TileMaterialFlags> tiles) noexcept {
-        return m_spatial.BuildTileMapFromGrid(
-            m_arena, widthTiles, heightTiles, tileSizeMeters, originX, originY, tiles);
-    }
+    void SetTile(i32 tx, i32 ty, TileFlag flag) noexcept { m_grid.SetTile(tx, ty, flag); }
+    [[nodiscard]] TileFlag SampleTile(i32 tx, i32 ty) const noexcept { return m_grid.SampleTile(tx, ty); }
+    [[nodiscard]] TileFlag SampleTileWorld(Vec2 pos) const noexcept { return m_grid.SampleTileWorld(pos); }
 
-    void Step(World& world, const SimStepView& step) noexcept;
+    void Step(World& world, const TickStep& step) noexcept;
+
+    // Sweeps `mover` by `delta` against tilemaps and SpatialGrid2D colliders, sliding along surfaces.
+    SweepResult2D SweepMove(
+        World& world,
+        EntityId mover,
+        Vec2 delta,
+        bool ignoreOneWay = false) noexcept;
 
     [[nodiscard]] RayHit2D Raycast(
-        f32 originX, f32 originY, f32 dirX, f32 dirY, f32 maxDist,
-        u16 categoryMask = 0xFFFFU,
+        Vec2 origin,
+        Vec2 dir,
+        f32 maxDist,
+        u16 queryMask = 0xFFFFU,
         EntityId ignoreEntity = kNullEntity,
-        bool includeSensors = true) const noexcept {
-        return m_spatial.Raycast(originX, originY, dirX, dirY, maxDist, categoryMask, ignoreEntity, includeSensors);
+        bool includeTriggers = false) const noexcept {
+        return m_grid.Raycast(origin, dir, maxDist, queryMask, ignoreEntity, includeTriggers);
     }
 
-    [[nodiscard]] SweepHit2D SweepAabb(
-        EntityId ignoreEntity,
-        f32 centerX, f32 centerY, f32 halfW, f32 halfH,
-        f32 deltaX, f32 deltaY,
-        u16 solidMask = 0xFFFFU,
+    [[nodiscard]] u32 RaycastAll(
+        Vec2 origin,
+        Vec2 dir,
+        f32 maxDist,
+        u16 queryMask,
+        std::span<RayHit2D> outHits,
+        EntityId ignoreEntity = kNullEntity,
+        bool includeTriggers = true) const noexcept {
+        return m_grid.RaycastAll(origin, dir, maxDist, queryMask, outHits, ignoreEntity, includeTriggers);
+    }
+
+    [[nodiscard]] SweepResult2D SweepBox(
+        const Rect& movingBox,
+        Vec2 delta,
+        u16 queryMask = 0xFFFFU,
+        EntityId ignoreEntity = kNullEntity,
         bool ignoreOneWay = false) const noexcept {
-        return m_spatial.SweepAabb(
-            ignoreEntity, centerX, centerY, halfW, halfH, deltaX, deltaY, solidMask, ignoreOneWay);
+        return m_grid.SweepBox(movingBox, delta, queryMask, ignoreEntity, ignoreOneWay);
     }
 
-    [[nodiscard]] SweepHit2D CastCircle(
-        EntityId ignoreEntity,
-        f32 centerX, f32 centerY, f32 radius,
-        f32 deltaX, f32 deltaY,
-        u16 solidMask = 0xFFFFU,
-        bool ignoreOneWay = false) const noexcept {
-        return m_spatial.CastCircle(
-            ignoreEntity, centerX, centerY, radius, deltaX, deltaY, solidMask, ignoreOneWay);
-    }
-
-    [[nodiscard]] u32 QueryAabb(
-        f32 minX, f32 minY, f32 maxX, f32 maxY,
-        u16 categoryMask,
+    [[nodiscard]] u32 QueryBox(
+        const Rect& queryBox,
+        u16 queryMask,
         std::span<EntityId> outEntities,
         EntityId ignoreEntity = kNullEntity,
-        bool includeSensors = true) const noexcept {
-        return m_spatial.QueryAabb(minX, minY, maxX, maxY, categoryMask, outEntities, ignoreEntity, includeSensors);
+        bool includeTriggers = true) const noexcept {
+        return m_grid.QueryBox(queryBox, queryMask, outEntities, ignoreEntity, includeTriggers);
     }
 
     [[nodiscard]] u32 QueryCircle(
-        f32 centerX, f32 centerY, f32 radius,
-        u16 categoryMask,
+        Vec2 center,
+        f32 radius,
+        u16 queryMask,
         std::span<EntityId> outEntities,
         EntityId ignoreEntity = kNullEntity,
-        bool includeSensors = true) const noexcept {
-        return m_spatial.QueryCircle(centerX, centerY, radius, categoryMask, outEntities, ignoreEntity, includeSensors);
+        bool includeTriggers = true) const noexcept {
+        return m_grid.QueryCircle(center, radius, queryMask, outEntities, ignoreEntity, includeTriggers);
     }
 
-    [[nodiscard]] constexpr const SpatialIndex2D& Spatial() const noexcept { return m_spatial; }
-    [[nodiscard]] constexpr const PhysicsConfig& Config() const noexcept { return m_cfg; }
-    constexpr void SetConfig(const PhysicsConfig& cfg) noexcept { m_cfg = cfg; }
-
-    [[nodiscard]] constexpr std::span<const ContactManifold2D> ActiveManifolds() const noexcept {
-        if (!m_manifolds) return {};
-        return {m_manifolds + (static_cast<usize>(m_manifoldFlip) * m_cfg.maxManifolds), m_activeManifoldCount};
-    }
-
-    [[nodiscard]] constexpr std::span<const ContactEvent2D> DrainContactEvents() noexcept {
-        const std::span<const ContactEvent2D> res{m_events, m_eventCount};
-        m_eventCount = 0U;
-        return res;
-    }
-
-    [[nodiscard]] constexpr std::span<const ContactEvent2D> PeekContactEvents() const noexcept {
+    [[nodiscard]] constexpr std::span<const ContactEvent2D> ContactEvents() const noexcept {
         return {m_events, m_eventCount};
     }
+    [[nodiscard]] constexpr std::span<const ContactEvent2D> DrainContactEvents() noexcept {
+        const std::span<const ContactEvent2D> out{m_events, m_eventCount};
+        m_eventCount = 0U;
+        return out;
+    }
 
+    [[nodiscard]] constexpr const SpatialGrid2D& Grid() const noexcept { return m_grid; }
+    [[nodiscard]] constexpr const PhysicsConfig& Config() const noexcept { return m_cfg; }
+    constexpr void SetConfig(const PhysicsConfig& cfg) noexcept { m_cfg = cfg; }
     [[nodiscard]] constexpr u64 StepCount() const noexcept { return m_stepCount; }
-    [[nodiscard]] constexpr u64 TotalResolvedContacts() const noexcept { return m_totalResolvedContacts; }
-    [[nodiscard]] constexpr u64 TotalSpeculativeHits() const noexcept { return m_totalSpeculativeHits; }
+    [[nodiscard]] constexpr bool IsInitialized() const noexcept { return m_initialized != 0U; }
 
     [[nodiscard]] u64 ComputeAuditHash(const World& world) const noexcept;
 
 private:
-    SpatialIndex2D m_spatial{};
+    void StepKinematicPlatforms(World& world, const TickStep& step) noexcept;
+    void StepDynamicBodies(World& world, const TickStep& step) noexcept;
+    void GatherContactEvents(const World& world) noexcept;
 
-    PhysicsConfig m_cfg{};
-    ContactManifold2D* m_manifolds{nullptr};
+    SpatialGrid2D   m_grid{};
+    PhysicsConfig   m_cfg{};
+    Arena           m_arena{};
     ContactEvent2D* m_events{nullptr};
-
-    Arena m_arena{};
-    u16 m_activeManifoldCount{0U};
-    u16 m_prevManifoldCount{0U};
-    u16 m_eventCount{0U};
-    u8 m_manifoldFlip{0U};
-    u8 m_initialized{0U};
-    u64 m_stepCount{0ULL};
-    u64 m_totalResolvedContacts{0ULL};
-    u64 m_totalSpeculativeHits{0ULL};
+    ActivePair*     m_pairs{nullptr};
+    u64             m_stepCount{0};
+    u16             m_eventCount{0};
+    u16             m_prevPairCount{0};
+    u8              m_pairFlip{0};
+    u8              m_initialized{0};
+    u16             m_pad{0};
 };
-static_assert(sizeof(PhysicsSystem) == 192);
+static_assert(sizeof(PhysicsSystem) == 144);
 
 } // namespace en

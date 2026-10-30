@@ -32,9 +32,19 @@ add_library(engine STATIC
     engine/assets/ImageLoader.cpp
     engine/renderer/Renderer.cpp
     engine/renderer/RenderList.cpp
+    engine/physics/PhysicsSystem.cpp
+    engine/physics/SpatialGrid2D.cpp
     engine/world/TransformSolver.cpp
     engine/world/World.cpp
     engine/world/WorldSystems.cpp
+    engine/gameplay/GameplaySystem.cpp
+    engine/audio/AudioMixer.cpp
+    engine/audio/AudioSystem.cpp
+    engine/debug/DebugDraw.cpp
+    engine/debug/DebugSystem.cpp
+    engine/debug/DebugTools.cpp
+    engine/framework/Application.cpp
+    engine/framework/SceneDirector.cpp
 )
 add_library(enginen ALIAS engine)
 
@@ -51,7 +61,22 @@ target_compile_options(engine PUBLIC
 
 # Engine Subsystem Test Suites
 enable_testing()
-foreach(name CoreTests TimeTests InputTests PlatformTests AssetsTests RendererTests WorldTests)
+set(TEST_SUITES
+    CoreTests
+    TimeTests
+    PlatformTests
+    InputTests
+    RendererTests
+    AssetsTests
+    WorldTests
+    PhysicsTests
+    GameplayTests
+    AudioTests
+    DebugTests
+    FrameworkTests
+)
+
+foreach(name ${TEST_SUITES})
     add_executable(${name} tests/subsystems/${name}.cpp)
     target_link_libraries(${name} PRIVATE engine)
     add_test(NAME ${name} COMMAND ${name})

@@ -115,31 +115,13 @@ struct ChannelMod {
         rampElapsed = 0U;
     }
 
-    [[nodiscard]] constexpr bool HasRamp() const noexcept {
-        return rampHold > 0U || rampRecover > 0U;
-    }
-
-    [[nodiscard]] constexpr f32 LocalScale() const noexcept {
+    [[nodiscard]] constexpr f32 LocalScale(bool hasRamp) const noexcept {
         if (hitstop > 0U) return 0.0f;
-        if (!HasRamp()) return baseScale;
+        if (!hasRamp) return baseScale;
         if (rampHold > 0U) return baseScale * rampTarget;
         const f32 t = static_cast<f32>(rampElapsed) / static_cast<f32>(rampRecover);
         const f32 s = t * t * (3.0f - 2.0f * t);
         return baseScale * Lerp(rampTarget, 1.0f, s);
-    }
-
-    constexpr bool StepTick() noexcept {
-        if (hitstop > 0U) {
-            --hitstop;
-            return true;
-        }
-        if (!HasRamp()) return false;
-        if (rampHold > 0U) {
-            if (--rampHold == 0U && rampRecover == 0U) ClearRamp();
-        } else if (++rampElapsed >= rampRecover) {
-            ClearRamp();
-        }
-        return true;
     }
 };
 static_assert(sizeof(ChannelMod) == 16);

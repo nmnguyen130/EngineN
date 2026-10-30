@@ -39,14 +39,14 @@ void FramePacer::EndFrame() noexcept {
             Clock::SleepNs(req);
             const u64 after = Clock::NowNs();
             const u64 slept = (after > now) ? (after - now) : req;
-            const u64 over  = (slept > req) ? (slept - req) : 0ULL;
+            const u64 over = (slept > req) ? (slept - req) : 0ULL;
             const u32 sample = static_cast<u32>(
                 std::clamp<u64>(over + kMinMarginNs, kMinMarginNs, kMaxMarginNs));
             m_marginNs = static_cast<u32>((static_cast<u64>(m_marginNs) * 7ULL + sample) >> 3U);
             now = after;
         }
         while (now < targetEndNs) {
-            Clock::YieldThread();
+            if (targetEndNs - now > 10'000ULL) Clock::YieldThread();
             now = Clock::NowNs();
         }
     }

@@ -8,6 +8,7 @@ namespace en {
 // Pure state machine with zero OS/SDL dependency; World channel scales cascade to gameplay channels.
 class TimeSystem {
 public:
+    // Bitmask of exact integer divisors k of 1440 Hz (30, 36, 40, 48, 60, 72, 80, 90, 120, 144, 160, 180, 240, 360, 480 Hz).
     static constexpr u64 kValidHarmonicMask =
         (1ULL << 3) | (1ULL << 4) | (1ULL << 6) | (1ULL << 8) | (1ULL << 9) |
         (1ULL << 10) | (1ULL << 12) | (1ULL << 16) | (1ULL << 18) | (1ULL << 20) |
@@ -25,8 +26,10 @@ public:
         m_masterScale = 1.0f;
         m_stepBudget  = 0U;
         m_maxCatchup  = 8U;
+        m_hitMask     = 0U;
+        m_rampMask    = 0U;
         m_paused      = false;
-        Rebake();
+        Rebake(kGameplayMask);
     }
 
     constexpr void BeginFrame(u64 rawFrameNs) noexcept {
@@ -64,29 +67,53 @@ public:
         if (m_paused) {
             if (m_stepBudget == 0U) {
                 SyncRenderStep();
-                return {};
+                return TickStep{};
             }
             fromBudget = true;
             --m_stepBudget;
         } else {
             if (m_accumUnits < kTickUnits || m_stats.lastFrameTicks >= m_maxCatchup) {
                 SyncRenderStep();
-                return {};
+                return TickStep{};
             }
             m_accumUnits -= kTickUnits;
         }
 
-        // m_baked is already up to date from the prior state transition or tick end.
         TickStep step = m_baked;
-        step.tick    = static_cast<u32>(++m_stats.totalTicks);
-        step.substep = m_stats.lastFrameTicks++;
-        step.active  = 1U;
+        step.tick     = static_cast<u32>(++m_stats.totalTicks);
+        step.substep  = m_stats.lastFrameTicks++;
+        step.active   = 1U;
 
-        bool changed = fromBudget && (m_stepBudget == 0U);
-        for (ChannelMod& mod : m_channels) {
-            changed |= mod.StepTick();
+        u8 dirty = (fromBudget && m_stepBudget == 0U) ? kGameplayMask : 0U;
+        const u8 active = static_cast<u8>(m_hitMask | m_rampMask);
+        if (active != 0U) {
+            for (u8 m = active; m != 0U; m &= static_cast<u8>(m - 1U)) {
+                const u8 i   = static_cast<u8>(std::countr_zero(m));
+                const u8 bit = static_cast<u8>(1U << i);
+                ChannelMod& s = m_channels[i];
+                if (s.hitstop > 0U) {
+                    if (--s.hitstop == 0U) {
+                        m_hitMask &= static_cast<u8>(~bit);
+                        dirty     |= bit;
+                    }
+                } else {
+                    if (s.rampHold > 0U) {
+                        if (--s.rampHold == 0U && s.rampRecover == 0U) {
+                            s.ClearRamp();
+                            m_rampMask &= static_cast<u8>(~bit);
+                            dirty      |= bit;
+                        }
+                    } else {
+                        if (++s.rampElapsed >= s.rampRecover) {
+                            s.ClearRamp();
+                            m_rampMask &= static_cast<u8>(~bit);
+                        }
+                        dirty |= bit;
+                    }
+                }
+            }
         }
-        if (changed) Rebake();
+        if (dirty != 0U) Rebake(dirty);
         SyncRenderStep();
         return step;
     }
@@ -95,51 +122,63 @@ public:
         MaskHitstop(ChannelBit(ch), ticks);
     }
 
-    constexpr void MaskHitstop(u8 channelMask, u16 ticks) noexcept {
-        const u8 mask = static_cast<u8>(channelMask & kGameplayMask);
-        if (mask == 0U || ticks == 0U) return;
-        for (u8 i = 0U; i < kGameplayChannels; ++i) {
-            if ((mask & (1U << i)) != 0U && ticks > m_channels[i].hitstop) {
+    constexpr void MaskHitstop(u8 mask, u16 ticks) noexcept {
+        const u8 valid = static_cast<u8>(mask & kGameplayMask);
+        if (valid == 0U || ticks == 0U) return;
+        u8 dirty = 0U;
+        for (u8 m = valid; m != 0U; m &= static_cast<u8>(m - 1U)) {
+            const u8 i   = static_cast<u8>(std::countr_zero(m));
+            const u8 bit = static_cast<u8>(1U << i);
+            if (ticks > m_channels[i].hitstop) {
+                if ((m_hitMask & bit) == 0U) dirty |= bit;
                 m_channels[i].hitstop = ticks;
+                m_hitMask |= bit;
             }
         }
-        Rebake();
-        SyncRenderStep();
+        if (dirty != 0U) {
+            Rebake(dirty);
+            SyncRenderStep();
+        }
     }
 
     constexpr void ClearHitstop() noexcept {
-        for (auto& ch : m_channels) ch.hitstop = 0U;
-        Rebake();
-        SyncRenderStep();
+        if (m_hitMask != 0U) {
+            const u8 dirty = std::exchange(m_hitMask, 0U);
+            for (auto& s : m_channels) s.hitstop = 0U;
+            Rebake(dirty);
+            SyncRenderStep();
+        }
     }
 
     constexpr void Ramp(TimeChannel ch, f32 targetScale, u16 holdTicks, u16 recoverTicks) noexcept {
-        const u8 i = static_cast<u8>(ch);
-        if (i >= kGameplayChannels) return;
-        ChannelMod& s = m_channels[i];
+        const u8 bit = ChannelBit(ch);
+        if (bit == 0U) return;
+        ChannelMod& s = m_channels[static_cast<u8>(ch)];
         if (holdTicks == 0U && recoverTicks == 0U) {
             s.ClearRamp();
+            m_rampMask &= static_cast<u8>(~bit);
         } else {
             s.rampTarget  = std::clamp(targetScale, 0.0f, kMaxTimeScale);
             s.rampHold    = holdTicks;
             s.rampRecover = recoverTicks;
             s.rampElapsed = 0U;
+            m_rampMask   |= bit;
         }
-        Rebake();
+        Rebake(bit);
         SyncRenderStep();
     }
 
     constexpr void SetScale(TimeChannel ch, f32 scale) noexcept {
-        const u8 i = static_cast<u8>(ch);
-        if (i >= kGameplayChannels) return;
-        m_channels[i].baseScale = std::clamp(scale, 0.0f, kMaxTimeScale);
-        Rebake();
+        const u8 bit = ChannelBit(ch);
+        if (bit == 0U) return;
+        m_channels[static_cast<u8>(ch)].baseScale = std::clamp(scale, 0.0f, kMaxTimeScale);
+        Rebake(bit);
         SyncRenderStep();
     }
 
     constexpr void SetMasterScale(f32 scale) noexcept {
         m_masterScale = std::clamp(scale, 0.0f, kMaxTimeScale);
-        Rebake();
+        Rebake(kGameplayMask);
         SyncRenderStep();
     }
 
@@ -147,7 +186,7 @@ public:
         if (m_paused != paused) {
             m_paused = paused;
             if (!paused) m_stepBudget = 0U;
-            Rebake();
+            Rebake(kGameplayMask);
             SyncRenderStep();
         }
     }
@@ -155,7 +194,7 @@ public:
     constexpr void Step(u16 ticks = 1U) noexcept {
         if (m_paused && ticks > 0U) {
             m_stepBudget = static_cast<u16>(std::min<u32>(m_stepBudget + ticks, m_maxCatchup));
-            Rebake();
+            Rebake(kGameplayMask);
             SyncRenderStep();
         }
     }
@@ -172,13 +211,12 @@ private:
         return (a >= b) ? (a - b) : (b - a);
     }
 
+    // O(1) bitmask rational snap for 1440 Hz divisors and exact 120 Hz tick multiples with VRR EMA fallback.
     [[nodiscard]] constexpr u64 ResolveDeltaUnits(u64 ns) noexcept {
         const u64 units = ns * kHarmonicHz;
         const u64 k = (units + (kNsPerSec >> 1U)) / kNsPerSec;
-        const bool isHarmonic = (k > 0ULL) &&
-            (((k % kHarmonicSubdiv) == 0ULL) ||
-             (k <= 48ULL && ((kValidHarmonicMask >> k) & 1ULL) != 0ULL));
-        if (isHarmonic) {
+        if ((k <= 48ULL && ((kValidHarmonicMask >> k) & 1ULL) != 0ULL) ||
+            (k > 0ULL && (k % kHarmonicSubdiv) == 0ULL)) {
             const u64 target = k * kNsPerSec;
             if (AbsDiff(units, target) <= kHarmonicSnapNs * kHarmonicHz) {
                 m_smoothedNs = target / kHarmonicHz;
@@ -193,21 +231,30 @@ private:
         return units;
     }
 
-    constexpr void Rebake() noexcept {
+    constexpr void Rebake(u8 dirtyMask) noexcept {
+        if ((dirtyMask & 1U) != 0U) dirtyMask = kGameplayMask;
         const bool worldPaused = m_paused && (m_stepBudget == 0U);
         const f32 worldScale = worldPaused
             ? 0.0f
-            : std::clamp(m_masterScale * m_channels[0].LocalScale(), 0.0f, kMaxTimeScale);
+            : std::clamp(m_masterScale * m_channels[0].LocalScale((m_rampMask & 1U) != 0U),
+                         0.0f, kMaxTimeScale);
 
-        u8 frozen = 0U;
-        for (u8 i = 0U; i < kGameplayChannels; ++i) {
+        for (u8 m = static_cast<u8>(dirtyMask & kGameplayMask); m != 0U; m &= static_cast<u8>(m - 1U)) {
+            const u8 i   = static_cast<u8>(std::countr_zero(m));
+            const u8 bit = static_cast<u8>(1U << i);
             const f32 eff = (i == 0U)
                 ? worldScale
-                : (worldPaused ? 0.0f : std::clamp(worldScale * m_channels[i].LocalScale(), 0.0f, kMaxTimeScale));
+                : (worldPaused
+                       ? 0.0f
+                       : std::clamp(worldScale * m_channels[i].LocalScale((m_rampMask & bit) != 0U),
+                                    0.0f, kMaxTimeScale));
             m_baked.dt[i] = eff * kFixedDt;
-            if (eff <= 1e-6f) frozen |= static_cast<u8>(1U << i);
+            if (eff <= 1e-6f) {
+                m_baked.frozenMask |= bit;
+            } else {
+                m_baked.frozenMask &= static_cast<u8>(~bit);
+            }
         }
-        m_baked.frozenMask = frozen;
     }
 
     constexpr void SyncRenderStep() noexcept {
@@ -228,6 +275,8 @@ private:
     f32        m_masterScale{1.0f};
     u16        m_stepBudget{0};
     u8         m_maxCatchup{8};
+    u8         m_hitMask{0};
+    u8         m_rampMask{0};
     bool       m_paused{false};
 };
 static_assert(sizeof(TimeSystem) == 160);
