@@ -28,22 +28,22 @@ bool CtsGenerationalFallbacksAndIdempotentScopes(CtsRunner& r) noexcept {
     std::array<u8, 64> rgba{};
     rgba.fill(0xABU);
     const TextureAssetHandle texA = bank.RegisterTexture(
-        "sprites/kaelen.png"_aid, s0, 4U, 4U, rgba, TextureHandle{2U, 1U});
+        "sprites/actor.png"_aid, s0, 4U, 4U, rgba, TextureHandle{2U, 1U});
     CTS_CHECK(r, texA.IsValid() && bank.VramBytes() == 64U);
 
     // Re-registering the same AssetId under scope s1 must return the identical handle,
     // pin both scopes (s0 | s1), and NOT duplicate VRAM or arena allocations!
     const u32 usedBefore = bank.ArenaUsed();
     const TextureAssetHandle texB = bank.RegisterTexture(
-        "sprites/kaelen.png"_aid, s1, 4U, 4U, rgba, TextureHandle{2U, 1U});
+        "sprites/actor.png"_aid, s1, 4U, 4U, rgba, TextureHandle{2U, 1U});
     CTS_CHECK(r, texA == texB && bank.VramBytes() == 64U && bank.ArenaUsed() == usedBefore);
 
     // Wrong AssetKind lookup for an existing AssetId must fail safely.
-    CTS_CHECK(r, !bank.FindBlob("sprites/kaelen.png"_aid).IsValid());
-    CTS_CHECK(r, bank.FindTexture("sprites/kaelen.png"_aid) == texA);
+    CTS_CHECK(r, !bank.FindBlob("sprites/actor.png"_aid).IsValid());
+    CTS_CHECK(r, bank.FindTexture("sprites/actor.png"_aid) == texA);
 
     // Registering a grid atlas and updating the master texture GPU handle propagates to all frames.
-    const AtlasHandle atlas = bank.RegisterGridAtlas("atlases/kaelen"_aid, s0, texA, 2U, 2U);
+    const AtlasHandle atlas = bank.RegisterGridAtlas("atlases/actor"_aid, s0, texA, 2U, 2U);
     CTS_CHECK(r, atlas.IsValid());
     bank.BindGpu(texA, TextureHandle{9U, 2U});
     for (u16 i = 0U; i < 4U; ++i) {

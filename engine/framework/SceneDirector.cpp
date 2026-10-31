@@ -2,11 +2,53 @@
 
 #include "assets/AssetBank.h"
 #include "audio/AudioSystem.h"
+#include "core/Jobs.h"
+#include "core/Serialization.h"
 #include "gameplay/GameplaySystem.h"
 #include "physics/PhysicsSystem.h"
 #include "world/World.h"
 
 namespace en {
+
+void SceneDirector::PrepareRoomAssetsJob(void* userCtx) noexcept {
+    auto* prep = static_cast<AsyncRoomPrep*>(userCtx);
+    if (!prep || !prep->assets) return;
+
+    const AssetBank& assets = *prep->assets;
+    if (prep->collisionMap.IsValid()) {
+        const BlobHandle bh = assets.FindBlob(prep->collisionMap);
+        if (bh.IsValid()) {
+            const BlobRecord& rec = assets.GetBlob(bh);
+            if (rec.data && rec.size >= sizeof(TileMapHeader)) {
+                TileMapHeader hdr{};
+                std::memcpy(&hdr, rec.data, sizeof(TileMapHeader));
+                if (hdr.magic == kTileMapMagic && hdr.version == 1U &&
+                    hdr.width > 0U && hdr.height > 0U) {
+                    prep->collisionBlob = bh;
+                }
+            }
+        }
+    }
+
+    if (prep->prefab.IsValid()) {
+        const BlobHandle bh = assets.FindBlob(prep->prefab);
+        if (bh.IsValid()) {
+            const BlobRecord& rec = assets.GetBlob(bh);
+            if (rec.data && rec.size >= sizeof(CookedPrefabHeader)) {
+                CookedPrefabHeader hdr{};
+                std::memcpy(&hdr, rec.data, sizeof(CookedPrefabHeader));
+                const std::span<const u8> bytes = rec.Bytes();
+                const u32 hdrCrc = Crc32(bytes.subspan(0U, 12U));
+                if (hdr.magic == kCookedPrefabMagic && hdr.version == 1U &&
+                    hdr.entityCount > 0U && Crc32(bytes.subspan(16U), hdrCrc) == hdr.schemaCrc32) {
+                    prep->prefabBlob = bh;
+                }
+            }
+        }
+    }
+
+    prep->completed = 1U;
+}
 
 Result<void, FwErrc> SceneDirector::Init(AssetBank& assets) noexcept {
     *this = SceneDirector{};
@@ -25,6 +67,7 @@ Result<void, FwErrc> SceneDirector::Init(AssetBank& assets) noexcept {
 }
 
 void SceneDirector::Shutdown(AssetBank& assets, LoadCtx* load) noexcept {
+    if (load && load->jobs) load->jobs->WaitAsync();
     if (load && m_roomExitFn) {
         m_roomExitFn(*load);
         m_roomExitFn = nullptr;
@@ -47,14 +90,16 @@ void SceneDirector::Shutdown(AssetBank& assets, LoadCtx* load) noexcept {
         m_persistentScope = 0xFFU;
     }
     (void)assets.EvictUnpinned();
-    m_phase    = TransitionPhase::Idle;
-    m_cmdCount = 0U;
+    m_phase     = TransitionPhase::Idle;
+    m_cmdCount  = 0U;
+    m_asyncPrep = {};
 }
 
 Result<void, FwErrc> SceneDirector::TransitionToRoom(const RoomDesc& room) noexcept {
     if (m_phase != TransitionPhase::Idle) return Err(FwErrc::Busy);
     if (!room.roomId.IsValid()) return Err(FwErrc::InvalidRoom);
     m_nextRoom     = room;
+    m_asyncPrep    = {};
     m_wipe         = room.wipe;
     m_wipeDuration = room.wipeTicks;
     m_wipeTick     = 0U;
@@ -123,6 +168,23 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
     if (m_phase == TransitionPhase::Idle) return false;
 
     if (m_phase == TransitionPhase::Out) {
+        if (m_asyncPrep.dispatched == 0U && load.assets) {
+            if (m_stagingScope == 0xFFU) {
+                if (auto st = load.assets->BeginScope()) m_stagingScope = *st;
+            }
+            m_asyncPrep = AsyncRoomPrep{
+                .assets       = load.assets,
+                .collisionMap = m_nextRoom.collisionMap,
+                .prefab       = m_nextRoom.prefab,
+                .dispatched   = 1U,
+            };
+            if (load.jobs) {
+                load.jobs->DispatchAsync(&SceneDirector::PrepareRoomAssetsJob, &m_asyncPrep);
+            } else {
+                PrepareRoomAssetsJob(&m_asyncPrep);
+            }
+        }
+
         if (m_wipeTick < m_wipeDuration) {
             ++m_wipeTick;
             return false;
@@ -132,6 +194,14 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
     }
 
     if (m_phase == TransitionPhase::Load) {
+        if (load.jobs) load.jobs->WaitAsync();
+        if (m_asyncPrep.completed == 0U && load.assets) {
+            m_asyncPrep.assets       = load.assets;
+            m_asyncPrep.collisionMap = m_nextRoom.collisionMap;
+            m_asyncPrep.prefab       = m_nextRoom.prefab;
+            PrepareRoomAssetsJob(&m_asyncPrep);
+        }
+
         AssetBank& assets = *load.assets;
         if (m_roomExitFn) {
             m_roomExitFn(load);
@@ -150,13 +220,11 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
         load.roomScope       = m_stagingScope;
         load.persistentScope = m_persistentScope;
 
-        if (m_nextRoom.collisionMap.IsValid() && load.physics) {
-            const BlobHandle bh = assets.FindBlob(m_nextRoom.collisionMap);
-            if (bh.IsValid()) (void)load.physics->BindCollisionMapBlob(assets, bh);
+        if (m_asyncPrep.collisionBlob.IsValid() && load.physics) {
+            (void)load.physics->BindCollisionMapBlob(assets, m_asyncPrep.collisionBlob);
         }
-        if (m_nextRoom.prefab.IsValid() && load.world) {
-            const BlobHandle bh = assets.FindBlob(m_nextRoom.prefab);
-            if (bh.IsValid()) (void)load.world->InstantiatePrefab(assets, bh);
+        if (m_asyncPrep.prefabBlob.IsValid() && load.world) {
+            (void)load.world->InstantiatePrefab(assets, m_asyncPrep.prefabBlob);
         }
         if (m_nextRoom.musicTrack.IsValid() && load.audio) {
             (void)load.audio->PlayMusic(m_nextRoom.musicTrack, assets, m_nextRoom.musicFadeBlocks);
@@ -167,8 +235,25 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
                 (void)assets.EvictUnpinned();
                 m_stagingScope = 0xFFU;
                 m_phase        = TransitionPhase::Idle;
+                m_asyncPrep    = {};
                 return Err(r.error());
             }
+        }
+
+        if (load.world) {
+            if (load.gameplay) {
+                (void)load.gameplay->ApplyRoomMutations(*load.world);
+            }
+            if (!m_nextRoom.bounds.IsEmpty() &&
+                (load.world->RegisteredPoolsMask() & (1ULL << CameraFollow2D::kTypeId)) != 0ULL) {
+                auto& camPool = load.world->GetPool<CameraFollow2D>();
+                for (usize i = 0U; i < camPool.Size(); ++i) {
+                    CameraFollow2D& cam = camPool.ComponentAtDense(i);
+                    cam.roomBounds      = m_nextRoom.bounds;
+                    cam.flags          |= (CameraFlags::ConfineToRoom | CameraFlags::SnapNextStep);
+                }
+            }
+            load.world->PropagateTransforms();
         }
 
         const u8 oldScope = m_roomScope;
@@ -177,6 +262,7 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
         m_currentRoom     = m_nextRoom.roomId;
         m_roomExitFn      = m_nextRoom.onExit;
         load.roomScope    = m_roomScope;
+        m_asyncPrep       = {};
         ++m_transitionCount;
 
         if (oldScope != 0xFFU && oldScope != m_persistentScope && oldScope != m_roomScope) {

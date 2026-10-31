@@ -22,7 +22,8 @@ enum class CueKind : u8 {
     CameraShake = 2,
     Hitstop     = 3,
     Rumble      = 4,
-    Custom      = 5,
+    DashGhost   = 5,
+    Custom      = 6,
 };
 
 enum class CharFlags : u8 {
@@ -34,6 +35,7 @@ enum class CharFlags : u8 {
     LockFacing     = 1U << 4,
     JumpRequested  = 1U << 5,
     DashRequested  = 1U << 6,
+    PogoRequested  = 1U << 7,
 };
 consteval bool enable_bitmask_operators(CharFlags) noexcept { return true; }
 
@@ -43,6 +45,7 @@ enum class CombatFlags : u8 {
     HitboxActive   = 1U << 1,
     CanClash       = 1U << 2,
     FlipWithFacing = 1U << 3,
+    PogoStrike     = 1U << 4,
 };
 consteval bool enable_bitmask_operators(CombatFlags) noexcept { return true; }
 
@@ -63,31 +66,9 @@ enum class HitOutcome : u8 {
     Clashed       = 4,
 };
 
-enum class CameraFlags : u8 {
-    None            = 0,
-    EnableLookahead = 1U << 0,
-    LatchGroundY    = 1U << 1,
-    ConfineToRoom   = 1U << 2,
-    SnapNextStep    = 1U << 3,
-};
-consteval bool enable_bitmask_operators(CameraFlags) noexcept { return true; }
-
-// 32-byte simulation cue emitted by gameplay systems for audio, VFX, hitstop, or camera feedback.
-struct GameplayCue {
-    AssetId     asset{};
-    Vec2        position{};
-    EntityId    emitter{kNullEntity};
-    f32         magnitude{1.0f};
-    u16         durationTicks{0};
-    u16         userTag{0};
-    CueKind     kind{CueKind::Audio};
-    TimeChannel channel{TimeChannel::World};
-    u16         pad{0};
-};
-static_assert(sizeof(GameplayCue) == 32);
-
 // 48-byte 2D Metroidvania character controller supporting coyote time, variable jump, wall slide/jump, and dash.
 // Value type paired with PhysicsBody2D and Collider2D.
+// Invariant: sizeof(CharacterController2D) == 48.
 struct CharacterController2D {
     static constexpr u8 kTypeId = 10;
 
@@ -128,17 +109,16 @@ struct CharacterController2D {
         else flags &= ~CharFlags::JumpHeld;
     }
 
-    constexpr void RequestDash() noexcept {
-        flags |= CharFlags::DashRequested;
+    constexpr void RequestDash() noexcept { flags |= CharFlags::DashRequested; }
+    constexpr void RequestPogo() noexcept { flags |= CharFlags::PogoRequested; }
+
+    constexpr void RefillAirMobility() noexcept {
+        airDashesLeft = maxAirDashes;
+        airJumpsLeft  = maxAirJumps;
     }
 
-    constexpr void DropOneWay(u8 ticks = 10U) noexcept {
-        oneWayDropTicks = ticks;
-    }
-
-    constexpr void ApplyKnockback(Vec2 impulse) noexcept {
-        knockbackVel += impulse;
-    }
+    constexpr void DropOneWay(u8 ticks = 10U) noexcept { oneWayDropTicks = ticks; }
+    constexpr void ApplyKnockback(Vec2 impulse) noexcept { knockbackVel += impulse; }
 
     [[nodiscard]] constexpr bool IsDashing() const noexcept { return dashTicks > 0U; }
     [[nodiscard]] constexpr bool IsWallSliding() const noexcept {
@@ -148,6 +128,8 @@ struct CharacterController2D {
 static_assert(sizeof(CharacterController2D) == 48);
 
 // 16-byte entity finite state machine with timed auto-transitions, cancel masks, and hitstop freeze.
+// Value type; stepped during PrePhysics when the entity's TimeChannel is not frozen.
+// Invariant: sizeof(StateMachine2D) == 16.
 struct StateMachine2D {
     static constexpr u8 kTypeId = 11;
 
@@ -198,6 +180,8 @@ struct StateMachine2D {
 static_assert(sizeof(StateMachine2D) == 16);
 
 // 16-byte health, poise, invulnerability frame, and team affiliation component.
+// Value type; tracks damage, stun recovery, and hit deduplication swing tags.
+// Invariant: sizeof(Health2D) == 16.
 struct Health2D {
     static constexpr u8 kTypeId = 12;
 
@@ -239,6 +223,8 @@ struct Health2D {
 static_assert(sizeof(Health2D) == 16);
 
 // 48-byte combat hurtbox and active attack hitbox component with automatic facing flip and swing deduplication.
+// Value type; supports continuous swept hitbox hull intersection across consecutive simulation ticks.
+// Invariant: sizeof(CombatBox2D) == 48.
 struct CombatBox2D {
     static constexpr u8 kTypeId = 13;
 
@@ -269,7 +255,7 @@ struct CombatBox2D {
     }
 
     constexpr void EndSwing() noexcept {
-        flags &= ~CombatFlags::HitboxActive;
+        flags &= ~(CombatFlags::HitboxActive | CombatFlags::PogoStrike);
     }
 
     [[nodiscard]] static constexpr Rect TransformBox(const Rect& local, Vec2 worldPos, i8 facing) noexcept {
@@ -288,42 +274,63 @@ struct CombatBox2D {
         const i8 dir = HasFlag(flags, CombatFlags::FlipWithFacing) ? facing : static_cast<i8>(1);
         return TransformBox(hitbox, worldPos, dir);
     }
+
+    [[nodiscard]] constexpr Rect SweptWorldHitbox(Vec2 prevWorldPos, Vec2 curWorldPos, i8 facing = 1) const noexcept {
+        const Rect a    = WorldHitbox(prevWorldPos, facing);
+        const Rect b    = WorldHitbox(curWorldPos, facing);
+        const f32  minX = std::min(a.x, b.x);
+        const f32  minY = std::min(a.y, b.y);
+        const f32  maxX = std::max(a.Right(), b.Right());
+        const f32  maxY = std::max(a.Bottom(), b.Bottom());
+        return {minX, minY, maxX - minX, maxY - minY};
+    }
 };
 static_assert(sizeof(CombatBox2D) == 48);
 
-// 16-byte hazard respawn anchor tracking the last stable solid ground position.
-struct SafeAnchor2D {
-    static constexpr u8 kTypeId = 14;
+// 32-byte track-based action timeline driving frame-accurate startup, active hitbox, recovery, and cancel windows.
+// Value type; evaluated during PrePhysics to toggle CombatBox2D hitboxes and StateMachine2D cancel masks.
+// Invariant: sizeof(ActionTimeline2D) == 32.
+struct ActionTimeline2D {
+    static constexpr u8 kTypeId = 16;
 
-    Vec2 safePos{0.0f, 0.0f};
-    Vec2 prevSafePos{0.0f, 0.0f};
-};
-static_assert(sizeof(SafeAnchor2D) == 16);
+    Rect hitbox{0.4f, -0.4f, 0.8f, 0.8f};
+    Vec2 knockback{6.0f, 4.0f};
+    i16  damage{10};
+    u8   startupTicks{4};
+    u8   activeTicks{4};
+    u8   recoveryTicks{8};
+    u8   cancelStartTick{8};
+    u8   cancelMask{0xFF};
+    u8   active{0};
 
-// 64-byte 2D Metroidvania camera follower with deadzone, lookahead, room confinement, and trauma shake.
-struct CameraFollow2D {
-    static constexpr u8 kTypeId = 15;
+    [[nodiscard]] constexpr u16 TotalTicks() const noexcept {
+        return static_cast<u16>(startupTicks) + activeTicks + recoveryTicks;
+    }
 
-    Rect        roomBounds{-1000.0f, -1000.0f, 2000.0f, 2000.0f};
-    Vec2        anchor{0.0f, 0.0f};
-    Vec2        velocity{0.0f, 0.0f};
-    Vec2        deadzone{1.0f, 0.75f};
-    f32         lookaheadDist{2.0f};
-    f32         lookaheadX{0.0f};
-    f32         groundLatchY{0.0f};
-    f32         trauma{0.0f};
-    EntityId    target{kNullEntity};
-    CameraFlags flags{CameraFlags::EnableLookahead | CameraFlags::ConfineToRoom | CameraFlags::SnapNextStep};
-    u8          followOmega{10};
-    u16         pad{0};
+    [[nodiscard]] constexpr bool InStartup(u16 tick) const noexcept {
+        return active != 0U && tick < startupTicks;
+    }
 
-    constexpr void AddTrauma(f32 amount) noexcept {
-        trauma = std::clamp(trauma + amount, 0.0f, 1.0f);
+    [[nodiscard]] constexpr bool InActive(u16 tick) const noexcept {
+        return active != 0U && tick >= startupTicks &&
+               tick < static_cast<u16>(startupTicks) + activeTicks;
+    }
+
+    [[nodiscard]] constexpr bool InRecovery(u16 tick) const noexcept {
+        return active != 0U &&
+               tick >= static_cast<u16>(startupTicks) + activeTicks &&
+               tick < TotalTicks();
+    }
+
+    [[nodiscard]] constexpr bool InCancelWindow(u16 tick) const noexcept {
+        return active != 0U && tick >= cancelStartTick;
     }
 };
-static_assert(sizeof(CameraFollow2D) == 64);
+static_assert(sizeof(ActionTimeline2D) == 32);
 
-// 32-byte resolved combat interaction record emitted during GameplaySystem::Step.
+// 32-byte resolved combat interaction record emitted during GameplaySystem::ResolveCombat.
+// Value type; inspected by gameplay callbacks and cleared at the start of the next tick.
+// Invariant: sizeof(CombatHitEvent) == 32.
 struct CombatHitEvent {
     EntityId   attacker{kNullEntity};
     EntityId   defender{kNullEntity};
@@ -338,40 +345,6 @@ struct CombatHitEvent {
 };
 static_assert(sizeof(CombatHitEvent) == 32);
 
-struct GameplayCallbacks {
-    void (*onStateStep)(
-        EntityId id,
-        StateMachine2D& fsm,
-        World& world,
-        const TickInput& input,
-        ActionBuffer& actions,
-        GameplaySystem& gameplay) noexcept{nullptr};
-    void (*onStateTransition)(
-        EntityId id,
-        u8 fromState,
-        u8 toState,
-        World& world,
-        GameplaySystem& gameplay) noexcept{nullptr};
-    void (*onCombatHit)(
-        const CombatHitEvent& hit,
-        World& world,
-        GameplaySystem& gameplay) noexcept{nullptr};
-};
-static_assert(sizeof(GameplayCallbacks) == 24);
-
-struct GameplayConfig {
-    f32 groundAccel{65.0f};
-    f32 airAccel{42.0f};
-    f32 knockbackDecay{12.0f};
-    f32 jumpCutMultiplier{0.45f};
-    u8  coyoteWindowTicks{8};
-    u8  dashDurationTicks{12};
-    u8  dashCooldownTicks{24};
-    u8  defaultStunTicks{15};
-    u16 maxCuesPerTick{256};
-    u16 maxCombatHitsPerTick{128};
-    u32 arenaBytes{128U * 1024U};
-};
-static_assert(sizeof(GameplayConfig) == 28);
-
 } // namespace en
+
+#include "gameplay/WorldComponents.h"

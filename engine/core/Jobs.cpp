@@ -12,8 +12,11 @@ bool JobSystem::Init(u32 workerThreads) noexcept {
     Shutdown();
     m_nextBatch.store(0U, std::memory_order_relaxed);
     m_remaining.store(0U, std::memory_order_relaxed);
+    m_asyncRuns.store(0U, std::memory_order_relaxed);
     m_epoch.store(0U, std::memory_order_relaxed);
     m_busy.store(false, std::memory_order_relaxed);
+    m_asyncPending.store(false, std::memory_order_relaxed);
+    m_asyncDone.store(true, std::memory_order_relaxed);
     m_stop.store(false, std::memory_order_relaxed);
     g_tlsOwner = this;
     g_tlsIdx   = 0U;
@@ -42,6 +45,7 @@ bool JobSystem::Init(u32 workerThreads) noexcept {
 }
 
 void JobSystem::Shutdown() noexcept {
+    WaitAsync();
     if (m_workerCount > 0U) {
         {
             std::lock_guard lock(m_mutex);
@@ -55,6 +59,46 @@ void JobSystem::Shutdown() noexcept {
     }
     m_remaining.store(0U, std::memory_order_relaxed);
     m_busy.store(false, std::memory_order_relaxed);
+    m_asyncPending.store(false, std::memory_order_relaxed);
+    m_asyncDone.store(true, std::memory_order_relaxed);
+}
+
+bool JobSystem::TryExecuteAsync() noexcept {
+    if (!m_asyncPending.exchange(false, std::memory_order_acq_rel)) return false;
+    const AsyncFn fn  = m_asyncFn;
+    void* const   ctx = m_asyncCtx;
+    if (fn) fn(ctx);
+    m_asyncRuns.fetch_add(1U, std::memory_order_relaxed);
+    m_asyncDone.store(true, std::memory_order_release);
+    return true;
+}
+
+void JobSystem::DispatchAsync(AsyncFn fn, void* userCtx) noexcept {
+    if (!fn) return;
+    WaitAsync();
+    if (m_workerCount == 0U) {
+        fn(userCtx);
+        m_asyncRuns.fetch_add(1U, std::memory_order_relaxed);
+        m_asyncDone.store(true, std::memory_order_release);
+        return;
+    }
+    {
+        std::lock_guard lock(m_mutex);
+        m_asyncFn  = fn;
+        m_asyncCtx = userCtx;
+        m_asyncDone.store(false, std::memory_order_release);
+        m_asyncPending.store(true, std::memory_order_release);
+        m_epoch.fetch_add(1U, std::memory_order_release);
+    }
+    m_wakeCv.notify_one();
+}
+
+void JobSystem::WaitAsync() noexcept {
+    if (m_asyncDone.load(std::memory_order_acquire)) return;
+    if (TryExecuteAsync()) return;
+    while (!m_asyncDone.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 }
 
 bool JobSystem::ClaimAndExecuteBatch(u32 threadIdx) noexcept {
@@ -107,13 +151,16 @@ void JobSystem::WorkerLoop(u32 workerIdx) noexcept {
     u32 seenEpoch = 0U;
 
     for (;;) {
+        (void)TryExecuteAsync();
         while (m_remaining.load(std::memory_order_acquire) > 0U) {
             if (!ClaimAndExecuteBatch(workerIdx)) break;
         }
+        (void)TryExecuteAsync();
 
         std::unique_lock lock(m_mutex);
         m_wakeCv.wait(lock, [this, &seenEpoch]() noexcept {
             return m_stop.load(std::memory_order_acquire) ||
+                   m_asyncPending.load(std::memory_order_acquire) ||
                    (m_epoch.load(std::memory_order_acquire) != seenEpoch &&
                     m_remaining.load(std::memory_order_acquire) > 0U);
         });

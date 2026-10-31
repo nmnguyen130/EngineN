@@ -5,10 +5,22 @@
 
 namespace en {
 
-// 4-layer state stack (play/pause/menu) and room transition state machine with asset scope management.
-// Value type; coordinates room scope eviction and screen wipe rendering without heap allocation.
+// 4-layer state stack (play/pause/menu) and room transition state machine with background JobSystem streaming.
+// Value type; coordinates async room asset verification during Out wipe, scope eviction, and screen wipes.
 class SceneDirector {
 public:
+    struct AsyncRoomPrep {
+        const AssetBank* assets{nullptr};
+        AssetId          collisionMap{};
+        AssetId          prefab{};
+        BlobHandle       collisionBlob{};
+        BlobHandle       prefabBlob{};
+        u8               dispatched{0};
+        u8               completed{0};
+        u16              pad{0};
+    };
+    static_assert(sizeof(AsyncRoomPrep) == 36 || sizeof(AsyncRoomPrep) == 40);
+
     [[nodiscard]] Result<void, FwErrc> Init(AssetBank& assets) noexcept;
     void Shutdown(AssetBank& assets, LoadCtx* load = nullptr) noexcept;
 
@@ -56,6 +68,8 @@ public:
     }
 
 private:
+    static void PrepareRoomAssetsJob(void* userCtx) noexcept;
+
     [[nodiscard]] constexpr Result<void, FwErrc> Enqueue(const SceneState& s, StateOp op) noexcept {
         if (m_cmdCount >= kMaxStateCmds) return Err(FwErrc::StackFull);
         m_cmds[m_cmdCount] = s;
@@ -94,10 +108,11 @@ private:
     std::array<SceneState, kMaxStateCmds> m_cmds{};
     std::array<StateOp, kMaxStateCmds>    m_ops{};
 
-    RoomDesc m_nextRoom{};
-    AssetId  m_currentRoom{};
+    RoomDesc      m_nextRoom{};
+    AsyncRoomPrep m_asyncPrep{};
+    AssetId       m_currentRoom{};
     void (*m_roomExitFn)(LoadCtx&) noexcept{nullptr};
 };
-static_assert(sizeof(SceneDirector) <= 512);
+static_assert(sizeof(SceneDirector) <= 576);
 
 } // namespace en

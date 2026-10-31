@@ -87,6 +87,36 @@ void WorldSystems::StepVisualsAndLifetimes(World& world, const TickStep& step) n
             }
         }
     }
+
+    if ((regMask & (1ULL << HitFlash2D::kTypeId)) != 0ULL) {
+        auto& flashPool     = world.GetPool<HitFlash2D>();
+        const auto entities = flashPool.Entities();
+        auto flashes        = flashPool.Components();
+        for (usize i = 0U; i < entities.size(); ++i) {
+            HitFlash2D& hf = flashes[i];
+            if (hf.remainingTicks == 0U) continue;
+            const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(entities[i].index));
+            if (!step.IsFrozen(ch)) --hf.remainingTicks;
+        }
+    }
+
+    if ((regMask & (1ULL << SquashStretch2D::kTypeId)) != 0ULL) {
+        const auto& ssPool  = world.GetPool<SquashStretch2D>();
+        const auto entities = ssPool.Entities();
+        const auto configs  = ssPool.Components();
+        for (usize i = 0U; i < entities.size(); ++i) {
+            const u16 idx = entities[i].index;
+            const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(idx));
+            if (step.IsFrozen(ch)) continue;
+            const WorldTransform2D& cur = world.GetWorldByIndex(idx);
+            if (cur.scaleX != 1.0f || cur.scaleY != 1.0f) {
+                const f32 rate        = configs[i].recoverSpeed * step.Dt(ch);
+                LocalTransform2D& loc = world.ModifyLocalTransformByIndex(idx);
+                loc.scaleX            = Approach(loc.scaleX, 1.0f, rate);
+                loc.scaleY            = Approach(loc.scaleY, 1.0f, rate);
+            }
+        }
+    }
 }
 
 void WorldSystems::ExtractRender(
@@ -136,6 +166,7 @@ void WorldSystems::ExtractRender(
     }
 
     const std::span<const u64> movedWords = world.MovedWords();
+    const bool hasFlashPool = (regMask & (1ULL << HitFlash2D::kTypeId)) != 0ULL;
 
     if ((regMask & (1ULL << Sprite2D::kTypeId)) != 0ULL) {
         const auto& spritePool     = world.GetPool<Sprite2D>();
@@ -172,8 +203,9 @@ void WorldSystems::ExtractRender(
                 }
             }
 
+            const u64 compMask          = world.GetComponentMaskByIndex(idx);
             const SpriteFrame* framePtr = &assetBank.GetSprite(sp.sprite);
-            if ((world.GetComponentMaskByIndex(idx) & (1ULL << SpriteAnimator2D::kTypeId)) != 0ULL) {
+            if ((compMask & (1ULL << SpriteAnimator2D::kTypeId)) != 0ULL) {
                 const SpriteAnimator2D& anim = animPool.DirectAtEntityIndex(idx);
                 if (anim.atlas.IsValid()) {
                     framePtr = &assetBank.GetAtlasFrame(
@@ -186,6 +218,17 @@ void WorldSystems::ExtractRender(
                 ? SortKey::YDepth(ry + rDepth)
                 : static_cast<u16>(std::clamp(static_cast<i32>(sp.baseDepth) + depthOffset, 0, 65535));
 
+            Color     quadCol   = sp.tint;
+            BlendMode quadBlend = sp.Blend();
+            if (hasFlashPool && (compMask & (1ULL << HitFlash2D::kTypeId)) != 0ULL) {
+                const HitFlash2D& hf = world.GetPool<HitFlash2D>().DirectAtEntityIndex(idx);
+                if (hf.Active()) {
+                    quadCol   = hf.flashColor.ToColor();
+                    quadCol.a *= sp.tint.a;
+                    quadBlend = hf.blend;
+                }
+            }
+
             outRenderList.Push({
                 .center  = {rx, ry},
                 .size    = {sp.width * sx, sp.height * sy},
@@ -193,12 +236,12 @@ void WorldSystems::ExtractRender(
                 .cosRot  = c,
                 .sinRot  = s,
                 .uv      = framePtr->uv,
-                .color   = sp.tint,
+                .color   = quadCol,
                 .texture = framePtr->gpuTexture,
                 .depth   = resolvedDepth,
                 .layer   = sp.layer,
                 .view    = sp.ViewSlot(),
-                .blend   = sp.Blend(),
+                .blend   = quadBlend,
                 .flipX   = sp.FlipX(),
                 .flipY   = sp.FlipY(),
             });

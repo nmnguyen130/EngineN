@@ -144,18 +144,22 @@ struct TileMapHeader {
 };
 static_assert(sizeof(TileMapHeader) == 24);
 
-// 32-byte configuration for PhysicsSystem initialization and solver tolerances.
+// 40-byte data-driven configuration for PhysicsSystem initialization and solver tolerances.
+// Value type; controls step-up, ledge-hop, ceiling corner correction, and downhill slope adhesion.
+// Invariant: sizeof(PhysicsConfig) == 40.
 struct PhysicsConfig {
     Vec2 gravity{0.0f, -32.0f};
     f32  cellSize{2.0f};
     f32  maxStepHeight{0.20f};
     f32  groundSnapDist{0.12f};
     f32  cornerCorrectionDist{0.18f};
+    f32  slopeSnapMultiplier{1.25f};
+    f32  ledgeHopMaxVy{8.0f};
     u16  maxProxies{4096};
     u16  maxContactPairs{1024};
     u32  arenaBytes{1024U * 1024U};
 };
-static_assert(sizeof(PhysicsConfig) == 32);
+static_assert(sizeof(PhysicsConfig) == 40);
 
 [[nodiscard]] constexpr RayHit2D RaycastBox(
     Vec2 origin, Vec2 dir, f32 maxDist, const Rect& box) noexcept {

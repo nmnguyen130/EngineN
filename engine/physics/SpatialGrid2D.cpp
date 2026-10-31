@@ -140,7 +140,7 @@ void SpatialGrid2D::Rebuild(const World& world) noexcept {
 
         const Collider2D&       col = cols[i];
         const WorldTransform2D& wt  = world.GetWorldByIndex(id.index);
-        const Rect              box = col.WorldBounds({wt.x, wt.y}, {wt.scaleX, wt.scaleY});
+        const Rect              box = col.WorldBounds({wt.x, wt.y});
         if (box.IsEmpty()) continue;
 
         const u16 pIdx   = m_proxyCount++;

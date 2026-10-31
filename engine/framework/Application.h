@@ -4,6 +4,7 @@
 #include "audio/AudioSystem.h"
 #include "core/Jobs.h"
 #include "debug/DebugSystem.h"
+#include "framework/EnginePipeline.h"
 #include "framework/SceneDirector.h"
 #include "gameplay/GameplaySystem.h"
 #include "input/ActionBuffer.h"
@@ -15,6 +16,7 @@
 #include "renderer/Renderer.h"
 #include "time/Clock.h"
 #include "time/TimeSystem.h"
+#include "vfx/VfxSystem.h"
 #include "world/World.h"
 
 namespace en {
@@ -23,18 +25,20 @@ struct AppConfig {
     std::string_view title{"EngineN"};
     Viewport         viewport{1280, 720};
     f32              pixelsPerMeter{48.0f};
+    u32              workerThreads{0U}; // 0U = automatic hardware_concurrency() detection
     AssetBankConfig  assets{};
     AudioConfig      audio{};
     WorldConfig      world{};
     PhysicsConfig    physics{};
     GameplayConfig   gameplay{};
+    VfxConfig        vfx{};
     DebugConfig      debug{};
     bool             headless{true};
     bool             enableDebug{true};
 };
 
-// Top-level Metroidvania engine runtime owning and orchestrating all 12 subsystems.
-// Move-only owner of an Arena-allocated Runtime state; Step() drives one full frame.
+// Top-level Metroidvania engine lifecycle owner managing subsystem initialization and OS frame pacing.
+// Move-only owner of an Arena-allocated Runtime state; delegates simulation and presentation execution to EnginePipeline.
 // Invariant: sizeof(Application) == 48.
 class Application {
 public:
@@ -68,9 +72,11 @@ public:
     [[nodiscard]] Renderer&       GetRenderer() noexcept;
     [[nodiscard]] JobSystem&      GetJobs() noexcept;
     [[nodiscard]] SceneDirector&  GetScenes() noexcept;
+    [[nodiscard]] EnginePipeline& GetPipeline() noexcept;
     [[nodiscard]] World&          GetWorld() noexcept;
     [[nodiscard]] PhysicsSystem&  GetPhysics() noexcept;
     [[nodiscard]] GameplaySystem& GetGameplay() noexcept;
+    [[nodiscard]] VfxSystem&      GetVfx() noexcept;
     [[nodiscard]] AssetBank&      GetAssets() noexcept;
     [[nodiscard]] AudioSystem&    GetAudio() noexcept;
     [[nodiscard]] DebugSystem&    GetDebug() noexcept;
@@ -84,9 +90,11 @@ public:
     [[nodiscard]] const Renderer&       GetRenderer() const noexcept;
     [[nodiscard]] const JobSystem&      GetJobs() const noexcept;
     [[nodiscard]] const SceneDirector&  GetScenes() const noexcept;
+    [[nodiscard]] const EnginePipeline& GetPipeline() const noexcept;
     [[nodiscard]] const World&          GetWorld() const noexcept;
     [[nodiscard]] const PhysicsSystem&  GetPhysics() const noexcept;
     [[nodiscard]] const GameplaySystem& GetGameplay() const noexcept;
+    [[nodiscard]] const VfxSystem&      GetVfx() const noexcept;
     [[nodiscard]] const AssetBank&      GetAssets() const noexcept;
     [[nodiscard]] const AudioSystem&    GetAudio() const noexcept;
     [[nodiscard]] const DebugSystem&    GetDebug() const noexcept;
@@ -100,8 +108,6 @@ private:
 
     [[nodiscard]] LoadCtx MakeLoadCtx() const noexcept;
     void ApplyDebugDirectives(const LoopDirectives& dir) noexcept;
-    void RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept;
-    void RenderFrame() noexcept;
 
     Arena    m_arena{};
     Runtime* m_rt{nullptr};

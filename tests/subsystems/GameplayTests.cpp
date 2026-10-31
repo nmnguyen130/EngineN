@@ -1,7 +1,9 @@
 #include "tests/subsystems/CtsHarness.h"
 
 #include "gameplay/GameplaySystem.h"
+#include "vfx/VfxSystem.h"
 #include "time/TimeSystem.h"
+#include <vector>
 
 namespace {
 
@@ -29,10 +31,13 @@ bool CtsCharacterLocomotionCoyoteWallJumpAndDash(CtsRunner& r) noexcept {
     (void)world.Emplace<PhysicsBody2D>(hero, PhysicsBody2D{.type = BodyType::Dynamic});
     (void)world.Emplace<CharacterController2D>(hero, CharacterController2D{.maxRunSpeed = 8.0f, .jumpSpeed = 14.0f});
     (void)world.Emplace<SafeAnchor2D>(hero);
+    (void)world.Emplace<SquashStretch2D>(hero);
 
     TimeSystem   time;
     TickInput    in{};
     ActionBuffer actions{};
+    VfxSystem    vfx;
+    CTS_CHECK(r, vfx.Init().has_value());
 
     auto stepTicks = [&](u32 n) noexcept {
         for (u32 i = 0U; i < n; ++i) {
@@ -40,6 +45,8 @@ bool CtsCharacterLocomotionCoyoteWallJumpAndDash(CtsRunner& r) noexcept {
             const TickStep step = time.PollTick();
             world.BeginTick(step);
             game.Step(world, phys, step, in, actions);
+            for (const GameplayCue& c : game.DrainCues()) vfx.ProcessCue(c, world);
+            vfx.Step(step);
             world.EndTick(step);
         }
     };
@@ -51,16 +58,29 @@ bool CtsCharacterLocomotionCoyoteWallJumpAndDash(CtsRunner& r) noexcept {
     CTS_CHECK(r, world.TryGet<SafeAnchor2D>(hero)->safePos.x > 2.0f);
 
     world.TryGet<CharacterController2D>(hero)->RequestJump(true);
-    stepTicks(2U);
+    stepTicks(1U);
+    // Procedural jump stretch: scaleX < 1.0f and scaleY > 1.0f, plus jump dust particles emitted!
+    CTS_CHECK(r, world.GetLocalTransform(hero).scaleX < 0.95f && world.GetLocalTransform(hero).scaleY > 1.05f);
+    CTS_CHECK(r, vfx.ActiveParticleCount() > 0U);
+    stepTicks(1U);
     const f32 vyBeforeCut = world.TryGet<PhysicsBody2D>(hero)->velocity.y;
     CTS_CHECK(r, vyBeforeCut > 10.0f);
+
+    // Verify Apex Hang Time: when airborne with JumpHeld and |vy| <= apexThreshold, gravityScale drops to 0.5f.
+    world.TryGet<PhysicsBody2D>(hero)->velocity.y = 1.0f;
+    stepTicks(1U);
+    CTS_CHECK(r, Near(world.TryGet<PhysicsBody2D>(hero)->gravityScale, 0.5f, 1e-3f));
+    world.TryGet<PhysicsBody2D>(hero)->velocity.y = vyBeforeCut;
     world.TryGet<CharacterController2D>(hero)->SetJumpHeld(false);
     stepTicks(1U);
     const f32 vyAfterCut = world.TryGet<PhysicsBody2D>(hero)->velocity.y;
     CTS_CHECK(r, vyAfterCut < vyBeforeCut * 0.6f);
 
     world.TryGet<CharacterController2D>(hero)->RequestDash();
-    stepTicks(15U);
+    stepTicks(3U);
+    // Verify Dash Ghost Trail (After-Image) emitted during dash!
+    CTS_CHECK(r, vfx.ActiveGhostCount() > 0U);
+    stepTicks(12U);
     world.TryGet<CharacterController2D>(hero)->moveInputX = 1.0f;
     stepTicks(40U);
     CTS_CHECK(r, world.TryGet<CharacterController2D>(hero)->wallCoyoteTicks > 0U);
@@ -97,12 +117,14 @@ bool CtsCombatHitboxesIframesParryAndClash(CtsRunner& r) noexcept {
     (void)world.Emplace<CharacterController2D>(hero, CharacterController2D{.facing = 1});
     (void)world.Emplace<StateMachine2D>(hero);
     (void)world.Emplace<Health2D>(hero, Health2D{.hp = 100, .maxHp = 100, .team = 1U});
+    (void)world.Emplace<PhysicsBody2D>(hero, PhysicsBody2D{.type = BodyType::Dynamic});
     (void)world.Emplace<CombatBox2D>(hero, CombatBox2D{.flags = CombatFlags::HurtboxActive | CombatFlags::FlipWithFacing | CombatFlags::CanClash});
 
     (void)world.Emplace<CharacterController2D>(enemy, CharacterController2D{.facing = -1});
     (void)world.Emplace<StateMachine2D>(enemy);
     (void)world.Emplace<Health2D>(enemy, Health2D{.hp = 50, .maxHp = 50, .autoIframeTicks = 10U, .poise = 15U, .maxPoise = 15U, .team = 2U});
     (void)world.Emplace<CombatBox2D>(enemy, CombatBox2D{.flags = CombatFlags::HurtboxActive | CombatFlags::FlipWithFacing | CombatFlags::CanClash});
+    (void)world.Emplace<HitFlash2D>(enemy);
 
     TimeSystem   time;
     TickInput    in{};
@@ -123,6 +145,8 @@ bool CtsCombatHitboxesIframesParryAndClash(CtsRunner& r) noexcept {
     CTS_CHECK(r, game.CombatHits()[0].damage == 20 && game.CombatHits()[0].poiseBroken == 1U);
     CTS_CHECK(r, world.TryGet<Health2D>(enemy)->hp == 30);
     CTS_CHECK(r, world.TryGet<Health2D>(enemy)->iframeTicks == 10U);
+    // Verify Sprite Hit Flash & combat spark particles on damage!
+    CTS_CHECK(r, world.TryGet<HitFlash2D>(enemy)->remainingTicks == 4U && !game.Cues().empty());
     CTS_CHECK(r, world.TryGet<StateMachine2D>(hero)->hitstopTicks == 4U);
 
     stepOne();
@@ -146,6 +170,35 @@ bool CtsCombatHitboxesIframesParryAndClash(CtsRunner& r) noexcept {
     CTS_CHECK(r, game.CombatHits().size() == 1U && game.CombatHits()[0].outcome == HitOutcome::Clashed);
     CTS_CHECK(r, !HasFlag(world.TryGet<CombatBox2D>(hero)->flags, CombatFlags::HitboxActive));
     CTS_CHECK(r, !HasFlag(world.TryGet<CombatBox2D>(enemy)->flags, CombatFlags::HitboxActive));
+
+    // ActionTimeline2D startup -> active -> recovery + PogoStrike air-mobility refill + SweptWorldHitbox tunneling check.
+    for (u32 i = 0U; i < 6U; ++i) stepOne();
+    world.TryGet<CharacterController2D>(hero)->airDashesLeft = 0U;
+    world.TryGet<CombatBox2D>(hero)->flags |= CombatFlags::PogoStrike;
+    world.TryGet<CombatBox2D>(hero)->hitstopTicks = 0U;
+    (void)world.Emplace<ActionTimeline2D>(hero, ActionTimeline2D{
+        .hitbox          = {0.1f, -0.5f, 1.0f, 1.0f},
+        .damage          = 10,
+        .startupTicks    = 2U,
+        .activeTicks     = 2U,
+        .recoveryTicks   = 2U,
+        .cancelStartTick = 4U,
+        .cancelMask      = 0x05U,
+        .active          = 1U,
+    });
+    world.TryGet<StateMachine2D>(hero)->TransitionTo(5U, 6U, 0U, 0x00U);
+
+    stepOne(); // tick 0 (startup)
+    CTS_CHECK(r, !HasFlag(world.TryGet<CombatBox2D>(hero)->flags, CombatFlags::HitboxActive));
+    stepOne(); // tick 1 (startup)
+    CTS_CHECK(r, !HasFlag(world.TryGet<CombatBox2D>(hero)->flags, CombatFlags::HitboxActive));
+    stepOne(); // tick 2 (active -> hits enemy, triggers PogoStrike!)
+    CTS_CHECK(r, game.CombatHits().size() == 1U && world.TryGet<Health2D>(enemy)->hp == 20);
+    stepOne(); // tick 3 (pre-physics applies PogoRequested -> refills airDashesLeft!)
+    CTS_CHECK(r, world.TryGet<CharacterController2D>(hero)->airDashesLeft == 1U);
+    stepOne(); // tick 4 (recovery + cancel window open)
+    CTS_CHECK(r, !HasFlag(world.TryGet<CombatBox2D>(hero)->flags, CombatFlags::HitboxActive));
+    CTS_CHECK(r, world.TryGet<StateMachine2D>(hero)->CanCancel(0x01U));
     return true;
 }
 
@@ -164,6 +217,29 @@ bool CtsCameraFollowRoomBoundsAndWorldFlags(CtsRunner& r) noexcept {
     CTS_CHECK(r, game.TestWorldFlag(0U) && game.TestWorldFlag(4095U) && !game.TestWorldFlag(2048U));
     game.SetWorldFlag(0U, false);
     CTS_CHECK(r, !game.TestWorldFlag(0U));
+
+    // WorldMutation2D SpatialGuid persistence & binary save/load round-trip.
+    const u64 bossGuid = WorldMutation2D::ComputeSpatialGuid(3U, 12, -4, 99U);
+    const EntityId boss = *world.Spawn({.local = {.x = 12.0f, .y = -4.0f}});
+    (void)world.Emplace<WorldMutation2D>(boss, WorldMutation2D{
+        .guid          = bossGuid,
+        .flagId        = 42U,
+        .flags         = MutationFlags::DestroyIfMutated,
+        .recordOnDeath = 1U,
+    });
+    CTS_CHECK(r, game.RecordMutation(bossGuid, 1U));
+    game.SetWorldFlag(42U, true);
+
+    std::vector<u8> saveBlob(game.RequiredSaveBytes());
+    const auto written = game.SerializePersistence(saveBlob);
+    CTS_CHECK(r, written.has_value() && *written == saveBlob.size());
+
+    game.ClearWorldFlags();
+    game.ClearMutations();
+    CTS_CHECK(r, !game.HasMutation(bossGuid) && !game.TestWorldFlag(42U));
+    CTS_CHECK(r, game.DeserializePersistence(saveBlob).has_value());
+    CTS_CHECK(r, game.HasMutation(bossGuid) && game.TestWorldFlag(42U));
+    CTS_CHECK(r, game.ApplyRoomMutations(world) == 1U && !world.IsAlive(boss));
 
     const EntityId hero = *world.Spawn({.local = {.x = 2.0f, .y = 5.0f}});
     (void)world.Emplace<CharacterController2D>(hero, CharacterController2D{.facing = 1});
@@ -263,8 +339,8 @@ bool DstGameplayStateMachineAndLockstepStress(CtsRunner& r) noexcept {
 int main() {
     CtsRunner runner{.suiteName = "GameplayTests (CTS+DST)"};
     runner.RunCase("Locomotion, Coyote, Variable Jump, Wall & Dash", CtsCharacterLocomotionCoyoteWallJumpAndDash);
-    runner.RunCase("Combat Hitboxes, Iframes, Parry & Clash", CtsCombatHitboxesIframesParryAndClash);
-    runner.RunCase("Camera Room Confinement, Shake & World Flags", CtsCameraFollowRoomBoundsAndWorldFlags);
+    runner.RunCase("Combat Hitboxes, Timelines, Pogo, Parry & Clash", CtsCombatHitboxesIframesParryAndClash);
+    runner.RunCase("Camera Confinement, World Flags & Mutation Save", CtsCameraFollowRoomBoundsAndWorldFlags);
     runner.RunCase("DST: 240-Tick FSM & Combat Lockstep Stress", DstGameplayStateMachineAndLockstepStress);
     return runner.Finish();
 }

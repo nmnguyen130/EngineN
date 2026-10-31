@@ -47,8 +47,8 @@ bool CtsPrimitivesHashingAndStrings(CtsRunner& r) noexcept {
     CTS_CHECK(r, AlignUp(100U, 0U) == 0U && AlignUp(100U, 3U) == 0U && AlignUp(~usize{0}, 16U) == 0U);
 
     // Case-insensitive + path-separator equivalence classes for StringId.
-    constexpr StringId s1 = "Data\\Sprites//Kaelen_Idle.PNG"_sid;
-    constexpr StringId s2 = "data/sprites//kaelen_idle.png"_sid;
+    constexpr StringId s1 = "Data\\Sprites//Actor_Idle.PNG"_sid;
+    constexpr StringId s2 = "data/sprites//actor_idle.png"_sid;
     CTS_CHECK(r, s1.IsValid() && s1 == s2 && !StringId{}.IsValid());
 
     // Generational Handle pack/unpack across boundary indices and generations.
@@ -60,12 +60,12 @@ bool CtsPrimitivesHashingAndStrings(CtsRunner& r) noexcept {
         }
     }
 
-    // FixedString<16> has kMaxLength = 13: "kaelen" (6) + "_123456" (7) = 13.
-    FixedString<16> fs("kaelen");
-    CTS_CHECK(r, fs.Size() == 6U && fs == "kaelen");
+    // FixedString<16> has kMaxLength = 13: "engine" (6) + "_123456" (7) = 13.
+    FixedString<16> fs("engine");
+    CTS_CHECK(r, fs.Size() == 6U && fs == "engine");
     CTS_CHECK(r, fs.Append("_123456") && fs.Size() == FixedString<16>::kMaxLength);
-    CTS_CHECK(r, !fs.Append("x") && fs == "kaelen_123456");
-    CTS_CHECK(r, !fs.Assign({"bad\0str", 7U}) && fs == "kaelen_123456");
+    CTS_CHECK(r, !fs.Append("x") && fs == "engine_123456");
+    CTS_CHECK(r, !fs.Assign({"bad\0str", 7U}) && fs == "engine_123456");
     fs.Clear();
     CTS_CHECK(r, fs.Empty() && fs.Size() == 0U && fs.CStr()[0] == '\0');
 
@@ -189,7 +189,7 @@ bool CtsArenaAndBinarySerialization(CtsRunner& r) noexcept {
     for (u32 i = 0U; i < 200U; ++i) {
         CTS_CHECK(r, w.Write(rng.NextU64()));
         CTS_CHECK(r, w.Write(rng.NextF32()));
-        CTS_CHECK(r, w.WriteStr("veil_echo"));
+        CTS_CHECK(r, w.WriteStr("engine_echo"));
     }
     CTS_CHECK(r, w.Ok());
 
@@ -201,7 +201,7 @@ bool CtsArenaAndBinarySerialization(CtsRunner& r) noexcept {
         std::string_view sv{};
         CTS_CHECK(r, rd.Read(u) && u == verifyRng.NextU64());
         CTS_CHECK(r, rd.Read(f) && f == verifyRng.NextF32());
-        CTS_CHECK(r, rd.ReadStr(sv) && sv == "veil_echo");
+        CTS_CHECK(r, rd.ReadStr(sv) && sv == "engine_echo");
     }
     CTS_CHECK(r, rd.Remaining() == 0U && rd.Ok());
     u8 extra = 0U;

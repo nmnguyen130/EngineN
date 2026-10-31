@@ -2,6 +2,7 @@
 
 #include "time/TimeSystem.h"
 #include "world/WorldSystems.h"
+#include "vfx/VfxSystem.h"
 
 #include <map>
 #include <vector>
@@ -154,16 +155,32 @@ bool CtsRenderExtractionAndLifetimeDeferredDestroy(CtsRunner& r) noexcept {
     CTS_CHECK(r, world.IsAlive(vfx));
     CTS_CHECK(r, Near(world.TryGet<Sprite2D>(vfx)->tint.a, 0.5f, 1e-3f));
 
+    // Opt-in HitFlash2D component on vfx + standalone VfxSystem with Swap-Back & JobSystem ParallelFor.
+    (void)world.Emplace<HitFlash2D>(vfx, HitFlash2D{.durationTicks = 3U, .remainingTicks = 3U});
+    VfxSystem vfxSys;
+    CTS_CHECK(r, vfxSys.Init({.maxParticles = 128U, .maxGhosts = 32U, .parallelBatchSize = 16U}).has_value());
+    vfxSys.EmitBurst({.origin = {1.0f, 2.0f}, .lifeTicks = 1U, .count = 32U});
+    vfxSys.EmitBurst({.origin = {1.0f, 2.0f}, .lifeTicks = 5U, .count = 32U});
+    CTS_CHECK(r, vfxSys.ActiveParticleCount() == 64U && world.TryGet<HitFlash2D>(vfx)->Active());
+
     RenderList list;
     list.Reset({1280, 720});
     WorldSystems::ExtractRender(world, bank, time.RenderView(), list, 48.0f);
-    CTS_CHECK(r, list.Stats().submitted == 2U);
+    vfxSys.ExtractRender(bank, list);
+    // 1 sprite (hit-flashing) + 1 point light + 64 dense particles = 66 quads!
+    CTS_CHECK(r, list.Stats().submitted == 66U);
+
+    JobSystem jobs;
+    CTS_CHECK(r, jobs.Init(0U) && jobs.WorkerCount() >= 1U);
 
     time.BeginFrame(kFixedDtNs);
     const TickStep s2 = time.PollTick();
     world.BeginTick(s2);
     WorldSystems::StepVisualsAndLifetimes(world, s2);
+    vfxSys.Step(s2, &jobs);
     world.EndTick(s2);
+    // The 32 particles with lifeTicks=1 expired and were Swap-Back compacted, leaving exactly 32 active!
+    CTS_CHECK(r, vfxSys.ActiveParticleCount() == 32U);
     CTS_CHECK(r, !world.IsAlive(vfx));
     return true;
 }

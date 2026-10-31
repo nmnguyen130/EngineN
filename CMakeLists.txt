@@ -32,18 +32,27 @@ add_library(engine STATIC
     engine/assets/ImageLoader.cpp
     engine/renderer/Renderer.cpp
     engine/renderer/RenderList.cpp
+    engine/physics/PhysicsSolver.cpp
     engine/physics/PhysicsSystem.cpp
     engine/physics/SpatialGrid2D.cpp
     engine/world/TransformSolver.cpp
     engine/world/World.cpp
+    engine/world/WorldSerialization.cpp
     engine/world/WorldSystems.cpp
+    engine/gameplay/CameraAndPersistence.cpp
+    engine/gameplay/CharacterController.cpp
+    engine/gameplay/CombatResolver.cpp
     engine/gameplay/GameplaySystem.cpp
+    engine/vfx/VfxSystem.cpp
     engine/audio/AudioMixer.cpp
     engine/audio/AudioSystem.cpp
+    engine/debug/DebugConsole.cpp
     engine/debug/DebugDraw.cpp
+    engine/debug/DebugInspector.cpp
+    engine/debug/DebugProfiler.cpp
     engine/debug/DebugSystem.cpp
-    engine/debug/DebugTools.cpp
     engine/framework/Application.cpp
+    engine/framework/EnginePipeline.cpp
     engine/framework/SceneDirector.cpp
 )
 add_library(enginen ALIAS engine)

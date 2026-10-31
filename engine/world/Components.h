@@ -69,6 +69,19 @@ struct WorldConfig {
 };
 static_assert(sizeof(WorldConfig) == 12);
 
+struct Rgba8 {
+    u8 r{255};
+    u8 g{255};
+    u8 b{255};
+    u8 a{255};
+
+    [[nodiscard]] constexpr Color ToColor() const noexcept {
+        constexpr f32 kInv = 1.0f / 255.0f;
+        return {r * kInv, g * kInv, b * kInv, a * kInv};
+    }
+};
+static_assert(sizeof(Rgba8) == 4);
+
 struct LocalTransform2D {
     static constexpr u8 kTypeId = 0;
     f32 x{0.0f};
@@ -250,6 +263,41 @@ struct Collider2D {
     }
 };
 static_assert(sizeof(Collider2D) == 24);
+
+// 16-byte opt-in sprite hit-flash component triggered when an entity receives damage.
+// Value type; overrides extracted Sprite2D tint and blend mode while remainingTicks > 0.
+// Invariant: sizeof(HitFlash2D) == 16.
+struct HitFlash2D {
+    static constexpr u8 kTypeId = 19;
+
+    Rgba8     flashColor{255, 255, 255, 255};
+    u8        durationTicks{4};
+    u8        remainingTicks{0};
+    BlendMode blend{BlendMode::Additive};
+    u8        emitSparks{1};
+    u64       pad{0};
+
+    constexpr void Trigger() noexcept { remainingTicks = durationTicks; }
+    [[nodiscard]] constexpr bool Active() const noexcept { return remainingTicks > 0U; }
+};
+static_assert(sizeof(HitFlash2D) == 16);
+
+// 32-byte opt-in procedural squash-and-stretch & dash after-image configuration component.
+// Value type; only entities attaching SquashStretch2D deform LocalTransform2D::scaleX/Y or emit dash ghosts.
+// Invariant: sizeof(SquashStretch2D) == 32.
+struct SquashStretch2D {
+    static constexpr u8 kTypeId = 20;
+
+    Vec2 jumpScale{0.78f, 1.25f};
+    Vec2 landScale{1.25f, 0.78f};
+    Vec2 dashScale{1.30f, 0.75f};
+    f32  recoverSpeed{3.8f};
+    u8   ghostIntervalTicks{2};
+    u8   ghostLifetimeTicks{8};
+    u8   emitDust{1};
+    u8   pad{0};
+};
+static_assert(sizeof(SquashStretch2D) == 32);
 
 inline constexpr u32 kCookedPrefabMagic  = 0x42465045U;
 inline constexpr u32 kWorldSnapshotMagic = 0x504E5357U;

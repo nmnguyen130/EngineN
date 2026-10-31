@@ -11,14 +11,15 @@
 
 namespace en {
 
-// Atomic batch-stealing parallel-for dispatcher with zero-allocation completion barriers.
+// Atomic batch-stealing parallel-for and background async job dispatcher with zero-allocation barriers.
 // Non-copyable owner of worker threads; nested ParallelFor calls execute inline on the calling worker.
 // Invariant: m_workerCount <= kMaxWorkers; batch indices are claimed via lock-free atomic fetch_add.
 class JobSystem {
 public:
     static constexpr u32 kMaxWorkers = 16;
 
-    using TaskFn = void (*)(u32 startIdx, u32 endIdx, u32 threadIdx, void* userCtx) noexcept;
+    using TaskFn  = void (*)(u32 startIdx, u32 endIdx, u32 threadIdx, void* userCtx) noexcept;
+    using AsyncFn = void (*)(void* userCtx) noexcept;
 
     JobSystem() noexcept = default;
     ~JobSystem() noexcept { Shutdown(); }
@@ -44,6 +45,16 @@ public:
         ParallelFor(itemCount, minBatchSize, &Thunk::Run, &thunk);
     }
 
+    // Dispatches a single background job (e.g. room streaming validation) without blocking the caller.
+    void DispatchAsync(AsyncFn fn, void* userCtx = nullptr) noexcept;
+    void WaitAsync() noexcept;
+    [[nodiscard]] bool IsAsyncDone() const noexcept {
+        return m_asyncDone.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] u64 AsyncRunCount() const noexcept {
+        return m_asyncRuns.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] u32 WorkerCount() const noexcept { return m_workerCount; }
 
 private:
@@ -57,15 +68,21 @@ private:
 
     void WorkerLoop(u32 workerIdx) noexcept;
     [[nodiscard]] bool ClaimAndExecuteBatch(u32 threadIdx) noexcept;
+    [[nodiscard]] bool TryExecuteAsync() noexcept;
 
     std::array<std::thread, kMaxWorkers> m_workers{};
     std::mutex              m_mutex{};
     std::condition_variable m_wakeCv{};
     Dispatch                m_dispatch{};
+    AsyncFn                 m_asyncFn{nullptr};
+    void*                   m_asyncCtx{nullptr};
     alignas(64) std::atomic<u32> m_nextBatch{0};
     alignas(64) std::atomic<u32> m_remaining{0};
+    std::atomic<u64>        m_asyncRuns{0};
     std::atomic<u32>        m_epoch{0};
     std::atomic<bool>       m_busy{false};
+    std::atomic<bool>       m_asyncPending{false};
+    std::atomic<bool>       m_asyncDone{true};
     std::atomic<bool>       m_stop{false};
     u32                     m_workerCount{0};
 };

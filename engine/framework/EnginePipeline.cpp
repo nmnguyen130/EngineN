@@ -1,0 +1,409 @@
+#include "framework/EnginePipeline.h"
+
+#include "assets/AssetBank.h"
+#include "audio/AudioSystem.h"
+#include "debug/DebugSystem.h"
+#include "framework/SceneDirector.h"
+#include "gameplay/GameplaySystem.h"
+#include "physics/PhysicsSystem.h"
+#include "platform/Platform.h"
+#include "renderer/RenderList.h"
+#include "renderer/Renderer.h"
+#include "time/Clock.h"
+#include "time/TimeSystem.h"
+#include "vfx/VfxSystem.h"
+#include "world/World.h"
+#include "world/WorldSystems.h"
+
+namespace en {
+
+using namespace en::literals;
+
+void EnginePipeline::Clear() noexcept {
+    m_srv         = {};
+    m_nodes       = {};
+    m_phaseStart  = {};
+    m_phaseCount  = {};
+    m_phaseRuns   = {};
+    m_count       = 0U;
+    m_dirty       = false;
+}
+
+void EnginePipeline::InitBuiltinStages(const PipelineServices& services) noexcept {
+    Clear();
+    m_srv = services;
+
+    (void)Register(SystemDesc{
+        .id       = "engine/pre_physics"_sid,
+        .fn       = {.tickFn = &EnginePipeline::StagePrePhysics},
+        .userData = this,
+        .order    = 0,
+        .phase    = PipelinePhase::PrePhysics,
+    });
+    (void)Register(SystemDesc{
+        .id       = "engine/physics"_sid,
+        .fn       = {.tickFn = &EnginePipeline::StagePhysics},
+        .userData = this,
+        .order    = 0,
+        .phase    = PipelinePhase::Physics,
+    });
+    (void)Register(SystemDesc{
+        .id       = "engine/post_physics"_sid,
+        .fn       = {.tickFn = &EnginePipeline::StagePostPhysics},
+        .userData = this,
+        .order    = 0,
+        .phase    = PipelinePhase::PostPhysics,
+    });
+    (void)Register(SystemDesc{
+        .id       = "engine/extract"_sid,
+        .fn       = {.drawFn = &EnginePipeline::StageExtract},
+        .userData = this,
+        .order    = 0,
+        .phase    = PipelinePhase::Extract,
+    });
+    (void)Register(SystemDesc{
+        .id       = "engine/overlay"_sid,
+        .fn       = {.drawFn = &EnginePipeline::StageOverlay},
+        .userData = this,
+        .order    = 0,
+        .phase    = PipelinePhase::Overlay,
+    });
+
+    Compile();
+}
+
+Result<void, FwErrc> EnginePipeline::Register(const SystemDesc& desc) noexcept {
+    if (!desc.id.IsValid() || (!desc.fn.tickFn && !desc.fn.drawFn) ||
+        static_cast<usize>(desc.phase) >= kPhaseCount) {
+        return Err(FwErrc::InvalidConfig);
+    }
+    for (u16 i = 0U; i < m_count; ++i) {
+        if (m_nodes[i].id == desc.id) {
+            m_nodes[i] = desc;
+            m_dirty    = true;
+            return {};
+        }
+    }
+    if (m_count >= kMaxSystems) return Err(FwErrc::PipelineFull);
+    m_nodes[m_count++] = desc;
+    m_dirty            = true;
+    return {};
+}
+
+bool EnginePipeline::Unregister(StringId id) noexcept {
+    if (!id.IsValid()) return false;
+    for (u16 i = 0U; i < m_count; ++i) {
+        if (m_nodes[i].id == id) {
+            for (u16 j = i; j + 1U < m_count; ++j) {
+                m_nodes[j] = m_nodes[j + 1U];
+            }
+            m_nodes[--m_count] = {};
+            m_dirty = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool EnginePipeline::SetEnabled(StringId id, bool enabled) noexcept {
+    if (!id.IsValid()) return false;
+    for (u16 i = 0U; i < m_count; ++i) {
+        if (m_nodes[i].id == id) {
+            m_nodes[i].enabled = enabled ? 1U : 0U;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool EnginePipeline::IsEnabled(StringId id) const noexcept {
+    for (u16 i = 0U; i < m_count; ++i) {
+        if (m_nodes[i].id == id) return m_nodes[i].enabled != 0U;
+    }
+    return false;
+}
+
+void EnginePipeline::Compile() noexcept {
+    if (!m_dirty) return;
+    m_dirty = false;
+
+    for (u16 i = 1U; i < m_count; ++i) {
+        const SystemDesc key = m_nodes[i];
+        u16 j = i;
+        while (j > 0U) {
+            const SystemDesc& prev = m_nodes[j - 1U];
+            const bool after = (static_cast<u8>(prev.phase) > static_cast<u8>(key.phase)) ||
+                               (prev.phase == key.phase && prev.order > key.order);
+            if (!after) break;
+            m_nodes[j] = prev;
+            --j;
+        }
+        m_nodes[j] = key;
+    }
+
+    m_phaseStart.fill(0U);
+    m_phaseCount.fill(0U);
+    for (u16 i = 0U; i < m_count; ++i) {
+        const usize p = static_cast<usize>(m_nodes[i].phase);
+        if (m_phaseCount[p] == 0U) m_phaseStart[p] = static_cast<u8>(i);
+        ++m_phaseCount[p];
+    }
+}
+
+void EnginePipeline::RunSimPhase(PipelinePhase phase, SimCtx& ctx, const TickStep& step) noexcept {
+    if (m_dirty) Compile();
+    const usize p = static_cast<usize>(phase);
+    if (p >= static_cast<usize>(PipelinePhase::Extract)) return;
+    ++m_phaseRuns[p];
+
+    const u8 start = m_phaseStart[p];
+    const u8 count = m_phaseCount[p];
+    for (u8 i = 0U; i < count; ++i) {
+        const SystemDesc& sys = m_nodes[start + i];
+        if (sys.enabled != 0U && sys.fn.tickFn) {
+            sys.fn.tickFn(ctx, step, sys.userData);
+        }
+    }
+}
+
+void EnginePipeline::RunDrawPhase(PipelinePhase phase, DrawCtx& ctx) noexcept {
+    if (m_dirty) Compile();
+    const usize p = static_cast<usize>(phase);
+    if (p < static_cast<usize>(PipelinePhase::Extract) || p >= kPhaseCount) return;
+    ++m_phaseRuns[p];
+
+    const u8 start = m_phaseStart[p];
+    const u8 count = m_phaseCount[p];
+    for (u8 i = 0U; i < count; ++i) {
+        const SystemDesc& sys = m_nodes[start + i];
+        if (sys.enabled != 0U && sys.fn.drawFn) {
+            sys.fn.drawFn(ctx, sys.userData);
+        }
+    }
+}
+
+void EnginePipeline::ExecuteSimTick(SimCtx& ctx, const TickStep& step) noexcept {
+    RunSimPhase(PipelinePhase::PrePhysics, ctx, step);
+    RunSimPhase(PipelinePhase::Physics, ctx, step);
+    RunSimPhase(PipelinePhase::PostPhysics, ctx, step);
+}
+
+void EnginePipeline::ExecuteRenderFrame(DrawCtx& ctx) noexcept {
+    RunDrawPhase(PipelinePhase::Extract, ctx);
+    RunDrawPhase(PipelinePhase::Overlay, ctx);
+
+    if (m_srv.renderer) {
+        if (m_srv.debug) {
+            ScopeTimer<Clock> submitTimer(m_srv.debug->Profiler(), ProfileScope::Submit);
+            m_srv.renderer->Submit(*ctx.list);
+        } else {
+            m_srv.renderer->Submit(*ctx.list);
+        }
+    }
+    if (m_srv.debug && m_srv.enableDebug != 0U) {
+        m_srv.debug->Profiler().RecordTelemetry(Telemetry{
+            .entities = static_cast<u16>(ctx.world->AliveCount()),
+            .quads    = static_cast<u16>(ctx.list->Stats().submitted),
+            .batches  = static_cast<u16>(ctx.list->Stats().batches),
+            .contacts = static_cast<u16>(ctx.physics->ContactEvents().size()),
+            .voices   = 0U,
+        });
+    }
+}
+
+std::span<const SystemDesc> EnginePipeline::PhaseSystems(PipelinePhase phase) noexcept {
+    if (m_dirty) Compile();
+    const usize p = static_cast<usize>(phase);
+    if (p >= kPhaseCount) return {};
+    return {m_nodes.data() + m_phaseStart[p], m_phaseCount[p]};
+}
+
+void EnginePipeline::StagePrePhysics(SimCtx& ctx, const TickStep& step, void*) noexcept {
+    ctx.world->BeginTick(step);
+    ctx.scenes->TickStates(ctx, step);
+    WorldSystems::StepVelocities(*ctx.world, step);
+    ctx.gameplay->StepPrePhysics(*ctx.world, step, *ctx.input, *ctx.actions);
+}
+
+void EnginePipeline::StagePhysics(SimCtx& ctx, const TickStep& step, void* ud) noexcept {
+    auto* self = static_cast<EnginePipeline*>(ud);
+    if (self->m_srv.debug) {
+        ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Physics);
+        ctx.physics->Step(*ctx.world, step);
+    } else {
+        ctx.physics->Step(*ctx.world, step);
+    }
+}
+
+void EnginePipeline::StagePostPhysics(SimCtx& ctx, const TickStep& step, void* ud) noexcept {
+    auto* self = static_cast<EnginePipeline*>(ud);
+    if (self->m_srv.debug) {
+        ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Gameplay);
+        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step);
+    } else {
+        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step);
+    }
+    WorldSystems::StepVisualsAndLifetimes(*ctx.world, step);
+    self->CheckRoomPortals(ctx);
+    self->RouteGameplayCues(ctx, step);
+    if (self->m_srv.vfx) {
+        self->m_srv.vfx->Step(step, self->m_srv.jobs);
+    }
+    ctx.world->EndTick(step);
+}
+
+void EnginePipeline::StageExtract(DrawCtx& ctx, void* ud) noexcept {
+    auto* self = static_cast<EnginePipeline*>(ud);
+    const Viewport vp = self->m_srv.viewport ? *self->m_srv.viewport : Viewport{1280, 720};
+    ctx.list->Reset(vp);
+    if (self->m_srv.debug) {
+        ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Extract);
+        WorldSystems::ExtractRender(
+            *ctx.world, *ctx.assets, *ctx.renderStep, *ctx.list, self->m_srv.pixelsPerMeter);
+        if (self->m_srv.vfx) self->m_srv.vfx->ExtractRender(*ctx.assets, *ctx.list);
+    } else {
+        WorldSystems::ExtractRender(
+            *ctx.world, *ctx.assets, *ctx.renderStep, *ctx.list, self->m_srv.pixelsPerMeter);
+        if (self->m_srv.vfx) self->m_srv.vfx->ExtractRender(*ctx.assets, *ctx.list);
+    }
+    ctx.scenes->DrawStates(ctx);
+}
+
+void EnginePipeline::StageOverlay(DrawCtx& ctx, void* ud) noexcept {
+    auto* self = static_cast<EnginePipeline*>(ud);
+    const Viewport vp = self->m_srv.viewport ? *self->m_srv.viewport : Viewport{1280, 720};
+    ctx.scenes->DrawWipe(*ctx.list, vp);
+    if (self->m_srv.debug && self->m_srv.enableDebug != 0U) {
+        ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Debug);
+        const u32 tick = self->m_srv.time
+            ? static_cast<u32>(self->m_srv.time->Stats().totalTicks)
+            : 0U;
+        FrameCtx fc{
+            .world    = ctx.world,
+            .physics  = ctx.physics,
+            .viewport = vp,
+            .tick     = tick,
+        };
+        self->m_srv.debug->Emit(fc, *ctx.list);
+    }
+}
+
+void EnginePipeline::CheckRoomPortals(SimCtx& ctx) noexcept {
+    if (ctx.scenes->IsBusy()) return;
+    if ((ctx.world->RegisteredPoolsMask() & (1ULL << RoomPortal2D::kTypeId)) == 0ULL) return;
+    const auto& portalPool = ctx.world->GetPool<RoomPortal2D>();
+    if (portalPool.Size() == 0U) return;
+
+    for (const ContactEvent2D& ev : ctx.physics->ContactEvents()) {
+        if (ev.kind != ContactEventKind::TriggerEnter) continue;
+        const EntityId portalId = ctx.world->Has<RoomPortal2D>(ev.entityA)
+            ? ev.entityA
+            : (ctx.world->Has<RoomPortal2D>(ev.entityB) ? ev.entityB : kNullEntity);
+        if (!portalId.IsValid()) continue;
+
+        const RoomPortal2D& portal = portalPool.DirectAtEntityIndex(portalId.index);
+        if (!portal.targetRoom.IsValid()) continue;
+        if (portal.requiredFlag < GameplaySystem::kMaxFlags &&
+            !ctx.gameplay->TestWorldFlag(portal.requiredFlag)) {
+            continue;
+        }
+
+        RoomDesc next{
+            .roomId       = portal.targetRoom,
+            .collisionMap = portal.targetCollisionMap,
+            .prefab       = portal.targetPrefab,
+            .wipeTicks    = portal.wipeTicks,
+            .wipe         = static_cast<WipeKind>(portal.wipeKind & 0x03U),
+            .clearWorld   = true,
+        };
+        (void)ctx.scenes->TransitionToRoom(next);
+        break;
+    }
+}
+
+void EnginePipeline::RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept {
+    u32        trigCount = 0U;
+    const auto cues      = ctx.gameplay->DrainCues();
+
+    CameraFollow2D* cam = nullptr;
+    if ((ctx.world->RegisteredPoolsMask() & MakeComponentMask<CameraFollow2D>()) != 0ULL) {
+        auto& pool = ctx.world->GetPool<CameraFollow2D>();
+        if (pool.Size() > 0U) cam = &pool.ComponentAtDense(0U);
+    }
+
+    for (const GameplayCue& c : cues) {
+        switch (c.kind) {
+            case CueKind::Audio:
+                if (trigCount < m_audioTriggers.size()) {
+                    Vec2 pos = c.position;
+                    if (pos == Vec2{} && c.emitter.IsValid() && ctx.world->IsAlive(c.emitter)) {
+                        const WorldTransform2D& wt = ctx.world->GetWorldByIndex(c.emitter.index);
+                        pos = {wt.x, wt.y};
+                    }
+                    m_audioTriggers[trigCount++] = AudioTrigger{
+                        .cueId     = c.asset,
+                        .position  = pos,
+                        .emitter   = c.emitter.Packed(),
+                        .gainScale = c.magnitude,
+                    };
+                }
+                break;
+            case CueKind::Effect:
+            case CueKind::DashGhost:
+                if (m_srv.vfx) m_srv.vfx->ProcessCue(c, *ctx.world);
+                break;
+            case CueKind::CameraShake:
+                if (cam) cam->AddTrauma(c.magnitude);
+                break;
+            case CueKind::Hitstop:
+                if (m_srv.time) m_srv.time->Hitstop(c.channel, c.durationTicks);
+                break;
+            case CueKind::Rumble:
+                if (m_srv.headless == 0U && m_srv.platform && m_srv.platform->IsInitialized()) {
+                    const u16 freq = static_cast<u16>(std::clamp(c.magnitude * 65535.0f, 0.0f, 65535.0f));
+                    (void)m_srv.platform->RumbleGamepad(freq, freq, static_cast<u32>(c.durationTicks) * 8U);
+                }
+                break;
+            default:
+                break;
+        }
+        if (m_srv.hooks && m_srv.hooks->onCue) {
+            m_srv.hooks->onCue(c, ctx, m_srv.hooks->userData);
+        }
+    }
+
+    std::array<f32, kGameplayChannels> scales{};
+    for (u8 i = 0U; i < kGameplayChannels; ++i) {
+        scales[i] = step.Scale(static_cast<TimeChannel>(i));
+    }
+
+    AudioUpdateDesc ad{
+        .triggers      = {m_audioTriggers.data(), trigCount},
+        .assets        = ctx.assets,
+        .occlusionFn   = [](Vec2 l, Vec2 e, void* p) noexcept -> bool {
+            const auto* phys = static_cast<const PhysicsSystem*>(p);
+            if (!phys) return false;
+            const Vec2 d   = e - l;
+            const f32  len = d.Length();
+            return len > 1e-4f && static_cast<bool>(phys->Raycast(l, d, len, 0x0001U));
+        },
+        .occlusionCtx  = ctx.physics,
+        .channelScales = scales.data(),
+        .listenerPos   = cam ? cam->anchor : Vec2{},
+        .tick          = step.tick,
+        .frozenMask    = static_cast<u8>(step.frozenMask | (ctx.scenes->IsFrozen() ? kGameplayMask : 0U)),
+    };
+    ctx.audio->Update(ad);
+}
+
+u64 EnginePipeline::ComputeAuditHash() const noexcept {
+    u64 h = HashCombine(0xCBF29CE484222325ULL, m_count);
+    for (u16 i = 0U; i < m_count; ++i) {
+        if (m_nodes[i].enabled != 0U) {
+            h = HashCombine(h, m_nodes[i].id.value ^ static_cast<u64>(m_nodes[i].phase));
+        }
+    }
+    return h;
+}
+
+} // namespace en

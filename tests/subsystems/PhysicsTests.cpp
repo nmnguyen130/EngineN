@@ -122,6 +122,35 @@ bool CtsMovingPlatformRidersStepUpAndTriggers(CtsRunner& r) noexcept {
     CTS_CHECK(r, Near(riderWt.x, 4.0f, 5e-2f) && Near(riderWt.y, 3.0f, 5e-2f));
     CTS_CHECK(r, riderBd.IsGrounded() && riderBd.carrier == plat);
     CTS_CHECK(r, trigEnters == 1U && trigExits == 1U);
+
+    // Moving solid lateral push and crush against a static wall.
+    world.Clear();
+    phys.Clear();
+
+    const EntityId wall = *world.Spawn({.local = {.x = 4.0f, .y = 1.0f}});
+    (void)world.Emplace<Collider2D>(wall, Collider2D{.halfExtents = {0.5f, 3.0f}, .layerMask = 1U, .isStatic = 1U});
+
+    const EntityId pusher = *world.Spawn({.local = {.x = 0.0f, .y = 1.0f}});
+    (void)world.Emplace<Collider2D>(pusher, Collider2D{.halfExtents = {1.0f, 1.0f}, .layerMask = 1U});
+    (void)world.Emplace<PhysicsBody2D>(pusher, PhysicsBody2D{.velocity = {6.0f, 0.0f}, .type = BodyType::Kinematic});
+
+    const EntityId victim = *world.Spawn({.local = {.x = 1.6f, .y = 1.0f}});
+    (void)world.Emplace<Collider2D>(victim, Collider2D{.halfExtents = {0.4f, 0.5f}, .layerMask = 2U, .queryMask = 1U});
+    (void)world.Emplace<PhysicsBody2D>(victim, PhysicsBody2D{.gravityScale = 0.0f, .type = BodyType::Dynamic});
+
+    bool crushedSeen = false;
+    for (u32 f = 0U; f < 60U; ++f) {
+        time.BeginFrame(kFixedDtNs);
+        const TickStep step = time.PollTick();
+        world.BeginTick(step);
+        phys.Step(world, step);
+        world.EndTick(step);
+        if (world.TryGet<PhysicsBody2D>(victim)->IsCrushed()) {
+            crushedSeen = true;
+            break;
+        }
+    }
+    CTS_CHECK(r, world.GetWorldTransform(victim).x > 2.5f && crushedSeen);
     return true;
 }
 
@@ -193,6 +222,41 @@ bool CtsLedgeStepUpSweepMoveCornerCorrectionAndQueries(CtsRunner& r) noexcept {
     const WorldTransform2D jumperWt = world.GetWorldTransform(jumper);
     // Corner correction nudges jumper right past x=21.4m so it continues upward past the ceiling at y=4.0m!
     CTS_CHECK(r, jumperWt.x >= 21.4f && jumperWt.y > 4.5f);
+
+    // Verify airborne Ledge Hop (ground corner correction): jumping actor clipping top 0.10m of a ledge pops onto it.
+    const EntityId ledge = *world.Spawn({.local = {.x = 30.0f, .y = 0.0f}});
+    (void)world.Emplace<Collider2D>(ledge, Collider2D{.halfExtents = {1.0f, 1.0f}, .layerMask = 16U, .isStatic = 1U});
+    const EntityId hopper = *world.Spawn({.local = {.x = 28.5f, .y = 1.40f}});
+    (void)world.Emplace<Collider2D>(hopper, Collider2D{.halfExtents = {0.4f, 0.5f}, .layerMask = 2U, .queryMask = 16U});
+    (void)world.Emplace<PhysicsBody2D>(hopper, PhysicsBody2D{.velocity = {6.0f, 0.5f}, .gravityScale = 0.0f, .type = BodyType::Dynamic});
+    for (u32 f = 0U; f < 20U; ++f) {
+        time.BeginFrame(kFixedDtNs);
+        const TickStep step = time.PollTick();
+        world.BeginTick(step);
+        phys.Step(world, step);
+        world.EndTick(step);
+    }
+    CTS_CHECK(r, world.GetWorldTransform(hopper).x > 29.0f && world.GetWorldTransform(hopper).y >= 1.49f);
+
+    // Verify Sort-and-Unique GatherContactEvents: large multi-cell overlapping colliders emit exactly 1 BeginContact.
+    const EntityId bigA = *world.Spawn({.local = {.x = -20.0f, .y = 0.0f}});
+    const EntityId bigB = *world.Spawn({.local = {.x = -20.0f, .y = 0.0f}});
+    (void)world.Emplace<Collider2D>(bigA, Collider2D{.halfExtents = {3.5f, 3.5f}, .layerMask = 32U, .queryMask = 32U});
+    (void)world.Emplace<Collider2D>(bigB, Collider2D{.halfExtents = {3.5f, 3.5f}, .layerMask = 32U, .queryMask = 32U});
+    time.BeginFrame(kFixedDtNs);
+    {
+        const TickStep step = time.PollTick();
+        world.BeginTick(step);
+        phys.Step(world, step);
+        world.EndTick(step);
+    }
+    u32 bigPairEvents = 0U;
+    for (const ContactEvent2D& ev : phys.ContactEvents()) {
+        if ((ev.entityA == bigA && ev.entityB == bigB) || (ev.entityA == bigB && ev.entityB == bigA)) {
+            ++bigPairEvents;
+        }
+    }
+    CTS_CHECK(r, bigPairEvents == 1U);
 
     AssetBank bank;
     CTS_CHECK(r, bank.Init().has_value());
@@ -283,7 +347,7 @@ bool DstDeterministicLockstepPhysicsStress(CtsRunner& r) noexcept {
 int main() {
     CtsRunner runner{.suiteName = "PhysicsTests (CTS+DST)"};
     runner.RunCase("Narrowphase, Tilemap Runs & One-Way Platforms", CtsNarrowphaseTilemapRunsAndOneWayPlatforms);
-    runner.RunCase("Moving Platform Riders, Step-Up & Triggers", CtsMovingPlatformRidersStepUpAndTriggers);
+    runner.RunCase("Moving Platform Riders, Push/Crush & Triggers", CtsMovingPlatformRidersStepUpAndTriggers);
     runner.RunCase("Ledge Step-Up, SweepMove, Corner Correction & Queries", CtsLedgeStepUpSweepMoveCornerCorrectionAndQueries);
     runner.RunCase("DST: 300-Tick Lockstep Multi-Body Stress", DstDeterministicLockstepPhysicsStress);
     return runner.Finish();

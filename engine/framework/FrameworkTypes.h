@@ -16,10 +16,12 @@ class AssetBank;
 class AudioSystem;
 class RenderList;
 class SceneDirector;
+class JobSystem;
 
 inline constexpr u8  kNoState      = 0xFFU;
 inline constexpr u32 kMaxStates    = 4U;
 inline constexpr u32 kMaxStateCmds = 4U;
+inline constexpr u32 kMaxSystems   = 32U;
 
 enum class FwErrc : u8 {
     None = 0,
@@ -39,6 +41,7 @@ enum class FwErrc : u8 {
     Busy,
     ScopeExhausted,
     InvalidRoom,
+    PipelineFull,
 };
 
 enum class StateFlags : u8 {
@@ -71,20 +74,34 @@ enum class TransitionPhase : u8 {
     In   = 3,
 };
 
-// 64-byte non-owning subsystem bundle passed to state simulation callbacks each 120 Hz tick.
+// Canonical 5-stage Metroidvania execution pipeline: 3 fixed-tick simulation stages + 2 variable-rate presentation stages.
+enum class PipelinePhase : u8 {
+    PrePhysics  = 0,
+    Physics     = 1,
+    PostPhysics = 2,
+    Extract     = 3,
+    Overlay     = 4,
+    Count       = 5,
+};
+
+// 64-byte non-owning subsystem bundle passed to state and pipeline simulation callbacks each 120 Hz tick.
+// Value type; all pointers remain valid for the duration of the tick.
+// Invariant: sizeof(SimCtx) == 64.
 struct SimCtx {
-    World*          world{nullptr};
-    PhysicsSystem*  physics{nullptr};
-    GameplaySystem* gameplay{nullptr};
-    AssetBank*      assets{nullptr};
-    AudioSystem*    audio{nullptr};
-    ActionBuffer*   actions{nullptr};
+    World*           world{nullptr};
+    PhysicsSystem*   physics{nullptr};
+    GameplaySystem*  gameplay{nullptr};
+    AssetBank*       assets{nullptr};
+    AudioSystem*     audio{nullptr};
+    ActionBuffer*    actions{nullptr};
     const TickInput* input{nullptr};
-    SceneDirector*  scenes{nullptr};
+    SceneDirector*   scenes{nullptr};
 };
 static_assert(sizeof(SimCtx) == 64);
 
-// 64-byte non-owning subsystem bundle passed to state render callbacks each frame.
+// 64-byte non-owning subsystem bundle passed to state and pipeline presentation/render callbacks each frame.
+// Value type; all pointers remain valid for the duration of the render frame.
+// Invariant: sizeof(DrawCtx) == 64.
 struct DrawCtx {
     const World*          world{nullptr};
     const PhysicsSystem*  physics{nullptr};
@@ -97,7 +114,9 @@ struct DrawCtx {
 };
 static_assert(sizeof(DrawCtx) == 64);
 
-// 64-byte non-owning subsystem bundle passed to state and room lifecycle load/unload callbacks.
+// 72-byte non-owning subsystem bundle passed to state and room lifecycle load/unload callbacks.
+// Value type; provides access to active room/persistent asset scopes and JobSystem for background streaming.
+// Invariant: sizeof(LoadCtx) == 72.
 struct LoadCtx {
     World*          world{nullptr};
     PhysicsSystem*  physics{nullptr};
@@ -105,15 +124,35 @@ struct LoadCtx {
     AssetBank*      assets{nullptr};
     AudioSystem*    audio{nullptr};
     SceneDirector*  scenes{nullptr};
+    JobSystem*      jobs{nullptr};
     void*           userData{nullptr};
     u32             frame{0};
     u8              roomScope{0xFF};
     u8              persistentScope{0xFF};
     u16             pad{0};
 };
-static_assert(sizeof(LoadCtx) == 64);
+static_assert(sizeof(LoadCtx) == 72);
+
+// 32-byte registered system node in the EnginePipeline 5-stage scheduler.
+// Value type; executes tickFn in simulation stages [0..2] and drawFn in presentation stages [3..4].
+// Invariant: sizeof(SystemDesc) == 32.
+struct SystemDesc {
+    StringId      id{};
+    union {
+        void (*tickFn)(SimCtx&, const TickStep&, void*) noexcept;
+        void (*drawFn)(DrawCtx&, void*) noexcept;
+    } fn{nullptr};
+    void*         userData{nullptr};
+    i16           order{0};
+    PipelinePhase phase{PipelinePhase::PrePhysics};
+    u8            enabled{1};
+    u32           pad{0};
+};
+static_assert(sizeof(SystemDesc) == 32);
 
 // 48-byte scene state descriptor for the 4-layer SceneDirector state stack.
+// Value type; callbacks are optional and invoked when corresponding StateFlags permit.
+// Invariant: sizeof(SceneState) == 48.
 struct SceneState {
     void (*onTick)(SimCtx&, const TickStep&, void*) noexcept{nullptr};
     void (*onDraw)(DrawCtx&, void*) noexcept{nullptr};
@@ -127,12 +166,15 @@ struct SceneState {
 };
 static_assert(sizeof(SceneState) == 48);
 
-// 56-byte Metroidvania room transition descriptor with collision map, prefab, music, and wipe settings.
+// 72-byte Metroidvania room transition descriptor with bounds, collision map, prefab, music, and wipe settings.
+// Value type; bounds (when non-empty) automatically update active CameraFollow2D room confinement on load.
+// Invariant: sizeof(RoomDesc) == 72.
 struct RoomDesc {
     AssetId roomId{};
     AssetId collisionMap{};
     AssetId prefab{};
     AssetId musicTrack{};
+    Rect    bounds{};
     Result<void, FwErrc> (*onEnter)(LoadCtx&) noexcept{nullptr};
     void (*onExit)(LoadCtx&) noexcept{nullptr};
     u8       musicFadeBlocks{48};
@@ -141,9 +183,11 @@ struct RoomDesc {
     bool     clearWorld{true};
     u32      pad{0};
 };
-static_assert(sizeof(RoomDesc) == 56);
+static_assert(sizeof(RoomDesc) == 72);
 
 // 64-byte application lifecycle and gameplay hook table.
+// Value type; all function pointers are optional.
+// Invariant: sizeof(AppHooks) == 64.
 struct AppHooks {
     void*             userData{nullptr};
     GameplayCallbacks gameplay{};

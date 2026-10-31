@@ -10,12 +10,12 @@ using namespace en::cts;
 bool CtsSandboxedPathSecurity(CtsRunner& r) noexcept {
     FilePath base{};
     FilePath invalidBase{};
-    CTS_CHECK(r, NormalizeDir("C:\\Games\\\\Veil//Data", base) && base == "C:/Games/Veil/Data/");
+    CTS_CHECK(r, NormalizeDir("C:\\Games\\\\EngineN//Data", base) && base == "C:/Games/EngineN/Data/");
     CTS_CHECK(r, !NormalizeDir("", invalidBase) && !NormalizeDir({"bad\0dir", 7U}, invalidBase));
 
     FilePath out{};
-    CTS_CHECK(r, ResolvePath(base, "sprites\\kaelen/./idle.png", out));
-    CTS_CHECK(r, out == "C:/Games/Veil/Data/sprites/kaelen/idle.png");
+    CTS_CHECK(r, ResolvePath(base, "sprites\\actor/./idle.png", out));
+    CTS_CHECK(r, out == "C:/Games/EngineN/Data/sprites/actor/idle.png");
 
     // Exhaustive adversarial path traversal & escape vectors.
     constexpr std::string_view kAttacks[]{
@@ -100,7 +100,7 @@ bool DstEventQueueReleaseProtectionAndUtf8(CtsRunner& r) noexcept {
 
 bool CtsAtomicFileIoOverwriteAndReadBounds(CtsRunner& r) noexcept {
     Platform plat;
-    CTS_CHECK(r, plat.Init("VeilCTS", "EngineN", true).has_value());
+    CTS_CHECK(r, plat.Init("EngineNCTS", "EngineN", true).has_value());
 
     Window win;
     CTS_CHECK(r, win.Create({.title = "CTS", .size = {1280, 720}}, true).has_value());

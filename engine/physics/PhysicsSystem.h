@@ -7,7 +7,7 @@ namespace en {
 
 // Deterministic 2D Metroidvania physics solver managing tilemaps, moving platforms, swept slide, and triggers.
 // Move-disabled owner of an Arena; registers Collider2D and PhysicsBody2D pools on Init.
-// Invariant: sizeof(PhysicsSystem) == 144, and zero heap allocations occur after Init.
+// Invariant: sizeof(PhysicsSystem) == 152, and zero heap allocations occur after Init.
 class PhysicsSystem {
 public:
     struct ActivePair {
@@ -144,6 +144,6 @@ private:
     u8              m_initialized{0};
     u16             m_pad{0};
 };
-static_assert(sizeof(PhysicsSystem) == 144);
+static_assert(sizeof(PhysicsSystem) == 152);
 
 } // namespace en
