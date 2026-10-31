@@ -73,7 +73,6 @@ void VfxSystem::EmitBurst(const ParticleBurstDesc& desc) noexcept {
 
     for (u8 i = 0U; i < desc.count; ++i) {
         if (m_particleCount >= m_cfg.maxParticles) {
-            // Overwrite oldest slot if at capacity.
             m_particles[i % m_cfg.maxParticles] = Particle2D{
                 .pos          = desc.origin,
                 .vel          = {desc.baseVel.x + NextSignedUnit(rng) * desc.velSpread.x,
@@ -112,6 +111,45 @@ void VfxSystem::EmitGhost(const DashGhost2D& ghost) noexcept {
         m_ghosts[m_ghostCount++] = ghost;
     } else {
         m_ghosts[m_tickCount % m_cfg.maxGhosts] = ghost;
+    }
+}
+
+void VfxSystem::ConsumeEvents(EventBus& bus, const World& world) noexcept {
+    if (!m_particles) return;
+
+    for (const VfxBurstEvent& b : bus.vfxBursts.Drain()) {
+        const u8 count = static_cast<u8>(std::clamp<u16>(b.count > 0U ? b.count : 6U, 1U, 64U));
+        const u8 life  = static_cast<u8>(std::clamp<u16>(b.durationTicks > 0U ? b.durationTicks : 14U, 1U, 255U));
+        EmitBurst(ParticleBurstDesc{
+            .origin    = b.origin,
+            .baseVel   = {0.0f, 1.8f * b.magnitude},
+            .velSpread = {2.8f * b.magnitude, 2.2f * b.magnitude},
+            .color     = b.color,
+            .size      = 0.11f,
+            .gravity   = -10.0f,
+            .lifeTicks = life,
+            .count     = count,
+        });
+    }
+
+    for (const DashGhostEvent& g : bus.dashGhosts.Drain()) {
+        DashGhost2D ghost{
+            .pos            = g.position,
+            .size           = {1.0f, 1.0f},
+            .tint           = {110, 215, 255, 180},
+            .remainingTicks = static_cast<u8>(std::clamp<u16>(g.durationTicks, 1U, 255U)),
+            .initialTicks   = static_cast<u8>(std::clamp<u16>(g.durationTicks, 1U, 255U)),
+            .layer          = 9U,
+            .flags          = static_cast<u8>(g.flags & 0x03U),
+        };
+        if (g.emitter.IsValid() && world.IsAlive(g.emitter)) {
+            if (const auto* sp = world.TryGet<Sprite2D>(g.emitter)) {
+                ghost.size   = {sp->width, sp->height};
+                ghost.sprite = sp->sprite;
+                ghost.layer  = (sp->layer > 0U) ? static_cast<u8>(sp->layer - 1U) : 0U;
+            }
+        }
+        EmitGhost(ghost);
     }
 }
 

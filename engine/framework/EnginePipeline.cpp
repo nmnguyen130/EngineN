@@ -20,13 +20,13 @@ namespace en {
 using namespace en::literals;
 
 void EnginePipeline::Clear() noexcept {
-    m_srv         = {};
-    m_nodes       = {};
-    m_phaseStart  = {};
-    m_phaseCount  = {};
-    m_phaseRuns   = {};
-    m_count       = 0U;
-    m_dirty       = false;
+    m_srv        = {};
+    m_nodes      = {};
+    m_phaseStart = {};
+    m_phaseCount = {};
+    m_phaseRuns  = {};
+    m_count      = 0U;
+    m_dirty      = false;
 }
 
 void EnginePipeline::InitBuiltinStages(const PipelineServices& services) noexcept {
@@ -236,19 +236,26 @@ void EnginePipeline::StagePhysics(SimCtx& ctx, const TickStep& step, void* ud) n
 }
 
 void EnginePipeline::StagePostPhysics(SimCtx& ctx, const TickStep& step, void* ud) noexcept {
-    auto* self = static_cast<EnginePipeline*>(ud);
+    auto*     self = static_cast<EnginePipeline*>(ud);
+    EventBus* bus  = self->m_srv.events;
     if (self->m_srv.debug) {
         ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Gameplay);
-        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step);
+        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step, bus);
     } else {
-        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step);
+        ctx.gameplay->StepPostPhysics(*ctx.world, *ctx.physics, step, bus);
     }
     WorldSystems::StepVisualsAndLifetimes(*ctx.world, step);
-    self->CheckRoomPortals(ctx);
-    self->RouteGameplayCues(ctx, step);
+
+    if (bus) {
+        if (self->m_srv.vfx) self->m_srv.vfx->ConsumeEvents(*bus, *ctx.world);
+        if (self->m_srv.time) self->m_srv.time->ConsumeEvents(*bus);
+        if (self->m_srv.platform) self->m_srv.platform->ConsumeEvents(*bus);
+        if (ctx.scenes) ctx.scenes->ConsumeEvents(*bus);
+    }
     if (self->m_srv.vfx) {
         self->m_srv.vfx->Step(step, self->m_srv.jobs);
     }
+    self->StepAudio(ctx, step);
     ctx.world->EndTick(step);
 }
 
@@ -272,6 +279,7 @@ void EnginePipeline::StageExtract(DrawCtx& ctx, void* ud) noexcept {
 void EnginePipeline::StageOverlay(DrawCtx& ctx, void* ud) noexcept {
     auto* self = static_cast<EnginePipeline*>(ud);
     const Viewport vp = self->m_srv.viewport ? *self->m_srv.viewport : Viewport{1280, 720};
+    ctx.list->EmitPostProcess();
     ctx.scenes->DrawWipe(*ctx.list, vp);
     if (self->m_srv.debug && self->m_srv.enableDebug != 0U) {
         ScopeTimer<Clock> t(self->m_srv.debug->Profiler(), ProfileScope::Debug);
@@ -288,88 +296,13 @@ void EnginePipeline::StageOverlay(DrawCtx& ctx, void* ud) noexcept {
     }
 }
 
-void EnginePipeline::CheckRoomPortals(SimCtx& ctx) noexcept {
-    if (ctx.scenes->IsBusy()) return;
-    if ((ctx.world->RegisteredPoolsMask() & (1ULL << RoomPortal2D::kTypeId)) == 0ULL) return;
-    const auto& portalPool = ctx.world->GetPool<RoomPortal2D>();
-    if (portalPool.Size() == 0U) return;
+void EnginePipeline::StepAudio(SimCtx& ctx, const TickStep& step) noexcept {
+    if (!ctx.audio) return;
 
-    for (const ContactEvent2D& ev : ctx.physics->ContactEvents()) {
-        if (ev.kind != ContactEventKind::TriggerEnter) continue;
-        const EntityId portalId = ctx.world->Has<RoomPortal2D>(ev.entityA)
-            ? ev.entityA
-            : (ctx.world->Has<RoomPortal2D>(ev.entityB) ? ev.entityB : kNullEntity);
-        if (!portalId.IsValid()) continue;
-
-        const RoomPortal2D& portal = portalPool.DirectAtEntityIndex(portalId.index);
-        if (!portal.targetRoom.IsValid()) continue;
-        if (portal.requiredFlag < GameplaySystem::kMaxFlags &&
-            !ctx.gameplay->TestWorldFlag(portal.requiredFlag)) {
-            continue;
-        }
-
-        RoomDesc next{
-            .roomId       = portal.targetRoom,
-            .collisionMap = portal.targetCollisionMap,
-            .prefab       = portal.targetPrefab,
-            .wipeTicks    = portal.wipeTicks,
-            .wipe         = static_cast<WipeKind>(portal.wipeKind & 0x03U),
-            .clearWorld   = true,
-        };
-        (void)ctx.scenes->TransitionToRoom(next);
-        break;
-    }
-}
-
-void EnginePipeline::RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept {
-    u32        trigCount = 0U;
-    const auto cues      = ctx.gameplay->DrainCues();
-
-    CameraFollow2D* cam = nullptr;
+    Vec2 listenerPos{};
     if ((ctx.world->RegisteredPoolsMask() & MakeComponentMask<CameraFollow2D>()) != 0ULL) {
-        auto& pool = ctx.world->GetPool<CameraFollow2D>();
-        if (pool.Size() > 0U) cam = &pool.ComponentAtDense(0U);
-    }
-
-    for (const GameplayCue& c : cues) {
-        switch (c.kind) {
-            case CueKind::Audio:
-                if (trigCount < m_audioTriggers.size()) {
-                    Vec2 pos = c.position;
-                    if (pos == Vec2{} && c.emitter.IsValid() && ctx.world->IsAlive(c.emitter)) {
-                        const WorldTransform2D& wt = ctx.world->GetWorldByIndex(c.emitter.index);
-                        pos = {wt.x, wt.y};
-                    }
-                    m_audioTriggers[trigCount++] = AudioTrigger{
-                        .cueId     = c.asset,
-                        .position  = pos,
-                        .emitter   = c.emitter.Packed(),
-                        .gainScale = c.magnitude,
-                    };
-                }
-                break;
-            case CueKind::Effect:
-            case CueKind::DashGhost:
-                if (m_srv.vfx) m_srv.vfx->ProcessCue(c, *ctx.world);
-                break;
-            case CueKind::CameraShake:
-                if (cam) cam->AddTrauma(c.magnitude);
-                break;
-            case CueKind::Hitstop:
-                if (m_srv.time) m_srv.time->Hitstop(c.channel, c.durationTicks);
-                break;
-            case CueKind::Rumble:
-                if (m_srv.headless == 0U && m_srv.platform && m_srv.platform->IsInitialized()) {
-                    const u16 freq = static_cast<u16>(std::clamp(c.magnitude * 65535.0f, 0.0f, 65535.0f));
-                    (void)m_srv.platform->RumbleGamepad(freq, freq, static_cast<u32>(c.durationTicks) * 8U);
-                }
-                break;
-            default:
-                break;
-        }
-        if (m_srv.hooks && m_srv.hooks->onCue) {
-            m_srv.hooks->onCue(c, ctx, m_srv.hooks->userData);
-        }
+        const auto& pool = ctx.world->GetPool<CameraFollow2D>();
+        if (pool.Size() > 0U) listenerPos = pool.ComponentAtDense(0U).anchor;
     }
 
     std::array<f32, kGameplayChannels> scales{};
@@ -377,8 +310,11 @@ void EnginePipeline::RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexce
         scales[i] = step.Scale(static_cast<TimeChannel>(i));
     }
 
+    const std::span<const AudioTrigger> triggers =
+        m_srv.events ? m_srv.events->audio.Drain() : std::span<const AudioTrigger>{};
+
     AudioUpdateDesc ad{
-        .triggers      = {m_audioTriggers.data(), trigCount},
+        .triggers      = triggers,
         .assets        = ctx.assets,
         .occlusionFn   = [](Vec2 l, Vec2 e, void* p) noexcept -> bool {
             const auto* phys = static_cast<const PhysicsSystem*>(p);
@@ -389,7 +325,7 @@ void EnginePipeline::RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexce
         },
         .occlusionCtx  = ctx.physics,
         .channelScales = scales.data(),
-        .listenerPos   = cam ? cam->anchor : Vec2{},
+        .listenerPos   = listenerPos,
         .tick          = step.tick,
         .frozenMask    = static_cast<u8>(step.frozenMask | (ctx.scenes->IsFrozen() ? kGameplayMask : 0U)),
     };

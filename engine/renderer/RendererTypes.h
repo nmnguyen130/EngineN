@@ -206,4 +206,13 @@ struct NineSlice {
 };
 static_assert(sizeof(NineSlice) == 64);
 
+// 52-byte 2D lighting and post-processing configuration for ambient multiply darkness, vignette, and hit-flash overlays.
+struct PostProcessConfig {
+    Color ambientColor{1.0f, 1.0f, 1.0f, 0.0f};
+    Color vignetteColor{0.05f, 0.0f, 0.02f, 0.0f};
+    Color flashColor{1.0f, 1.0f, 1.0f, 0.0f};
+    f32   vignetteThickness{0.18f};
+};
+static_assert(sizeof(PostProcessConfig) == 52);
+
 } // namespace en

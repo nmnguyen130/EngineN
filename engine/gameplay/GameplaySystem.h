@@ -1,15 +1,17 @@
 #pragma once
 
 #include "core/Containers.h"
+#include "core/EventBus.h"
 #include "core/Memory.h"
 #include "gameplay/GameplayTypes.h"
+#include "gameplay/WorldMap2D.h"
 #include "physics/PhysicsSystem.h"
 
 namespace en {
 
-// Deterministic 2D Metroidvania gameplay coordinator managing locomotion, FSMs, combat, mutations, and cameras.
-// Move-disabled owner of an Arena; exposes a 4096-bit progression flag table, sparse GUID mutation journal, and cue/combat event buffers.
-// Invariant: sizeof(GameplaySystem) == 648, and zero heap allocations occur after Init.
+// Deterministic 2D Metroidvania gameplay coordinator managing locomotion, FSMs, combat, mutations, world map, and cameras.
+// Move-disabled owner of an Arena; exposes a 4096-bit progression flag table, sparse GUID mutation journal, WorldMap2D, and cue/combat buffers.
+// Invariant: sizeof(GameplaySystem) == 656, and zero heap allocations occur after Init.
 class GameplaySystem {
 public:
     static constexpr u32 kFlagWords     = 64U;
@@ -46,7 +48,8 @@ public:
         PhysicsSystem& physics,
         const TickStep& step,
         const TickInput& input,
-        ActionBuffer& actions) noexcept;
+        ActionBuffer& actions,
+        EventBus* bus = nullptr) noexcept;
 
     // Canonical pipeline stage entry points invoked by EnginePipeline.
     void StepPrePhysics(
@@ -57,7 +60,8 @@ public:
     void StepPostPhysics(
         World& world,
         const PhysicsSystem& physics,
-        const TickStep& step) noexcept;
+        const TickStep& step,
+        EventBus* bus = nullptr) noexcept;
 
     // Granular subsystem steps (implemented across CharacterController.cpp, CombatResolver.cpp, CameraAndPersistence.cpp).
     void BeginTick(const TickInput& input, ActionBuffer& actions, bool playerFrozen) noexcept;
@@ -72,7 +76,12 @@ public:
         const PhysicsSystem& physics,
         const TickStep& step) noexcept;
     void ResolveCombat(World& world, const TickStep& step) noexcept;
-    void StepCameras(World& world, const TickStep& step) noexcept;
+    void StepRoomPortals(
+        const World& world,
+        const PhysicsSystem& physics,
+        EventBus& bus) const noexcept;
+    void PublishCuesToBus(const World& world, EventBus& bus) noexcept;
+    void StepCameras(World& world, const TickStep& step, EventBus* bus = nullptr) noexcept;
 
     // Applies persistent world flags and spatial GUID mutations to newly spawned room entities.
     u32 ApplyRoomMutations(World& world) noexcept;
@@ -112,6 +121,12 @@ public:
 
     constexpr void ClearWorldFlags() noexcept { m_worldFlags.fill(0ULL); }
 
+    [[nodiscard]] WorldMap2D& WorldMap() noexcept { return *m_worldMap; }
+    [[nodiscard]] const WorldMap2D& WorldMap() const noexcept { return *m_worldMap; }
+    void ClearWorldMap() noexcept {
+        if (m_worldMap) m_worldMap->Clear();
+    }
+
     bool RecordMutation(u64 guid, u32 value = 1U) noexcept {
         return guid != 0ULL && m_mutations.Insert(guid, value);
     }
@@ -129,7 +144,7 @@ public:
     [[nodiscard]] constexpr u32 MutationCount() const noexcept { return m_mutations.Size(); }
 
     [[nodiscard]] usize RequiredSaveBytes() const noexcept {
-        return sizeof(SaveHeader) + sizeof(m_worldFlags) +
+        return sizeof(SaveHeader) + sizeof(m_worldFlags) + sizeof(WorldMap2D) +
                static_cast<usize>(m_mutations.Size()) * (sizeof(u64) + sizeof(u32));
     }
 
@@ -154,6 +169,7 @@ private:
     Arena                       m_arena{};
     GameplayCue*                m_cues{nullptr};
     CombatHitEvent*             m_hits{nullptr};
+    WorldMap2D*                 m_worldMap{nullptr};
     HashMap<u32>                m_mutations{};
     u64                         m_tickCount{0};
     u32                         m_totalHits{0};
@@ -161,6 +177,6 @@ private:
     u16                         m_hitCount{0};
     std::array<u64, kFlagWords> m_worldFlags{};
 };
-static_assert(sizeof(GameplaySystem) == 648);
+static_assert(sizeof(GameplaySystem) == 656);
 
 } // namespace en

@@ -118,6 +118,13 @@ public:
         return step;
     }
 
+    template <typename EventBusT>
+    constexpr void ConsumeEvents(EventBusT& bus) noexcept {
+        for (const auto& ev : bus.hitstops.Drain()) {
+            Hitstop(ev.channel, ev.durationTicks);
+        }
+    }
+
     constexpr void Hitstop(TimeChannel ch, u16 ticks) noexcept {
         MaskHitstop(ChannelBit(ch), ticks);
     }

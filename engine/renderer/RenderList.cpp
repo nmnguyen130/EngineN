@@ -19,6 +19,33 @@ inline constexpr auto kQuadIndices = MakeIndices();
 
 } // namespace
 
+void RenderList::EmitPostProcess(const PostProcessConfig& fx) noexcept {
+    if (!m_viewport.Valid()) return;
+    const f32 vw = static_cast<f32>(m_viewport.w);
+    const f32 vh = static_cast<f32>(m_viewport.h);
+
+    // 1. Ambient darkness multiply pass (layer 195, before additive PointLight2D layer 200).
+    if (fx.ambientColor.a > 1e-4f) {
+        PushRect({0.0f, 0.0f, vw, vh}, fx.ambientColor, 0U, 195U, 32768U, kHudViewSlot, BlendMode::Multiply);
+    }
+
+    // 2. Screen-border trauma / low-health vignette bands (layer 240).
+    if (fx.vignetteColor.a > 1e-4f && fx.vignetteThickness > 1e-4f) {
+        const f32 t  = std::clamp(fx.vignetteThickness, 0.01f, 0.45f);
+        const f32 bx = vw * t;
+        const f32 by = vh * t;
+        PushRect({0.0f, 0.0f, vw, by}, fx.vignetteColor, 0U, 240U, 32768U, kHudViewSlot, BlendMode::Alpha);
+        PushRect({0.0f, vh - by, vw, by}, fx.vignetteColor, 0U, 240U, 32768U, kHudViewSlot, BlendMode::Alpha);
+        PushRect({0.0f, by, bx, vh - 2.0f * by}, fx.vignetteColor, 0U, 240U, 32768U, kHudViewSlot, BlendMode::Alpha);
+        PushRect({vw - bx, by, bx, vh - 2.0f * by}, fx.vignetteColor, 0U, 240U, 32768U, kHudViewSlot, BlendMode::Alpha);
+    }
+
+    // 3. Full-screen additive hit-flash / lightning overlay (layer 245).
+    if (fx.flashColor.a > 1e-4f) {
+        PushRect({0.0f, 0.0f, vw, vh}, fx.flashColor, 0U, 245U, 32768U, kHudViewSlot, BlendMode::Additive);
+    }
+}
+
 void RenderList::Push(const QuadCmd& cmd) noexcept {
     const u8 pass = cmd.pass & 0x03U;
     if ((m_enabledPassMask & (1U << pass)) == 0U || cmd.size.x <= 0.0f || cmd.size.y <= 0.0f ||

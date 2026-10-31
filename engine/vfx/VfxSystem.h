@@ -1,6 +1,7 @@
 #pragma once
 
 #include "assets/AssetBank.h"
+#include "core/EventBus.h"
 #include "core/Jobs.h"
 #include "core/Memory.h"
 #include "gameplay/GameplayTypes.h"
@@ -27,7 +28,10 @@ public:
     void EmitBurst(const ParticleBurstDesc& desc) noexcept;
     void EmitGhost(const DashGhost2D& ghost) noexcept;
 
-    // Consumes a GameplayCue (CueKind::Effect or CueKind::DashGhost) and spawns the corresponding VFX.
+    // Consumes VfxBurstEvent and DashGhostEvent channels directly from the deferred EventBus.
+    void ConsumeEvents(EventBus& bus, const World& world) noexcept;
+
+    // Consumes a standalone GameplayCue (CueKind::Effect or CueKind::DashGhost) and spawns the corresponding VFX.
     void ProcessCue(const GameplayCue& cue, const World& world) noexcept;
 
     // Steps active particles (via JobSystem::ParallelFor) and ghosts, then compacts expired slots via Swap-Back.

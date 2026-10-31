@@ -4,8 +4,15 @@
 
 namespace en {
 
-void GameplaySystem::StepCameras(World& world, const TickStep& step) noexcept {
+void GameplaySystem::StepCameras(World& world, const TickStep& step, EventBus* bus) noexcept {
     if (!m_cues || !step) return;
+
+    f32 pendingTrauma = 0.0f;
+    if (bus) {
+        for (const CameraTraumaEvent& ev : bus->cameraTrauma.Drain()) {
+            pendingTrauma += ev.trauma;
+        }
+    }
 
     auto& camPool = world.GetPool<CameraFollow2D>();
     if (camPool.Size() == 0U) return;
@@ -14,6 +21,9 @@ void GameplaySystem::StepCameras(World& world, const TickStep& step) noexcept {
     for (usize i = 0U; i < camPool.Size(); ++i) {
         const EntityId camId = camPool.Entities()[i];
         CameraFollow2D& cam  = camPool.ComponentAtDense(i);
+        if (pendingTrauma > 0.0f) {
+            cam.AddTrauma(pendingTrauma);
+        }
         if (!world.IsAlive(cam.target)) continue;
 
         const auto ch = static_cast<TimeChannel>(world.GetTimeChannelByIndex(camId.index));
@@ -134,7 +144,7 @@ u32 GameplaySystem::ApplyRoomMutations(World& world) noexcept {
 
 Result<usize, GameplayErrc> GameplaySystem::SerializePersistence(std::span<u8> outBuf) const noexcept {
     const usize needed = RequiredSaveBytes();
-    if (outBuf.size() < needed) return Err(GameplayErrc::OutOfMemory);
+    if (outBuf.size() < needed || !m_worldMap) return Err(GameplayErrc::OutOfMemory);
 
     BinaryWriter writer(outBuf);
     SaveHeader hdr{
@@ -146,6 +156,9 @@ Result<usize, GameplayErrc> GameplaySystem::SerializePersistence(std::span<u8> o
     };
     if (!writer.Write(hdr)) return Err(GameplayErrc::OutOfMemory);
     if (!writer.WriteBytes({reinterpret_cast<const u8*>(m_worldFlags.data()), sizeof(m_worldFlags)})) {
+        return Err(GameplayErrc::OutOfMemory);
+    }
+    if (!writer.WriteBytes({reinterpret_cast<const u8*>(m_worldMap), sizeof(WorldMap2D)})) {
         return Err(GameplayErrc::OutOfMemory);
     }
 
@@ -163,7 +176,7 @@ Result<usize, GameplayErrc> GameplaySystem::SerializePersistence(std::span<u8> o
 }
 
 Result<void, GameplayErrc> GameplaySystem::DeserializePersistence(std::span<const u8> inBuf) noexcept {
-    if (inBuf.size() < sizeof(SaveHeader) + sizeof(m_worldFlags)) {
+    if (!m_worldMap || inBuf.size() < sizeof(SaveHeader) + sizeof(m_worldFlags) + sizeof(WorldMap2D)) {
         return Err(GameplayErrc::InvalidConfig);
     }
 
@@ -173,7 +186,7 @@ Result<void, GameplayErrc> GameplaySystem::DeserializePersistence(std::span<cons
         return Err(GameplayErrc::InvalidConfig);
     }
 
-    const usize expectedSize = sizeof(SaveHeader) + sizeof(m_worldFlags) +
+    const usize expectedSize = sizeof(SaveHeader) + sizeof(m_worldFlags) + sizeof(WorldMap2D) +
                                static_cast<usize>(hdr.mutationCount) * (sizeof(u64) + sizeof(u32));
     if (inBuf.size() < expectedSize) return Err(GameplayErrc::InvalidConfig);
 
@@ -182,6 +195,10 @@ Result<void, GameplayErrc> GameplaySystem::DeserializePersistence(std::span<cons
 
     std::array<u64, kFlagWords> loadedFlags{};
     if (!reader.ReadBytes({reinterpret_cast<u8*>(loadedFlags.data()), sizeof(loadedFlags)})) {
+        return Err(GameplayErrc::InvalidConfig);
+    }
+    WorldMap2D loadedMap{};
+    if (!reader.ReadBytes({reinterpret_cast<u8*>(&loadedMap), sizeof(WorldMap2D)})) {
         return Err(GameplayErrc::InvalidConfig);
     }
 
@@ -195,6 +212,7 @@ Result<void, GameplayErrc> GameplaySystem::DeserializePersistence(std::span<cons
     }
 
     m_worldFlags = loadedFlags;
+    *m_worldMap  = loadedMap;
     m_tickCount  = hdr.tickCount;
     return {};
 }

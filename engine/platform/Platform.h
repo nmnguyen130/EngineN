@@ -43,6 +43,16 @@ public:
     bool RumbleGamepad(u16 lowFreq, u16 highFreq, u32 durationMs) noexcept;
     void StopRumble() noexcept;
 
+    template <typename EventBusT>
+    void ConsumeEvents(EventBusT& bus) noexcept {
+        for (const auto& ev : bus.rumbles.Drain()) {
+            if (!m_headless && m_initialized) {
+                const u16 freq = static_cast<u16>(std::clamp(ev.intensity * 65535.0f, 0.0f, 65535.0f));
+                (void)RumbleGamepad(freq, freq, static_cast<u32>(ev.durationTicks) * 8U);
+            }
+        }
+    }
+
     [[nodiscard]] constexpr Result<FilePath, PlatformErrc> ResolveAsset(
         std::string_view rel) const noexcept {
         FilePath out{};

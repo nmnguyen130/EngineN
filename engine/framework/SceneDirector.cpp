@@ -95,11 +95,40 @@ void SceneDirector::Shutdown(AssetBank& assets, LoadCtx* load) noexcept {
     m_asyncPrep = {};
 }
 
+Result<void, FwErrc> SceneDirector::PreloadRoom(
+    const RoomDesc& room, AssetBank& assets, JobSystem* jobs) noexcept {
+    if (m_phase != TransitionPhase::Idle) return Err(FwErrc::Busy);
+    if (!room.roomId.IsValid()) return Err(FwErrc::InvalidRoom);
+
+    if (jobs) jobs->WaitAsync();
+    if (m_stagingScope == 0xFFU) {
+        auto st = assets.BeginScope();
+        if (!st) return Err(FwErrc::ScopeExhausted);
+        m_stagingScope = *st;
+    }
+
+    m_asyncPrep = AsyncRoomPrep{
+        .assets       = &assets,
+        .roomId       = room.roomId,
+        .collisionMap = room.collisionMap,
+        .prefab       = room.prefab,
+        .dispatched   = 1U,
+    };
+    if (jobs) {
+        jobs->DispatchAsync(&SceneDirector::PrepareRoomAssetsJob, &m_asyncPrep);
+    } else {
+        PrepareRoomAssetsJob(&m_asyncPrep);
+    }
+    return {};
+}
+
 Result<void, FwErrc> SceneDirector::TransitionToRoom(const RoomDesc& room) noexcept {
     if (m_phase != TransitionPhase::Idle) return Err(FwErrc::Busy);
     if (!room.roomId.IsValid()) return Err(FwErrc::InvalidRoom);
-    m_nextRoom     = room;
-    m_asyncPrep    = {};
+    m_nextRoom = room;
+    if (m_asyncPrep.roomId != room.roomId) {
+        m_asyncPrep = {};
+    }
     m_wipe         = room.wipe;
     m_wipeDuration = room.wipeTicks;
     m_wipeTick     = 0U;
@@ -107,6 +136,22 @@ Result<void, FwErrc> SceneDirector::TransitionToRoom(const RoomDesc& room) noexc
         ? TransitionPhase::Load
         : TransitionPhase::Out;
     return {};
+}
+
+void SceneDirector::ConsumeEvents(EventBus& bus) noexcept {
+    for (const RoomTransitionEvent& ev : bus.roomTransitions.Drain()) {
+        if (IsBusy()) continue;
+        RoomDesc next{
+            .roomId       = ev.targetRoom,
+            .collisionMap = ev.collisionMap,
+            .prefab       = ev.prefab,
+            .wipeTicks    = ev.wipeTicks,
+            .wipe         = static_cast<WipeKind>(ev.wipeKind & 0x03U),
+            .clearWorld   = ev.clearWorld != 0U,
+        };
+        (void)TransitionToRoom(next);
+        break;
+    }
 }
 
 void SceneDirector::RebakeMasks() noexcept {
@@ -174,6 +219,7 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
             }
             m_asyncPrep = AsyncRoomPrep{
                 .assets       = load.assets,
+                .roomId       = m_nextRoom.roomId,
                 .collisionMap = m_nextRoom.collisionMap,
                 .prefab       = m_nextRoom.prefab,
                 .dispatched   = 1U,
@@ -197,6 +243,7 @@ Result<bool, FwErrc> SceneDirector::AdvanceRoomTransition(LoadCtx& load) noexcep
         if (load.jobs) load.jobs->WaitAsync();
         if (m_asyncPrep.completed == 0U && load.assets) {
             m_asyncPrep.assets       = load.assets;
+            m_asyncPrep.roomId       = m_nextRoom.roomId;
             m_asyncPrep.collisionMap = m_nextRoom.collisionMap;
             m_asyncPrep.prefab       = m_nextRoom.prefab;
             PrepareRoomAssetsJob(&m_asyncPrep);

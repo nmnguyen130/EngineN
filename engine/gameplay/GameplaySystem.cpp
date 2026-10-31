@@ -29,7 +29,8 @@ Result<void, GameplayErrc> GameplaySystem::Init(
 
     auto cues = m_arena.Alloc<GameplayCue>(cfg.maxCuesPerTick);
     auto hits = m_arena.Alloc<CombatHitEvent>(cfg.maxCombatHitsPerTick);
-    if (cues.empty() || hits.empty() || !m_mutations.Init(m_arena, kMaxMutations)) {
+    auto wmap = m_arena.Alloc<WorldMap2D>(1U);
+    if (cues.empty() || hits.empty() || wmap.empty() || !m_mutations.Init(m_arena, kMaxMutations)) {
         Shutdown();
         return Err(GameplayErrc::OutOfMemory);
     }
@@ -38,6 +39,8 @@ Result<void, GameplayErrc> GameplaySystem::Init(
     m_callbacks = callbacks;
     m_cues      = cues.data();
     m_hits      = hits.data();
+    m_worldMap  = wmap.data();
+    m_worldMap->Clear();
     return {};
 }
 
@@ -45,6 +48,7 @@ void GameplaySystem::Shutdown() noexcept {
     m_arena.Shutdown();
     m_cues      = nullptr;
     m_hits      = nullptr;
+    m_worldMap  = nullptr;
     m_mutations = {};
     m_tickCount = 0ULL;
     m_totalHits = 0U;
@@ -72,11 +76,16 @@ void GameplaySystem::StepPrePhysics(
 void GameplaySystem::StepPostPhysics(
     World& world,
     const PhysicsSystem& physics,
-    const TickStep& step) noexcept {
+    const TickStep& step,
+    EventBus* bus) noexcept {
     if (!m_cues || !step) return;
     SyncCharactersPostPhysics(world, physics, step);
     ResolveCombat(world, step);
-    StepCameras(world, step);
+    if (bus) {
+        StepRoomPortals(world, physics, *bus);
+        PublishCuesToBus(world, *bus);
+    }
+    StepCameras(world, step, bus);
 }
 
 void GameplaySystem::Step(
@@ -84,11 +93,103 @@ void GameplaySystem::Step(
     PhysicsSystem& physics,
     const TickStep& step,
     const TickInput& input,
-    ActionBuffer& actions) noexcept {
+    ActionBuffer& actions,
+    EventBus* bus) noexcept {
     if (!m_cues || !step) return;
     StepPrePhysics(world, step, input, actions);
     physics.Step(world, step);
-    StepPostPhysics(world, physics, step);
+    StepPostPhysics(world, physics, step, bus);
+}
+
+void GameplaySystem::StepRoomPortals(
+    const World& world,
+    const PhysicsSystem& physics,
+    EventBus& bus) const noexcept {
+    if ((world.RegisteredPoolsMask() & (1ULL << RoomPortal2D::kTypeId)) == 0ULL) return;
+    const auto& portalPool = world.GetPool<RoomPortal2D>();
+    if (portalPool.Size() == 0U) return;
+
+    for (const ContactEvent2D& ev : physics.ContactEvents()) {
+        if (ev.kind != ContactEventKind::TriggerEnter) continue;
+        const EntityId portalId = world.Has<RoomPortal2D>(ev.entityA)
+            ? ev.entityA
+            : (world.Has<RoomPortal2D>(ev.entityB) ? ev.entityB : kNullEntity);
+        if (!portalId.IsValid()) continue;
+
+        const RoomPortal2D& portal = portalPool.DirectAtEntityIndex(portalId.index);
+        if (!portal.targetRoom.IsValid()) continue;
+        if (portal.requiredFlag < kMaxFlags && !TestWorldFlag(portal.requiredFlag)) {
+            continue;
+        }
+
+        (void)bus.roomTransitions.Publish(RoomTransitionEvent{
+            .targetRoom   = portal.targetRoom,
+            .collisionMap = portal.targetCollisionMap,
+            .prefab       = portal.targetPrefab,
+            .spawnPos     = portal.spawnPos,
+            .wipeTicks    = portal.wipeTicks,
+            .wipeKind     = static_cast<u8>(portal.wipeKind & 0x03U),
+            .clearWorld   = 1U,
+        });
+        break;
+    }
+}
+
+void GameplaySystem::PublishCuesToBus(const World& world, EventBus& bus) noexcept {
+    for (const GameplayCue& c : DrainCues()) {
+        switch (c.kind) {
+            case CueKind::Audio: {
+                Vec2 pos = c.position;
+                if (pos == Vec2{} && c.emitter.IsValid() && world.IsAlive(c.emitter)) {
+                    const WorldTransform2D& wt = world.GetWorldByIndex(c.emitter.index);
+                    pos = {wt.x, wt.y};
+                }
+                (void)bus.audio.Publish(AudioTrigger{
+                    .cueId     = c.asset,
+                    .position  = pos,
+                    .emitter   = c.emitter.Packed(),
+                    .gainScale = c.magnitude,
+                });
+                break;
+            }
+            case CueKind::Effect:
+                (void)bus.vfxBursts.Publish(VfxBurstEvent{
+                    .origin        = c.position,
+                    .magnitude     = c.magnitude,
+                    .durationTicks = c.durationTicks,
+                    .count         = c.userTag,
+                });
+                break;
+            case CueKind::DashGhost:
+                (void)bus.dashGhosts.Publish(DashGhostEvent{
+                    .position      = c.position,
+                    .emitter       = c.emitter,
+                    .durationTicks = c.durationTicks,
+                    .flags         = c.userTag,
+                });
+                break;
+            case CueKind::CameraShake:
+                (void)bus.cameraTrauma.Publish(CameraTraumaEvent{
+                    .origin = c.position,
+                    .trauma = c.magnitude,
+                });
+                break;
+            case CueKind::Hitstop:
+                (void)bus.hitstops.Publish(HitstopEvent{
+                    .durationTicks = c.durationTicks,
+                    .channel       = c.channel,
+                });
+                break;
+            case CueKind::Rumble:
+                (void)bus.rumbles.Publish(RumbleEvent{
+                    .intensity     = c.magnitude,
+                    .durationTicks = c.durationTicks,
+                });
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 u64 GameplaySystem::ComputeAuditHash(const World& world) const noexcept {
@@ -96,6 +197,9 @@ u64 GameplaySystem::ComputeAuditHash(const World& world) const noexcept {
     h     = HashCombine(h, m_totalHits);
     for (const u64 w : m_worldFlags) {
         if (w != 0ULL) h = HashCombine(h, w);
+    }
+    if (m_worldMap && m_worldMap->discoveredCount > 0U) {
+        h = HashCombine(h, Crc32({reinterpret_cast<const u8*>(m_worldMap), sizeof(WorldMap2D)}));
     }
 
     u64 mutXor = 0ULL;

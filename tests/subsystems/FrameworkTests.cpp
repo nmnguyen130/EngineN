@@ -49,7 +49,6 @@ bool CtsSceneDirectorStackMasksAndRoomWipeTransitions(CtsRunner& r) noexcept {
     };
     CTS_CHECK(r, app.GetScenes().Push(pauseState).has_value());
     CTS_CHECK(r, app.StepTicks(5U).has_value());
-    // While pauseState is on top with Freeze, simulation ticks are frozen so state1Ticks remains 5!
     CTS_CHECK(r, app.GetScenes().TopStateId() == 2U && app.GetScenes().IsFrozen() && state1Ticks == 5U);
 
     // Pop pauseState -> simulation resumes!
@@ -57,7 +56,7 @@ bool CtsSceneDirectorStackMasksAndRoomWipeTransitions(CtsRunner& r) noexcept {
     CTS_CHECK(r, app.StepTicks(5U).has_value());
     CTS_CHECK(r, app.GetScenes().TopStateId() == 1U && !app.GetScenes().IsFrozen() && state1Ticks == 10U);
 
-    // Room transition with 4-tick Fade wipe, automatic collision map loading, room bounds clamping, and mutation patching.
+    // Room transition with background PreloadRoom, 4-tick Fade wipe, automatic collision map loading, and mutation patching.
     std::array<u8, sizeof(TileMapHeader) + 16U> mapBlob{};
     BinaryWriter writer(mapBlob);
     (void)writer.Write(TileMapHeader{.width = 4U, .height = 4U, .tileSize = 1.0f});
@@ -67,7 +66,6 @@ bool CtsSceneDirectorStackMasksAndRoomWipeTransitions(CtsRunner& r) noexcept {
     (void)app.GetAssets().RegisterBlob(
         "rooms/crypt.col"_aid, app.GetScenes().PersistentScope(), writer.Written());
 
-    // Pre-mark flag 10 as collected so the relic spawned in crypt is automatically removed on room load!
     app.GetGameplay().SetWorldFlag(10U, true);
 
     RoomDesc crypt{
@@ -93,29 +91,28 @@ bool CtsSceneDirectorStackMasksAndRoomWipeTransitions(CtsRunner& r) noexcept {
         .wipeTicks = 4U,
         .wipe      = WipeKind::Fade,
     };
+
+    // Proactively pre-warm adjacent room in background via JobSystem before transition!
+    CTS_CHECK(r, app.GetScenes().PreloadRoom(crypt, app.GetAssets(), &app.GetJobs()).has_value());
+    app.GetJobs().WaitAsync();
+    CTS_CHECK(r, app.GetScenes().IsPreloaded("rooms/crypt"_aid));
+
     CTS_CHECK(r, app.GetScenes().TransitionToRoom(crypt).has_value());
     CTS_CHECK(r, app.StepTicks(12U).has_value());
     CTS_CHECK(r, app.GetScenes().CurrentRoom() == "rooms/crypt"_aid);
     CTS_CHECK(r, app.GetScenes().TransitionCount() == 1U);
-    // Verify Background Room Streaming job executed asynchronously on JobSystem during Fade Out wipe!
     CTS_CHECK(r, app.GetJobs().AsyncRunCount() >= 1U);
     CTS_CHECK(r, app.GetPhysics().SampleTile(1, 0) == TileFlag::Solid);
-    // Relic was automatically destroyed by ApplyRoomMutations, leaving hero + cam = 2 entities!
     CTS_CHECK(r, app.GetWorld().AliveCount() == 2U);
     CTS_CHECK(r, app.GetWorld().GetPool<CameraFollow2D>().ComponentAtDense(0U).roomBounds == Rect{0.0f, 0.0f, 32.0f, 18.0f});
     return true;
 }
 
-bool CtsEnginePipelinePhaseOrderingAndRoomPortals(CtsRunner& r) noexcept {
+bool CtsEnginePipelinePhaseOrderingAndEventBusPortals(CtsRunner& r) noexcept {
     Application app;
     CTS_CHECK(r, app.Init({.headless = true, .enableDebug = true}).has_value());
 
     std::vector<u8> phaseTrace;
-    auto recordPhase = [](u8 tag, std::vector<u8>* vec) noexcept {
-        vec->push_back(tag);
-    };
-    (void)recordPhase;
-
     struct TraceCtx {
         std::vector<u8>* trace;
         u8               tag;
@@ -167,7 +164,8 @@ bool CtsEnginePipelinePhaseOrderingAndRoomPortals(CtsRunner& r) noexcept {
     CTS_CHECK(r, app.Step(kFixedDtNs).has_value());
     CTS_CHECK(r, phaseTrace.size() == 2U && phaseTrace[0] == 2U && phaseTrace[1] == 3U);
 
-    // Verify automatic RoomPortal2D trigger transition when player overlaps doorway trigger.
+    // Verify direct EventBus publishing and automatic RoomPortal2D trigger transition via EventBus!
+    (void)app.GetEvents().vfxBursts.Publish({.origin = {1.0f, 1.0f}, .magnitude = 1.0f, .durationTicks = 10U, .count = 8U});
     const EntityId hero = *app.GetWorld().Spawn({.local = {.x = 0.0f, .y = 0.0f}});
     (void)app.GetWorld().Emplace<Collider2D>(hero, Collider2D{.halfExtents = {0.5f, 0.5f}, .layerMask = 2U, .queryMask = 0xFFFFU});
     (void)app.GetWorld().Emplace<PhysicsBody2D>(hero, PhysicsBody2D{.gravityScale = 0.0f, .type = BodyType::Dynamic});
@@ -181,6 +179,7 @@ bool CtsEnginePipelinePhaseOrderingAndRoomPortals(CtsRunner& r) noexcept {
     });
 
     CTS_CHECK(r, app.StepTicks(2U).has_value());
+    CTS_CHECK(r, app.GetVfx().ActiveParticleCount() == 8U);
     CTS_CHECK(r, app.GetScenes().CurrentRoom() == "rooms/sanctuary"_aid);
     return true;
 }
@@ -251,8 +250,8 @@ bool DstFullEngineEndToEndDeterministicLockstep(CtsRunner& r) noexcept {
 
 int main() {
     CtsRunner runner{.suiteName = "FrameworkTests (CTS+DST)"};
-    runner.RunCase("SceneDirector Stack, Masks & Room Transitions", CtsSceneDirectorStackMasksAndRoomWipeTransitions);
-    runner.RunCase("EnginePipeline 5-Stage Ordering & RoomPortals", CtsEnginePipelinePhaseOrderingAndRoomPortals);
+    runner.RunCase("SceneDirector Stack, PreloadRoom & Transitions", CtsSceneDirectorStackMasksAndRoomWipeTransitions);
+    runner.RunCase("EnginePipeline 5-Stage Ordering & EventBus Portals", CtsEnginePipelinePhaseOrderingAndEventBusPortals);
     runner.RunCase("DST: 120-Tick Full Engine End-to-End Lockstep", DstFullEngineEndToEndDeterministicLockstep);
     return runner.Finish();
 }

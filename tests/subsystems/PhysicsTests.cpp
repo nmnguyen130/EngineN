@@ -72,6 +72,46 @@ bool CtsNarrowphaseTilemapRunsAndOneWayPlatforms(CtsRunner& r) noexcept {
     const PhysicsBody2D&   hb = *world.TryGet<PhysicsBody2D>(hero);
     CTS_CHECK(r, hb.IsGrounded() && !hb.TouchingWall());
     CTS_CHECK(r, wt.x > 6.0f && Near(wt.y, 1.5f, 2e-2f));
+
+    // Verify 2D Slope Physics (Slope45Up climbing onto flat plateau + Slope45Down downhill adhesion without airborne detachment).
+    world.Clear();
+    phys.Clear();
+    tiles.fill(TileFlag::Empty);
+    for (u32 x = 0U; x < 16U; ++x) tiles[x] = TileFlag::Solid;
+    // Row 1: x=3 is Slope45Up, x=4..5 is Solid plateau, x=6 is Slope45Down!
+    tiles[1U * 16U + 3U] = TileFlag::Slope45Up;
+    tiles[1U * 16U + 4U] = TileFlag::Solid;
+    tiles[1U * 16U + 5U] = TileFlag::Solid;
+    tiles[1U * 16U + 6U] = TileFlag::Slope45Down;
+    CTS_CHECK(r, phys.BuildTileMap(16U, 8U, 1.0f, {0.0f, 0.0f}, tiles).has_value());
+
+    const RayHit2D slopeRay = phys.Raycast({3.5f, 4.0f}, {0.0f, -1.0f}, 5.0f);
+    CTS_CHECK(r, slopeRay && slopeRay.tile == TileFlag::Slope45Up && Near(slopeRay.point.y, 1.5f, 2e-2f));
+
+    const EntityId runner = *world.Spawn({.local = {.x = 1.5f, .y = 1.5f}});
+    (void)world.Emplace<Collider2D>(runner, Collider2D{.halfExtents = {0.35f, 0.5f}, .layerMask = 2U, .queryMask = 1U});
+    (void)world.Emplace<PhysicsBody2D>(runner, PhysicsBody2D{.velocity = {6.0f, 0.0f}, .type = BodyType::Dynamic});
+
+    bool climbedSlope = false;
+    bool descendedSlopeGrounded = false;
+    for (u32 f = 0U; f < 140U; ++f) {
+        time.BeginFrame(kFixedDtNs);
+        const TickStep step = time.PollTick();
+        world.BeginTick(step);
+        world.TryGet<PhysicsBody2D>(runner)->velocity.x = 6.0f;
+        phys.Step(world, step);
+        world.EndTick(step);
+
+        const WorldTransform2D rWt = world.GetWorldTransform(runner);
+        const PhysicsBody2D&   rBd = *world.TryGet<PhysicsBody2D>(runner);
+        if (rWt.x > 4.2f && rWt.x < 5.8f && rWt.y > 2.4f && rBd.IsGrounded()) {
+            climbedSlope = true;
+        }
+        if (rWt.x > 6.2f && rWt.x < 6.8f && rBd.IsGrounded() && rBd.OnSlope()) {
+            descendedSlopeGrounded = true;
+        }
+    }
+    CTS_CHECK(r, climbedSlope && descendedSlopeGrounded);
     return true;
 }
 
@@ -220,7 +260,6 @@ bool CtsLedgeStepUpSweepMoveCornerCorrectionAndQueries(CtsRunner& r) noexcept {
         world.EndTick(step);
     }
     const WorldTransform2D jumperWt = world.GetWorldTransform(jumper);
-    // Corner correction nudges jumper right past x=21.4m so it continues upward past the ceiling at y=4.0m!
     CTS_CHECK(r, jumperWt.x >= 21.4f && jumperWt.y > 4.5f);
 
     // Verify airborne Ledge Hop (ground corner correction): jumping actor clipping top 0.10m of a ledge pops onto it.
@@ -346,7 +385,7 @@ bool DstDeterministicLockstepPhysicsStress(CtsRunner& r) noexcept {
 
 int main() {
     CtsRunner runner{.suiteName = "PhysicsTests (CTS+DST)"};
-    runner.RunCase("Narrowphase, Tilemap Runs & One-Way Platforms", CtsNarrowphaseTilemapRunsAndOneWayPlatforms);
+    runner.RunCase("Narrowphase, Tilemap Runs, Slopes & One-Way", CtsNarrowphaseTilemapRunsAndOneWayPlatforms);
     runner.RunCase("Moving Platform Riders, Push/Crush & Triggers", CtsMovingPlatformRidersStepUpAndTriggers);
     runner.RunCase("Ledge Step-Up, SweepMove, Corner Correction & Queries", CtsLedgeStepUpSweepMoveCornerCorrectionAndQueries);
     runner.RunCase("DST: 300-Tick Lockstep Multi-Body Stress", DstDeterministicLockstepPhysicsStress);

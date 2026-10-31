@@ -2,6 +2,7 @@
 
 #include "assets/AssetBank.h"
 #include "assets/ImageLoader.h"
+#include "assets/LdtkImporter.h"
 
 #include <vector>
 
@@ -93,7 +94,6 @@ bool DstMetroidvania500RoomStreamingStress(CtsRunner& r) noexcept {
         CTS_CHECK(r, roomScopeRes.has_value());
         const u8 roomScope = *roomScopeRes;
 
-        // Allocate variable-sized room textures, atlas, blob, and audio.
         const u16 dim = (room % 3U == 0U) ? 16U : ((room % 2U == 0U) ? 8U : 4U);
         const usize bytes = static_cast<usize>(dim) * dim * 4U;
         const AssetId texId{Mix64(room * 10ULL + 1ULL)};
@@ -109,31 +109,25 @@ bool DstMetroidvania500RoomStreamingStress(CtsRunner& r) noexcept {
 
         CTS_CHECK(r, roomTex.IsValid() && roomAtl.IsValid() && roomBlb.IsValid() && roomAud.IsValid());
 
-        // Leave room: end scope and evict unpinned room assets.
         bank.EndScope(roomScope);
         CTS_CHECK(r, bank.EvictUnpinned() == 4U);
-
-        // Because FreeBytes coalesces adjacent blocks and rolls back the top of the arena,
-        // ArenaUsed() must return to the exact permanent baseline after every single room!
         CTS_CHECK(r, bank.ArenaUsed() == permBaselineArena);
         CTS_CHECK(r, bank.VramBytes() == 256U);
     }
 
-    // Permanent hero texture must remain valid after 500 room transitions.
     CTS_CHECK(r, bank.GetTexture(permHero).width == 8U);
     r.RecordFuzzOps(500U * 4U);
     r.MixDigest(bank.EvictCount());
     return true;
 }
 
-bool CtsImageDecodersAndCorruptionGuards(CtsRunner& r) noexcept {
+bool CtsImageDecodersAndLdtkLevelImporter(CtsRunner& r) noexcept {
     std::vector<u8> pixels(512U * 192U * 4U);
     CTS_CHECK(r, ImageLoader::LoadRgbaImageFromDisk(
         "data/fonts/pixel_game_font.png",
         "data/fonts/pixel_game_font.bmp",
         512U, 192U, pixels));
 
-    // Dimension mismatch and non-existent paths must fail cleanly without modifying buffer size.
     CTS_CHECK(r, !ImageLoader::LoadRgbaImageFromDisk(
         "data/fonts/pixel_game_font.png",
         "data/fonts/pixel_game_font.bmp",
@@ -142,6 +136,72 @@ bool CtsImageDecodersAndCorruptionGuards(CtsRunner& r) noexcept {
         "data/fonts/non_existent.png",
         "data/fonts/non_existent.bmp",
         512U, 192U, pixels));
+
+    // Verify zero-allocation LdtkImporter JSON parsing (including slopes & Y-up row flip) and binary blob cooking.
+    Arena scratch;
+    CTS_CHECK(r, scratch.Init(64U * 1024U));
+
+    constexpr std::string_view kLdtkJson = R"json({
+        "worldX": 0,
+        "worldY": 0,
+        "layerInstances": [
+            {
+                "__identifier": "Collisions",
+                "__cWid": 4,
+                "__cHei": 3,
+                "__gridSize": 16,
+                "intGridCsv": [
+                    0, 0, 2, 0,
+                    0, 5, 1, 6,
+                    1, 1, 1, 1
+                ]
+            },
+            {
+                "__identifier": "Entities",
+                "entityInstances": [
+                    {
+                        "__identifier": "PlayerSpawn",
+                        "iid": "ent-hero-01",
+                        "width": 16,
+                        "height": 32,
+                        "px": [32, 32],
+                        "fieldInstances": [{ "__value": 7 }]
+                    },
+                    {
+                        "__identifier": "SaveBench",
+                        "iid": "ent-bench-01",
+                        "width": 32,
+                        "height": 16,
+                        "px": [48, 32],
+                        "fieldInstances": [{ "__value": 42 }]
+                    }
+                ]
+            }
+        ]
+    })json";
+
+    const auto parsed = LdtkImporter::ParseLevelJson(kLdtkJson, scratch, 16.0f);
+    CTS_CHECK(r, parsed.has_value());
+    CTS_CHECK(r, parsed->widthTiles == 4U && parsed->heightTiles == 3U);
+    CTS_CHECK(r, Near(parsed->tileSizeMeters, 1.0f));
+    // Bottom row in LDtk (row 2) -> ty = 0 in Y-up engine: all Solid!
+    CTS_CHECK(r, parsed->tiles[0 * 4 + 0] == TileFlag::Solid);
+    // Middle row in LDtk (row 1) -> ty = 1 in Y-up engine: col 1 = Slope45Up (5), col 2 = Solid (1), col 3 = Slope45Down (6)!
+    CTS_CHECK(r, parsed->tiles[1 * 4 + 1] == TileFlag::Slope45Up);
+    CTS_CHECK(r, parsed->tiles[1 * 4 + 2] == TileFlag::Solid);
+    CTS_CHECK(r, parsed->tiles[1 * 4 + 3] == TileFlag::Slope45Down);
+    // Top row in LDtk (row 0) -> ty = 2 in Y-up engine: col 2 = OneWay (2)!
+    CTS_CHECK(r, parsed->tiles[2 * 4 + 2] == TileFlag::OneWay);
+
+    CTS_CHECK(r, parsed->entities.size() == 2U);
+    CTS_CHECK(r, parsed->entities[0].identifier == "PlayerSpawn"_sid);
+    CTS_CHECK(r, Near(parsed->entities[0].worldPos.x, 2.0f) && Near(parsed->entities[0].worldPos.y, 1.0f));
+    CTS_CHECK(r, parsed->entities[0].customInt == 7);
+    CTS_CHECK(r, parsed->entities[1].identifier == "SaveBench"_sid && parsed->entities[1].customInt == 42);
+
+    std::array<u8, 256> cookedBlob{};
+    const auto cookedBytes = LdtkImporter::CookTileMapBlob(*parsed, cookedBlob);
+    CTS_CHECK(r, cookedBytes.has_value() && *cookedBytes == sizeof(TileMapHeader) + 12U);
     return true;
 }
 
@@ -151,6 +211,6 @@ int main() {
     CtsRunner runner{.suiteName = "AssetsTests (CTS+DST)"};
     runner.RunCase("Generational Fallbacks & Multi-Scope Pinning", CtsGenerationalFallbacksAndIdempotentScopes);
     runner.RunCase("DST: 500-Room Streaming & Coalescing Stress", DstMetroidvania500RoomStreamingStress);
-    runner.RunCase("Disk PNG/BMP Decoders & Corruption Guards", CtsImageDecodersAndCorruptionGuards);
+    runner.RunCase("Disk PNG/BMP Decoders & LDtk Level Importer", CtsImageDecodersAndLdtkLevelImporter);
     return runner.Finish();
 }

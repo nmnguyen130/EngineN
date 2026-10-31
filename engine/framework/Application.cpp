@@ -12,6 +12,7 @@ struct Application::Runtime {
     PhysicsSystem  physics{};
     GameplaySystem gameplay{};
     VfxSystem      vfx{};
+    EventBus       events{};
     SceneDirector  scenes{};
     EnginePipeline pipeline{};
     DebugSystem    debug{};
@@ -150,7 +151,7 @@ Result<void, FwErrc> Application::Init(const AppConfig& cfg, const AppHooks& hoo
         .debug          = (m_debug != 0U) ? &m_rt->debug : nullptr,
         .vfx            = &m_rt->vfx,
         .jobs           = &m_rt->jobs,
-        .hooks          = &m_rt->hooks,
+        .events         = &m_rt->events,
         .viewport       = &m_rt->viewport,
         .pixelsPerMeter = m_ppm,
         .headless       = m_headless,
@@ -182,6 +183,7 @@ void Application::Shutdown() noexcept {
         m_rt->pipeline.Clear();
         m_rt->scenes.Shutdown(m_rt->assets, &load);
         if (m_debug != 0U) m_rt->debug.Shutdown();
+        m_rt->events.ClearAll();
         m_rt->vfx.Shutdown();
         m_rt->gameplay.Shutdown();
         m_rt->physics.Shutdown();
@@ -342,6 +344,7 @@ Platform&       Application::GetPlatform() noexcept       { return m_rt->platfor
 Window&         Application::GetWindow() noexcept         { return m_rt->window; }
 Renderer&       Application::GetRenderer() noexcept       { return m_rt->renderer; }
 JobSystem&      Application::GetJobs() noexcept           { return m_rt->jobs; }
+EventBus&       Application::GetEvents() noexcept         { return m_rt->events; }
 SceneDirector&  Application::GetScenes() noexcept         { return m_rt->scenes; }
 EnginePipeline& Application::GetPipeline() noexcept       { return m_rt->pipeline; }
 World&          Application::GetWorld() noexcept          { return m_rt->world; }
@@ -360,6 +363,7 @@ const Platform&       Application::GetPlatform() const noexcept   { return m_rt-
 const Window&         Application::GetWindow() const noexcept     { return m_rt->window; }
 const Renderer&       Application::GetRenderer() const noexcept   { return m_rt->renderer; }
 const JobSystem&      Application::GetJobs() const noexcept       { return m_rt->jobs; }
+const EventBus&       Application::GetEvents() const noexcept     { return m_rt->events; }
 const SceneDirector&  Application::GetScenes() const noexcept     { return m_rt->scenes; }
 const EnginePipeline& Application::GetPipeline() const noexcept   { return m_rt->pipeline; }
 const World&          Application::GetWorld() const noexcept      { return m_rt->world; }

@@ -97,6 +97,25 @@ void PhysicsSystem::StepDynamicBodies(World& world, const TickStep& step) noexce
             if (h.entity.IsValid()) body.carrier = h.entity;
         };
 
+        // Pre-elevate vertical displacement when walking uphill on a slope tile so the collider
+        // rises along the slope surface before testing adjacent flat plateau tiles.
+        if ((col.queryMask & 0x0001U) != 0U && m_grid.TileSize() > 0.0f && std::abs(rem.x) > 1e-6f) {
+            const Rect preBox  = col.WorldBounds({pos.x + rem.x, pos.y});
+            const f32  footX   = preBox.Center().x;
+            const f32  invTile = 1.0f / m_grid.TileSize();
+            const i32  tx      = static_cast<i32>(std::floor((footX - m_grid.Origin().x) * invTile));
+            const i32  ty      = static_cast<i32>(std::floor((preBox.y + 0.05f - m_grid.Origin().y) * invTile));
+            const TileFlag tf  = m_grid.SampleTile(tx, ty);
+            if (IsSlopeTile(tf)) {
+                const Rect tRect  = m_grid.TileWorldBounds(tx, ty);
+                const f32  u      = (footX - tRect.x) / tRect.w;
+                const f32  surfY  = tRect.y + SampleSlopeHeight(tf, u, tRect.h);
+                if (preBox.y < surfY && surfY - preBox.y <= m_grid.TileSize()) {
+                    pos.y += (surfY - preBox.y);
+                }
+            }
+        }
+
         for (u32 iter = 0U; iter < 3U; ++iter) {
             if (std::abs(rem.x) <= 1e-6f && std::abs(rem.y) <= 1e-6f) break;
 
@@ -137,8 +156,6 @@ void PhysicsSystem::StepDynamicBodies(World& world, const TickStep& step) noexce
             }
 
             // Ground step-up & airborne Ledge Hop corner correction:
-            // When moving horizontally (grounded or jumping) and only the bottom 2-4cm (maxStepHeight)
-            // clips the top lip of a ledge, pop the actor up onto the ledge surface.
             if (std::abs(hit.normal.x) > 0.9f && m_cfg.maxStepHeight > 1e-3f &&
                 (wasGrounded || body.velocity.y <= m_cfg.ledgeHopMaxVy)) {
                 const Rect curBox = col.WorldBounds(pos);
@@ -206,8 +223,47 @@ void PhysicsSystem::StepDynamicBodies(World& world, const TickStep& step) noexce
             }
         }
 
-        // High-speed Slope Adhesion / Downhill Snapping:
-        // Scale snap distance with horizontal travel so actors never detach or bounce when running down slopes/stairs.
+        // Analytical 2D Slope Heightmap Resolution & Downhill Slope Snapping:
+        // Evaluates the tile column containing the actor's foot center X (current row and row below).
+        if ((col.queryMask & 0x0001U) != 0U && m_grid.TileSize() > 0.0f) {
+            const Rect curBox      = col.WorldBounds(pos);
+            const f32  footX       = curBox.Center().x;
+            const f32  invTile     = 1.0f / m_grid.TileSize();
+            const i32  tx          = static_cast<i32>(std::floor((footX - m_grid.Origin().x) * invTile));
+            const i32  baseTy      = static_cast<i32>(std::floor((curBox.y + 0.05f - m_grid.Origin().y) * invTile));
+            const f32  horizTravel = std::abs(body.velocity.x) * dt;
+            const f32  snapDist    = std::max(m_cfg.groundSnapDist, horizTravel * m_cfg.slopeSnapMultiplier);
+
+            for (i32 dy = 0; dy >= -1; --dy) {
+                const i32      ty = baseTy + dy;
+                const TileFlag tf = m_grid.SampleTile(tx, ty);
+                if (!IsSlopeTile(tf)) continue;
+
+                const Rect tRect = m_grid.TileWorldBounds(tx, ty);
+                const f32  u     = (footX - tRect.x) / tRect.w;
+                const f32  surfY = tRect.y + SampleSlopeHeight(tf, u, tRect.h);
+                const f32  diffY = surfY - curBox.y;
+
+                const bool penetrating = (diffY >= -kSkin && diffY <= m_grid.TileSize() + 0.1f &&
+                                          (wasGrounded || body.velocity.y <= 0.1f));
+                const bool snappingDown = (!penetrating && wasGrounded && body.velocity.y <= 0.1f &&
+                                           diffY < 0.0f && -diffY <= snapDist);
+
+                if (penetrating || snappingDown) {
+                    pos.y += diffY;
+                    body.contacts |= (ContactFlags::Ground | ContactFlags::Slope);
+                    const Vec2 n  = SlopeNormal(tf);
+                    const f32  vn = body.velocity.Dot(n);
+                    if (vn < 0.0f || snappingDown) {
+                        const Vec2 vSlope = ProjectVelocityOnSlope(body.velocity, n);
+                        body.velocity.y   = vSlope.y;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // High-speed Flat/Entity Ground Adhesion & Downhill Snapping:
         if (!body.IsGrounded() && wasGrounded && body.velocity.y <= 0.0f && m_cfg.groundSnapDist > 0.0f) {
             const f32 horizTravel = std::abs(body.velocity.x) * dt;
             const f32 snapDist    = std::max(m_cfg.groundSnapDist, horizTravel * m_cfg.slopeSnapMultiplier);
@@ -216,9 +272,6 @@ void PhysicsSystem::StepDynamicBodies(World& world, const TickStep& step) noexce
             if (snap && snap.normal.y >= kMinGroundNormalY && snap.time > 0.0f && snap.time < 1.0f) {
                 pos.y -= snapDist * std::max(0.0f, snap.time - kSkin);
                 markGround(snap);
-                if (snap.normal.y < 0.999f && (snap.normal.x * body.velocity.x) > 0.0f) {
-                    body.velocity.y = -body.velocity.x * (snap.normal.x / snap.normal.y);
-                }
             }
         }
 

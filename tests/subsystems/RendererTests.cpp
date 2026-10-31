@@ -92,6 +92,16 @@ bool CtsCamera2DCullingAndPrimitives(CtsRunner& r) noexcept {
     CTS_CHECK(r, Near(textSize.x, 24.0f) && textSize.y > 30.0f);
     list.PushText({50.0f, 50.0f}, "A B\nC", {1.0f, 1.0f, 1.0f, 1.0f}, 1.0f, 0U, 20U, 7U, TextureHandle{2U, 1U});
     CTS_CHECK(r, list.Stats().submitted == 20U); // +3 visible glyphs ('A', 'B', 'C')
+
+    // Verify 2D Ambient Lightmap Multiply pass + 4-edge trauma vignette + full-screen hit flash (+6 quads).
+    list.SetPostProcess(PostProcessConfig{
+        .ambientColor      = {0.20f, 0.25f, 0.35f, 0.85f},
+        .vignetteColor     = {0.10f, 0.0f, 0.02f, 0.65f},
+        .flashColor        = {1.0f, 1.0f, 1.0f, 0.50f},
+        .vignetteThickness = 0.15f,
+    });
+    list.EmitPostProcess();
+    CTS_CHECK(r, list.Stats().submitted == 26U);
     return true;
 }
 
@@ -146,7 +156,7 @@ bool CtsTexturePoolExhaustionAndGenerations(CtsRunner& r) noexcept {
 int main() {
     CtsRunner runner{.suiteName = "RendererTests (CTS+DST)"};
     runner.RunCase("DST: 4,096-Quad SortKey & Batching Oracle", DstRenderList4096QuadSortAndBatchOracle);
-    runner.RunCase("Camera2D Round-Trip, Culling & UI Primitives", CtsCamera2DCullingAndPrimitives);
+    runner.RunCase("Camera2D Round-Trip, Culling & Lighting/PostFX", CtsCamera2DCullingAndPrimitives);
     runner.RunCase("512-Slot GPU Pool Exhaustion & Generations", CtsTexturePoolExhaustionAndGenerations);
     return runner.Finish();
 }

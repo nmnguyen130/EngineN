@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audio/AudioTypes.h"
+#include "core/EventBus.h"
 #include "framework/FrameworkTypes.h"
 
 namespace en {
@@ -15,18 +15,18 @@ class VfxSystem;
 // Value type; bound once during Application::Init.
 // Invariant: sizeof(PipelineServices) == 72.
 struct PipelineServices {
-    TimeSystem*     time{nullptr};
-    Platform*       platform{nullptr};
-    Renderer*       renderer{nullptr};
-    DebugSystem*    debug{nullptr};
-    VfxSystem*      vfx{nullptr};
-    JobSystem*      jobs{nullptr};
-    const AppHooks* hooks{nullptr};
-    Viewport*       viewport{nullptr};
-    f32             pixelsPerMeter{48.0f};
-    u8              headless{1};
-    u8              enableDebug{1};
-    u16             pad0{0};
+    TimeSystem*  time{nullptr};
+    Platform*    platform{nullptr};
+    Renderer*    renderer{nullptr};
+    DebugSystem* debug{nullptr};
+    VfxSystem*   vfx{nullptr};
+    JobSystem*   jobs{nullptr};
+    EventBus*    events{nullptr};
+    Viewport*    viewport{nullptr};
+    f32          pixelsPerMeter{48.0f};
+    u8           headless{1};
+    u8           enableDebug{1};
+    u16          pad0{0};
 };
 static_assert(sizeof(PipelineServices) == 72);
 
@@ -77,12 +77,10 @@ private:
     static void StageExtract(DrawCtx& ctx, void* ud) noexcept;
     static void StageOverlay(DrawCtx& ctx, void* ud) noexcept;
 
-    void CheckRoomPortals(SimCtx& ctx) noexcept;
-    void RouteGameplayCues(SimCtx& ctx, const TickStep& step) noexcept;
+    void StepAudio(SimCtx& ctx, const TickStep& step) noexcept;
 
     PipelineServices                    m_srv{};
     std::array<SystemDesc, kMaxSystems> m_nodes{};
-    std::array<AudioTrigger, 64>        m_audioTriggers{};
     std::array<u64, kPhaseCount>        m_phaseRuns{};
     std::array<u8, kPhaseCount>         m_phaseStart{};
     std::array<u8, kPhaseCount>         m_phaseCount{};

@@ -249,8 +249,10 @@ void SpatialGrid2D::VisitTileRuns(const Rect& area, Fn&& fn) const noexcept {
             const TileFlag flags = SampleTile(tx, ty);
             if (flags == TileFlag::Empty) continue;
             i32 runEnd = tx;
-            while (runEnd + 1 <= maxTX && SampleTile(runEnd + 1, ty) == flags) {
-                ++runEnd;
+            if (!IsSlopeTile(flags)) {
+                while (runEnd + 1 <= maxTX && SampleTile(runEnd + 1, ty) == flags) {
+                    ++runEnd;
+                }
             }
             const f32 runX = m_originX + static_cast<f32>(tx) * m_tileSize;
             const f32 runW = static_cast<f32>(runEnd - tx + 1) * m_tileSize;
@@ -284,6 +286,28 @@ RayHit2D SpatialGrid2D::Raycast(
 
     if ((queryMask & 0x0001U) != 0U) {
         VisitTileRuns(searchArea, [&](i32, i32, i32, const Rect& runBox, TileFlag flags) noexcept {
+            if (IsSlopeTile(flags)) {
+                const RayHit2D boxHit = RaycastBox(origin, unitDir, best.distance, runBox);
+                if (!boxHit) return;
+                const Vec2 pt = boxHit.point;
+                const f32  u  = (pt.x - runBox.x) / runBox.w;
+                const f32  sy = runBox.y + SampleSlopeHeight(flags, u, runBox.h);
+                if (unitDir.y < -1e-5f && origin.y >= sy - 1e-3f) {
+                    const f32 dist = (origin.y - sy) / (-unitDir.y);
+                    if (dist >= 0.0f && dist <= best.distance) {
+                        const Vec2 hitPt = origin + unitDir * dist;
+                        if (hitPt.x >= runBox.x - 1e-3f && hitPt.x <= runBox.Right() + 1e-3f) {
+                            best.point    = {hitPt.x, runBox.y + SampleSlopeHeight(flags, (hitPt.x - runBox.x) / runBox.w, runBox.h)};
+                            best.normal   = SlopeNormal(flags);
+                            best.distance = dist;
+                            best.fraction = (maxDist > 1e-8f) ? (dist / maxDist) : 0.0f;
+                            best.tile     = flags;
+                            best.hit      = 1U;
+                        }
+                    }
+                }
+                return;
+            }
             if (!HasFlag(flags, TileFlag::Solid)) return;
             const RayHit2D h = RaycastBox(origin, unitDir, best.distance, runBox);
             if (h && h.distance <= best.distance) {
@@ -376,10 +400,24 @@ SweepResult2D SpatialGrid2D::SweepBox(
 
     if ((queryMask & 0x0001U) != 0U) {
         VisitTileRuns(searchArea, [&](i32 tx0, i32 tx1, i32 ty, const Rect& runBox, TileFlag flags) noexcept {
+            // Slopes are resolved analytically via heightmap evaluation in PhysicsSolver::StepDynamicBodies.
+            if (IsSlopeTile(flags)) return;
+
             const bool isOneWay = HasFlag(flags, TileFlag::OneWay) && !HasFlag(flags, TileFlag::Solid);
             if (!HasFlag(flags, TileFlag::Solid | TileFlag::OneWay)) return;
             if (isOneWay) {
                 if (ignoreOneWay || delta.y > 0.0f || movingBox.y < runBox.Bottom() - 2e-3f) return;
+            }
+
+            // When the actor's foot center X is inside an adjacent slope tile in the same row,
+            // that slope is the authoritative ground surface and suppresses adjacent flat overhang collisions.
+            if (!isOneWay && m_tileSize > 0.0f) {
+                const f32 footX  = movingBox.Center().x + delta.x;
+                const i32 footTX = static_cast<i32>(std::floor((footX - m_originX) / m_tileSize));
+                if ((footTX == tx0 - 1 || footTX == tx1 + 1) &&
+                    (IsSlopeTile(SampleTile(footTX, ty)) || IsSlopeTile(SampleTile(footTX, ty - 1)))) {
+                    return;
+                }
             }
 
             SweepResult2D h = SweepBoxVsBox(movingBox, delta, runBox);

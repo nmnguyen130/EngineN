@@ -2,6 +2,7 @@
 
 #include "assets/AssetBank.h"
 #include "audio/AudioSystem.h"
+#include "core/EventBus.h"
 #include "core/Jobs.h"
 #include "debug/DebugSystem.h"
 #include "framework/EnginePipeline.h"
@@ -71,6 +72,7 @@ public:
     [[nodiscard]] Window&         GetWindow() noexcept;
     [[nodiscard]] Renderer&       GetRenderer() noexcept;
     [[nodiscard]] JobSystem&      GetJobs() noexcept;
+    [[nodiscard]] EventBus&       GetEvents() noexcept;
     [[nodiscard]] SceneDirector&  GetScenes() noexcept;
     [[nodiscard]] EnginePipeline& GetPipeline() noexcept;
     [[nodiscard]] World&          GetWorld() noexcept;
@@ -89,6 +91,7 @@ public:
     [[nodiscard]] const Window&         GetWindow() const noexcept;
     [[nodiscard]] const Renderer&       GetRenderer() const noexcept;
     [[nodiscard]] const JobSystem&      GetJobs() const noexcept;
+    [[nodiscard]] const EventBus&       GetEvents() const noexcept;
     [[nodiscard]] const SceneDirector&  GetScenes() const noexcept;
     [[nodiscard]] const EnginePipeline& GetPipeline() const noexcept;
     [[nodiscard]] const World&          GetWorld() const noexcept;

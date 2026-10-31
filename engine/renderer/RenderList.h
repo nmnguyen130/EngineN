@@ -4,7 +4,7 @@
 
 namespace en {
 
-// 2D quad command list with frustum culling, 64-bit sort-key ordering, and state batching.
+// 2D quad command list with frustum culling, 64-bit sort-key ordering, state batching, and 2D lighting/post-fx passes.
 // Value type with fixed inline storage and zero runtime allocations.
 class RenderList {
 public:
@@ -55,6 +55,12 @@ public:
     }
 
     constexpr void SetPixelSnap(bool on) noexcept { m_pixelSnap = on; }
+
+    constexpr void SetPostProcess(const PostProcessConfig& fx) noexcept { m_postFx = fx; }
+    [[nodiscard]] constexpr const PostProcessConfig& PostProcess() const noexcept { return m_postFx; }
+
+    void EmitPostProcess() noexcept { EmitPostProcess(m_postFx); }
+    void EmitPostProcess(const PostProcessConfig& fx) noexcept;
 
     void Push(const QuadCmd& cmd) noexcept;
 
@@ -119,14 +125,15 @@ public:
     }
 
 private:
-    u64         m_lastKey{0};
-    Viewport    m_viewport{1280, 720};
-    RenderStats m_stats{};
-    u8          m_enabledPassMask{0x0F};
-    u8          m_clearPassMask{0x01};
-    bool        m_monotonic{true};
-    bool        m_compiled{false};
-    bool        m_pixelSnap{false};
+    u64               m_lastKey{0};
+    Viewport          m_viewport{1280, 720};
+    RenderStats       m_stats{};
+    PostProcessConfig m_postFx{};
+    u8                m_enabledPassMask{0x0F};
+    u8                m_clearPassMask{0x01};
+    bool              m_monotonic{true};
+    bool              m_compiled{false};
+    bool              m_pixelSnap{false};
 
     std::array<PassDesc, kMaxPasses>    m_passes{};
     std::array<Camera2D, kMaxViews>     m_views{};

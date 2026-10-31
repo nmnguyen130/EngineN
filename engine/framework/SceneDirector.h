@@ -1,16 +1,18 @@
 #pragma once
 
+#include "core/EventBus.h"
 #include "framework/FrameworkTypes.h"
 #include "renderer/RenderList.h"
 
 namespace en {
 
 // 4-layer state stack (play/pause/menu) and room transition state machine with background JobSystem streaming.
-// Value type; coordinates async room asset verification during Out wipe, scope eviction, and screen wipes.
+// Value type; supports proactive adjacent room pre-warming (PreloadRoom), async verification, and screen wipes.
 class SceneDirector {
 public:
     struct AsyncRoomPrep {
         const AssetBank* assets{nullptr};
+        AssetId          roomId{};
         AssetId          collisionMap{};
         AssetId          prefab{};
         BlobHandle       collisionBlob{};
@@ -19,7 +21,7 @@ public:
         u8               completed{0};
         u16              pad{0};
     };
-    static_assert(sizeof(AsyncRoomPrep) == 36 || sizeof(AsyncRoomPrep) == 40);
+    static_assert(sizeof(AsyncRoomPrep) == 48);
 
     [[nodiscard]] Result<void, FwErrc> Init(AssetBank& assets) noexcept;
     void Shutdown(AssetBank& assets, LoadCtx* load = nullptr) noexcept;
@@ -37,7 +39,14 @@ public:
         return Enqueue(s, StateOp::Reset);
     }
 
+    // Pre-warms and CRC-verifies an adjacent room's collision map and prefab in the background via JobSystem
+    // before the player touches a doorway portal, enabling zero-stall seamless room transitions.
+    [[nodiscard]] Result<void, FwErrc> PreloadRoom(
+        const RoomDesc& room, AssetBank& assets, JobSystem* jobs = nullptr) noexcept;
+
     [[nodiscard]] Result<void, FwErrc> TransitionToRoom(const RoomDesc& room) noexcept;
+
+    void ConsumeEvents(EventBus& bus) noexcept;
 
     [[nodiscard]] Result<bool, FwErrc> Tick(LoadCtx& load) noexcept;
 
@@ -47,6 +56,9 @@ public:
 
     [[nodiscard]] constexpr bool IsBusy() const noexcept {
         return m_cmdCount > 0U || m_phase != TransitionPhase::Idle;
+    }
+    [[nodiscard]] constexpr bool IsPreloaded(AssetId roomId) const noexcept {
+        return roomId.IsValid() && m_asyncPrep.roomId == roomId && m_asyncPrep.completed != 0U;
     }
     [[nodiscard]] constexpr TransitionPhase Phase() const noexcept { return m_phase; }
     [[nodiscard]] constexpr u8 RoomScope() const noexcept { return m_roomScope; }
@@ -113,6 +125,6 @@ private:
     AssetId       m_currentRoom{};
     void (*m_roomExitFn)(LoadCtx&) noexcept{nullptr};
 };
-static_assert(sizeof(SceneDirector) <= 576);
+static_assert(sizeof(SceneDirector) <= 592);
 
 } // namespace en

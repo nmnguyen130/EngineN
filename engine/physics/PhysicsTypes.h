@@ -21,13 +21,47 @@ enum class BodyType : u8 {
 };
 
 enum class TileFlag : u8 {
-    Empty     = 0,
-    Solid     = 1U << 0,
-    OneWay    = 1U << 1,
-    Hazard    = 1U << 2,
-    Climbable = 1U << 3,
+    Empty         = 0,
+    Solid         = 1U << 0,
+    OneWay        = 1U << 1,
+    Hazard        = 1U << 2,
+    Climbable     = 1U << 3,
+    Slope45Up     = 1U << 4,
+    Slope45Down   = 1U << 5,
+    SlopeLowHalf  = 1U << 6,
+    SlopeHighHalf = 1U << 7,
+    Slope22UpLo   = Slope45Up | SlopeLowHalf,
+    Slope22UpHi   = Slope45Up | SlopeHighHalf,
+    Slope22DownLo = Slope45Down | SlopeLowHalf,
+    Slope22DownHi = Slope45Down | SlopeHighHalf,
 };
 consteval bool enable_bitmask_operators(TileFlag) noexcept { return true; }
+
+[[nodiscard]] constexpr bool IsSlopeTile(TileFlag f) noexcept {
+    return HasFlag(f, TileFlag::Slope45Up | TileFlag::Slope45Down);
+}
+
+[[nodiscard]] constexpr f32 SampleSlopeHeight(TileFlag f, f32 localU, f32 tileSize) noexcept {
+    const f32 u    = std::clamp(localU, 0.0f, 1.0f);
+    const bool up  = HasFlag(f, TileFlag::Slope45Up);
+    const f32 ramp = up ? u : (1.0f - u);
+    if (HasFlag(f, TileFlag::SlopeLowHalf))  return 0.5f * ramp * tileSize;
+    if (HasFlag(f, TileFlag::SlopeHighHalf)) return (0.5f + 0.5f * ramp) * tileSize;
+    return ramp * tileSize;
+}
+
+[[nodiscard]] constexpr Vec2 SlopeNormal(TileFlag f) noexcept {
+    const f32 sign = HasFlag(f, TileFlag::Slope45Up) ? -1.0f : 1.0f;
+    if (HasFlag(f, TileFlag::SlopeLowHalf | TileFlag::SlopeHighHalf)) {
+        return {sign * 0.44721360f, 0.89442719f};
+    }
+    return {sign * 0.70710678f, 0.70710678f};
+}
+
+[[nodiscard]] constexpr Vec2 ProjectVelocityOnSlope(Vec2 velocity, Vec2 slopeNormal) noexcept {
+    const Vec2 tangent{slopeNormal.y, -slopeNormal.x};
+    return tangent * velocity.x;
+}
 
 enum class ContactFlags : u8 {
     None      = 0,
@@ -69,6 +103,7 @@ struct PhysicsBody2D {
     [[nodiscard]] constexpr bool IsKinematic() const noexcept { return type == BodyType::Kinematic; }
     [[nodiscard]] constexpr bool IsDynamic() const noexcept { return type == BodyType::Dynamic; }
     [[nodiscard]] constexpr bool IsGrounded() const noexcept { return HasFlag(contacts, ContactFlags::Ground); }
+    [[nodiscard]] constexpr bool OnSlope() const noexcept { return HasFlag(contacts, ContactFlags::Slope); }
     [[nodiscard]] constexpr bool OnCeiling() const noexcept { return HasFlag(contacts, ContactFlags::Ceiling); }
     [[nodiscard]] constexpr bool OnWallLeft() const noexcept { return HasFlag(contacts, ContactFlags::WallLeft); }
     [[nodiscard]] constexpr bool OnWallRight() const noexcept { return HasFlag(contacts, ContactFlags::WallRight); }
